@@ -253,7 +253,7 @@ describe('rackGeometry', () => {
 // ── Cabinet (wine fridge) ───────────────────────────────────────────────────
 // Position contract: shelves top to bottom; inside a bay row 1 rests on the
 // plank; position = cols × Σ shelfRows[k<i] + (row − 1) × cols + slot.
-const { cabinetShelfRows, cabinetPosition, validateCabinetConfig } = require('./rackGeometry');
+const { cabinetShelfRows, cabinetPosition, validateCabinetConfig, cabinetRowWidth, cabinetBayCapacity, cabinetRows, cabinetBays } = require('./rackGeometry');
 
 describe('cabinet rack geometry', () => {
   test('capacity is cols × Σ shelfRows; missing entries count as 1', () => {
@@ -312,5 +312,111 @@ describe('cabinet rack geometry', () => {
 
   test('getMaxPosition reads a cabinet document', () => {
     expect(getMaxPosition({ type: 'cabinet', rows: 2, cols: 4, typeConfig: { shelfRows: [1, 5] } })).toBe(24);
+  });
+
+  // ── Alternating rows (support ticket 2026-09-15: Liebherr GrandCru 5001) ──
+  // The rows of a bay are cols / cols−1 wide in turn: 6 in front of 5, then
+  // 5 in front of 6. Unlike twoDeep and stagger this changes capacity and
+  // the numbering, so it is pinned here row by row.
+  describe('alternate', () => {
+    test('row widths follow the honeycomb: two deep 6/5, 5/6, 6/5…; single deep 6, 5, 6…', () => {
+      const deep = { twoDeep: true, alternate: true };
+      expect([1, 2, 3, 4, 5, 6, 7, 8].map((r) => cabinetRowWidth(r, 6, deep))).toEqual([6, 5, 5, 6, 6, 5, 5, 6]);
+      const single = { twoDeep: false, alternate: true };
+      expect([1, 2, 3, 4, 5].map((r) => cabinetRowWidth(r, 6, single))).toEqual([6, 5, 6, 5, 6]);
+      // Off (the default): every row is cols wide, whatever twoDeep says.
+      expect([1, 2, 3, 4].map((r) => cabinetRowWidth(r, 6, { twoDeep: true, alternate: false }))).toEqual([6, 6, 6, 6]);
+      expect([1, 2, 3].map((r) => cabinetRowWidth(r, 6))).toEqual([6, 6, 6]);
+      // A one-wide cabinet has nothing to alternate — never a 0-wide row.
+      expect([1, 2, 3, 4].map((r) => cabinetRowWidth(r, 1, deep))).toEqual([1, 1, 1, 1]);
+    });
+
+    test('capacity is the sum of the real row widths: a GrandCru shelf of 6/5, 5/6, 6/5, 5/6 holds 44', () => {
+      expect(cabinetBayCapacity(8, 6, { twoDeep: true, alternate: true })).toBe(44);
+      expect(cabinetBayCapacity(7, 6, { twoDeep: true, alternate: true })).toBe(38);
+      expect(cabinetBayCapacity(7, 6, { twoDeep: true, alternate: false })).toBe(42);
+      // The 5001 preset: three honeycomb shelves of 44 between two of 33.
+      expect(totalSlots('cabinet', 5, 6, { shelfRows: [6, 8, 8, 8, 6], twoDeep: true, alternate: true })).toBe(198);
+      expect(totalSlots('cabinet', 1, 6, { shelfRows: [4], twoDeep: false, alternate: true })).toBe(6 + 5 + 6 + 5);
+      // Not set → the plain cols × Σ shelfRows of every existing cabinet.
+      expect(totalSlots('cabinet', 5, 6, { shelfRows: [6, 8, 8, 8, 6], twoDeep: true })).toBe(216);
+      expect(getMaxPosition({ type: 'cabinet', rows: 2, cols: 6, typeConfig: { shelfRows: [2, 3], alternate: true } })).toBe(11 + 16);
+    });
+
+    test('cabinetPosition sums the earlier rows\' own widths and refuses a slot past a narrow row', () => {
+      const shape = { cols: 6, shelfRows: [2, 3], twoDeep: true, alternate: true }; // (6+5) + (6+5+5) = 27
+      expect(cabinetPosition({ ...shape, shelfIndex: 0, row: 1, slot: 6 })).toBe(6);
+      expect(cabinetPosition({ ...shape, shelfIndex: 0, row: 2, slot: 1 })).toBe(7);
+      expect(cabinetPosition({ ...shape, shelfIndex: 0, row: 2, slot: 5 })).toBe(11);
+      expect(cabinetPosition({ ...shape, shelfIndex: 0, row: 2, slot: 6 })).toBeNull(); // the back row holds 5
+      expect(cabinetPosition({ ...shape, shelfIndex: 1, row: 1, slot: 1 })).toBe(12);
+      expect(cabinetPosition({ ...shape, shelfIndex: 1, row: 3, slot: 5 })).toBe(27);
+      expect(cabinetPosition({ ...shape, shelfIndex: 1, row: 3, slot: 6 })).toBeNull();
+      expect(cabinetPosition({ ...shape, shelfIndex: 1, row: 3, slot: 5 })).toBe(totalSlots('cabinet', 2, 6, shape));
+      // Single deep: level 2 is the narrow one.
+      const single = { cols: 4, shelfRows: [3], twoDeep: false, alternate: true }; // 4 + 3 + 4
+      expect(cabinetPosition({ ...single, shelfIndex: 0, row: 2, slot: 3 })).toBe(7);
+      expect(cabinetPosition({ ...single, shelfIndex: 0, row: 2, slot: 4 })).toBeNull();
+      expect(cabinetPosition({ ...single, shelfIndex: 0, row: 3, slot: 4 })).toBe(11);
+    });
+
+    test('cabinetRows walks every bottle row in position order with its start and width', () => {
+      expect(cabinetRows(2, 6, { shelfRows: [1, 3], alternate: true })).toEqual([
+        { shelfIndex: 0, row: 1, start: 0, width: 6 },
+        { shelfIndex: 1, row: 1, start: 6, width: 6 },
+        { shelfIndex: 1, row: 2, start: 12, width: 5 },
+        { shelfIndex: 1, row: 3, start: 17, width: 5 },
+      ]);
+      expect(cabinetRows(2, 4, { shelfRows: [1, 2] }).map((r) => [r.start, r.width])).toEqual([[0, 4], [4, 4], [8, 4]]);
+    });
+
+    // Support ticket 2026-08-31: the 5001's loading diagram is three 6-wide
+    // honeycomb shelves between two 4-wide staggered ones — per-shelf width
+    // and pattern, one cabinet.
+    test('per-shelf width and pattern: the GrandCru 5001 loading diagram is one cabinet of 196', () => {
+      const tc = { shelfRows: [8, 8, 8, 8, 8], shelfCols: [4, 6, 6, 6, 4], shelfAlternate: [false, true, true, true, false], twoDeep: true };
+      expect(cabinetBays(5, 6, tc)).toEqual([
+        { rows: 8, cols: 4, alternate: false }, { rows: 8, cols: 6, alternate: true }, { rows: 8, cols: 6, alternate: true },
+        { rows: 8, cols: 6, alternate: true }, { rows: 8, cols: 4, alternate: false },
+      ]);
+      expect(totalSlots('cabinet', 5, 6, tc)).toBe(2 * 32 + 3 * 44);
+      // Top bay: 8 rows of 4 → 1..32; the honeycomb bay below starts at 33.
+      expect(cabinetPosition({ cols: 6, ...tc, shelfIndex: 0, row: 8, slot: 4 })).toBe(32);
+      expect(cabinetPosition({ cols: 6, ...tc, shelfIndex: 0, row: 1, slot: 5 })).toBeNull();
+      expect(cabinetPosition({ cols: 6, ...tc, shelfIndex: 1, row: 1, slot: 1 })).toBe(33);
+      expect(cabinetPosition({ cols: 6, ...tc, shelfIndex: 1, row: 2, slot: 5 })).toBe(33 + 6 + 4);
+      expect(cabinetPosition({ cols: 6, ...tc, shelfIndex: 1, row: 2, slot: 6 })).toBeNull();
+      expect(cabinetPosition({ cols: 6, ...tc, shelfIndex: 4, row: 8, slot: 4 })).toBe(196);
+      expect(cabinetRows(5, 6, tc).map((r) => r.width).slice(6, 12)).toEqual([4, 4, 6, 5, 5, 6]);
+      // Missing entries mean the cabinet's own width / pattern; a width past
+      // the cabinet is clamped on read.
+      expect(cabinetBays(3, 6, { shelfRows: [1, 1, 1], shelfCols: [4], shelfAlternate: [true], alternate: false }))
+        .toEqual([{ rows: 1, cols: 4, alternate: true }, { rows: 1, cols: 6, alternate: false }, { rows: 1, cols: 6, alternate: false }]);
+      expect(cabinetBays(1, 6, { shelfRows: [1], shelfCols: [9] })[0].cols).toBe(6);
+      expect(totalSlots('cabinet', 2, 6, { shelfRows: [2, 2], shelfCols: [3, 6] })).toBe(6 + 12);
+    });
+
+    test('validateCabinetConfig: shelfCols 1..cols and shelfAlternate booleans, one entry per shelf', () => {
+      expect(validateCabinetConfig({ shelfRows: [2, 2], shelfCols: [4, 6], shelfAlternate: [false, true] }, 'cabinet', 2, false, 6)).toBeNull();
+      expect(validateCabinetConfig({ shelfRows: [2, 2], shelfCols: [4] }, 'cabinet', 2, false, 6)).toMatch(/shelfCols must list one entry per shelf/);
+      expect(validateCabinetConfig({ shelfRows: [2, 2], shelfCols: [4, 7] }, 'cabinet', 2, false, 6)).toMatch(/between 1 and the cabinet width \(6\)/);
+      expect(validateCabinetConfig({ shelfRows: [2, 2], shelfCols: [0, 6] }, 'cabinet', 2, false, 6)).toMatch(/cabinet width/);
+      expect(validateCabinetConfig({ shelfRows: [2, 2], shelfCols: [2.5, 6] }, 'cabinet', 2, false, 6)).toMatch(/cabinet width/);
+      expect(validateCabinetConfig({ shelfRows: [2, 2], shelfAlternate: [true] }, 'cabinet', 2, false, 6)).toMatch(/shelfAlternate must list one entry per shelf/);
+      expect(validateCabinetConfig({ shelfRows: [2, 2], shelfAlternate: [true, 'no'] }, 'cabinet', 2, false, 6)).toMatch(/shelfAlternate entry must be a boolean/);
+      expect(validateCabinetConfig({ shelfCols: [4, 6] }, 'cabinet', 2, false, 6)).toMatch(/shelfRows is required/);
+      expect(validateCabinetConfig({ shelfCols: [4, 6] }, 'grid', 2, false, 6)).toMatch(/cabinet racks only/);
+      // Without a known width the schema's 20 bounds it.
+      expect(validateCabinetConfig({ shelfRows: [1], shelfCols: [20] }, 'cabinet', 1, false)).toBeNull();
+      expect(validateCabinetConfig({ shelfRows: [1], shelfCols: [21] }, 'cabinet', 1, false)).toMatch(/cabinet width/);
+    });
+
+    test('validateCabinetConfig: alternate is a boolean and cabinet-only', () => {
+      expect(validateCabinetConfig({ shelfRows: [2, 2], alternate: true }, 'cabinet', 2, false)).toBeNull();
+      expect(validateCabinetConfig({ shelfRows: [2, 2], alternate: false }, 'cabinet', 2, false)).toBeNull();
+      expect(validateCabinetConfig({ shelfRows: [2, 2], alternate: 'yes' }, 'cabinet', 2, false)).toMatch(/alternate must be a boolean/);
+      expect(validateCabinetConfig({ alternate: true }, 'cabinet', 2, false)).toMatch(/required/);
+      expect(validateCabinetConfig({ alternate: true }, 'grid', 2, false)).toMatch(/cabinet racks only/);
+    });
   });
 });

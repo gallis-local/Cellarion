@@ -10,7 +10,7 @@
  * explicitly in the CSV.
  */
 
-const { totalSlots, cabinetShelfRows, cabinetPosition } = require('./rackGeometry');
+const { totalSlots, cabinetPosition, cabinetRows, cabinetRowWidth, cabinetOptions, cabinetBays } = require('./rackGeometry');
 
 const DEFAULT_RACK_TYPE = 'grid';
 const VALID_ANCHORS = ['top-left', 'top-right', 'bottom-left', 'bottom-right'];
@@ -47,7 +47,7 @@ function computeRackPosition({
   position, row, col,
   rackRows, rackCols,
   rackType, bottlesPerCell, backCols,
-  shelfRows,
+  shelfRows, twoDeep, alternate, shelfCols, shelfAlternate,
   layer, slotInLayer,
   internalSlot,
   anchor = DEFAULT_ANCHOR
@@ -78,7 +78,8 @@ function computeRackPosition({
   // is the row inside that shelf's bay (1 = resting on the plank) and
   // `slotInLayer` the slot left to right — Oeno's own vocabulary. Without
   // layer/slot the bottle takes the bay's first cell and placeBottles' overflow
-  // scan fans the rest out. Geometry contract: rackGeometry.cabinetPosition.
+  // scan fans the rest out. Geometry contract: rackGeometry.cabinetPosition
+  // (twoDeep / alternate decide a row's width on an alternating cabinet).
   if (rackType === 'cabinet' && position !== undefined && position !== null && position !== '') {
     const p = parseInt(position, 10);
     if (isNaN(p) || p < 1) return { error: 'Invalid shelf' };
@@ -87,17 +88,45 @@ function computeRackPosition({
     if (p > rows) return { error: `shelf ${p} exceeds rackRows ${rows}` };
     const bottomAnchored = anchor === 'bottom-left' || anchor === 'bottom-right';
     const shelfIndex = bottomAnchored ? rows - p : p - 1;
-    const list = cabinetShelfRows(rows, { shelfRows });
+    const cab = { shelfRows, twoDeep, alternate, shelfCols, shelfAlternate };
+    const bays = cabinetBays(rows, cols, cab);
+    const bay = bays[shelfIndex];
+    const cell = { shelfIndex, cols, ...cab, shelfRows: bays.map((b) => b.rows) };
     const layerNum = parseInt(layer, 10);
     const slotNum = parseInt(slotInLayer, 10);
     if (!isNaN(layerNum) && !isNaN(slotNum)) {
-      if (layerNum < 1 || layerNum > list[shelfIndex]) {
-        return { error: `row ${layerNum} exceeds the ${list[shelfIndex]} rows of shelf ${p}` };
+      if (layerNum < 1 || layerNum > bay.rows) {
+        return { error: `row ${layerNum} exceeds the ${bay.rows} rows of shelf ${p}` };
       }
-      if (slotNum < 1 || slotNum > cols) return { error: `slot ${slotNum} exceeds shelf width ${cols}` };
-      return { position: cabinetPosition({ shelfIndex, row: layerNum, slot: slotNum, cols, shelfRows: list }) };
+      const width = cabinetRowWidth(layerNum, bay.cols, { twoDeep: cabinetOptions(cab).twoDeep, alternate: bay.alternate });
+      if (slotNum < 1 || slotNum > width) return { error: `slot ${slotNum} exceeds shelf width ${width}` };
+      return { position: cabinetPosition({ ...cell, row: layerNum, slot: slotNum }) };
     }
-    return { position: cabinetPosition({ shelfIndex, row: 1, slot: 1, cols, shelfRows: list }) };
+    return { position: cabinetPosition({ ...cell, row: 1, slot: 1 }) };
+  }
+
+  // Cabinet with (row, col) input (a cabinet's `position` is always a shelf
+  // number, handled above): its bottle rows run bay by bay from the top,
+  // plank up, and on an alternating cabinet they are not all `cols` wide —
+  // so the row-major stride below does not apply. Walk the real rows instead
+  // (rackGeometry.cabinetRows). A bottom anchor flips against the BOTTLE
+  // rows (Σ shelfRows), not the shelf count; a right anchor mirrors within
+  // the row's own width.
+  if (rackType === 'cabinet') {
+    if (isNaN(rows) || rows < 1) return { error: 'rackRows is required for cabinet placement' };
+    if (isNaN(cols) || cols < 1) return { error: 'rackCols is required for cabinet placement' };
+    const bottleRows = cabinetRows(rows, cols, { shelfRows, twoDeep, alternate, shelfCols, shelfAlternate });
+    const srcRow = parseInt(row, 10);
+    const srcCol = parseInt(col, 10);
+    if (isNaN(srcRow) || srcRow < 1) return { error: 'Invalid row' };
+    if (isNaN(srcCol) || srcCol < 1) return { error: 'Invalid col' };
+    const extent = bottleRows.length;
+    if (srcRow > extent) return { error: `row ${srcRow} exceeds rackRows ${extent}` };
+    const effectiveRow = (anchor === 'bottom-left' || anchor === 'bottom-right') ? extent - srcRow + 1 : srcRow;
+    const { start, width } = bottleRows[effectiveRow - 1];
+    if (srcCol > width) return { error: `col ${srcCol} exceeds row width ${width}` };
+    const effectiveCol = (anchor === 'top-right' || anchor === 'bottom-right') ? width - srcCol + 1 : srcCol;
+    return { position: start + effectiveCol };
   }
 
   // Shelf racks: the source position is a SHELF NUMBER (row), matching how
@@ -204,12 +233,9 @@ function computeRackPosition({
     colWidth = frontWidth;
   }
 
-  // Apply anchor transforms in the cell grid (rows × cols). A cabinet's
-  // vertical extent for row/col input is its BOTTLE rows (Σ shelfRows), not
-  // its shelf count — numbering is row-major with stride cols either way.
-  const rowExtent = rackType === 'cabinet'
-    ? cabinetShelfRows(rows, { shelfRows }).reduce((sum, r) => sum + r, 0)
-    : rows;
+  // Apply anchor transforms in the cell grid (rows × cols). (Cabinets never
+  // reach this point — their rows are walked above.)
+  const rowExtent = rows;
   let effectiveRow = srcRow;
   let effectiveCol = srcCol;
 
@@ -366,6 +392,10 @@ function placeBottlesInRack(rack, items, anchor) {
       bottlesPerCell: rack.typeConfig?.bottlesPerCell,
       backCols: rack.typeConfig?.backCols,
       shelfRows: rack.typeConfig?.shelfRows,
+      twoDeep: rack.typeConfig?.twoDeep,
+      alternate: rack.typeConfig?.alternate,
+      shelfCols: rack.typeConfig?.shelfCols,
+      shelfAlternate: rack.typeConfig?.shelfAlternate,
       anchor
     });
     if (result.error) {

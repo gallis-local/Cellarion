@@ -44,6 +44,24 @@ const rackModuleSchema = new mongoose.Schema({
     // shelf). Drawing only — every level still holds `cols` bottles and the
     // position contract is unchanged, so turning it on never moves a bottle.
     stagger: { type: Boolean },
+    // Cabinet racks only: rows alternate in width like a honeycomb — the
+    // first level's front row holds `cols`, its back row (in the gaps between
+    // those bottles) one fewer, the level above nests in its grooves so its
+    // front row holds one fewer and its back row `cols` again, and so on
+    // (6 / 5 in front of 5 / 6: a Liebherr GrandCru's wooden shelf, support
+    // ticket 2026-09-15). UNLIKE twoDeep and stagger this CHANGES capacity
+    // and the position numbering (utils/rackGeometry.cabinetRowWidth), so
+    // the UI offers it at creation only and the update route's resize guard
+    // blocks a shrink past placed bottles. Implies stagger when drawn.
+    alternate: { type: Boolean },
+    // Cabinet racks only, per shelf (top first, length === rows when set):
+    // a shelf narrower than the cabinet (1..cols) and a shelf that alternates
+    // or not on its own — so one cabinet holds the Liebherr GrandCru 5001's
+    // 4-wide staggered top and bottom shelves between its 6-wide honeycomb
+    // ones (support ticket 2026-08-31). A missing entry means the cabinet's
+    // own cols / alternate. Shape, like shelfRows: creation-only in the UI.
+    shelfCols: { type: [Number], default: undefined },
+    shelfAlternate: { type: [Boolean], default: undefined },
     // Hex racks only: mirror the row sequence top-to-bottom. Pure reversal —
     // never changes total slot count (see rackSchema.typeConfig.hexFlip below).
     hexFlip: { type: Boolean, default: false },
@@ -90,6 +108,24 @@ const rackSchema = new mongoose.Schema({
     // shelf). Drawing only — every level still holds `cols` bottles and the
     // position contract is unchanged, so turning it on never moves a bottle.
     stagger: { type: Boolean },
+    // Cabinet racks only: rows alternate in width like a honeycomb — the
+    // first level's front row holds `cols`, its back row (in the gaps between
+    // those bottles) one fewer, the level above nests in its grooves so its
+    // front row holds one fewer and its back row `cols` again, and so on
+    // (6 / 5 in front of 5 / 6: a Liebherr GrandCru's wooden shelf, support
+    // ticket 2026-09-15). UNLIKE twoDeep and stagger this CHANGES capacity
+    // and the position numbering (utils/rackGeometry.cabinetRowWidth), so
+    // the UI offers it at creation only and the update route's resize guard
+    // blocks a shrink past placed bottles. Implies stagger when drawn.
+    alternate: { type: Boolean },
+    // Cabinet racks only, per shelf (top first, length === rows when set):
+    // a shelf narrower than the cabinet (1..cols) and a shelf that alternates
+    // or not on its own — so one cabinet holds the Liebherr GrandCru 5001's
+    // 4-wide staggered top and bottom shelves between its 6-wide honeycomb
+    // ones (support ticket 2026-08-31). A missing entry means the cabinet's
+    // own cols / alternate. Shape, like shelfRows: creation-only in the UI.
+    shelfCols: { type: [Number], default: undefined },
+    shelfAlternate: { type: [Boolean], default: undefined },
     // Grid racks only: 1-indexed row numbers with headroom for a top layer
     // of bottles resting in the gaps (cols across + cols-1 on top).
     // POSITION NUMBERING CONTRACT (double-height rows): the base grid keeps
