@@ -520,9 +520,36 @@ describe('set_wine_profile', () => {
     expect(w.grapes).toEqual([oid('9')]);
     expect(w.aiProfile.source).toBe('ai'); // profile untouched, still enrichment-eligible
     expect(body.summary).toMatch(/record fields corrected/);
-    expect(body.data.record).toEqual({ type: 'white', grapes: ['Savagnin'] });
+    expect(body.data.record).toEqual({ type: 'white', colour: null, grapes: ['Savagnin'] });
     // The undo snapshot carries the record fields so undo_last can put them back.
     expect(McpActionLog.create.mock.calls[0][0].prev).toMatchObject({ type: 'fortified', grapes: [] });
+  });
+
+  // Support ticket 2026-09-17: a sparkling rosé is type sparkling + colour rosé.
+  test('colour is a record field too — set beside the type, snapshotted for undo', async () => {
+    const w = wine({ type: 'rosé', colour: null });
+    const body = parse(await tool('set_wine_profile').handler(
+      { wine_id: oid('f'), type: 'sparkling', colour: 'rosé' }, SOMM_CTX));
+    expect(body.error).toBeUndefined();
+    expect(w.type).toBe('sparkling');
+    expect(w.colour).toBe('rosé');
+    expect(w.aiProfile.source).toBe('ai');
+    expect(body.data.record).toEqual({ type: 'sparkling', colour: 'rosé' });
+    expect(McpActionLog.create.mock.calls[0][0].prev).toMatchObject({ type: 'rosé', colour: null });
+  });
+
+  // Audit 2026-09-19: the model hook would drop it, so the tool used to report
+  // a success that stored nothing.
+  test('a colour on a wine that stays red/white/rosé is refused, nothing written', async () => {
+    const w = wine({ type: 'red' });
+    const body = parse(await tool('set_wine_profile').handler({ wine_id: oid('f'), colour: 'rosé' }, SOMM_CTX));
+    expect(body.error.code).toBe('invalid_input');
+    expect(body.error.message).toMatch(/only applies to sparkling, dessert and fortified/);
+    expect(w.save).not.toHaveBeenCalled();
+    expect(McpActionLog.create).not.toHaveBeenCalled();
+    // Clearing is always fine — there is nothing to refuse.
+    const cleared = parse(await tool('set_wine_profile').handler({ wine_id: oid('f'), colour: null }, SOMM_CTX));
+    expect(cleared.error).toBeUndefined();
   });
 
   // Ticket 2026-08-11: "Tinta Roriz" was silently stored as Tempranillo. The
@@ -1599,6 +1626,25 @@ describe('propose_wine_correction', () => {
     });
   });
 
+  // Audit 2026-09-19: the somm path had no type check at filing, so an admin
+  // could "approve" a colour that the apply step then skipped.
+  test('a colour on a wine the proposal leaves red/white/rosé is refused at filing; with the type it files', async () => {
+    mkWine({ type: 'red' });
+    const refused = parse(await tool('propose_wine_correction').handler({
+      wine_id: WINE_ID, kind: 'field_correction', proposed_fields: { colour: 'rosé' }, reason: REASON,
+    }, SOMM_CTX));
+    expect(refused.error.code).toBe('invalid_input');
+    expect(refused.error.message).toMatch(/typed red/);
+    expect(WineCorrectionProposal.create).not.toHaveBeenCalled();
+
+    WineCorrectionProposal.create.mockResolvedValue({ _id: 'prop-c' });
+    const filed = parse(await tool('propose_wine_correction').handler({
+      wine_id: WINE_ID, kind: 'field_correction', proposed_fields: { type: 'sparkling', colour: 'rosé' }, reason: REASON,
+    }, SOMM_CTX));
+    expect(filed.error).toBeUndefined();
+    expect(WineCorrectionProposal.create.mock.calls[0][0].proposedFields).toEqual({ type: 'sparkling', colour: 'rosé' });
+  });
+
   test('files a field_correction: snapshot captured, ledger row + audit written, nothing applied', async () => {
     mkWine();
     WineCorrectionProposal.create.mockResolvedValue({ _id: 'prop-1' });
@@ -1628,6 +1674,8 @@ describe('propose_wine_correction', () => {
       // Both proposable since 2026-08-19, so both must ride in the snapshot —
       // the admin drift check compares against it field by field.
       type: null, grapes: null,
+      // Proposable since 2026-09-19 (colour of a sparkling/dessert/fortified wine).
+      colour: null,
     });
 
     const row = McpActionLog.create.mock.calls[0][0];

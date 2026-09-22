@@ -19,6 +19,7 @@ const { parsePagination } = require('../../utils/pagination');
 const { isValidId } = require('../../utils/validation');
 const { validateImageRef } = require('../../services/accountOps');
 const { ensurePendingVintageProfile } = require('../../utils/vintageProfile');
+const { WINE_COLOURS, colourTypeConflict } = require('../../utils/wineColour');
 
 const router = express.Router();
 
@@ -114,7 +115,7 @@ router.put('/:id/resolve', async (req, res) => {
       // 2026-07-22 RC4). A likely duplicate returns 409 with candidates so the
       // admin links the request to the existing wine instead — or resubmits
       // with confirmCreate:true after an explicit "create anyway".
-      const { name, producer, country, region, appellation, grapes, type, image } = wineData;
+      const { name, producer, country, region, appellation, grapes, type, colour, image } = wineData;
 
       if (!name || !producer || !country) {
         return res.status(400).json({ error: 'Name, producer, and country are required to create wine' });
@@ -124,6 +125,12 @@ router.put('/:id/resolve', async (req, res) => {
       }
       if (!isValidId(String(country))) {
         return res.status(400).json({ error: 'Invalid country' });
+      }
+      {
+        // Same rule as the admin wine editor: refuse a colour the type cannot
+        // carry rather than approve the request and silently drop it.
+        const colourErr = colourTypeConflict(type || null, WINE_COLOURS.includes(colour) ? colour : null);
+        if (colourErr) return res.status(400).json({ error: colourErr });
       }
 
       // Image: an explicitly blank field means "no image" — it must NOT fall
@@ -208,6 +215,9 @@ router.put('/:id/resolve', async (req, res) => {
         classification: pradikatSplit.classification || undefined,
         grapes: grapes || [],
         type: type || null, // no guessed red (ticket 6a85ad44)
+        // Sparkling/dessert/fortified only; the model hook drops anything else
+        // and infers rosé from the name when this is empty.
+        colour: WINE_COLOURS.includes(colour) ? colour : null,
         image: imageToStore,
         normalizedKey,
         createdBy: req.user.id,
@@ -302,7 +312,8 @@ router.put('/:id/resolve', async (req, res) => {
     if (wineRequest.requestType === 'grape_suggestion') {
       notifMsg = `Your grape suggestion for "${wineRequest.wineName}" has been reviewed. Thank you for helping improve the wine registry!`;
     } else if (backfilledCount > 0) {
-      notifMsg = `Your request for "${wineRequest.wineName}" has been approved and added to the registry as "${linkedWine.name}" by ${linkedWine.producer}. Your ${backfilledCount} bottle${backfilledCount !== 1 ? 's' : ''} in the cellar have been updated.`;
+      const many = backfilledCount !== 1;
+      notifMsg = `Your request for "${wineRequest.wineName}" has been approved and added to the registry as "${linkedWine.name}" by ${linkedWine.producer}. Your ${backfilledCount} bottle${many ? 's' : ''} in the cellar ${many ? 'have' : 'has'} been updated.`;
     } else {
       notifMsg = `Your request for "${wineRequest.wineName}" has been approved. It was added to the registry as "${linkedWine.name}" by ${linkedWine.producer}.`;
     }

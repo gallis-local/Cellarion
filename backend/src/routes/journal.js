@@ -12,6 +12,7 @@ const {
 } = require('../services/journalOps');
 const { escapeRegex } = require('../utils/sanitize');
 const { isValidId } = require('../utils/validation');
+const { CONSUMED_STATUSES } = require('../config/constants');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -43,7 +44,7 @@ function redactPeople(entry, requesterId) {
 router.get('/wine-search', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
-    if (!q || q.length < 2) return res.json({ bottles: [], wines: [] });
+    if (!q || q.length < 2) return res.json({ bottles: [], consumed: [], wines: [] });
 
     const regex = new RegExp(escapeRegex(q), 'i');
 
@@ -61,31 +62,46 @@ router.get('/wine-search', async (req, res) => {
       pendingIdentity: { $ne: true },
       nonWine: { $ne: true },
     })
-      .select('name producer type')
+      .select('name producer type colour')
       .limit(200)
       .lean();
     const matchedWineIds = matchedWines.map(w => w._id);
 
-    const bottles = matchedWineIds.length
-      ? await Bottle.find({ user: req.user.id, status: 'active', wineDefinition: { $in: matchedWineIds } })
-          .populate({ path: 'wineDefinition', select: 'name producer type' })
-          .select('vintage wineDefinition')
-          .limit(10)
-          .lean()
-      : [];
+    // Active bottles ("your cellar") AND the ones already drunk, as a separate
+    // section, newest consumption first. A tasting journal is a record of
+    // wines one has drunk, and the picker used to offer only what was still
+    // in the rack — so every finished single bottle fell back to typed text
+    // with no producer, no vintage and no reference (chfish ticket 6aa6c200,
+    // 2026-09-13). Recently consumed bottles are the likeliest subject.
+    const [bottles, consumedBottles] = matchedWineIds.length
+      ? await Promise.all([
+          Bottle.find({ user: req.user.id, status: 'active', wineDefinition: { $in: matchedWineIds } })
+            .populate({ path: 'wineDefinition', select: 'name producer type colour' })
+            .select('vintage wineDefinition')
+            .limit(10)
+            .lean(),
+          Bottle.find({ user: req.user.id, status: { $in: CONSUMED_STATUSES }, wineDefinition: { $in: matchedWineIds } })
+            .populate({ path: 'wineDefinition', select: 'name producer type colour' })
+            .select('vintage wineDefinition status consumedAt')
+            .sort({ consumedAt: -1 })
+            .limit(10)
+            .lean(),
+        ])
+      : [[], []];
 
-    const matchedBottles = bottles
-      .filter(b => b.wineDefinition)
-      .map(b => ({
-        _id: b._id,
-        vintage: b.vintage,
-        wine: b.wineDefinition
-      }));
+    const shape = (b) => ({
+      _id: b._id,
+      vintage: b.vintage,
+      wine: b.wineDefinition,
+      ...(b.status && b.status !== 'active' ? { status: b.status, consumedAt: b.consumedAt || null } : {}),
+    });
+    const matchedBottles = bottles.filter(b => b.wineDefinition).map(shape);
+    const consumed = consumedBottles.filter(b => b.wineDefinition).map(shape);
 
     // Wine register results (already capped)
     const wines = matchedWines.slice(0, 10);
 
-    res.json({ bottles: matchedBottles, wines });
+    res.json({ bottles: matchedBottles, consumed, wines });
   } catch (err) {
     console.error('Journal wine search error:', err);
     res.status(500).json({ error: 'Search failed' });
@@ -93,8 +109,8 @@ router.get('/wine-search', async (req, res) => {
 });
 
 const POPULATE_PAIRINGS = [
-  { path: 'pairings.bottle', select: 'vintage wineDefinition', populate: { path: 'wineDefinition', select: 'name producer type' } },
-  { path: 'pairings.wine', select: 'name producer type' },
+  { path: 'pairings.bottle', select: 'vintage wineDefinition', populate: { path: 'wineDefinition', select: 'name producer type colour' } },
+  { path: 'pairings.wine', select: 'name producer type colour' },
   // profileVisibility is fetched ONLY for redactPeople's gate — it is
   // stripped from every response before send.
   { path: 'people.user', select: 'username displayName profileVisibility' }

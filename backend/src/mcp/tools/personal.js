@@ -30,7 +30,7 @@ registerTool({
     const [total, items] = await Promise.all([
       WishlistItem.countDocuments(filter),
       WishlistItem.find(filter)
-        .populate({ path: 'wineDefinition', select: 'name producer type', populate: ['country', 'region'] })
+        .populate({ path: 'wineDefinition', select: 'name producer type colour', populate: ['country', 'region'] })
         .sort({ createdAt: -1 }).skip(offset).limit(limit).lean(),
     ]);
     const data = items.map((it) => ({
@@ -41,6 +41,7 @@ registerTool({
             name: it.wineDefinition.name,
             producer: it.wineDefinition.producer || null,
             type: it.wineDefinition.type || null,
+            ...(it.wineDefinition.colour ? { colour: it.wineDefinition.colour } : {}),
             country: it.wineDefinition.country?.name || null,
             region: it.wineDefinition.region?.name || null,
           }
@@ -86,15 +87,22 @@ registerTool({
       mood: e.mood ?? null,
       notes: e.notes || null,
       people: (e.people || []).map((p) => p.name).filter(Boolean),
-      pairings: (e.pairings || []).map((p) => ({
-        dish: p.dish || null,
-        wine:
-          p.bottle?.wineDefinition?.name ||
-          p.wine?.name ||
-          p.wineName || null,
-        vintage: p.bottle?.vintage || null,
-        notes: p.notes || null,
-      })),
+      // A pairing stores a bottle and/or wine REFERENCE; wineName is only the
+      // text fallback for the day a referenced bottle is gone. Hand the ids
+      // and the producer back so a client can tell which "Sauvignon" this
+      // was and follow the reference (chfish ticket 6aa6c200, 2026-09-13).
+      pairings: (e.pairings || []).map((p) => {
+        const wineDoc = p.bottle?.wineDefinition || p.wine || null;
+        return {
+          dish: p.dish || null,
+          bottle_id: p.bottle?._id || null,
+          wine_id: wineDoc?._id || null,
+          producer: wineDoc?.producer || null,
+          wine: wineDoc?.name || p.wineName || null,
+          vintage: p.bottle?.vintage || p.vintage || null,
+          notes: p.notes || null,
+        };
+      }),
     }));
     return ok(`${data.length} of ${total} journal entr(ies)`, data, { page: { limit, offset, total } });
   },

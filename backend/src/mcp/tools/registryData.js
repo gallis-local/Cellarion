@@ -58,7 +58,12 @@ registerTool({
       applies_to: f.resolvedFrom === 'vintage' ? f.resolvedVintage : (f.resolvedFrom === 'wine' ? 'all vintages' : null),
       wine_value: f.wineValue,
       overrides: f.overrides,
-      contributed_by: f.contributedBy,
+      // Who supplied a value is not something a reader is told (services/
+      // registryDataOps no longer even loads it). The FIELD stays, always null:
+      // docs/mcp-versioning.md forbids removing a response field in place, it
+      // was nullable from the start, and an agent wired against it keeps
+      // parsing. Drop it only with the next major line.
+      contributed_by: null,
       // A pending suggestion (anyone's) holds this slot's one review slot —
       // do not file another for the same slot; it would only conflict.
       suggestion_pending: f.hasPendingSuggestion,

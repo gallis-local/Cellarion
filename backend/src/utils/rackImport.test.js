@@ -667,3 +667,154 @@ describe('shelf racks with bottlesPerCell > 1', () => {
       .toEqual({ position: (4 - 2) * 6 + 3 });
   });
 });
+
+// ── Stacked shelves: no back row, bottlesPerCell > 1 ────────────────────────
+// Oeno's Vintec VWM storage shelves report every stacked row as its own
+// "layer" (user export, 2026-09-15: up to 10 layers × 7 slots per shelf).
+// The importer maps such a cabinet to cols = width, bottlesPerCell = layer
+// count, backCols = 0, and the layer math here must follow: layer-major
+// numbering inside the shelf, so layer 1 keeps the front-row formula.
+describe('stacked shelf racks (backCols 0, bottlesPerCell > 1): layer N is the N-th stacked row', () => {
+  const stacked = { rackType: 'shelf', rackRows: 6, rackCols: 7, backCols: 0, bottlesPerCell: 10 };
+  const stride = 7 * 10; // positions per shelf
+
+  test('layer-major numbering: shelfBase + (layer - 1) × cols + slot', () => {
+    expect(computeRackPosition({ ...stacked, position: 1, layer: 1, slotInLayer: 3 })).toEqual({ position: 3 });
+    expect(computeRackPosition({ ...stacked, position: 1, layer: 2, slotInLayer: 1 })).toEqual({ position: 8 });
+    expect(computeRackPosition({ ...stacked, position: 1, layer: 10, slotInLayer: 7 })).toEqual({ position: 70 });
+    expect(computeRackPosition({ ...stacked, position: 2, layer: 3, slotInLayer: 4 })).toEqual({ position: stride + 14 + 4 });
+  });
+
+  test('bottom-left anchor (Oeno): shelf 6 of 6 is the top row of positions', () => {
+    expect(computeRackPosition({ ...stacked, position: 6, layer: 1, slotInLayer: 1, anchor: 'bottom-left' })).toEqual({ position: 1 });
+    expect(computeRackPosition({ ...stacked, position: 1, layer: 1, slotInLayer: 1, anchor: 'bottom-left' })).toEqual({ position: 5 * stride + 1 });
+  });
+
+  test('a row beyond bottlesPerCell or a slot beyond the shelf width is an error, never a silent neighbour', () => {
+    expect(computeRackPosition({ ...stacked, position: 1, layer: 11, slotInLayer: 1 }).error).toMatch(/layer 11/);
+    expect(computeRackPosition({ ...stacked, position: 1, layer: 1, slotInLayer: 8 }).error).toMatch(/slot 8/);
+  });
+
+  test('a front/back rack (backCols > 0) still rejects layer 3: layers mean front and back there', () => {
+    const frontBack = { rackType: 'shelf', rackRows: 6, rackCols: 6, backCols: 5, bottlesPerCell: 2 };
+    expect(computeRackPosition({ ...frontBack, position: 1, layer: 3, slotInLayer: 1 }).error).toMatch(/invalid layer 3/);
+  });
+
+  test('bpc = 1 with no back row keeps the historical capacity-0 error for layer 2', () => {
+    const single = { rackType: 'shelf', rackRows: 6, rackCols: 6, backCols: 0, bottlesPerCell: 1 };
+    expect(computeRackPosition({ ...single, position: 1, layer: 2, slotInLayer: 1 }).error).toMatch(/back capacity 0/);
+  });
+
+  test('end-to-end: a Vintec VWM-shaped cabinet places every stacked row exactly, and a doubled cell overflows next door', () => {
+    const rack = {
+      type: 'shelf', rows: 6, cols: 7, typeConfig: { bottlesPerCell: 10, backCols: 0 },
+      slots: [], maxPosition: 6 * 70
+    };
+    const { placements, unplaced } = placeBottlesInRack(rack, [
+      // shelf 5 of 6 (bottom-left) → effective shelf 2 → base 70; layer 7 slot 3 → 70 + 42 + 3
+      { item: { rackPosition: 5, layer: 7, slotInLayer: 3 }, bottleId: 'a', sourceIndex: 0 },
+      // Oeno duplicates a layer definition now and then: same cell twice → nearest free
+      { item: { rackPosition: 5, layer: 7, slotInLayer: 3 }, bottleId: 'b', sourceIndex: 1 },
+      { item: { rackPosition: 5, layer: 11, slotInLayer: 1 }, bottleId: 'c', sourceIndex: 2 },
+    ], 'bottom-left');
+    expect(placements.map(p => [p.bottle, p.position, !!p.overflowed])).toEqual([['a', 115, false], ['b', 116, true]]);
+    expect(unplaced).toEqual([{ sourceIndex: 2, requestedPosition: null, reason: 'layer 11 exceeds the 10 stacked rows per shelf' }]);
+  });
+});
+
+// ── Cabinet (wine fridge): shelf number + row-in-bay + slot ─────────────────
+describe('cabinet racks: shelf + layer + slotInLayer land in the exact cell', () => {
+  // 3 shelves: top bay 1 row, middle bay 3 rows, bottom bay 2 rows; 6 across.
+  const cab = { rackType: 'cabinet', rackRows: 3, rackCols: 6, shelfRows: [1, 3, 2] };
+
+  test('top-left anchor: shelf 1 is the top bay', () => {
+    expect(computeRackPosition({ ...cab, position: 1, layer: 1, slotInLayer: 2 })).toEqual({ position: 2 });
+    expect(computeRackPosition({ ...cab, position: 2, layer: 1, slotInLayer: 1 })).toEqual({ position: 7 });
+    expect(computeRackPosition({ ...cab, position: 2, layer: 3, slotInLayer: 6 })).toEqual({ position: 24 });
+    expect(computeRackPosition({ ...cab, position: 3, layer: 2, slotInLayer: 1 })).toEqual({ position: 31 });
+  });
+
+  test('bottom-left anchor (Oeno): shelf 1 is the BOTTOM bay, layer = Oeno layer', () => {
+    expect(computeRackPosition({ ...cab, position: 1, layer: 1, slotInLayer: 1, anchor: 'bottom-left' })).toEqual({ position: 25 });
+    expect(computeRackPosition({ ...cab, position: 3, layer: 1, slotInLayer: 6, anchor: 'bottom-left' })).toEqual({ position: 6 });
+    expect(computeRackPosition({ ...cab, position: 2, layer: 2, slotInLayer: 3, anchor: 'bottom-left' })).toEqual({ position: 6 + 6 + 3 });
+  });
+
+  test('a row beyond the bay, a slot beyond the width, or a shelf beyond rows is an error', () => {
+    expect(computeRackPosition({ ...cab, position: 1, layer: 2, slotInLayer: 1 }).error).toMatch(/row 2 exceeds the 1 rows of shelf 1/);
+    expect(computeRackPosition({ ...cab, position: 2, layer: 1, slotInLayer: 7 }).error).toMatch(/slot 7/);
+    expect(computeRackPosition({ ...cab, position: 4, layer: 1, slotInLayer: 1 }).error).toMatch(/shelf 4 exceeds/);
+  });
+
+  test('row/col input on a cabinet: bottom anchor flips against the BOTTLE rows, not the shelf count', () => {
+    // 3 shelves of 2 rows = 6 bottle rows, 4 across. Row 6 (bottom-anchored)
+    // is the top bottle row → position 1..4; row 1 is the very bottom → 21..24.
+    const cab2 = { rackType: 'cabinet', rackRows: 3, rackCols: 4, shelfRows: [2, 2, 2] };
+    expect(computeRackPosition({ ...cab2, row: 6, col: 1, anchor: 'bottom-left' })).toEqual({ position: 1 });
+    expect(computeRackPosition({ ...cab2, row: 1, col: 4, anchor: 'bottom-left' })).toEqual({ position: 24 });
+    expect(computeRackPosition({ ...cab2, row: 4, col: 2, anchor: 'bottom-left' })).toEqual({ position: 10 });
+    expect(computeRackPosition({ ...cab2, row: 7, col: 1, anchor: 'bottom-left' }).error).toMatch(/row 7 exceeds rackRows 6/);
+    // top-left is plain row-major and unaffected
+    expect(computeRackPosition({ ...cab2, row: 2, col: 3 })).toEqual({ position: 7 });
+  });
+
+  test('an alternating cabinet (6 in front of 5, then 5 in front of 6) maps every layer by its own width', () => {
+    // 2 shelves, 6 across: top bay 2 rows (6 + 5), bottom bay 4 rows (6 + 5 + 5 + 6) = 33.
+    const alt = { rackType: 'cabinet', rackRows: 2, rackCols: 6, shelfRows: [2, 4], twoDeep: true, alternate: true };
+    expect(computeRackPosition({ ...alt, position: 1, layer: 2, slotInLayer: 5 })).toEqual({ position: 11 });
+    expect(computeRackPosition({ ...alt, position: 1, layer: 2, slotInLayer: 6 }).error).toMatch(/slot 6 exceeds shelf width 5/);
+    expect(computeRackPosition({ ...alt, position: 2, layer: 3, slotInLayer: 1 })).toEqual({ position: 11 + 6 + 5 + 1 });
+    expect(computeRackPosition({ ...alt, position: 2, layer: 4, slotInLayer: 6 })).toEqual({ position: 33 });
+    // Oeno's bottom anchor: shelf 1 is the bottom bay.
+    expect(computeRackPosition({ ...alt, position: 1, layer: 4, slotInLayer: 6, anchor: 'bottom-left' })).toEqual({ position: 33 });
+    // Row/col input walks the same rows: bottle row 2 is the narrow back row.
+    expect(computeRackPosition({ ...alt, row: 2, col: 5 })).toEqual({ position: 11 });
+    expect(computeRackPosition({ ...alt, row: 2, col: 6 }).error).toMatch(/col 6 exceeds row width 5/);
+    expect(computeRackPosition({ ...alt, row: 3, col: 1 })).toEqual({ position: 12 });
+    // Bottom anchor against the 6 bottle rows; right anchor mirrors within the row's own width.
+    expect(computeRackPosition({ ...alt, row: 1, col: 1, anchor: 'bottom-left' })).toEqual({ position: 28 });
+    expect(computeRackPosition({ ...alt, row: 5, col: 1, anchor: 'bottom-right' })).toEqual({ position: 11 });
+    expect(computeRackPosition({ ...alt, row: 7, col: 1, anchor: 'bottom-left' }).error).toMatch(/row 7 exceeds rackRows 6/);
+    // placeBottlesInRack threads the flags from the rack's typeConfig.
+    const rack = { type: 'cabinet', rows: 2, cols: 6, typeConfig: { shelfRows: [2, 4], twoDeep: true, alternate: true }, slots: [], maxPosition: 33 };
+    const { placements, unplaced } = placeBottlesInRack(rack, [
+      { item: { rackPosition: 2, layer: 4, slotInLayer: 6 }, bottleId: 'a', sourceIndex: 0 },
+    ], 'top-left');
+    expect(unplaced).toEqual([]);
+    expect(placements.map(p => [p.bottle, p.position])).toEqual([['a', 33]]);
+  });
+
+  test('per-shelf width and pattern: a 4-wide staggered top shelf above a 6-wide honeycomb one', () => {
+    const cab5001 = {
+      rackType: 'cabinet', rackRows: 2, rackCols: 6, shelfRows: [2, 2],
+      shelfCols: [4, 6], shelfAlternate: [false, true], twoDeep: true,
+    }; // top bay 4 + 4 = 8, bottom bay 6 + 5 = 11
+    expect(computeRackPosition({ ...cab5001, position: 1, layer: 2, slotInLayer: 4 })).toEqual({ position: 8 });
+    expect(computeRackPosition({ ...cab5001, position: 1, layer: 1, slotInLayer: 5 }).error).toMatch(/slot 5 exceeds shelf width 4/);
+    expect(computeRackPosition({ ...cab5001, position: 2, layer: 1, slotInLayer: 6 })).toEqual({ position: 14 });
+    expect(computeRackPosition({ ...cab5001, position: 2, layer: 2, slotInLayer: 5 })).toEqual({ position: 19 });
+    expect(computeRackPosition({ ...cab5001, position: 2, layer: 2, slotInLayer: 6 }).error).toMatch(/slot 6 exceeds shelf width 5/);
+    expect(computeRackPosition({ ...cab5001, row: 3, col: 6 })).toEqual({ position: 14 });
+    // Bottom-right: row 1 is the bottom bay's back row (5 wide, from 14); col 4 mirrored is col 2.
+    expect(computeRackPosition({ ...cab5001, row: 1, col: 4, anchor: 'bottom-right' })).toEqual({ position: 16 });
+    const rack = { type: 'cabinet', rows: 2, cols: 6, typeConfig: { shelfRows: [2, 2], shelfCols: [4, 6], shelfAlternate: [false, true] }, slots: [], maxPosition: 19 };
+    const { placements, unplaced } = placeBottlesInRack(rack, [
+      { item: { rackPosition: 1, layer: 1, slotInLayer: 6, }, bottleId: 'a', sourceIndex: 0 },
+      { item: { rackPosition: 2, layer: 2, slotInLayer: 5 }, bottleId: 'b', sourceIndex: 1 },
+    ], 'top-left');
+    expect(unplaced.map((u) => u.reason)).toEqual(['slot 6 exceeds shelf width 4']);
+    expect(placements.map(p => [p.bottle, p.position])).toEqual([['b', 19]]);
+  });
+
+  test('without layer/slot the bottle takes the bay\'s first cell and overflow fans the rest out', () => {
+    expect(computeRackPosition({ ...cab, position: 2 })).toEqual({ position: 7 });
+    const rack = { type: 'cabinet', rows: 3, cols: 6, typeConfig: { shelfRows: [1, 3, 2], twoDeep: true }, slots: [], maxPosition: 36 };
+    const { placements, unplaced } = placeBottlesInRack(rack, [
+      { item: { rackPosition: 2 }, bottleId: 'a', sourceIndex: 0 },
+      { item: { rackPosition: 2 }, bottleId: 'b', sourceIndex: 1 },
+      { item: { rackPosition: 2, layer: 3, slotInLayer: 6 }, bottleId: 'c', sourceIndex: 2 },
+    ], 'top-left');
+    expect(unplaced).toEqual([]);
+    expect(placements.map(p => [p.bottle, p.position])).toEqual([['a', 7], ['c', 24], ['b', 8]]);
+  });
+});

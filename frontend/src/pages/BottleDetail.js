@@ -23,8 +23,10 @@ import ViewDetails from '../components/bottle/ViewDetails';
 import BottleJourney from '../components/BottleJourney';
 import OwnerInquiryCard from '../components/bottle/OwnerInquiryCard';
 import PersonalDataCard from '../components/bottle/PersonalDataCard';
+import LotHistory from '../components/bottle/LotHistory';
 import DialogBox from '../components/DialogBox';
 import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
+import { swatchType, wineTypeLabel } from '../utils/wineColour';
 import './BottleDetail.css';
 
 // Lazy-load heavy components only needed on user interaction
@@ -32,7 +34,6 @@ const ReportWineModal = lazy(() => import('../components/ReportWineModal'));
 const MoveBottleModal = lazy(() => import('../components/MoveBottleModal'));
 const ReviewForm = lazy(() => import('../components/ReviewForm'));
 const ConsumeModal = lazy(() => import('../components/ConsumeModal').then(m => ({ default: m.ConsumeModal })));
-const SuggestGrapesModal = lazy(() => import('../components/SuggestGrapesModal').then(m => ({ default: m.SuggestGrapesModal })));
 const RecommendWineModal = lazy(() => import('../components/RecommendWineModal'));
 const AddMoreBottlesModal = lazy(() => import('../components/AddMoreBottlesModal'));
 
@@ -68,7 +69,9 @@ function BottleDetail() {
   const [restoreError, setRestoreError] = useState(null);
   const [mistakeOpen, setMistakeOpen] = useState(false);
   const [mistakeBusy, setMistakeBusy] = useState(false);
-  const [suggestGrapesOpen, setSuggestGrapesOpen] = useState(false);
+  // Bumped to send the reader to the wine record in "suggest a fix" mode —
+  // wrong DATA is corrected there, with the right value, not reported in prose.
+  const [suggestFixSignal, setSuggestFixSignal] = useState(0);
   // What the last draft publish / attach did; survives the refetch that
   // unmounts the draft banner. Cleared when the page moves to another bottle.
   const [draftNotice, setDraftNotice] = useState(null);
@@ -274,9 +277,9 @@ function BottleDetail() {
     }
   };
 
-  const handleConsumeConfirm = async (reason, note, rating, consumedRatingScale) => {
+  const handleConsumeConfirm = async (reason, note, rating, consumedRatingScale, consumedAt) => {
     try {
-      const res = await consumeBottle(apiFetch, bottleId, { reason, note, rating, consumedRatingScale });
+      const res = await consumeBottle(apiFetch, bottleId, { reason, note, rating, consumedRatingScale, consumedAt });
       const data = await res.json();
       if (res.ok) {
         // Prompt for journal entry if user hasn't opted out
@@ -544,7 +547,7 @@ function BottleDetail() {
               {wine?.country?.name && <span className="bd-country">{displayProducer ? ' · ' : ' — '}{wine.country.name}</span>}
             </p>
             {wine?.type && (
-              <span className={`wine-type-pill ${wine.type}`}>{wine.type}</span>
+              <span className={`wine-type-pill ${swatchType(wine)}`}>{wineTypeLabel(wine, t)}</span>
             )}
           </div>
         </div>
@@ -597,7 +600,7 @@ function BottleDetail() {
           canEdit={canEdit}
           hasImage={!!(defaultImage || pendingImage || bottle.wineDefinition?.image)}
           onEdit={() => setEditing(true)}
-          onSuggestGrapes={() => setSuggestGrapesOpen(true)}
+          suggestFixSignal={suggestFixSignal}
           onRemove={() => setConsumeOpen(true)}
           onReportWine={(reason) => { setReportWineOpen(true); setReportDefaultReason(typeof reason === 'string' ? reason : null); }}
           wineDraft={bottle.wineDraft || null}
@@ -612,6 +615,12 @@ function BottleDetail() {
       {!user?.isDemo && (
         <PersonalDataCard apiFetch={apiFetch} bottleId={bottleId} currentUserId={user?.id} wineId={wine?._id} vintage={bottle?.vintage} />
       )}
+
+      {/* ── The viewer's other bottles of this wine, and what happened to the
+          ones already drunk (support ticket 2026-09-16). Hides itself when
+          there is nothing to say. Personal, so it sits with the personal
+          cards, above the registry's profile and the community reviews. ── */}
+      <LotHistory apiFetch={apiFetch} bottleId={bottleId} vintage={bottle?.vintage} isOwner={userRole === 'owner'} />
 
       {/* ── AI tasting profile (generated, vintage-neutral) ── */}
       {wine?.aiProfile?.description && (
@@ -897,13 +906,6 @@ function BottleDetail() {
           />
         )}
 
-        {suggestGrapesOpen && (
-          <SuggestGrapesModal
-            wine={wine}
-            onClose={() => setSuggestGrapesOpen(false)}
-          />
-        )}
-
         {addMoreOpen && bottle && (
           <AddMoreBottlesModal
             bottle={bottle}
@@ -916,6 +918,14 @@ function BottleDetail() {
           <ReportWineModal
             wine={bottle.wineDefinition}
             defaultReason={reportDefaultReason}
+            // Offered only where the record's own suggest actions are (not the
+            // demo, not a private draft — same gate as WineRecordSection) AND
+            // while the record is on screen: the edit form replaces it, and the
+            // tasting-profile report button stays clickable there, so the
+            // hand-off would have been a dead click (pre-deploy audit 2026-09-18).
+            onSuggestFix={!editing && !user?.isDemo && bottle.wineDefinition.draft !== true
+              ? () => { setReportWineOpen(false); setReportDefaultReason(null); setSuggestFixSignal(n => n + 1); }
+              : undefined}
             onClose={() => { setReportWineOpen(false); setReportDefaultReason(null); }}
           />
         )}

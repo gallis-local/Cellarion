@@ -59,7 +59,14 @@ test('get_wine_public_data passes roles (visibility) and surfaces any-pending + 
   const res = await tool('get_wine_public_data').handler({ wine_id: WINE }, USER_CTX);
   const body = parse(res);
   expect(ops.dataForWine).toHaveBeenCalledWith(WINE, ME, { roles: USER_CTX.user.roles });
-  expect(body.data.fields[0]).toMatchObject({ key: 'ABV', value: 13.5, contributed_by: 'kurt', suggestion_pending: false });
+  expect(body.data.fields[0]).toMatchObject({ key: 'ABV', value: 13.5, suggestion_pending: false });
+  // Who contributed a value is stored, never told to a reader (2026-09-18) —
+  // not even if an older service layer were still to hand the name over. The
+  // FIELD stays, always null: docs/mcp-versioning.md forbids removing a
+  // response field in place, and it was nullable from the start.
+  expect(body.data.fields[0]).toHaveProperty('contributed_by', null);
+  expect(body.data.fields[1]).toHaveProperty('contributed_by', null);
+  expect(JSON.stringify(body)).not.toMatch(/kurt/);
   expect(body.data.fields[1]).toMatchObject({ value: null, suggestion_pending: true, my_pending_suggestion: true });
 });
 

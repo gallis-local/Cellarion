@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const mongoose = require('mongoose');
 const { generateWineSlug, isIdentitySentinel, isImplausibleIdentity } = require('../utils/normalize');
 const { computeCanonicalKey } = require('../utils/wineIdentity');
+const { isStyleType, inferColourFromName } = require('../utils/wineColour');
 
 const wineDefinitionSchema = new mongoose.Schema({
   name: {
@@ -73,6 +74,16 @@ const wineDefinitionSchema = new mongoose.Schema({
     // a curator to look, a wrong value closes the question.
     type: String,
     enum: ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'],
+  },
+  // The COLOUR of a sparkling, dessert or fortified wine — the three types
+  // that are a style, not a colour (utils/wineColour.js). A Trento DOC rosé is
+  // type 'sparkling', colour 'rosé'. Always null for red/white/rosé, where the
+  // type already is the colour; the pre-validate hook below enforces that and
+  // fills it from a rosé name when a wine is created or retyped.
+  colour: {
+    type: String,
+    enum: ['red', 'white', 'rosé'],
+    default: null
   },
   image: {
     type: String,
@@ -734,6 +745,22 @@ wineDefinitionSchema.pre('validate', function(next) {
   )) {
     this.crossChecksCleared = undefined;
     this.crossChecksClearedAt = null;
+  }
+  // COLOUR belongs to the style types only. Anything else holds none — a
+  // colour left behind by a retype to red/white/rosé (or to no type) would
+  // contradict the type that now says it. For a style type with no colour, a
+  // rosé NAME supplies one, but only when the wine is created, its type
+  // changes, or a private draft is published (drafts that predate the field
+  // get their colour as they enter the registry): afterwards the stored value
+  // is a curator's, and a later save must not re-infer over a colour someone
+  // deliberately cleared. Nor in THIS save, when the caller stated the colour
+  // — "none" included (utils/wineColour.stateColour).
+  if (!isStyleType(this.type)) {
+    if (this.colour != null) this.colour = null;
+  } else if (this.colour == null && !this.$locals.colourStated &&
+             (this.isNew || this.isModified('type') || this.isModified('draft'))) {
+    const inferred = inferColourFromName(this.name, this.producer);
+    if (inferred) this.colour = inferred;
   }
   next();
 });

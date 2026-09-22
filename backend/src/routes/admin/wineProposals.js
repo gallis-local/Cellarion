@@ -30,6 +30,7 @@ const WineDefinition = require('../../models/WineDefinition');
 const WineVintageProfile = require('../../models/WineVintageProfile');
 const Bottle = require('../../models/Bottle');
 const Country = require('../../models/Country');
+const Grape = require('../../models/Grape');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const { logAudit } = require('../../services/audit');
 const { submitUrls } = require('../../services/indexNow');
@@ -40,12 +41,16 @@ const { findOrCreateRegion } = require('../../services/findOrCreateWine');
 // Same helpers the somm's own set_wine_profile writes through, so an approved
 // proposal and a direct curator edit resolve varieties identically.
 const { WINE_TYPES, resolveGrapeIdsStrict } = require('../../services/wineProfileOps');
+const { WINE_COLOURS, isStyleType } = require('../../utils/wineColour');
 const { resolveCanonicalAppellation } = require('../../services/appellationResolve');
 const { performWineMerge } = require('./wines');
-const { generateWineKey, normalizeAppellation, normalizeString, resolveCountryName } = require('../../utils/normalize');
+const { generateWineKey, normalizeAppellation, normalizeString, resolveCountryName, resolveGrapeName } = require('../../utils/normalize');
 const { parsePagination } = require('../../utils/pagination');
 const { isValidId } = require('../../utils/validation');
 const { stripHtml } = require('../../utils/sanitize');
+// Telling the submitter lives in a service: merges and deletes close pending
+// corrections too (routes/admin/wines.js) and owe the same notification.
+const { notifyProposer } = require('../../services/wineCorrectionNotify');
 
 router.use(requireAuth, requireRole('admin'));
 
@@ -55,7 +60,7 @@ const PROPOSAL_STATUSES = ['pending', 'approved', 'rejected'];
 // `grapes` is deliberately NOT here: it is a LIST, and the diff/drift shape
 // this list feeds is string-to-string. It is rendered by joining the names,
 // alongside these, in the diff builder below.
-const IDENTITY_FIELDS = ['producer', 'name', 'appellation', 'region', 'country', 'classification', 'type'];
+const IDENTITY_FIELDS = ['producer', 'name', 'appellation', 'region', 'country', 'classification', 'type', 'colour'];
 
 /** Grape names for display in a diff row — the same join both sides use. */
 const grapeLabel = (names) => (Array.isArray(names) && names.length ? names.join(', ') : null);
@@ -72,6 +77,7 @@ const liveIdentity = (wine) => ({
   country: wine.country?.name || null,
   classification: wine.classification || null,
   type: wine.type || null,
+  colour: wine.colour || null,
   // Populated when the caller asked for it; a bare id array joins to nothing
   // and the row simply reads "—", which is honest for an unpopulated read.
   grapes: grapeLabel((wine.grapes || []).map((g) => g && g.name).filter(Boolean)),
@@ -111,7 +117,7 @@ router.get('/', async (req, res) => {
       { path: 'proposer', select: 'username' },
       {
         path: 'wineDefinition',
-        select: 'name producer appellation classification type nonWine country region grapes',
+        select: 'name producer appellation classification type colour nonWine country region grapes',
         populate: [
           { path: 'country', select: 'name' },
           { path: 'region', select: 'name' },
@@ -121,6 +127,32 @@ router.get('/', async (req, res) => {
       },
       { path: 'mergeTargetId', select: 'name producer appellation type' },
     ]);
+
+    // A user may deliberately propose a variety the taxonomy lacks (the web
+    // grape picker's "add as a new variety"); approving refuses it until the
+    // variety exists. One batched lookup for the page, so the modal can say so
+    // up front instead of the admin learning it from a 400.
+    const proposedGrapeKeys = new Set();
+    for (const p of rows) {
+      for (const g of (p.proposedFields && p.proposedFields.grapes) || []) {
+        const key = normalizeString(resolveGrapeName(g));
+        if (key) proposedGrapeKeys.add(key);
+      }
+    }
+    const knownGrapeKeys = new Set();
+    if (proposedGrapeKeys.size) {
+      const keys = [...proposedGrapeKeys];
+      const found = await Grape.find({ $or: [{ normalizedName: { $in: keys } }, { normalizedSynonyms: { $in: keys } }] })
+        .select('normalizedName normalizedSynonyms').lean();
+      for (const g of found) {
+        knownGrapeKeys.add(g.normalizedName);
+        for (const s of g.normalizedSynonyms || []) knownGrapeKeys.add(s);
+      }
+    }
+    const isUnknownGrape = (name) => {
+      const key = normalizeString(resolveGrapeName(name));
+      return !key || !knownGrapeKeys.has(key);
+    };
 
     const proposals = rows.map((p) => {
       const live = p.wineDefinition ? liveIdentity(p.wineDefinition) : null;
@@ -138,6 +170,9 @@ router.get('/', async (req, res) => {
         // so the modal needs no list-aware branch.
         if (Array.isArray(p.proposedFields.grapes) && p.proposedFields.grapes.length) {
           diff.grapes = { current: live ? live.grapes : null, proposed: grapeLabel(p.proposedFields.grapes) };
+          // Only worth saying while it can still be acted on.
+          const unknown = p.status === 'pending' ? p.proposedFields.grapes.filter(isUnknownGrape) : [];
+          if (unknown.length) diff.grapes.unknown = unknown;
         }
       }
       return {
@@ -236,6 +271,8 @@ async function approveProposal(proposalId, req, { deferFollowThrough = false } =
     // applied (audit 2026-08-16: per-proposal firing raced same-wine batches
     // and cost N forced AI calls for one wine).
     let followThrough = null;
+    // The corrected wine, for the submitter's notification once all is recorded.
+    let correctedWine = null;
     try {
       if (proposal.kind === 'field_correction') {
         const wine = await WineDefinition.findById(proposal.wineDefinition);
@@ -243,6 +280,7 @@ async function approveProposal(proposalId, req, { deferFollowThrough = false } =
           await revertClaim();
           return { status: 404, body: { error: 'The proposed wine no longer exists' } };
         }
+        correctedWine = wine;
         // Before-image for the re-enrich decision below — same real-change
         // semantics as the admin PUT.
         const beforeProfileInputs = profileInputsSnapshot(wine);
@@ -299,6 +337,23 @@ async function approveProposal(proposalId, req, { deferFollowThrough = false } =
           }
           wine.type = pf.type;
           applied.push('type');
+        }
+
+        // Colour is judged against the type the wine has NOW (after any type
+        // in this same proposal): on a red/white/rosé wine the type already is
+        // the colour, and the model hook would drop it anyway — say so rather
+        // than report a field as applied that was not stored.
+        if (pf.colour) {
+          if (!WINE_COLOURS.includes(pf.colour)) {
+            await revertClaim();
+            return { status: 400, body: { error: `Unknown colour "${pf.colour}" — must be one of: ${WINE_COLOURS.join(', ')}` } };
+          }
+          if (isStyleType(wine.type)) {
+            wine.colour = pf.colour;
+            applied.push('colour');
+          } else {
+            applied.push('colour (skipped — only sparkling, dessert and fortified wines carry one)');
+          }
         }
 
         // Grapes resolve against LIVE taxonomy at approval, not at filing: a
@@ -407,6 +462,8 @@ async function approveProposal(proposalId, req, { deferFollowThrough = false } =
         appliedNote,
       });
 
+    notifyProposer(proposal, correctedWine, req.user.id, true);
+
     return {
       status: 200,
       body: { message: 'Proposal approved and applied', proposalId: proposal._id, status: 'approved', appliedNote },
@@ -453,6 +510,20 @@ async function rejectProposal(proposalId, reason, req) {
   logAudit(req, 'admin.wineProposal.reject',
     { type: 'WineCorrectionProposal', id: proposal._id },
     { kind: proposal.kind, wineDefinitionId: proposal.wineDefinition, reason });
+
+  // Only the label is needed — and only when there is somebody to tell. The
+  // decision is ALREADY recorded and audited above, so a failed label read must
+  // not answer 500 (the admin would retry into a 409 and the submitter would
+  // never hear): the notification then simply goes out without the label.
+  if (proposal.kind === 'field_correction' && proposal.via) {
+    let wineDoc = null;
+    try {
+      wineDoc = await WineDefinition.findById(proposal.wineDefinition).select('name producer').lean();
+    } catch (err) {
+      console.warn('[wineProposals] label lookup for the rejection notice failed (non-fatal):', err.message);
+    }
+    notifyProposer(proposal, wineDoc, req.user.id, false, reason);
+  }
 
   return { status: 200, body: { message: 'Proposal rejected', proposalId: proposal._id, status: 'rejected' } };
 }

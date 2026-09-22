@@ -1,5 +1,6 @@
 /**
- * Public taxonomy routes — no auth required.
+ * Public taxonomy routes — no auth required (the one exception, /grape-names,
+ * says so on the route).
  * Powers the public /regions/:slug, /countries/:slug, /grapes/:slug,
  * and /wines/type/:type discovery pages.
  *
@@ -16,6 +17,7 @@ const WineDefinition = require('../models/WineDefinition');
 const { parsePagination } = require('../utils/pagination');
 const { baseLanguage, localizedName } = require('../utils/localizedName');
 const { rateLimitKey } = require('../utils/clientIp');
+const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -78,7 +80,7 @@ function clearTaxonomyListCache() {
 }
 
 // Shared wine projection for public lists
-const WINE_PROJECTION = 'name producer slug type appellation region country image communityRating';
+const WINE_PROJECTION = 'name producer slug type colour appellation region country image communityRating';
 
 // Registry lockdown (2026-09-06, L2): these four listings are the one
 // unauthenticated surface that pages through the registry. At 100 a page with
@@ -326,6 +328,60 @@ router.get('/grapes', async (req, res) => {
   } catch (err) {
     console.error('[taxonomy] grapes list error:', err);
     res.status(500).json({ error: 'Failed to fetch grapes' });
+  }
+});
+
+/**
+ * GET /api/taxonomy/grape-names — the whole grape vocabulary, for the grape
+ * picker on the bottle page's "suggest a fix" form (support ticket 2026-09-17:
+ * a comma-separated text box is no way to enter varieties).
+ *
+ * Unlike /grapes above this is NOT gated on MIN_WINES: a correction has to be
+ * able to name a rare variety, which is exactly the one no public page exists
+ * for. Synonyms ride along so typing "Shiraz" or "Tinta Roriz" finds the
+ * canonical variety the registry stores, and wineCount lets the client rank a
+ * short query sensibly. No ids: a correction carries names, resolved again at
+ * approval.
+ *
+ * Left out: a user-minted variety nobody has reviewed and no wine uses — the
+ * same "needs a human" rule the admin taxonomy screen applies. That is where
+ * the typos and the junk sit, and a picker must not offer them back.
+ *
+ * Signed-in only. The vocabulary is not a secret, but the one caller is a form
+ * that only signed-in users can open, and this router's other lists are what
+ * a crawler walks.
+ */
+router.get('/grape-names', requireAuth, async (req, res) => {
+  // Set on the two success paths only: stamped up front, a 500 went out
+  // cacheable for an hour too, and the picker's "Try again" would have been
+  // answered from the browser's cache (pre-deploy audit 2026-09-18).
+  const cacheable = () => res.set('Cache-Control', 'private, max-age=3600');
+  try {
+    const cached = getCachedList('grape-names');
+    if (cached) { cacheable(); return res.json(cached); }
+
+    const [grapes, countByGrape] = await Promise.all([
+      Grape.find({})
+        .select('name color synonyms createdByUser reviewedAt')
+        .sort({ name: 1 })
+        .lean(),
+      countWinesBy('grapes', { unwind: true }),
+    ]);
+
+    const result = [];
+    for (const g of grapes) {
+      const wineCount = countByGrape.get(String(g._id)) || 0;
+      if (g.createdByUser && !g.reviewedAt && wineCount === 0) continue;
+      result.push({ name: g.name, color: g.color || null, synonyms: g.synonyms || [], wineCount });
+    }
+
+    const body = { grapes: result };
+    listCache.set('grape-names', { at: Date.now(), body });
+    cacheable();
+    res.json(body);
+  } catch (err) {
+    console.error('[taxonomy] grape names error:', err);
+    res.status(500).json({ error: 'Failed to fetch grape names' });
   }
 });
 

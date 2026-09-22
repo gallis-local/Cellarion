@@ -333,6 +333,68 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
       return ok(envelope.summary, envelope.data);
     }
 
+    if (d.op === 'key_update') {
+      const PersonalDataKey = require('../models/PersonalDataKey');
+      const key = await PersonalDataKey.findOne({ _id: d.keyId, user: ctx.user.id });
+      if (!key) return fail('conflict', 'That key no longer exists; nothing was changed.');
+      const claimed = await McpActionLog.findOneAndUpdate({ _id: row._id, reversed: false }, { $set: { reversed: true, idempotencyKey: null } });
+      if (!claimed) return fail('conflict', 'That action is already being undone by another request.');
+      // prev carries ONLY the fields that action changed (a rename-only row
+      // has no unit, and vice versa), so undoing a rename never touches a unit
+      // set elsewhere. A unit restore obeys the same rule as the forward path:
+      // never on a key that holds entries (audit 2026-09-14 M2).
+      const prev = row.prev || {};
+      const restoresUnit = Object.prototype.hasOwnProperty.call(prev, 'unit') && (prev.unit || null) !== (key.unit || null);
+      if (restoresUnit) {
+        const PersonalDataEntry = require('../models/PersonalDataEntry');
+        const entries = await PersonalDataEntry.countDocuments({ key: key._id });
+        if (entries > 0) {
+          await unclaim(row._id);
+          return fail('conflict', `"${key.name}" now holds ${entries} entr${entries === 1 ? 'y' : 'ies'} — its unit is part of what each value means and cannot be changed back. Nothing was changed.`);
+        }
+      }
+      if (prev.name) { key.name = prev.name; key.nameKey = prev.name.toLowerCase(); }
+      if (restoresUnit) key.unit = prev.unit || undefined;
+      try {
+        await key.save();
+      } catch (err) {
+        await unclaim(row._id); // failed → let the undo be retried
+        if (err?.code === 11000) return fail('conflict', `A key called "${prev.name}" exists again — rename it first, then retry.`);
+        throw err;
+      }
+      const envelope = {
+        summary: `Undid key change — "${key.name}"${restoresUnit ? ` (unit ${JSON.stringify(key.unit || null)})` : ''} restored`,
+        data: { undone: 'update_personal_key', key_id: key._id, restored: { name: key.name, unit: key.unit || null } },
+      };
+      await logAction(ctx, { tool: 'undo_last', action: 'personal_data', viaUndo: true, detail: { undid: String(row._id) }, result: envelope });
+      return ok(envelope.summary, envelope.data);
+    }
+
+    if (d.op === 'key_delete') {
+      const PersonalDataKey = require('../models/PersonalDataKey');
+      const prev = row.prev || {};
+      const claimed = await McpActionLog.findOneAndUpdate({ _id: row._id, reversed: false }, { $set: { reversed: true, idempotencyKey: null } });
+      if (!claimed) return fail('conflict', 'That action is already being undone by another request.');
+      let recreated;
+      try {
+        // Same id as before, so an analytics field id noted earlier still resolves.
+        recreated = await PersonalDataKey.create({
+          _id: prev._id, user: ctx.user.id, name: prev.name, type: prev.type,
+          unit: prev.unit || undefined, enumOptions: prev.enumOptions || undefined,
+        });
+      } catch (err) {
+        await unclaim(row._id); // failed → let the undo be retried
+        if (err?.code === 11000) return fail('conflict', `A key called "${prev.name}" exists again; nothing was recreated.`);
+        throw err;
+      }
+      const envelope = {
+        summary: `Undid key delete — "${recreated.name}" recreated`,
+        data: { undone: 'delete_personal_key', key_id: recreated._id },
+      };
+      await logAction(ctx, { tool: 'undo_last', action: 'personal_data', viaUndo: true, detail: { undid: String(row._id) }, result: envelope });
+      return ok(envelope.summary, envelope.data);
+    }
+
     return fail('unavailable', 'That personal-data action cannot be undone.');
   }
 
@@ -796,7 +858,9 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
     envelope = { summary: `Undid update on ${bottleLabel(bottle)} — restored: ${Object.keys(prevFields).join(', ')}`, data: { undone: 'update_bottle', bottle_id: bottle._id, restored: result.changes } };
     reverseEntry = { action: 'update', prev: result.prev };
   } else if (row.action === 'consume') {
-    const prevSnapshot = { reason: bottle.consumedReason || bottle.status, note: bottle.consumedNote, rating: bottle.consumedRating, ratingScale: bottle.consumedRatingScale };
+    // consumedAt rides along so that undoing THIS undo re-consumes on the day
+    // the user actually recorded, not on the day of the undo (audit 2026-09-14).
+    const prevSnapshot = { reason: bottle.consumedReason || bottle.status, note: bottle.consumedNote, rating: bottle.consumedRating, ratingScale: bottle.consumedRatingScale, consumedAt: bottle.consumedAt || undefined };
     const result = await restoreBottle(bottle, ctx.req);
     if (result.error) return fail('conflict', `Cannot undo that consume: ${result.error.message}`);
     envelope = { summary: `Undid consume — ${bottleLabel(bottle)} is back in the cellar (unplaced)`, data: { undone: 'consume_bottle', bottle_id: bottle._id, status: 'active' } };
@@ -806,7 +870,7 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
       return fail('conflict', 'That restore cannot be undone: the bottle has been consumed again since. Nothing was changed.');
     }
     const prev = row.prev || {};
-    const result = await consumeBottle(bottle, { reason: prev.reason || 'drank', note: prev.note, rating: prev.rating, ratingScale: prev.ratingScale }, ctx.req);
+    const result = await consumeBottle(bottle, { reason: prev.reason || 'drank', note: prev.note, rating: prev.rating, ratingScale: prev.ratingScale, consumedAt: prev.consumedAt }, ctx.req);
     if (result.error) return fail('conflict', `Cannot undo that restore: ${result.error.message}`);
     envelope = { summary: `Undid restore — ${bottleLabel(bottle)} is consumed again (${bottle.status})`, data: { undone: 'restore_bottle', bottle_id: bottle._id, status: bottle.status } };
     reverseEntry = { action: 'consume', prev: null };

@@ -7,7 +7,7 @@ process.env.JWT_SECRET = 'test-secret';
 
 jest.mock('../models/Rack', () => {
   const model = { findOne: jest.fn() };
-  model.RACK_TYPES = ['grid', 'x-rack', 'hex', 'triangle', 'stack', 'cube', 'shelf'];
+  model.RACK_TYPES = ['grid', 'x-rack', 'hex', 'triangle', 'stack', 'cube', 'shelf', 'cabinet'];
   return model;
 });
 jest.mock('../models/Cellar', () => ({ findById: jest.fn() }));
@@ -18,7 +18,13 @@ jest.mock('../services/rackOps', () => ({
   createGridRack: jest.fn(),
   normalizeRackGroup: jest.requireActual('../services/rackOps').normalizeRackGroup,
 }));
-jest.mock('../utils/rackGeometry', () => ({ getMaxPosition: jest.fn(() => 32), validateDoubleHeightRows: jest.fn(() => null) }));
+jest.mock('../utils/rackGeometry', () => ({
+  cabinetShelfAlternate: jest.requireActual('../utils/rackGeometry').cabinetShelfAlternate,
+  getMaxPosition: jest.fn(() => 32),
+  validateDoubleHeightRows: jest.fn(() => null),
+  // Real validator — the cabinet gate is part of the pinned PUT contract.
+  validateCabinetConfig: jest.requireActual('../utils/rackGeometry').validateCabinetConfig,
+}));
 
 const express = require('express');
 const http = require('http');
@@ -123,5 +129,137 @@ describe('PUT /api/racks/:id group validation (audit 2026-09-07)', () => {
     expect(status).toBe(400);
     expect(doc.group).toBe('Basement');
     expect(doc.save).not.toHaveBeenCalled();
+  });
+});
+
+// ── A cabinet's drawing-only options are editable after creation ────────────
+// twoDeep and stagger change how the cabinet is DRAWN; capacity and slot
+// numbering are untouched, so flipping them on a loaded rack must not move a
+// bottle. The shape (rows / cols / shelfRows) stays creation-only.
+describe('PUT /api/racks/:id cabinet options', () => {
+  const cabinet = (over = {}) => rackDoc({
+    type: 'cabinet', rows: 3, cols: 4,
+    typeConfig: { shelfRows: [2, 2, 2], twoDeep: true, stagger: true },
+    slots: [{ position: 7, bottle: '64b0000000000000000000cc' }],
+    ...over,
+  });
+
+  test('turning nesting off keeps the shape, the slots and the capacity', async () => {
+    const doc = cabinet();
+    Rack.findOne.mockResolvedValue(doc);
+    const { status } = await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, {
+      name: 'Fridge', group: '', typeConfig: { shelfRows: [2, 2, 2], twoDeep: true, stagger: false },
+    });
+    expect(status).toBe(200);
+    expect(doc.typeConfig).toEqual({ shelfRows: [2, 2, 2], twoDeep: true, stagger: false });
+    expect(doc.rows).toBe(3);
+    expect(doc.cols).toBe(4);
+    expect(doc.slots).toEqual([{ position: 7, bottle: '64b0000000000000000000cc' }]);
+    expect(doc.save).toHaveBeenCalled();
+  });
+
+  test('a typeConfig that drops the shelf list is refused, so the shape cannot be lost', async () => {
+    const doc = cabinet();
+    Rack.findOne.mockResolvedValue(doc);
+    const { status, body } = await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, {
+      typeConfig: { twoDeep: false, stagger: false },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/shelfRows is required/);
+    expect(doc.save).not.toHaveBeenCalled();
+  });
+
+  test('a shelf list that no longer matches the shelf count is refused', async () => {
+    const doc = cabinet();
+    Rack.findOne.mockResolvedValue(doc);
+    const { status, body } = await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, {
+      typeConfig: { shelfRows: [2, 2], twoDeep: true, stagger: true },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/one entry per shelf/);
+  });
+
+  test('the alternate flag rides along untouched, and a non-boolean one is refused', async () => {
+    // An EMPTY cabinet: on a loaded one whose rows alternate, two-deep is
+    // part of the shape and locked (pinned below, audit 2026-09-16).
+    const doc = cabinet({ typeConfig: { shelfRows: [2, 2, 2], twoDeep: true, stagger: true, alternate: true }, slots: [] });
+    Rack.findOne.mockResolvedValue(doc);
+    const ok = await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, {
+      typeConfig: { shelfRows: [2, 2, 2], twoDeep: false, stagger: true, alternate: true },
+    });
+    expect(ok.status).toBe(200);
+    expect(doc.typeConfig).toEqual({ shelfRows: [2, 2, 2], twoDeep: false, stagger: true, alternate: true });
+
+    const bad = await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, {
+      typeConfig: { shelfRows: [2, 2, 2], twoDeep: true, stagger: true, alternate: 'yes' },
+    });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toMatch(/alternate must be a boolean/);
+  });
+
+  test('per-shelf lists ride along, and a shelf wider than the cabinet is refused', async () => {
+    const shape = { shelfRows: [2, 2, 2], twoDeep: true, stagger: true, alternate: false, shelfCols: [3, 4, 4], shelfAlternate: [false, true, true] };
+    const doc = cabinet({ typeConfig: shape });
+    Rack.findOne.mockResolvedValue(doc);
+    const ok = await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { typeConfig: { ...shape, stagger: false } });
+    expect(ok.status).toBe(200);
+    expect(doc.typeConfig).toEqual({ ...shape, stagger: false });
+
+    const bad = await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { typeConfig: { ...shape, shelfCols: [3, 5, 4] } });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toMatch(/cabinet width \(4\)/);
+  });
+
+  test('a narrower cols alone is checked against the stored per-shelf widths (audit 2026-09-16)', async () => {
+    const doc = cabinet({ typeConfig: { shelfRows: [2, 2, 2], shelfCols: [4, 3, 4], twoDeep: true, stagger: true } });
+    Rack.findOne.mockResolvedValue(doc);
+    const { status, body } = await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { cols: 3 });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/shelfCols/);
+    expect(doc.save).not.toHaveBeenCalled();
+    // Narrowing to a width every shelf fits is still fine.
+    const ok = cabinet({ typeConfig: { shelfRows: [2, 2, 2], shelfCols: [3, 3, 3], twoDeep: true, stagger: true } });
+    Rack.findOne.mockResolvedValue(ok);
+    expect((await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { cols: 3 })).status).toBe(200);
+  });
+
+  test('two-deep is fixed on a LOADED cabinet whose rows alternate — it sets which rows are the narrow ones', async () => {
+    const shape = { shelfRows: [2, 2, 2], twoDeep: true, stagger: true, alternate: true };
+    const loaded = cabinet({ typeConfig: { ...shape } });
+    Rack.findOne.mockResolvedValue(loaded);
+    const { status, body } = await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { typeConfig: { ...shape, twoDeep: false } });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/Two deep/);
+    expect(loaded.save).not.toHaveBeenCalled();
+    // The same flag sent back is not a change; an EMPTY cabinet may still flip it.
+    Rack.findOne.mockResolvedValue(cabinet({ typeConfig: { ...shape } }));
+    expect((await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { typeConfig: { ...shape } })).status).toBe(200);
+    Rack.findOne.mockResolvedValue(cabinet({ typeConfig: { ...shape }, slots: [] }));
+    expect((await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { typeConfig: { ...shape, twoDeep: false } })).status).toBe(200);
+    // A plain cabinet (no alternating bay) keeps two-deep drawing-only.
+    Rack.findOne.mockResolvedValue(cabinet());
+    expect((await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { typeConfig: { shelfRows: [2, 2, 2], twoDeep: false, stagger: true } })).status).toBe(200);
+  });
+
+  test('a shape edit is audited with both sides; a rename carries no shape (audit 2026-09-16)', async () => {
+    const { logAudit } = require('../services/audit');
+    Rack.findOne.mockResolvedValue(cabinet({ slots: [] }));
+    await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { typeConfig: { shelfRows: [2, 2, 2], twoDeep: false, stagger: true } });
+    const meta = logAudit.mock.calls.find((c) => c[1] === 'rack.update')[3];
+    expect(meta.shape.from.typeConfig.twoDeep).toBe(true);
+    expect(meta.shape.to.typeConfig.twoDeep).toBe(false);
+    logAudit.mockClear();
+    Rack.findOne.mockResolvedValue(cabinet({ slots: [] }));
+    await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { name: 'Renamed' });
+    expect(logAudit.mock.calls.find((c) => c[1] === 'rack.update')[3].shape).toBeUndefined();
+  });
+
+  test('renaming a cabinet without touching its shape still works', async () => {
+    const doc = cabinet();
+    Rack.findOne.mockResolvedValue(doc);
+    const { status } = await request(buildApp(), 'PUT', `/api/racks/${RACK_ID}`, { name: 'Kitchen fridge' });
+    expect(status).toBe(200);
+    expect(doc.name).toBe('Kitchen fridge');
+    expect(doc.typeConfig).toEqual({ shelfRows: [2, 2, 2], twoDeep: true, stagger: true });
   });
 });

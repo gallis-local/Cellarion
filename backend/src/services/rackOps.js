@@ -11,9 +11,12 @@
 // on Rack) surfaces as a 409/conflict so a losing concurrent writer retries.
 const Cellar = require('../models/Cellar');
 const Rack = require('../models/Rack');
+// Same bound the PUT route applies (routes/racks.js MAX_RACK_DIM).
+const MAX_RACK_DIM = 20;
+const isRackDim = (v) => Number.isInteger(v) && v >= 1 && v <= MAX_RACK_DIM;
 const Bottle = require('../models/Bottle');
 const { logAudit } = require('./audit');
-const { getMaxPosition, validateDoubleHeightRows } = require('../utils/rackGeometry');
+const { getMaxPosition, validateDoubleHeightRows, validateCabinetConfig } = require('../utils/rackGeometry');
 const { removeFromRacks } = require('./bottleOps');
 
 const { RACK_TYPES } = Rack;
@@ -57,6 +60,13 @@ async function createGridRack(cellarDoc, { name, type = 'grid', rows = 4, cols =
   if (type && !RACK_TYPES.includes(type)) {
     return { error: { status: 400, message: `Invalid rack type. Must be one of: ${RACK_TYPES.join(', ')}` } };
   }
+  // The schema's min/max fires only at save(), after validateCabinetConfig
+  // has compared the shelf list against parseInt(rows) — so a rows of 5.5
+  // used to save as a cabinet with 5.5 shelves (audit 2026-09-16). MCP
+  // already enforces this through zod; REST did not.
+  if ((rows != null && !isRackDim(rows)) || (cols != null && !isRackDim(cols))) {
+    return { error: { status: 400, message: `rows and cols must be whole numbers between 1 and ${MAX_RACK_DIM}` } };
+  }
   const rack = new Rack({
     cellar: cellarDoc._id,
     user: cellarDoc.user, // rack owned by the cellar owner
@@ -69,7 +79,11 @@ async function createGridRack(cellarDoc, { name, type = 'grid', rows = 4, cols =
   if (typeConfig) {
     const dhrError = validateDoubleHeightRows(typeConfig, rack.type, rack.rows, false);
     if (dhrError) return { error: { status: 400, message: dhrError } };
+    const cabError = validateCabinetConfig(typeConfig, rack.type, rack.rows, false, rack.cols);
+    if (cabError) return { error: { status: 400, message: cabError } };
     rack.typeConfig = typeConfig;
+  } else if (rack.type === 'cabinet') {
+    return { error: { status: 400, message: 'shelfRows is required for a cabinet rack' } };
   }
   try {
     await rack.save();
@@ -98,8 +112,16 @@ async function placeBottleInRack(rack, position, bottleId, req) {
   if (pos < 1 || pos > maxPos) return { error: { status: 400, message: `Position must be 1–${maxPos}` } };
   if ((rack.disabledPositions || []).includes(pos)) return { error: { status: 400, message: 'This slot is disabled' } };
 
-  const bottle = await Bottle.findOne({ _id: bottleId, cellar: rack.cellar }).select('_id');
+  const bottle = await Bottle.findOne({ _id: bottleId, cellar: rack.cellar }).select('_id status');
   if (!bottle) return { error: { status: 404, message: 'Bottle not found in this cellar' } };
+  // Consuming a bottle clears its rack slot (bottleOps.consumeBottle); the
+  // reverse must hold too — a consumed bottle cannot be put into a slot, from
+  // any surface (web slot picker, post-add placing queue, MCP place_bottle).
+  // Audit 2026-09-14: bottles added straight into the drinking history were
+  // offered for placement and this accepted them.
+  if (bottle.status && bottle.status !== 'active') {
+    return { error: { status: 400, message: 'Only a bottle still in the cellar can be placed in a rack — this one is consumed' } };
+  }
 
   const occupant = rack.slots.find((s) => s.position === pos && String(s.bottle) !== String(bottleId));
   const displaced = occupant ? String(occupant.bottle) : null;

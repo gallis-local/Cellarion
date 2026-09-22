@@ -4,9 +4,11 @@ import { useThree, useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import {
   BOTTLE_RADIUS, CELL_W, CELL_H, RACK_DEPTH, WOOD_THICK, PANEL_THICK,
-  getDisplayDims, buildScaledLayout, getGridDoubleRows,
+  getDisplayDims, buildScaledLayout, getGridDoubleRows, getCabinetGeometry,
 } from '../../utils/roomConstants';
-import { getTotalSlots, getModularTotalSlots, DOUBLE_ROW_HEADROOM } from '../../utils/rackLayouts';
+import { getTotalSlots, getModularTotalSlots, DOUBLE_ROW_HEADROOM, cabinetRowWidth, cabinetBayUnits } from '../../utils/rackLayouts';
+import { swatchType } from '../../utils/wineColour';
+import { CabinetBody, CabinetDoor, CabinetShelfPlank, CABINET_COLORS } from './CabinetParts';
 
 // ── Bright, visible wine colors by type ──────────────────
 const GLASS_COLORS = {
@@ -471,6 +473,67 @@ function computeShelfSlotPositions(rows, cols, backCols, width, height, bpc = 1,
   return positions;
 }
 
+// Cabinet (wine fridge): each bay stacks its rows in Y (real stacking, not
+// the shelf type's z-stagger). Row 1 rests on the plank; with twoDeep, odd
+// rows are the front row of a level (base toward the viewer, neck pointing
+// in) and even rows the back row (neck-to-neck behind them). Geometry comes
+// from roomConstants.getCabinetGeometry so body, planks and bottles agree.
+// On an alternating bay the rows are cols / cols−1 wide in turn
+// (rackLayouts.cabinetRowWidth) and the narrow ones sit half a bottle over,
+// in the grooves of the wide row below — the shelf is exactly cols wide. A
+// bay narrower than the cabinet (its own cols) sits centred in the body.
+// `row` carries the BAY index so PullOutShelfRow can slide a whole bay.
+function computeCabinetSlotPositions(cab, width, depth) {
+  const positions = [];
+  // A staggered shelf is half a bottle wider than its bottle count, so the
+  // cells are sized against the widest bay's cols + 0.5 and the offset level
+  // lands inside the frame instead of through the side panel. (Not for an
+  // alternating bay: there the offset rows are the narrow ones and never
+  // poke out.)
+  const drawOpts = { twoDeep: cab.twoDeep, stagger: cab.stagger, backOffset: false };
+  const units = Math.max(1, ...cab.bays.map((b) => cabinetBayUnits(b, drawOpts)));
+  const cW = width / units;
+  const halfD = depth / 2;
+  // A bottle's local +Y axis is 0.285 long; a base 0.029 in from a face puts
+  // the neck just short of the centreline (same figures as the shelf type).
+  const frontBottleZ = halfD - 0.029;
+  const backBottleZ = -(halfD - 0.029);
+  const frontEmptyZ = halfD - 0.005;
+  const backEmptyZ = -halfD + 0.005;
+  let pos = 1;
+  cab.bays.forEach((bay, i) => {
+    const cols = Math.max(1, bay.cols);
+    const nest = bay.alternate || cab.stagger;
+    const x0 = -width / 2 + cW / 2 + ((units - cabinetBayUnits(bay, drawOpts)) / 2) * cW;
+    for (let r = 1; r <= bay.rows; r++) {
+      const level = cab.twoDeep ? Math.ceil(r / 2) : r;
+      const isBack = cab.twoDeep && r % 2 === 0;
+      const y = bay.bottom + BOTTLE_RADIUS + 0.003 + (level - 1) * bay.levelPitch;
+      // Nested levels alternate half a bottle left and right (see
+      // roomConstants.getCabinetGeometry): the shelf is half a bottle wider
+      // than its bottle count, exactly like a real fridge's staggered shelf.
+      // Alternating rows: the narrow rows are the offset ones instead.
+      const rowWidth = cabinetRowWidth(r, cols, { twoDeep: cab.twoDeep, alternate: bay.alternate });
+      const nudge = bay.alternate
+        ? (rowWidth < cols ? cW / 2 : 0)
+        : (nest && cols > 1 && level % 2 === 0 ? cW / 2 : 0);
+      for (let c = 0; c < rowWidth; c++) {
+        positions.push({
+          position: pos++,
+          x: x0 + c * cW + nudge,
+          y,
+          z: isBack ? backEmptyZ : frontEmptyZ,
+          bottleZ: isBack ? backBottleZ : frontBottleZ,
+          isBack,
+          flipNeck: !isBack,
+          row: i,
+        });
+      }
+    }
+  });
+  return positions;
+}
+
 // Stack: single column
 function computeStackSlotPositions(rows, height) {
   const cH = height / rows;
@@ -503,6 +566,7 @@ function PullOutShelfRow({
   row,
   isPulled,
   plankY,
+  floorY,
   rackHeight,
   innerW,
   shelfDepth,
@@ -537,7 +601,7 @@ function PullOutShelfRow({
   // handle below the floor.
   const handleY = plankY != null
     ? plankY + 0.012
-    : -rackHeight / 2 + PANEL_THICK + 0.012;
+    : floorY != null ? floorY + 0.012 : -rackHeight / 2 + PANEL_THICK + 0.012;
   // Place the handle at the cabinet's actual front face so it's reachable
   // before the shelf is pulled, and remains reachable after for retracting.
   const handleZ = depth / 2 - 0.005;
@@ -561,7 +625,7 @@ function PullOutShelfRow({
       {rowSlots.map(({ position: pos, x, y, z = 0, bottleZ, isBack, flipNeck }) => {
         const slot = slotMap[pos];
         const filled = !!slot;
-        const wineType = slot?.bottle?.wineDefinition?.type || 'red';
+        const wineType = swatchType(slot?.bottle?.wineDefinition, 'red');
         const finalBottleZ = bottleZ !== undefined ? bottleZ : (-0.08 + z);
         if (!filled && disabledSet?.has(pos)) {
           return <DisabledSlotDisc key={pos} position={[x, y, z]} isBack={isBack} />;
@@ -643,6 +707,10 @@ export default function RackMesh({
   highlightBottleId,
   getBottleStyle,
   enableShelfPullOut = false,
+  // Cabinet racks: light the interior. On in the single-rack 3D view, off in
+  // the room — every extra light there recompiles every material and adds a
+  // loop to every fragment, and the emissive LED strips carry the look.
+  cabinetLit = false,
 }) {
   // Which shelf row is currently pulled out (or null). Telescopic-drawer
   // behaviour: only one row at a time; clicking the active row's pull
@@ -676,9 +744,19 @@ export default function RackMesh({
   }, []);
 
   const rackType = rack.type || 'grid';
+  const isCabinet = rackType === 'cabinet' && !rack.isModular;
 
   // Compute display grid dimensions per type
   const { displayRows, displayCols } = getDisplayDims(rack);
+
+  // Cabinet (wine fridge): bay-by-bay geometry shared with the camera + room.
+  const cab = useMemo(
+    () => (isCabinet ? { ...getCabinetGeometry(rack), cols: displayCols } : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isCabinet, rack.rows, rack.cols, rack.typeConfig?.shelfRows, rack.typeConfig?.twoDeep,
+      rack.typeConfig?.stagger, rack.typeConfig?.alternate, rack.typeConfig?.shelfCols,
+      rack.typeConfig?.shelfAlternate, displayCols]
+  );
 
   // Double-height rows (grid racks only) — the rack grows taller by
   // DOUBLE_ROW_HEADROOM cell heights per double row so the top-layer
@@ -714,14 +792,16 @@ export default function RackMesh({
   const baseInnerW = scaledLayout ? scaledLayout.innerW : displayCols * CELL_W;
   const baseInnerH = scaledLayout
     ? scaledLayout.innerH
-    : displayRows * CELL_H + doubleRows.length * extraRowH;
+    : cab
+      ? cab.innerH
+      : displayRows * CELL_H + doubleRows.length * extraRowH;
   const defaultWidth = baseInnerW + PANEL_THICK * 2;
   // x-rack is square by construction; honouring a stray widthOverride (e.g.
   // left over from a rack that was switched to x-rack after a width was set)
   // would stretch the slot grid and X-beams out of alignment, so ignore it.
   const width = rackType === 'x-rack' ? defaultWidth : (widthOverride || defaultWidth);
   const hasShelfBack = rackType === 'shelf' && (rack.typeConfig?.backCols || 0) > 0;
-  const depth = depthOverride || (hasShelfBack ? RACK_DEPTH * 1.7 : RACK_DEPTH);
+  const depth = depthOverride || (cab ? cab.depth : hasShelfBack ? RACK_DEPTH * 1.7 : RACK_DEPTH);
   const innerW = (width - PANEL_THICK * 2);
   const innerH = baseInnerH;
   const height = innerH + PANEL_THICK * 2;
@@ -759,6 +839,7 @@ export default function RackMesh({
         ? scaledLayout.positions
         : scaledLayout.positions.map(p => ({ ...p, x: p.x * sx }));
     }
+    if (cab) return computeCabinetSlotPositions(cab, innerW, depth);
     if (rackType === 'x-rack') return computeXRackSlotPositions(rack.typeConfig?.bottlesPerSection || 10, innerW, innerH);
     if (rackType === 'hex') return computeHexSlotPositions(rack.rows || 4, rack.cols || 4, innerW, innerH, rack.typeConfig?.hexFlip, rack.typeConfig?.hexEqualRows);
     if (rackType === 'triangle') return computeTriangleSlotPositions(rack.cols || 1, innerW, innerH);
@@ -771,7 +852,7 @@ export default function RackMesh({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scaledLayout, rackType, rack.rows, rack.cols, displayRows, displayCols, innerW, innerH, depth,
       doubleRows, rack.typeConfig?.backCols, rack.typeConfig?.bottlesPerCell, rack.typeConfig?.bottlesPerSection,
-      rack.typeConfig?.hexFlip, rack.typeConfig?.hexEqualRows]);
+      rack.typeConfig?.hexFlip, rack.typeConfig?.hexEqualRows, cab]);
 
   const edgesGeom = useMemo(() => {
     const sw = width * rackScale, sh = height * rackScale, sd = depth * rackScale;
@@ -889,6 +970,20 @@ export default function RackMesh({
     <group ref={groupRef} position={position} rotation={[0, rotRad, 0]}>
     <group scale={[rackScale, rackScale, rackScale]}>
 
+      {/* ── Body: wooden frame (every rack type) or steel cabinet carcass */}
+      {isCabinet ? (
+        <CabinetBody
+          width={width}
+          height={height}
+          depth={depth}
+          topStrip={cab.topStrip}
+          bottomExtra={cab.bottomExtra}
+          bodyColor={isSelected ? CABINET_COLORS.bodySelected : undefined}
+          hovered={hovered}
+          lit={cabinetLit}
+        />
+      ) : (
+        <>
       {/* ── Side panels (full height, open depth) ──── */}
       <mesh position={[-width / 2 + PANEL_THICK / 2, 0, -depth * 0.05]} castShadow>
         <boxGeometry args={[PANEL_THICK, height, shelfDepth]} />
@@ -911,12 +1006,17 @@ export default function RackMesh({
         <meshStandardMaterial map={woodTex} color={frameColor} roughness={0.7} />
       </mesh>
 
+        </>
+      )}
+
       {/* ── Type-specific internal structure ─────────── */}
 
       {/* Grid / hex / stack / triangle: shelves + scallops + rails. Cube and
           modular racks have irregular internal layouts (driven by the scaled
-          2D layout), so the simple per-row planks/scallops don't apply. */}
-      {rackType !== 'x-rack' && rackType !== 'shelf' && rackType !== 'cube' && !rack.isModular && (
+          2D layout), so the simple per-row planks/scallops don't apply — and
+          a cabinet brings its own beech shelves (and would get grid cradles
+          that no longer line up under its narrowed, staggered cells). */}
+      {rackType !== 'x-rack' && rackType !== 'shelf' && rackType !== 'cube' && !isCabinet && !rack.isModular && (
         <>
           {/* Shelves between rows (thin planks). headroomAbove shifts a
               plank down past the extra headroom of every double-height row
@@ -986,6 +1086,22 @@ export default function RackMesh({
         </>
       )}
 
+      {/* Cabinet: beech shelves between bays (static — the room view). When
+          pull-out is enabled each bay renders its own plank inside its
+          sliding group instead. */}
+      {isCabinet && !enableShelfPullOut && cab.bays.map((bay) => (
+        bay.plankY != null && (
+          <CabinetShelfPlank
+            key={`cab-plank-${bay.index}`}
+            innerW={innerW}
+            shelfDepth={depth * 0.9}
+            y={bay.plankY}
+            woodTex={woodTex}
+            color="#D9B98A"
+          />
+        )
+      ))}
+
       {/* X-Rack: two diagonal beams forming an X */}
       {rackType === 'x-rack' && (() => {
         const diagLen = Math.sqrt(innerW * innerW + innerH * innerH);
@@ -1010,15 +1126,16 @@ export default function RackMesh({
       })()}
 
       {/* ── Bottles / empty slots ─────────────────── */}
-      {rackType === 'shelf' && enableShelfPullOut ? (
-        // Per-row groups so each shelf row can slide forward independently.
-        // Planks live inside the row groups too (so the wood slides with
-        // its bottles).
-        Array.from({ length: displayRows }).map((_, r) => {
+      {(rackType === 'shelf' || isCabinet) && enableShelfPullOut ? (
+        // Per-row groups so each shelf row (or cabinet bay) can slide forward
+        // independently. Planks live inside the row groups too (so the wood
+        // slides with its bottles).
+        Array.from({ length: isCabinet ? cab.bays.length : displayRows }).map((_, r) => {
           const rowSlots = slotPositions.filter(sp => sp.row === r);
-          const hasPlank = r < displayRows - 1;
+          const lastRow = isCabinet ? cab.bays.length - 1 : displayRows - 1;
+          const hasPlank = r < lastRow;
           const plankY = hasPlank
-            ? height / 2 - PANEL_THICK - (r + 1) * CELL_H
+            ? (isCabinet ? cab.bays[r].plankY : height / 2 - PANEL_THICK - (r + 1) * CELL_H)
             : null;
           return (
             <PullOutShelfRow
@@ -1026,13 +1143,14 @@ export default function RackMesh({
               row={r}
               isPulled={pulledShelfRow === r}
               plankY={plankY}
+              floorY={isCabinet ? cab.bays[r].bottom : undefined}
               rackHeight={height}
               innerW={innerW}
-              shelfDepth={shelfDepth}
+              shelfDepth={isCabinet ? depth * 0.9 : shelfDepth}
               depth={depth}
               woodTex={woodTex}
-              shelfColor={shelfColor}
-              frameColor={frameColor}
+              shelfColor={isCabinet ? '#D9B98A' : shelfColor}
+              frameColor={isCabinet ? CABINET_COLORS.steel : frameColor}
               rowSlots={rowSlots}
               slotMap={slotMap}
               disabledSet={disabledSet}
@@ -1048,13 +1166,13 @@ export default function RackMesh({
         slotPositions.map(({ position: pos, x, y, z = 0, bottleZ, isBack, flipNeck }) => {
           const slot = slotMap[pos];
           const filled = !!slot;
-          const wineType = slot?.bottle?.wineDefinition?.type || 'red';
+          const wineType = swatchType(slot?.bottle?.wineDefinition, 'red');
           const finalBottleZ = bottleZ !== undefined ? bottleZ : (-0.08 + z);
           if (!filled && disabledSet.has(pos)) {
             return (
               <DisabledSlotDisc
                 key={pos}
-                position={[x, y, rackType === 'shelf' ? z : (depth / 2 - 0.005)]}
+                position={[x, y, (rackType === 'shelf' || isCabinet) ? z : (depth / 2 - 0.005)]}
                 isBack={isBack}
               />
             );
@@ -1077,7 +1195,7 @@ export default function RackMesh({
               // row). Other types use z=0; place their ring at the actual
               // cabinet front face (depth-aware) so it tracks the opening even
               // when depthOverride resizes the cabinet.
-              position={[x, y, rackType === 'shelf' ? z : (depth / 2 - 0.005)]}
+              position={[x, y, (rackType === 'shelf' || isCabinet) ? z : (depth / 2 - 0.005)]}
               slotPosition={pos}
               onClick={onEmptySlotClick}
               isBack={isBack}
@@ -1085,6 +1203,11 @@ export default function RackMesh({
             />
           );
         })
+      )}
+
+      {/* ── Cabinet glass door (click the handle to swing it open) ── */}
+      {isCabinet && (
+        <CabinetDoor width={width} height={height} depth={depth} bottomExtra={cab.bottomExtra} />
       )}
 
       {/* ── Click/drag plane (behind rack, doesn't block bottle clicks) */}

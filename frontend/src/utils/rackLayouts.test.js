@@ -1,6 +1,7 @@
 import {
   computeLayout, computeModularLayout, getModularTotalSlots, getTotalSlots,
-  SLOT_RADIUS, validDoubleHeightRows, DOUBLE_ROW_HEADROOM,
+  SLOT_RADIUS, validDoubleHeightRows, DOUBLE_ROW_HEADROOM, cabinetShelfRows,
+  cabinetRowWidth, cabinetBayCapacity, cabinetBays, cabinetBayUnits,
 } from './rackLayouts';
 
 describe('computeLayout', () => {
@@ -255,6 +256,208 @@ describe('computeLayout', () => {
     });
   });
 
+  // ── Cabinet (wine fridge) ─────────────────────────────────────────
+  // POSITION NUMBERING CONTRACT: shelves top to bottom; inside a bay row 1
+  // rests on the plank; position = cols × Σ shelfRows[k<i] + (row − 1) × cols
+  // + slot. twoDeep pairs rows front/back per level without renumbering.
+  describe('cabinet', () => {
+    const tc = { shelfRows: [1, 3, 2], twoDeep: true }; // 6 + 18 + 12 = 36
+    const layout = computeLayout('cabinet', 3, 6, tc);
+    const at = (p) => layout.slots.find(s => s.position === p);
+
+    it('numbers bays top to bottom and rows from the plank up', () => {
+      expect(layout.totalSlots).toBe(36);
+      // top bay (1 row): positions 1..6 on one y
+      expect(new Set(layout.slots.slice(0, 6).map(s => s.cy)).size).toBe(1);
+      // middle bay starts at 7 and sits BELOW the top bay
+      expect(at(7).cy).toBeGreaterThan(at(1).cy);
+      // inside the middle bay, row 3 (positions 19..24) is drawn ABOVE row 1 (7..12)
+      expect(at(19).cy).toBeLessThan(at(7).cy);
+      // bottom bay (25..36) is below the middle bay's lowest row
+      expect(at(25).cy).toBeGreaterThan(at(7).cy);
+    });
+
+    it('twoDeep: even rows are the back row of their level — smaller, staggered, slightly higher', () => {
+      expect(at(7).isBack).toBeUndefined();
+      expect(at(13).isBack).toBe(true);             // row 2 of the middle bay
+      expect(at(13).cy).toBeLessThan(at(7).cy);      // peeks above its front row
+      expect(at(13).cy).toBeGreaterThan(at(19).cy);  // but stays below the level above
+      expect(at(13).cx).toBeGreaterThan(at(7).cx);   // half-cell stagger
+      expect(layout.backRadius).toBeDefined();
+      // row 3 (level 2 front) rests on bottles, not wood → no scallop bumps
+      expect(at(19).isTop).toBe(true);
+      expect(at(7).isTop).toBeUndefined();
+    });
+
+    it('single-deep: every row is its own level, no back rows', () => {
+      const single = computeLayout('cabinet', 2, 4, { shelfRows: [2, 1], twoDeep: false });
+      expect(single.totalSlots).toBe(12);
+      expect(single.slots.some(s => s.isBack)).toBe(false);
+      expect(single.backRadius).toBeUndefined();
+      const p = (n) => single.slots.find(s => s.position === n);
+      expect(p(5).cy).toBeLessThan(p(1).cy); // row 2 above row 1 in the top bay
+      expect(p(9).cy).toBeGreaterThan(p(1).cy); // bottom bay below
+    });
+
+    it('stagger (default): stacked levels nest — offset half a bottle, sitting closer together, same positions', () => {
+      const square = computeLayout('cabinet', 3, 6, { ...tc, stagger: false });
+      // Numbering is identical with and without stagger — it is drawing only.
+      expect(layout.slots.map(s => s.position)).toEqual(square.slots.map(s => s.position));
+      expect(layout.totalSlots).toBe(square.totalSlots);
+      expect(layout.cabinet.stagger).toBe(true);
+      expect(square.cabinet.stagger).toBe(false);
+
+      const at = (l, p) => l.slots.find(s => s.position === p);
+      // Middle bay rows: 1 = level 1 front (7..12), 2 = level 1 back (13..18),
+      // 3 = level 2 front (19..24). Only EVEN levels are nudged, so level 1 —
+      // front and back alike — keeps its x and level 2 moves half a cell.
+      expect(at(layout, 7).cx).toBe(at(square, 7).cx);
+      expect(at(layout, 13).cx).toBe(at(square, 13).cx);
+      expect(at(layout, 19).cx).toBeGreaterThan(at(square, 19).cx);
+      // Nested levels sit closer to the level below than squared ones do.
+      const nestedGap = at(layout, 7).cy - at(layout, 19).cy;
+      const squareGap = at(square, 7).cy - at(square, 19).cy;
+      expect(nestedGap).toBeLessThan(squareGap);
+      expect(nestedGap).toBeGreaterThan(0);
+      // The staggered shelf is half a bottle wider, and nothing escapes it.
+      expect(layout.viewBox.width).toBeGreaterThan(square.viewBox.width);
+      layout.slots.forEach((slot) => {
+        expect(slot.cx).toBeLessThanOrEqual(layout.viewBox.width);
+      });
+      // A bay of a single row has nothing to nest, so it is unaffected —
+      // horizontally AND vertically (the first level rests on the plank).
+      const oneRow = computeLayout('cabinet', 1, 4, { shelfRows: [1] });
+      const oneRowSquare = computeLayout('cabinet', 1, 4, { shelfRows: [1], stagger: false });
+      expect(oneRow.slots.map(s => s.cx)).toEqual(oneRowSquare.slots.map(s => s.cx));
+      expect(oneRow.slots.map(s => s.cy)).toEqual(oneRowSquare.slots.map(s => s.cy));
+      expect(oneRow.viewBox.height).toBe(oneRowSquare.viewBox.height);
+      // Only the levels above the first close up: a 3-level bay nests twice.
+      const three = computeLayout('cabinet', 1, 4, { shelfRows: [3], twoDeep: false });
+      const threeSquare = computeLayout('cabinet', 1, 4, { shelfRows: [3], twoDeep: false, stagger: false });
+      expect(three.viewBox.height).toBeLessThan(threeSquare.viewBox.height);
+      // Exactly one nesting step per level ABOVE the first: a 3-level bay
+      // closes up twice as much as a 2-level bay. (The bay is anchored at its
+      // top, so a shorter bay legitimately lifts its own plank.)
+      const twoLvl = computeLayout("cabinet", 1, 4, { shelfRows: [2], twoDeep: false });
+      const twoLvlSquare = computeLayout("cabinet", 1, 4, { shelfRows: [2], twoDeep: false, stagger: false });
+      const step = twoLvlSquare.viewBox.height - twoLvl.viewBox.height;
+      expect(step).toBeGreaterThan(0);
+      expect(threeSquare.viewBox.height - three.viewBox.height).toBeCloseTo(step * 2, 6);
+    });
+
+    it('draws one plank line between bays and exposes the bay list', () => {
+      expect(layout.shelfYs).toHaveLength(2);
+      expect(layout.cabinet.bays.map(b => b.rows)).toEqual([1, 3, 2]);
+      expect(layout.cabinet.bays.map(b => b.levels)).toEqual([1, 2, 1]);
+      expect(computeLayout('cabinet', 1, 3, { shelfRows: [2] }).shelfYs).toBeUndefined();
+    });
+
+    // Support ticket 2026-09-15: a Liebherr GrandCru 5001 stacks 6 in front
+    // of 5, then 5 in front of 6 — rows alternate cols / cols−1, the narrow
+    // ones lying in the grooves of the wide ones. Changes capacity and the
+    // numbering, so unlike stagger it is pinned slot by slot.
+    describe('alternate', () => {
+      const alt = computeLayout('cabinet', 1, 6, { shelfRows: [4], twoDeep: true, alternate: true });
+      const at = (p) => alt.slots.find(s => s.position === p);
+
+      it('rows are 6, 5, 5, 6 wide and numbered straight on — 22 slots, not 24', () => {
+        expect(alt.totalSlots).toBe(22);
+        expect(alt.slots.map(s => s.position)).toEqual(Array.from({ length: 22 }, (_, i) => i + 1));
+        expect(getTotalSlots('cabinet', 1, 6, { shelfRows: [4], twoDeep: true, alternate: true })).toBe(22);
+        // row 1 (level 1 front) 1..6, row 2 (level 1 back) 7..11, row 3 (level 2 front) 12..16, row 4 (level 2 back) 17..22
+        const rowOf = (from, to) => alt.slots.filter(s => s.position >= from && s.position <= to);
+        expect(new Set(rowOf(1, 6).map(s => s.cy)).size).toBe(1);
+        expect(rowOf(7, 11).every(s => s.isBack)).toBe(true);
+        expect(rowOf(12, 16).every(s => !s.isBack && s.isTop)).toBe(true);
+        expect(rowOf(17, 22).every(s => s.isBack)).toBe(true);
+        expect(at(7).cy).toBeLessThan(at(1).cy);
+        expect(at(12).cy).toBeLessThan(at(7).cy);
+        expect(at(17).cy).toBeLessThan(at(12).cy);
+      });
+
+      it('the narrow rows sit half a bottle over, in the gaps of the wide rows; the wide rows line up', () => {
+        const half = (at(2).cx - at(1).cx) / 2;
+        expect(at(7).cx).toBeCloseTo(at(1).cx + half, 6);   // level 1 back (5) between the 6 in front
+        expect(at(12).cx).toBeCloseTo(at(1).cx + half, 6);  // level 2 front (5) in the grooves of level 1
+        expect(at(17).cx).toBeCloseTo(at(1).cx, 6);         // level 2 back (6) full width again
+        expect(at(11).cx).toBeCloseTo(at(5).cx + half, 6);
+        expect(at(22).cx).toBeCloseTo(at(6).cx, 6);
+      });
+
+      it('the shelf is exactly cols wide — no half-bottle overhang — and nothing escapes it', () => {
+        const plain = computeLayout('cabinet', 1, 6, { shelfRows: [4], twoDeep: false, stagger: false });
+        expect(alt.viewBox.width).toBe(plain.viewBox.width);
+        alt.slots.forEach((slot) => {
+          expect(slot.cx + SLOT_RADIUS).toBeLessThanOrEqual(alt.viewBox.width);
+          expect(slot.cx - SLOT_RADIUS).toBeGreaterThanOrEqual(0);
+        });
+      });
+
+      it('alternating rows always nest: stagger is implied, and the levels sit at the nested pitch', () => {
+        const forced = computeLayout('cabinet', 1, 6, { shelfRows: [4], twoDeep: true, alternate: true, stagger: false });
+        expect(forced.cabinet.stagger).toBe(true);
+        expect(forced.cabinet.alternate).toBe(true);
+        expect(forced.slots.map(s => [s.cx, s.cy])).toEqual(alt.slots.map(s => [s.cx, s.cy]));
+        const nested = computeLayout('cabinet', 1, 6, { shelfRows: [4], twoDeep: true, stagger: true });
+        expect(alt.viewBox.height).toBe(nested.viewBox.height);
+      });
+
+      it('single deep: levels alternate 4, 3, 4 with the 3 centred in the grooves', () => {
+        const single = computeLayout('cabinet', 1, 4, { shelfRows: [3], twoDeep: false, alternate: true });
+        expect(single.totalSlots).toBe(11);
+        const p = (n) => single.slots.find(s => s.position === n);
+        const half = (p(2).cx - p(1).cx) / 2;
+        expect(p(5).cx).toBeCloseTo(p(1).cx + half, 6);
+        expect(p(7).cx).toBeCloseTo(p(3).cx + half, 6);
+        expect(p(8).cx).toBeCloseTo(p(1).cx, 6);
+        expect(single.slots.some(s => s.isBack)).toBe(false);
+      });
+
+      it('per-shelf width and pattern: a narrower bay is centred, and the 5001 loading diagram is 196', () => {
+        const tc = { shelfRows: [8, 8, 8, 8, 8], shelfCols: [4, 6, 6, 6, 4], shelfAlternate: [false, true, true, true, false], twoDeep: true };
+        const l = computeLayout('cabinet', 5, 6, tc);
+        expect(l.totalSlots).toBe(196);
+        expect(getTotalSlots('cabinet', 5, 6, tc)).toBe(196);
+        expect(l.cabinet.bays.map(b => [b.cols, b.alternate])).toEqual([[4, false], [6, true], [6, true], [6, true], [4, false]]);
+        expect(l.cabinet.alternate).toBe(false); // not EVERY bay
+        const p = (n) => l.slots.find(s => s.position === n);
+        // Top bay: 8 rows of 4 (positions 1..32), staggered — the second
+        // level nudged half a cell; the honeycomb bay below starts at 33.
+        expect(l.slots.filter(s => s.position <= 32).map(s => s.isBack).filter(Boolean)).toHaveLength(16);
+        expect(p(9).cx).toBeCloseTo(p(1).cx + (p(2).cx - p(1).cx) / 2, 6);
+        expect(p(33).cy).toBeGreaterThan(p(1).cy);
+        // The 4-wide bay (4.5 units with its stagger + back row: 4 + 0.5 + 0.5
+        // = 5) sits centred inside the 6-wide cabinet (6.5 units: 6 + 0.5 for
+        // the back row… an alternating bay is exactly 6), so its first bottle
+        // starts to the right of the honeycomb bay's first bottle.
+        expect(p(1).cx).toBeGreaterThan(p(33).cx);
+        // A layout without per-shelf lists is unchanged by the new fields.
+        const plain = computeLayout('cabinet', 2, 6, { shelfRows: [2, 3], twoDeep: true });
+        const explicit = computeLayout('cabinet', 2, 6, { shelfRows: [2, 3], twoDeep: true, shelfCols: [6, 6], shelfAlternate: [false, false] });
+        expect(explicit.slots).toEqual(plain.slots);
+        expect(explicit.viewBox).toEqual(plain.viewBox);
+        expect(cabinetBays(2, 6, { shelfRows: [1, 2], shelfCols: [3] })).toEqual([{ rows: 1, cols: 3, alternate: false }, { rows: 2, cols: 6, alternate: false }]);
+        // Every slot stays inside the drawing.
+        l.slots.forEach((slot) => {
+          expect(slot.cx + SLOT_RADIUS).toBeLessThanOrEqual(l.viewBox.width);
+          expect(slot.cx - SLOT_RADIUS).toBeGreaterThanOrEqual(0);
+        });
+      });
+
+      it('the helpers mirror the backend: widths 6/5/5/6…, a bay of 8 holds 44, the 5001 preset 198', () => {
+        const deep = { twoDeep: true, alternate: true };
+        expect([1, 2, 3, 4, 5, 6, 7, 8].map((r) => cabinetRowWidth(r, 6, deep))).toEqual([6, 5, 5, 6, 6, 5, 5, 6]);
+        expect([1, 2, 3].map((r) => cabinetRowWidth(r, 6, { twoDeep: false, alternate: true }))).toEqual([6, 5, 6]);
+        expect([1, 2].map((r) => cabinetRowWidth(r, 1, deep))).toEqual([1, 1]);
+        expect(cabinetBayCapacity(8, 6, deep)).toBe(44);
+        expect(cabinetBayCapacity(8, 6, { twoDeep: true, alternate: false })).toBe(48);
+        expect(getTotalSlots('cabinet', 5, 6, { shelfRows: [6, 8, 8, 8, 6], twoDeep: true, alternate: true })).toBe(198);
+        // Off by default: an existing cabinet keeps cols × Σ shelfRows.
+        expect(getTotalSlots('cabinet', 5, 6, { shelfRows: [6, 8, 8, 8, 6], twoDeep: true })).toBe(216);
+      });
+    });
+  });
+
   describe('all types have valid coordinates', () => {
     const cases = [
       ['grid', 4, 8, undefined],
@@ -266,6 +469,12 @@ describe('computeLayout', () => {
       ['cube', 2, 3, { moduleRows: 2, moduleCols: 2 }],
       ['shelf', 3, 2, undefined],
       ['shelf', 2, 3, { bottlesPerCell: 4 }],
+      ['cabinet', 3, 6, { shelfRows: [1, 3, 2], twoDeep: true }],
+      ['cabinet', 2, 4, { shelfRows: [2, 5], twoDeep: false }],
+      ['cabinet', 2, 4, undefined],
+      ['cabinet', 2, 6, { shelfRows: [3, 4], twoDeep: true, alternate: true }],
+      ['cabinet', 2, 5, { shelfRows: [3, 2], twoDeep: false, alternate: true }],
+      ['cabinet', 3, 6, { shelfRows: [4, 4, 2], shelfCols: [4, 6, 3], shelfAlternate: [false, true, false] }],
     ];
 
     test.each(cases)('%s layout has positive coordinates within viewBox', (type, rows, cols, tc) => {
@@ -424,9 +633,34 @@ describe('getTotalSlots', () => {
       ['stack', 8, 1, undefined],
       ['cube', 2, 3, { moduleRows: 2, moduleCols: 2 }],
       ['shelf', 3, 2, undefined],
+      ['cabinet', 3, 6, { shelfRows: [1, 3, 2], twoDeep: true }],
+      ['cabinet', 2, 4, { shelfRows: [2, 5], twoDeep: false }],
+      ['cabinet', 2, 6, { shelfRows: [3, 4], twoDeep: true, alternate: true }],
     ];
     cases.forEach(([type, rows, cols, tc]) => {
       expect(getTotalSlots(type, rows, cols, tc)).toBe(computeLayout(type, rows, cols, tc).totalSlots);
     });
+  });
+
+  it('cabinet capacity is cols × Σ shelfRows, missing entries count as 1', () => {
+    expect(getTotalSlots('cabinet', 5, 7, { shelfRows: [4, 4, 4, 4, 4] })).toBe(140);
+    expect(getTotalSlots('cabinet', 3, 6, { shelfRows: [1, 3, 2] })).toBe(36);
+    expect(getTotalSlots('cabinet', 2, 5)).toBe(10);
+    expect(cabinetShelfRows(4, { shelfRows: [2, 30] })).toEqual([2, 12, 1, 1]);
+  });
+});
+
+describe('cabinetBayUnits', () => {
+  it("counts the two-deep back row's half bottle only where the back row is drawn offset (audit 2026-09-16)", () => {
+    const bay = { rows: 2, cols: 6, alternate: false };
+    // The 2D map draws the back row at c + 0.5, so it needs the half.
+    expect(cabinetBayUnits(bay, { twoDeep: true, stagger: false })).toBe(6.5);
+    // The shelf view and the 3D room stack the back row straight behind the
+    // front: without backOffset the default cabinet gained a blank strip.
+    expect(cabinetBayUnits(bay, { twoDeep: true, stagger: false, backOffset: false })).toBe(6);
+    expect(cabinetBayUnits(bay, { twoDeep: true, stagger: true, backOffset: false })).toBe(6.5);
+    expect(cabinetBayUnits({ ...bay, cols: 1 }, { twoDeep: false, stagger: true })).toBe(1);
+    // An alternating bay never pokes out: its offset rows are the narrow ones.
+    expect(cabinetBayUnits({ ...bay, alternate: true }, { twoDeep: true, stagger: true })).toBe(6);
   });
 });

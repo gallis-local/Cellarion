@@ -1422,7 +1422,7 @@ function ImportBottles() {
                         {t('importBottles.rack.capacityBelow', { capacity: existingCapacity, required })}
                       </div>
                     )}
-                    {detectedFormat === 'oeno-export' && existing.type !== 'shelf' && !existing.isModular && (
+                    {detectedFormat === 'oeno-export' && existing.type !== 'shelf' && existing.type !== 'cabinet' && !existing.isModular && (
                       <div className="rack-config-warn rack-config-existing-warn">
                         <Trans
                           i18nKey="importBottles.rack.oenoTypeWarning"
@@ -1505,7 +1505,11 @@ function ImportBottles() {
                           updateCfg({
                             type: newType,
                             rows: newDims.defaultRows,
-                            cols: newDims.defaultCols
+                            cols: newDims.defaultCols,
+                            // A cabinet needs its per-shelf list; other types must not carry it.
+                            ...(newType === 'cabinet'
+                              ? { typeConfig: { shelfRows: Array.from({ length: newDims.defaultRows }, () => 2), twoDeep: true } }
+                              : { typeConfig: {} }),
                           });
                         }}
                       >
@@ -1516,28 +1520,73 @@ function ImportBottles() {
                         <option value="triangle">{t('importBottles.rack.typeTriangle')}</option>
                         <option value="x-rack">{t('importBottles.rack.typeXRack')}</option>
                         <option value="cube">{t('importBottles.rack.typeCube')}</option>
+                        <option value="cabinet">{t('importBottles.rack.typeCabinet')}</option>
                       </select>
                     </label>
 
                     {dims.showRows && (
                       <label className="rack-config-field">
-                        <span>{dims.rowLabel === 'racks.heightLabel' ? t('importBottles.rack.height') : t('importBottles.rack.rows')}</span>
+                        <span>{dims.rowLabel === 'racks.heightLabel' ? t('importBottles.rack.height') : dims.rowLabel === 'racks.shelvesLabel' ? t('importBottles.rack.shelves') : t('importBottles.rack.rows')}</span>
                         <input
                           type="number" min="1" max="20"
                           value={cfg.rows}
-                          onChange={(e) => updateCfg({ rows: parseInt(e.target.value, 10) || 1 })}
+                          onChange={(e) => {
+                            const newRows = parseInt(e.target.value, 10) || 1;
+                            if (cfg.type !== 'cabinet') { updateCfg({ rows: newRows }); return; }
+                            // Cabinet: keep the per-shelf list the length of the
+                            // shelf count. Extra shelves are 1-row shelves added at
+                            // the TOP for bottom-anchored files (Oeno numbers its
+                            // shelves from the bottom, so "more shelves than the
+                            // file shows" means shelves above) and at the bottom
+                            // otherwise; shrinking drops from the same end.
+                            const cur = Array.isArray(cfg.typeConfig?.shelfRows) ? cfg.typeConfig.shelfRows : [];
+                            const bottomAnchored = positionAnchor === 'bottom-left' || positionAnchor === 'bottom-right';
+                            const missing = newRows - cur.length;
+                            const next = missing >= 0
+                              ? (bottomAnchored ? [...Array(missing).fill(1), ...cur] : [...cur, ...Array(missing).fill(1)])
+                              : (bottomAnchored ? cur.slice(-newRows) : cur.slice(0, newRows));
+                            updateCfg({ rows: newRows, typeConfig: { ...(cfg.typeConfig || {}), shelfRows: next } });
+                          }}
                         />
                       </label>
                     )}
                     {dims.showCols && (
                       <label className="rack-config-field">
-                        <span>{dims.colLabel === 'racks.baseWidthLabel' ? t('importBottles.rack.baseWidth') : t('importBottles.rack.cols')}</span>
+                        <span>{dims.colLabel === 'racks.baseWidthLabel' ? t('importBottles.rack.baseWidth') : dims.colLabel === 'racks.bottlesAcrossLabel' ? t('importBottles.rack.bottlesAcross') : t('importBottles.rack.cols')}</span>
                         <input
                           type="number" min="1" max="20"
                           value={cfg.cols}
                           onChange={(e) => updateCfg({ cols: parseInt(e.target.value, 10) || 1 })}
                         />
                       </label>
+                    )}
+                    {dims.showCabinet && (
+                      <>
+                        <label className="rack-config-field">
+                          <span>{t('importBottles.rack.shelfRows')}</span>
+                          {/* Comma list, committed on blur so typing a comma doesn't
+                              fight a controlled value. Fitted to the shelf count +
+                              clamped again server-side. */}
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            key={`${name}-${cfg.rows}`}
+                            defaultValue={Array.from({ length: cfg.rows }, (_, i) => cfg.typeConfig?.shelfRows?.[i] || 1).join(', ')}
+                            onBlur={(e) => {
+                              const parsed = e.target.value.split(/[,\s]+/).map((v) => parseInt(v, 10)).filter((n) => Number.isFinite(n));
+                              updateTc('shelfRows', Array.from({ length: cfg.rows }, (_, i) => Math.max(1, Math.min(12, parsed[i] || 1))));
+                            }}
+                          />
+                        </label>
+                        <label className="rack-config-field">
+                          <span>{t('importBottles.rack.twoDeep')}</span>
+                          <input
+                            type="checkbox"
+                            checked={cfg.typeConfig?.twoDeep !== false}
+                            onChange={(e) => updateTc('twoDeep', e.target.checked)}
+                          />
+                        </label>
+                      </>
                     )}
                     {dims.showBottlesPerCell && (
                       <label className="rack-config-field">
@@ -2046,7 +2095,8 @@ function ImportBottles() {
                             {isExpanded ? t('importBottles.review.hide') : t('importBottles.review.options', { count: r.matches.length })}
                           </button>
                         )}
-                        {r.status === 'fuzzy' && r.item.wineName && r.item.producer && !isSkipped && !isRequested && (
+                        {/* A producer-less row can be looked up too: the model splits the producer out of the display name (2026-09-14). */}
+                        {r.status === 'fuzzy' && r.item.wineName && !isSkipped && !isRequested && (
                           <button
                             className="btn btn-secondary btn-xs"
                             onClick={() => handleAiSearch(r.index)}

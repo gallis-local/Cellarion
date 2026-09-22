@@ -253,6 +253,28 @@ describe('PII and data minimisation', () => {
     expect(res.content[0].text).not.toContain(STRANGER);
   });
 
+  test('list_journal pairings carry the bottle/wine references and the producer; stored text is only the fallback (ticket 6aa6c200)', async () => {
+    JournalEntry.countDocuments.mockResolvedValue(1);
+    JournalEntry.find.mockReturnValue(chain([{
+      _id: oid('e'), date: new Date(), people: [],
+      pairings: [
+        // referenced bottle, renamed in the registry since the entry was written
+        { dish: 'Risotto', bottle: { _id: oid('1'), vintage: '2024', wineDefinition: { _id: oid('2'), name: 'Sauvignon', producer: 'Jermann' } }, wine: null, wineName: 'Sauvignon 2024' },
+        // registry wine only
+        { dish: null, bottle: null, wine: { _id: oid('3'), name: 'Brut', producer: 'Nicolas Feuillatte' }, wineName: 'Brut' },
+        // free text, nothing referenced
+        { dish: null, bottle: null, wine: null, wineName: 'Some rosé' },
+        // the bottle was deleted after the entry was written: populate → null, the stored vintage survives
+        { dish: null, bottle: null, wine: { _id: oid('4'), name: 'Pinot Gris', producer: 'Hugel' }, wineName: 'Hugel Pinot Gris', vintage: '2022' },
+      ],
+    }]));
+    const [entry] = parse(await tool('list_journal').handler({}, CTX)).data;
+    expect(entry.pairings[0]).toMatchObject({ bottle_id: oid('1'), wine_id: oid('2'), producer: 'Jermann', wine: 'Sauvignon', vintage: '2024' });
+    expect(entry.pairings[1]).toMatchObject({ bottle_id: null, wine_id: oid('3'), producer: 'Nicolas Feuillatte', wine: 'Brut', vintage: null });
+    expect(entry.pairings[2]).toMatchObject({ bottle_id: null, wine_id: null, producer: null, wine: 'Some rosé' });
+    expect(entry.pairings[3]).toMatchObject({ bottle_id: null, wine_id: oid('4'), producer: 'Hugel', wine: 'Pinot Gris', vintage: '2022' });
+  });
+
   test('search_registry output excludes registry internals (normalizedKey, createdBy)', async () => {
     WineDefinition.find.mockReturnValue(chain([{
       _id: oid('f'), name: 'Barolo', producer: 'X', type: 'red',

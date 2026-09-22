@@ -38,6 +38,7 @@ const { resolveGrapeIdsStrict } = require('./wineProfileOps');
 const { validatePendingFix, runPromotionFollowThrough } = require('./pendingWineOps');
 const { findVisibleWine } = require('./wineVisibility');
 const { isValidId } = require('../utils/validation');
+const { stateColour, colourTypeConflict } = require('../utils/wineColour');
 
 const DRAFT_TTL_DAYS = 7;
 const DRAFT_TTL_MS = DRAFT_TTL_DAYS * 24 * 60 * 60 * 1000;
@@ -47,7 +48,7 @@ const FIELD_MAX = 200;
 // What a creator may edit on their draft. The same names the curation queue's
 // fix takes (validatePendingFix), plus classification (display data a draft
 // commonly carries from a scan).
-const DRAFT_FIELDS = ['name', 'producer', 'appellation', 'regionName', 'countryName', 'grapeNames', 'type', 'classification'];
+const DRAFT_FIELDS = ['name', 'producer', 'appellation', 'regionName', 'countryName', 'grapeNames', 'type', 'colour', 'classification'];
 
 const fail = (code, message) => ({ ok: false, code, message });
 const POPULATE = [
@@ -66,6 +67,7 @@ function draftSummary(w, extra = {}) {
     appellation: w.appellation || null,
     classification: w.classification || null,
     type: w.type || null,
+    colour: w.colour || null,
     country: name(w.country),
     region: name(w.region),
     grapes: Array.isArray(w.grapes) ? w.grapes.map((g) => name(g)).filter(Boolean) : [],
@@ -186,7 +188,11 @@ async function updateDraft(wine, clean, userId) {
       ? await resolveCanonicalAppellation(normalizeAppellation(clean.appellation))
       : null;
   }
+  // Refused, not accepted-and-dropped by the model hook (audit 2026-09-19).
+  const colourErr = colourTypeConflict(clean.type || wine.type, clean.colour);
+  if (colourErr) return fail('invalid_input', colourErr);
   if (clean.type) wine.type = clean.type;
+  if (clean.colour !== undefined) stateColour(wine, clean.colour);
   if (clean.classification !== undefined) wine.classification = clean.classification || null;
 
   let countryDoc = null;

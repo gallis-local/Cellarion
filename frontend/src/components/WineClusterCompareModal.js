@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import Modal from './Modal';
 import WineImage from './WineImage';
 import { adminGetWine, adminSaveWine, adminMergeCluster } from '../api/admin';
+import { swatchType, recordedColour } from '../utils/wineColour';
 import './WineModalThumbs.css';
 
 /**
@@ -93,6 +94,9 @@ function WineClusterCompareModal({ cluster, apiFetch, onClose, onMerged }) {
         name: pick('name').name,
         producer: pick('producer').producer,
         type: pick('type').type || 'red',
+        // The colour belongs to the type it was recorded under, so it comes
+        // from the same wine — a sparkling rosé picked for its type stays one.
+        colour: recordedColour(pick('type')),
         appellation: pick('appellation').appellation || '',
         country: countryId(pick('country')) || countryId(keeper),
         region: regionId(pick('region')),
@@ -210,13 +214,13 @@ function WineClusterCompareModal({ cluster, apiFetch, onClose, onMerged }) {
                     <button type="button" onClick={() => pickWine('image', id)} disabled={merging}
                       title={w.image ? (isPicked ? 'Surviving photo' : 'Keep this photo') : 'No photo'}
                       style={{ border: isPicked ? `2px solid ${accent}` : '2px solid transparent', borderRadius: 6, padding: 2, background: 'none', cursor: w.image ? 'pointer' : 'default' }}>
-                      <WineImage image={w.image} alt={w.name} wineType={w.type} className="compare-wine-thumb" placeholder="compare-wine-placeholder" />
+                      <WineImage image={w.image} alt={w.name} wineType={swatchType(w)} className="compare-wine-thumb" placeholder="compare-wine-placeholder" />
                     </button>
                   </td>
                 );
               })}
               <td style={{ ...tdStyle, textAlign: 'center' }}>
-                <WineImage image={(byId[picks.image] || {}).image} alt="result" wineType={keeper?.type} className="compare-wine-thumb" placeholder="compare-wine-placeholder" />
+                <WineImage image={(byId[picks.image] || {}).image} alt="result" wineType={swatchType(byId[picks.type] || keeper)} className="compare-wine-thumb" placeholder="compare-wine-placeholder" />
               </td>
             </tr>
           </tbody>

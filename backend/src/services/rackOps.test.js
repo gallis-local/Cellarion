@@ -11,7 +11,7 @@ jest.mock('../models/Cellar', () => {
 });
 jest.mock('../models/Rack', () => {
   const M = jest.fn(function (doc) { Object.assign(this, doc); this._id = 'rack-new'; this.save = jest.fn().mockResolvedValue(undefined); });
-  M.RACK_TYPES = ['grid', 'x-rack', 'hex', 'triangle', 'stack', 'cube', 'shelf'];
+  M.RACK_TYPES = ['grid', 'x-rack', 'hex', 'triangle', 'stack', 'cube', 'shelf', 'cabinet'];
   M.updateMany = jest.fn().mockResolvedValue({});
   return M;
 });
@@ -22,6 +22,7 @@ jest.mock('../utils/rackGeometry', () => ({
   // Real validator — createGridRack's typeConfig gate is part of the pinned
   // contract (shared with the REST rack-update route).
   validateDoubleHeightRows: jest.requireActual('../utils/rackGeometry').validateDoubleHeightRows,
+  validateCabinetConfig: jest.requireActual('../utils/rackGeometry').validateCabinetConfig,
 }));
 jest.mock('./bottleOps', () => ({ removeFromRacks: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('./search', () => ({ indexBottle: jest.fn() }));
@@ -80,6 +81,34 @@ describe('createGridRack', () => {
     expect(nonGrid.error.message).toMatch(/only supported on grid racks/);
   });
 
+  test('cabinet: shelfRows is required and must match rows; a valid shape is stored as given', async () => {
+    const cellar = { _id: 'c1', user: 'owner' };
+    let res = await createGridRack(cellar, { name: 'Fridge', type: 'cabinet', rows: 3, cols: 6 }, REQ);
+    expect(res.error.status).toBe(400);
+    expect(res.error.message).toMatch(/shelfRows is required/);
+
+    res = await createGridRack(cellar, { name: 'Fridge', type: 'cabinet', rows: 3, cols: 6, typeConfig: { shelfRows: [2, 2] } }, REQ);
+    expect(res.error.status).toBe(400);
+    expect(res.error.message).toMatch(/one entry per shelf/);
+
+    res = await createGridRack(cellar, { name: 'Fridge', type: 'cabinet', rows: 3, cols: 6, typeConfig: { shelfRows: [1, 4, 6], twoDeep: true } }, REQ);
+    expect(res.error).toBeUndefined();
+    expect(res.rack).toMatchObject({ type: 'cabinet', rows: 3, cols: 6, typeConfig: { shelfRows: [1, 4, 6], twoDeep: true } });
+
+    // shelfRows on a non-cabinet type is a client bug, not silently ignored
+    res = await createGridRack(cellar, { name: 'G', type: 'grid', rows: 2, cols: 2, typeConfig: { shelfRows: [1, 1] } }, REQ);
+    expect(res.error.message).toMatch(/cabinet racks only/);
+  });
+
+  test('rows and cols must be whole numbers in range — 5.5, "5", 0 or 21 are 400, never saved (audit 2026-09-16)', async () => {
+    for (const dims of [{ rows: 5.5, cols: 6 }, { rows: '5', cols: 6 }, { rows: 5, cols: 0 }, { rows: 21, cols: 6 }]) {
+      const res = await createGridRack(cellar, { name: 'Bad', type: 'grid', ...dims }, REQ);
+      expect(res.error).toEqual(expect.objectContaining({ status: 400 }));
+      expect(res.error.message).toMatch(/whole numbers/);
+    }
+    expect(Rack).not.toHaveBeenCalled();
+  });
+
   test('trims the rack name', async () => {
     const res = await createGridRack(cellar, { name: '  Wall rack  ' }, REQ);
     expect(res.rack.name).toBe('Wall rack');
@@ -96,6 +125,16 @@ describe('placeBottleInRack', () => {
     expect((await placeBottleInRack(dr, 5, 'b1', REQ)).error.message).toMatch(/disabled/);
     Bottle.findOne.mockReturnValue(selectable(null));
     expect((await placeBottleInRack(rack(), 5, 'bX', REQ)).error.status).toBe(404);
+  });
+
+  test('a consumed bottle cannot be placed — consume clears the slot, so the reverse must hold (audit 2026-09-14)', async () => {
+    Bottle.findOne.mockReturnValue(selectable({ _id: 'b1', status: 'drank' }));
+    const res = await placeBottleInRack(rack(), 5, 'b1', REQ);
+    expect(res.error.status).toBe(400);
+    expect(res.error.message).toMatch(/consumed/);
+    // an active bottle, or a legacy lookup without status, still places
+    Bottle.findOne.mockReturnValue(selectable({ _id: 'b1', status: 'active' }));
+    expect((await placeBottleInRack(rack(), 5, 'b1', REQ)).error).toBeUndefined();
   });
 
   test('filter-then-push: clears other racks, drops old slot + occupant, reports displaced', async () => {

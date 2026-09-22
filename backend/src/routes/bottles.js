@@ -23,6 +23,7 @@ const { unlinkImageFiles } = require('../services/imageProcessor');
 const { gatherPriceWarnings } = require('../services/priceWarnings');
 const { getCurrentRelease } = require('../services/communityPrice');
 const { findLotSiblingIds } = require('../services/bottleLot');
+const { buildCaseJourneys } = require('../services/insightsService');
 const { stripHtml, escapeRegex } = require('../utils/sanitize');
 const { toNormalized } = require('../utils/ratingUtils');
 const { classifyMaturity, buildProfileMap, parseMaturityFilter, matchesMaturityFilter } = require('../utils/maturityUtils');
@@ -352,6 +353,19 @@ router.get('/', async (req, res) => {
       bottles = bottles.slice(skip, skip + limit);
     }
 
+    // The user's own photos (chosen default, own uploads by bottle or wine) —
+    // the same resolution every cellar list uses. Without it this list showed
+    // registry images only, so bottles photographed by their owner rendered
+    // blank (support ticket 2026-09-19). Required lazily: routes/cellars is a
+    // router module and this keeps load order out of it. A failed photo
+    // lookup degrades to registry images; it never fails the list.
+    try {
+      const { attachBottleImageUrls } = require('./cellars');
+      bottles = await attachBottleImageUrls(bottles, req.user.id);
+    } catch (err) {
+      console.error('GET /api/bottles photo lookup failed:', err.message);
+    }
+
     const items = bottles.map(b => ({
       ...b,
       // Regional grape display names resolved per wine (additive `displayName`
@@ -648,6 +662,56 @@ router.get('/:id', requireBottleAccess('viewer'), async (req, res) => {
   }
 });
 
+// The viewer's OWN story with this wine: what happened to their other bottles
+// of it — how many remain, and for each one already drunk the date, rating and
+// note (support ticket 2026-09-16: "if I drink a bottle, I can't see that
+// information in the other bottles"). The data was always stored — a consumed
+// bottle keeps its document — but only the drunk bottle's own page showed it.
+//
+// NOTHING IS COPIED BETWEEN BOTTLES. This is computed on read from the
+// siblings, so each bottle stays the single truth about itself; the ticket's
+// literal "store it in every bottle" would duplicate data and make a later
+// correction silently wrong on every other copy.
+//
+// ?vintages=this (default) is the bottle's own vintage, 'all' every vintage of
+// the wine as its own group, newest first — your note on the 2019 next to the
+// 2020 you are holding (mirrors the Reviews card's "this vintage / all
+// vintages" filter on the same page). Vintages are never merged: a rating of
+// the 2015 says nothing about whether the 2020 is ready, and the drink window
+// and pace verdict are per vintage.
+//
+// Owned cellars only, exactly like the lot above: from a bottle in someone
+// else's cellar the viewer's own bottles would be the wrong story to tell.
+const LOT_HISTORY_MAX_VINTAGES = 20;
+router.get('/:id/lot-history', requireBottleAccess('viewer'), async (req, res) => {
+  try {
+    const { bottle, cellar } = req;
+    const scope = req.query.vintages === 'all' ? 'all' : 'this';
+    const empty = { scope, vintage: bottle.vintage || 'NV', lots: [] };
+
+    const ownsCellar = String(cellar.user && (cellar.user._id || cellar.user)) === String(req.user.id);
+    // A bottle still waiting for its wine request has no registry wine, and
+    // the lot is defined by that wine — there is nothing to group by yet.
+    if (!ownsCellar || !bottle.wineDefinition) return res.json(empty);
+
+    const result = await buildCaseJourneys(req.user.id, {
+      focusWineId: String(bottle.wineDefinition._id || bottle.wineDefinition),
+      focusVintage: scope === 'all' ? null : (bottle.vintage || 'NV'),
+      sort: 'vintage',
+      limit: scope === 'all' ? LOT_HISTORY_MAX_VINTAGES : 1,
+      // The bottle on screen must be among the capped vintages, or a
+      // 21-vintage vertical's oldest bottle reads "no bottles of this vintage".
+      pinVintage: scope === 'all' ? (bottle.vintage || 'NV') : null,
+      // The page shows a note as the user wrote it (the field allows 1000).
+      noteMaxLength: 1000,
+    });
+    res.json({ ...empty, lots: result.data || [] });
+  } catch (error) {
+    console.error('Lot history error:', error);
+    res.status(500).json({ error: 'Failed to load this wine\'s history' });
+  }
+});
+
 // PUT /api/bottles/:id - Update bottle (owner or editor)
 router.put('/:id', requireBottleAccess('editor'), async (req, res) => {
   try {
@@ -757,8 +821,12 @@ router.put('/:id/default-image', requireBottleAccess('editor'), async (req, res)
 // POST /api/bottles/:id/consume - Soft-remove bottle (owner or editor)
 router.post('/:id/consume', requireBottleAccess('editor'), async (req, res) => {
   try {
-    const { reason = 'drank', note, rating, consumedRatingScale } = req.body;
-    const result = await consumeBottle(req.bottle, { reason, note, rating, ratingScale: consumedRatingScale }, req);
+    // consumedAt: the day the bottle was actually drunk, when that is not
+    // today (support ticket 2026-09-13: "how do I set the consumed date?").
+    // The service validates it (a real date, not in the future); absent →
+    // now, as before. The bulk action has taken the same field since v1.200.
+    const { reason = 'drank', note, rating, consumedRatingScale, consumedAt } = req.body;
+    const result = await consumeBottle(req.bottle, { reason, note, rating, ratingScale: consumedRatingScale, consumedAt }, req);
     if (result.error) return res.status(result.error.status).json({ error: result.error.message });
     res.json({ bottle: result.bottle });
   } catch (error) {

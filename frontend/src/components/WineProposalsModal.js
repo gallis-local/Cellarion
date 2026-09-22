@@ -25,6 +25,8 @@ const FIELD_KEYS = {
   // Proposable since 2026-08-19 (somm ticket 6a85ad44). Grapes arrive as a
   // joined string from the route, so the generic diff row renders them as-is.
   type: 'admin.wines.proposals.fields.type',
+  // The colour of a sparkling/dessert/fortified wine (support ticket 2026-09-17).
+  colour: 'admin.wines.proposals.fields.colour',
   grapes: 'admin.wines.proposals.fields.grapes',
 };
 
@@ -464,6 +466,13 @@ function WineProposalsModal({ apiFetch, onClose, onChanged }) {
                   {p.currentSnapshot && p.currentSnapshot[field] !== d.current && (
                     <em style={{ ...mutedStyle, fontSize: '0.78rem' }}>
                       {t('admin.wines.proposals.drift', { value: p.currentSnapshot[field] || '—' })}
+                    </em>
+                  )}
+                  {/* A variety the submitter knowingly added as new: approving
+                      refuses it until the taxonomy has it, so say so up front. */}
+                  {Array.isArray(d.unknown) && d.unknown.length > 0 && (
+                    <em style={{ flexBasis: '100%', fontSize: '0.78rem', color: 'var(--color-warning)' }}>
+                      {t('admin.wines.proposals.unknownGrapes', 'Not in the grape taxonomy yet: {{names}} — add it under Taxonomy first, then approve.', { names: d.unknown.join(', ') })}
                     </em>
                   )}
                 </div>

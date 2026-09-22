@@ -4,6 +4,8 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { searchWines, resolveWine, identifyWineByText } from '../api/wines';
 import { adoptRegistryWine } from '../api/bridge';
+import { getRacks } from '../api/racks';
+import DialogBox from '../components/DialogBox';
 import useLabelScanner from '../hooks/useLabelScanner';
 import { CURRENCIES } from '../config/currencies';
 import { BOTTLE_SIZES, bottleSizeLabel } from '../config/bottleSizes';
@@ -15,6 +17,7 @@ import RatingInput from '../components/RatingInput';
 import WineImage from '../components/WineImage';
 import SimilarWinesModal from '../components/SimilarWinesModal';
 import { WINE_TYPES } from '../config/wineTypes';
+import { swatchType, wineTypeLabel, isStyleType, colourLabel, WINE_COLOURS } from '../utils/wineColour';
 import './AddBottle.css';
 
 function AddBottle() {
@@ -109,6 +112,10 @@ function AddBottle() {
   // when POST k of N fails, a retry only creates the remaining N−k instead of
   // duplicating the whole batch. Reset whenever a new wine is selected.
   const createdBottlesRef = useRef([]);
+  // Post-add placing offer (issue #1055): { ids, count } once the save landed
+  // in a cellar that has racks. Skippable, never blocking — "Not now" goes to
+  // the cellar page exactly as before.
+  const [placePrompt, setPlacePrompt] = useState(null);
   const imagesLinkedRef = useRef(false);
 
   // ── Scan result state ──
@@ -324,7 +331,8 @@ function AddBottle() {
     // answer belonged to a different wine (audit 2026-09-12).
     setCreateAsDraft(false);
     setPendingNewWine(wineData);
-    setSelectedWine({ name: wineData.name, producer: wineData.producer, type: wineData.type });
+    // colour rides along: step 2 draws the wine the user just described.
+    setSelectedWine({ name: wineData.name, producer: wineData.producer, type: wineData.type, colour: wineData.colour || null });
     setBottleData(prev => ({ ...prev, vintage: carriedVintage || '' }));
     setScanResult(null);
     setLabelImage(null);
@@ -613,14 +621,14 @@ function AddBottle() {
   // the local-row renderer keeps its "SAVED wine only" contract.
   const renderRegistryRow = (item) => (
     <div key={`registry-${item.registryId}`} className="wine-row registry-wine-row" onClick={() => handleAdoptRegistry(item)} role="button" tabIndex={0} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleAdoptRegistry(item); } }}>
-      <WineImage image={item.image} alt={item.name} className="wine-row-image" wrapClass="wine-row-img-wrap" credit={item.imageCredit} creditClass="wine-row-credit" wineType={item.type} placeholder="wine-row-placeholder" />
+      <WineImage image={item.image} alt={item.name} className="wine-row-image" wrapClass="wine-row-img-wrap" credit={item.imageCredit} creditClass="wine-row-credit" wineType={swatchType(item)} placeholder="wine-row-placeholder" />
       <div className="wine-info">
         <h3>{item.name} <span className="registry-badge">{t('addBottle.registryBadge', 'shared registry')}</span></h3>
         <p className="producer">{item.producer}</p>
         <div className="wine-meta">
           {item.country && <span>{item.country}</span>}
           {item.region && <span>• {item.region}</span>}
-          {item.type && <span className={`wine-type-pill ${item.type}`}>{item.type}</span>}
+          {item.type && <span className={`wine-type-pill ${swatchType(item)}`}>{wineTypeLabel(item, t)}</span>}
         </div>
         {item.grapes?.length > 0 && (
           <p className="wine-grapes">{item.grapes.join(', ')}</p>
@@ -651,14 +659,14 @@ function AddBottle() {
   // list, so the two can never drift. Takes a SAVED wine only.
   const renderWineRow = (wine) => (
     <div key={wine._id} className="wine-row" onClick={() => handleSelectWine(wine)} role="button" tabIndex={0} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleSelectWine(wine); } }}>
-      <WineImage image={wine.image} alt={wine.name} className="wine-row-image" wrapClass="wine-row-img-wrap" credit={wine.imageCredit} creditClass="wine-row-credit" wineType={wine.type} placeholder="wine-row-placeholder" />
+      <WineImage image={wine.image} alt={wine.name} className="wine-row-image" wrapClass="wine-row-img-wrap" credit={wine.imageCredit} creditClass="wine-row-credit" wineType={swatchType(wine)} placeholder="wine-row-placeholder" />
       <div className="wine-info">
         <h3>{wine.name}</h3>
         <p className="producer">{wine.producer}</p>
         <div className="wine-meta">
           <span>{wine.country?.name}</span>
           {wine.region && <span>• {wine.region.name}</span>}
-          <span className={`wine-type-pill ${wine.type}`}>{wine.type}</span>
+          <span className={`wine-type-pill ${swatchType(wine, '')}`}>{wineTypeLabel(wine, t)}</span>
         </div>
         {wine.grapes?.length > 0 && (
           <p className="wine-grapes">{wine.grapes.map(g => g.displayName || g.name).join(', ')}</p>
@@ -801,6 +809,23 @@ function AddBottle() {
 
       // Link uploaded images to the first bottle
       linkUploadedImages();
+      // Offer to place the new bottles now when the cellar has racks (issue
+      // #1055). One read; any failure to answer simply skips the offer.
+      const newIds = createdBottlesRef.current.map(b => b?._id).filter(Boolean);
+      let hasRacks = false;
+      // Bottles added straight into the drinking history are consumed — a
+      // consumed bottle has no place in a rack (audit 2026-09-14 M).
+      if (newIds.length > 0 && !addToHistory) {
+        try {
+          const rr = await getRacks(apiFetch, cellarId);
+          const rd = rr.ok ? await rr.json() : null;
+          hasRacks = Array.isArray(rd?.racks) ? rd.racks.length > 0 : Array.isArray(rd) && rd.length > 0;
+        } catch { /* no offer */ }
+      }
+      if (hasRacks) {
+        setPlacePrompt({ ids: newIds, count: newIds.length });
+        return;
+      }
       navigate(`/cellars/${cellarId}`);
     } catch (err) {
       setError(partialError(t('common.networkError'), createdBottlesRef.current.length));
@@ -971,7 +996,7 @@ function AddBottle() {
                       wrapClass="scan-wine-shot-img-wrap"
                       credit={scanMatchedWine.imageCredit}
                       creditClass="wine-row-credit"
-                      wineType={scanMatchedWine.type}
+                      wineType={swatchType(scanMatchedWine)}
                       placeholder="wine-row-placeholder scan-wine-placeholder"
                     />
                     <figcaption className="scan-wine-shot-caption">{t('addBottle.scanRegistryPhoto')}</figcaption>
@@ -1081,7 +1106,12 @@ function AddBottle() {
                 <div className="form-group">
                   <label>{t('addBottle.scanType')}</label>
                   <select value={pendingWineData.type}
-                    onChange={e => setPendingWineData(p => ({ ...p, type: e.target.value }))}>
+                    onChange={e => setPendingWineData(p => ({
+                      ...p,
+                      type: e.target.value,
+                      // A colour belongs to sparkling/dessert/fortified only.
+                      ...(isStyleType(e.target.value) ? {} : { colour: '' }),
+                    }))}>
                     {/* Unknown is a real answer: the scan and the AI now return
                         null rather than defaulting to red (ticket 6a85ad44), so
                         the form must be able to carry that through instead of
@@ -1090,6 +1120,18 @@ function AddBottle() {
                     {WINE_TYPES.map(wt => <option key={wt} value={wt}>{wt}</option>)}
                   </select>
                 </div>
+                {/* Only where the type does not already say the colour. Left
+                    "not stated", a rosé name ("Brut Rosé") still fills it in. */}
+                {isStyleType(pendingWineData.type) && (
+                  <div className="form-group">
+                    <label htmlFor="new-wine-colour">{t('wineColour.label', 'Colour')}</label>
+                    <select id="new-wine-colour" value={pendingWineData.colour || ''}
+                      onChange={e => setPendingWineData(p => ({ ...p, colour: e.target.value }))}>
+                      <option value="">{t('wineColour.notStated', 'Not stated')}</option>
+                      {WINE_COLOURS.map(c => <option key={c} value={c}>{colourLabel(c, t)}</option>)}
+                    </select>
+                  </div>
+                )}
                 <div className="form-group form-group-full">
                   <label>{t('addBottle.scanGrapes')}</label>
                   <input type="text" value={pendingWineData.grapes}
@@ -1183,7 +1225,7 @@ function AddBottle() {
                       {isRegistryWine ? t('addBottle.aiMatchHint') : t('addBottle.aiIdentifiedHint')}
                     </p>
                     <div className="ai-result-wine">
-                      <WineImage image={card.image} alt={card.name} className="wine-row-image" wrapClass="wine-row-img-wrap" credit={card.imageCredit} creditClass="wine-row-credit" wineType={card.type} placeholder="wine-row-placeholder" />
+                      <WineImage image={card.image} alt={card.name} className="wine-row-image" wrapClass="wine-row-img-wrap" credit={card.imageCredit} creditClass="wine-row-credit" wineType={swatchType(card)} placeholder="wine-row-placeholder" />
                       <div className="wine-info">
                         <h3>{card.name}</h3>
                         <p className="producer">{card.producer}</p>
@@ -1191,7 +1233,7 @@ function AddBottle() {
                           {countryName && <span>{countryName}</span>}
                           {regionName && <span>• {regionName}</span>}
                           {card.appellation && <span>• {card.appellation}</span>}
-                          <span className={`wine-type-pill ${card.type || 'unknown'}`}>{card.type || t('common.unknown')}</span>
+                          <span className={`wine-type-pill ${swatchType(card, 'unknown')}`}>{wineTypeLabel(card, t) || t('common.unknown')}</span>
                         </div>
                         {grapeNames.length > 0 && (
                           <p className="wine-grapes">{grapeNames.join(', ')}</p>
@@ -1739,6 +1781,34 @@ function AddBottle() {
           }}
           onCancel={() => { setSoftCandidates(null); setSoftPending(null); }}
         />
+      )}
+
+      {/* Post-add placing offer (issue #1055) — skippable, never blocking */}
+      {placePrompt && (
+        <div className="modal-overlay" onClick={() => navigate(`/cellars/${cellarId}`)}>
+          <DialogBox
+            className="modal-box"
+            onClick={e => e.stopPropagation()}
+            onClose={() => navigate(`/cellars/${cellarId}`)}
+            label={t('addBottle.placePrompt.title', { count: placePrompt.count })}
+          >
+            <h2>{t('addBottle.placePrompt.title', { count: placePrompt.count })}</h2>
+            <p>{t('addBottle.placePrompt.body')}</p>
+            <div className="modal-actions">
+              <button type="button" className="btn btn-secondary" onClick={() => navigate(`/cellars/${cellarId}`)}>
+                {t('addBottle.placePrompt.notNow')}
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                data-testid="place-now"
+                onClick={() => navigate(`/cellars/${cellarId}/racks`, { state: { placeQueue: placePrompt.ids } })}
+              >
+                {t('addBottle.placePrompt.placeNow')}
+              </button>
+            </div>
+          </DialogBox>
+        </div>
       )}
     </div>
   );

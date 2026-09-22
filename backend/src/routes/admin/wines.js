@@ -14,6 +14,7 @@ const {
 } = require('../../utils/normalize');
 const { resolveCanonicalAppellation } = require('../../services/appellationResolve');
 const { validateImageRef } = require('../../services/accountOps');
+const { WINE_COLOURS, stateColour, colourTypeConflict } = require('../../utils/wineColour');
 const { scoreWineMatch } = require('../../services/wineMatching');
 const { conflictingStyleTerms } = require('../../utils/styleTerms');
 const { sameProducerAppellationGroups, nearProducerPairs, nameSubsetPairs } = require('../../services/registryFragmentation');
@@ -31,7 +32,9 @@ const Discussion = require('../../models/Discussion');
 const DiscussionReply = require('../../models/DiscussionReply');
 const WineEmbedding = require('../../models/WineEmbedding');
 const WineNotDuplicate = require('../../models/WineNotDuplicate');
-const WineCorrectionProposal = require('../../models/WineCorrectionProposal');
+// Pending correction proposals close with their wine THROUGH this service, so
+// a user who filed one is told what happened (it owns the model access).
+const { closePendingForWine } = require('../../services/wineCorrectionNotify');
 const { repointInquiriesForWineMerge, closeInquiriesForWineDelete } = require('../../services/ownerInquiryOps');
 const WineList = require('../../models/WineList');
 const WishlistItem = require('../../models/WishlistItem');
@@ -169,10 +172,18 @@ router.get('/', async (req, res) => {
 // "create anyway".
 router.post('/', async (req, res) => {
   try {
-    const { name, producer, country, region, appellation, grapes, type, image, confirmCreate } = req.body;
+    const { name, producer, country, region, appellation, grapes, type, colour, image, confirmCreate } = req.body;
 
     if (!name || !producer || !country) {
       return res.status(400).json({ error: 'Name, producer, and country are required' });
+    }
+    if (colour != null && colour !== '' && !WINE_COLOURS.includes(colour)) {
+      return res.status(400).json({ error: `Colour must be one of: ${WINE_COLOURS.join(', ')}` });
+    }
+    {
+      // Refused, not accepted-and-dropped by the model hook (audit 2026-09-19).
+      const colourErr = colourTypeConflict(type || null, colour);
+      if (colourErr) return res.status(400).json({ error: colourErr });
     }
     if (typeof name !== 'string' || typeof producer !== 'string') {
       return res.status(400).json({ error: 'Name and producer must be strings' });
@@ -263,6 +274,9 @@ router.post('/', async (req, res) => {
       classification: pradikatSplit.classification || undefined,
       grapes: grapes || [],
       type: type || null, // no guessed red (ticket 6a85ad44)
+      // Kept only on a sparkling/dessert/fortified wine — the model hook drops
+      // it otherwise, and fills it from a rosé name when none is given.
+      colour: colour || null,
       image: image || null,
       normalizedKey,
       createdBy: req.user.id,
@@ -376,7 +390,7 @@ router.get('/duplicate-clusters', async (req, res) => {
     // merge candidate against a wine (#844's stated contract, which this pool
     // was missed out of — code audit 2026-07-27, H3).
     const wines = await WineDefinition.find({ nonWine: { $ne: true }, pendingIdentity: { $ne: true } })
-      .select('name producer appellation image type country region')
+      .select('name producer appellation image type colour country region')
       .populate('country', 'name')
       .populate('region', 'name')
       .lean();
@@ -1435,12 +1449,20 @@ router.get('/:id', async (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
-    const { name, producer, country, region, appellation, grapes, type, image } = req.body;
+    const { name, producer, country, region, appellation, grapes, type, colour, image } = req.body;
 
     const wine = await WineDefinition.findById(req.params.id);
     // A private draft is not registry content, not even to an admin (draft design 2026-09-12).
     if (!wine || wine.draft === true) {
       return res.status(404).json({ error: 'Wine not found' });
+    }
+    if (colour != null && colour !== '' && !WINE_COLOURS.includes(colour)) {
+      return res.status(400).json({ error: `Colour must be one of: ${WINE_COLOURS.join(', ')}` });
+    }
+    {
+      // Judged against the type this save leaves the wine with.
+      const colourErr = colourTypeConflict(type || wine.type, colour);
+      if (colourErr) return res.status(400).json({ error: colourErr });
     }
 
     // Snapshot the profile-feeding fields BEFORE any mutation — the re-enrich
@@ -1459,6 +1481,11 @@ router.put('/:id', async (req, res) => {
     }
     if (grapes !== undefined) wine.grapes = grapes;
     if (type) wine.type = type;
+    // Absent = leave alone; '' or null = clear. The model hook drops it again
+    // if the (possibly new) type is itself a colour.
+    // stateColour: an explicit "not stated" sent with a retype must not be
+    // re-inferred from the name by the model hook.
+    if (colour !== undefined) stateColour(wine, colour);
 
     // Image handling. When the admin clears the default image, look for an
     // approved+public gallery image to promote in its place — otherwise the
@@ -1609,10 +1636,10 @@ router.delete('/:id', async (req, res) => {
       WineNotDuplicate.deleteMany({ $or: [{ wineA: id }, { wineB: id }] }),
       // Pending correction proposals on (or targeting) a deleted wine would
       // dangle in the review queue forever — same closure as performWineMerge.
-      WineCorrectionProposal.updateMany(
-        { status: 'pending', $or: [{ wineDefinition: id }, { mergeTargetId: id }] },
-        { $set: { status: 'rejected', decidedAt: new Date(), rejectReason: 'Closed automatically: the wine was deleted before review.' } }
-      ),
+      // Through the shared closer, so a user who filed one is told (the wine is
+      // gone, so the notification has nowhere to link).
+      closePendingForWine(id, 'Closed automatically: the wine was deleted before review.',
+        { wine, actorId: req.user?.id }),
       // Active owner inquiries have nothing left to verify — same closure.
       closeInquiriesForWineDelete(id, req),
       // Qdrant points + WineEmbedding bookkeeping rows (same helper as merge).
@@ -1839,13 +1866,14 @@ async function performWineMerge(sourceId, targetId, req) {
   // than asking the somm to re-file against the keeper. decidedBy stays null —
   // this is lifecycle closure, not a reviewer's judgement.
   const keeperLabel = [target.producer, target.name].filter(Boolean).join(' — ');
-  await WineCorrectionProposal.updateMany(
-    { status: 'pending', $or: [{ wineDefinition: sourceId }, { mergeTargetId: sourceId }] },
-    { $set: {
-      status: 'rejected',
-      decidedAt: new Date(),
-      rejectReason: `Closed automatically: the wine was merged into "${keeperLabel}". Re-file against that wine if the issue still applies.`.slice(0, 500),
-    } }
+  // The shared closer also TELLS a user who filed one (pre-deploy audit
+  // 2026-09-18): this is where a correction that made the wine collide with its
+  // twin ends up, and the bottle now points at the keeper, so nothing on the
+  // web would ever show them the outcome. The notification links to the keeper.
+  await closePendingForWine(
+    sourceId,
+    `Closed automatically: the wine was merged into "${keeperLabel}". Re-file against that wine if the issue still applies.`.slice(0, 500),
+    { wine: source, linkWineId: targetId, actorId: req?.user?.id }
   );
 
   // Owner inquiries take the opposite path to proposals: the merge does NOT
@@ -2142,15 +2170,10 @@ router.post('/merge', async (req, res) => {
     const goldenKeeperLabel = [keeper.producer, keeper.name].filter(Boolean).join(' — ');
     for (const src of sources) {
       bottlesMoved += await reassignWineRefs(src._id, keeperOid);
-      await WineCorrectionProposal.updateMany(
-        { status: 'pending', $or: [{ wineDefinition: src._id }, { mergeTargetId: src._id }] },
-        {
-          $set: {
-            status: 'rejected',
-            decidedAt: new Date(),
-            rejectReason: `Closed automatically: the wine was merged into "${goldenKeeperLabel}". Re-file against that wine if the issue still applies.`.slice(0, 500),
-          },
-        }
+      await closePendingForWine(
+        src._id,
+        `Closed automatically: the wine was merged into "${goldenKeeperLabel}". Re-file against that wine if the issue still applies.`.slice(0, 500),
+        { wine: src, linkWineId: keeperOid, actorId: req.user?.id }
       );
       await repointInquiriesForWineMerge(src._id, keeperOid, goldenKeeperLabel, req);
     }

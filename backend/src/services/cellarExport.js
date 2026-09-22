@@ -91,6 +91,9 @@ function mapBottlesForExport(bottles, racks, imagesByBottle = new Map(), reviews
       region: wine.region?.name || '',
       appellation: wine.appellation || '',
       type: wine.type || '',
+      // The colour of a sparkling/dessert/fortified wine, when recorded — so a
+      // sparkling rosé survives an export → import round-trip as one.
+      ...(wine.colour ? { colour: wine.colour } : {}),
       // Grape varieties (names only) so the importer can reconstruct them via
       // findOrCreateGrapes on a cross-instance migration — otherwise every
       // auto-created wine lands with an empty grape list.
@@ -298,7 +301,10 @@ async function buildCellarDataExport(userId, scope) {
           { path: 'region', select: 'name' },
           { path: 'grapes', select: 'name' },
         ],
-        select: 'name producer type appellation country region grapes',
+        // Every wine field mapBottlesForExport emits has to be listed here —
+        // `colour` was emitted but not selected, so no export ever carried one
+        // (audit 2026-09-19; pinned by cellarExport.select.test.js).
+        select: 'name producer type colour appellation country region grapes',
       })
       .limit(EXPORT_MAX)
       .lean(),

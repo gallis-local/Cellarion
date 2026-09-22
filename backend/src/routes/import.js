@@ -39,7 +39,7 @@ const { WINE_TYPES } = require('../services/wineProfileOps');
 const { parseAndValidateVintage, parseDrinkYear } = require('../utils/validation');
 const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
 const { extractAiExplanation } = require('../utils/jsonExtract');
-const { getMaxPosition } = require('../utils/rackGeometry');
+const { getMaxPosition, cabinetShelfRows, cabinetShelfCols, cabinetShelfAlternate } = require('../utils/rackGeometry');
 const { planRackCreations, placeBottlesInRack, VALID_ANCHORS, DEFAULT_ANCHOR } = require('../utils/rackImport');
 const { RACK_TYPES } = require('../models/Rack');
 const { validatePriceSanity } = require('../utils/priceValidation');
@@ -468,6 +468,51 @@ async function findExactRegistryWine(item) {
     .populate(['country', 'region', 'grapes']);
 }
 
+// Longest producer prefix tried against the registry, in tokens. Real
+// producer names run to five tokens ("Domaine de la Romanée-Conti", "A.A.
+// Badenhorst Family Wines"); six covers the rest without scanning a whole
+// display name word by word.
+const PRODUCER_PREFIX_MAX_TOKENS = 6;
+
+/**
+ * Split a producer-less display name on a producer the REGISTRY already knows.
+ *
+ * A CellarTracker export without a Producer column carries "Louis Jadot
+ * Moulin-à-Vent Château des Jacques" in its Wine column. The client used to
+ * guess the first word ("Louis"), which minted 285 wines under one-word
+ * producers on 2026-09-12 and cost 121 curator corrections. The registry is
+ * the better oracle: the longest leading token run that equals an existing
+ * producer (normalizedKey is `<producer>:<name>:<appellation>`, so an
+ * anchored prefix on the unique index is one cheap read per length) is the
+ * producer, and the rest is the wine's own name. Nothing matches → null, and
+ * the row goes to the model with the full display name instead.
+ *
+ * Pending and draft rows are excluded by construction (their key namespaces
+ * start with `pending~` / `draft~`), non-wine records explicitly.
+ */
+async function splitKnownProducerPrefix(displayName) {
+  const tokens = String(displayName || '').trim().split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return null;
+  for (let n = Math.min(PRODUCER_PREFIX_MAX_TOKENS, tokens.length - 1); n >= 1; n--) {
+    const prefixKey = normalizeString(tokens.slice(0, n).join(' '));
+    if (!prefixKey) continue;
+    const filter = { normalizedKey: new RegExp(`^${escapeRegex(prefixKey)}:`), nonWine: { $ne: true } };
+    const hit = await WineDefinition.findOne(filter).select('producer').lean();
+    if (!hit || !hit.producer) continue;
+    // A ONE-word producer is the shape the 2026-09-12 first-word guess left
+    // behind ("Kim", "Louis", "19"), and those junk rows are still in the
+    // registry until their purge. A single wine under a one-word producer is
+    // not corroboration; two or more is (Hugel, Penfolds, Ridge all qualify).
+    // Anything longer than one word is trusted as before (audit 2026-09-14 M1).
+    if (n === 1) {
+      const siblings = await WineDefinition.countDocuments(filter, { limit: 2 });
+      if (siblings < 2) continue;
+    }
+    return { producer: hit.producer, wineName: tokens.slice(n).join(' ') };
+  }
+  return null;
+}
+
 /**
  * Find best wine matches for a single import item.
  * Strategy:
@@ -678,20 +723,17 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     // the cascade's own "zero AI for known wines" intent. Only the AI fan-out
     // itself (Pass 1b) is gated on availability.
     const aiConfigured = aiProvider.isConfigured(); // invariant for the whole request
-    const cascadeEligible = preResults.filter(pr => !pr.errorMsg && pr.item.wineName && pr.item.producer);
 
-    // Build unique wine keys — one cascade/AI attempt per unique wine, not per bottle
-    const aiKeyMap = new Map(); // normalizedKey -> preResult (representative)
-    for (const pr of cascadeEligible) {
-      const key = `${normalizeString(pr.item.wineName)}:${normalizeString(pr.item.producer)}`;
-      if (!aiKeyMap.has(key)) aiKeyMap.set(key, pr);
-      if (pr.forceAi) aiKeyMap.get(key).forceAi = true; // any row's Look-up button forces the key
-    }
-    const uniquePrs = [...aiKeyMap.values()];
-
-    // Latch a client disconnect as EARLY as possible — BEFORE the sequential
-    // Pass 1a cascade — so a disconnect during Pass 1a (which can be long for a
-    // big batch) still stops us LAUNCHING (and debiting) the AI fan-out below.
+    // A row that names the wine but not the producer (a CellarTracker export
+    // without a Producer column: "Kim Crawford Pinot Gris" in one cell) is
+    // split on a producer the registry already knows BEFORE any lookup, so it
+    // joins the cascade as an ordinary row. The client no longer guesses the
+    // first word (2026-09-12: 285 wines minted under "Louis", "Kim", "19"…);
+    // rows the registry cannot split keep the full display name and go to
+    // the model, which is told the producer is embedded in it.
+    // Latch a client disconnect as EARLY as possible — before the split
+    // probes and the Pass 1a cascade — so a requester that has gone away
+    // stops us spending reads and, below, launching (and debiting) AI calls.
     // res 'close' fires when the underlying connection closes; writableEnded
     // distinguishes a premature client disconnect from normal completion.
     // (req 'close' fires on message completion in Node >= 15, so it can't be
@@ -699,6 +741,42 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     let aiBudgetExhausted = false;
     let clientDisconnected = false;
     res.on('close', () => { if (!res.writableEnded) clientDisconnected = true; });
+
+    // ONE probe per distinct display name, not per row (a 2000-row file of
+    // the same six wines is six probes), and a sentinel producer ("Unknown",
+    // "-") counts as none — the CT mapper already sends '' for it, generic
+    // CSV/Vivino rows did not (audit 2026-09-14 M2/L4).
+    const splitByName = new Map(); // normalized display name → split result | null
+    for (const pr of preResults) {
+      if (clientDisconnected) break;
+      if (pr.errorMsg || !pr.item.wineName) continue;
+      if (pr.item.producer && !isIdentitySentinel(pr.item.producer)) continue;
+      if (pr.item.producer) pr.item.producer = ''; // sentinel → genuinely producer-less
+      const nameKey = normalizeString(pr.item.wineName);
+      if (!splitByName.has(nameKey)) splitByName.set(nameKey, await splitKnownProducerPrefix(pr.item.wineName));
+      const split = splitByName.get(nameKey);
+      if (split) {
+        pr.item.producer = split.producer;
+        pr.item.wineName = split.wineName;
+        // The file never stated this producer: the row may match the registry
+        // (a) exactly or (b) fuzzily, but it must not be treated as a
+        // complete, file-stated identity and minted without the model (c).
+        pr.producerFromRegistry = true;
+      }
+    }
+    const identifyEligible = preResults.filter(pr => !pr.errorMsg && pr.item.wineName);
+
+    // Build unique wine keys — one cascade/AI attempt per unique wine, not per bottle
+    const aiKeyMap = new Map(); // normalizedKey -> preResult (representative)
+    for (const pr of identifyEligible) {
+      const key = `${normalizeString(pr.item.wineName)}:${normalizeString(pr.item.producer)}`;
+      if (!aiKeyMap.has(key)) aiKeyMap.set(key, pr);
+      if (pr.forceAi) aiKeyMap.get(key).forceAi = true; // any row's Look-up button forces the key
+    }
+    const uniquePrs = [...aiKeyMap.values()];
+
+    // (The client-disconnect latch — clientDisconnected / aiBudgetExhausted —
+    // is armed above, before the producer-split probes.)
 
     // ── Pass 1a: registry-first cascade (zero AI for known wines) ──────────
     // (a) exact normalizedKey match (raw + producer-prefix-stripped variant);
@@ -728,6 +806,11 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     };
     for (const pr of uniquePrs) {
       if (clientDisconnected) break; // requester gone — stop the cascade, skip AI entirely
+      // A row still without a producer after the registry split runs the
+      // cascade too: (a) and (c) need a producer and simply return null, but
+      // (b)'s query variants were built for exactly this display-name shape
+      // (registry backlog 2026-09-06) and resolve a known wine at >= 0.95
+      // with zero AI. Only an unknown wine then reaches the model.
       // forceAi bypasses the cascade only when there is an AI to reach; with
       // no key configured the shared cascade is the best available outcome.
       if (pr.forceAi && aiConfigured) continue;
@@ -753,7 +836,11 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       // of its own; loading it is one taxonomy read for the whole request.
       const needsColourMap = !pr.item.type
         && Array.isArray(pr.item.grapes) && pr.item.grapes.length > 0;
-      const identity = fileCompleteIdentity(
+      // A producer the REGISTRY supplied (splitKnownProducerPrefix) is not a
+      // file-stated identity: such a row may match (a)/(b) above, but an
+      // unknown wine goes to the model rather than being minted from the
+      // guess (audit 2026-09-14 L3).
+      const identity = pr.producerFromRegistry ? null : fileCompleteIdentity(
         pr.item,
         needsColourMap ? await getGrapeColourOf() : null
       );
@@ -826,7 +913,7 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
 
     // Attach the shared cascade/AI result to every eligible preResult with
     // that key (duplicates share the representative's outcome, as before).
-    for (const pr of cascadeEligible) {
+    for (const pr of identifyEligible) {
       const key = `${normalizeString(pr.item.wineName)}:${normalizeString(pr.item.producer)}`;
       const rep = aiKeyMap.get(key);
       if (rep.registryWine) { pr.registryWine = rep.registryWine; continue; }
@@ -1291,6 +1378,36 @@ router.post('/confirm', async (req, res) => {
           if (bpc !== undefined) tc.bottlesPerCell = bpc;
           if (bps !== undefined) tc.bottlesPerSection = bps;
           if (bc !== undefined) tc.backCols = bc;
+          // Cabinet racks only: per-shelf row counts fitted to rows (1..12)
+          // and the two-deep flag. A list shorter than rows grows with 1-row
+          // shelves — at the TOP for bottom-anchored files (Oeno numbers
+          // shelves from the bottom, so "the cabinet has more shelves than
+          // the file shows" means extra shelves above), at the bottom
+          // otherwise (audit 2026-09-15).
+          if (entry.type === 'cabinet') {
+            const raw = Array.isArray(cfg.typeConfig.shelfRows) ? cfg.typeConfig.shelfRows : [];
+            const fitted = raw.slice(0, rows).map((v) => clampInt(v, 1, 12) || 1);
+            const missing = rows - fitted.length;
+            const bottomAnchored = positionAnchor === 'bottom-left' || positionAnchor === 'bottom-right';
+            tc.shelfRows = missing > 0
+              ? (bottomAnchored ? [...Array(missing).fill(1), ...fitted] : [...fitted, ...Array(missing).fill(1)])
+              : fitted;
+            tc.twoDeep = cfg.typeConfig.twoDeep !== false;
+            tc.stagger = cfg.typeConfig.stagger !== false;
+            tc.alternate = cfg.typeConfig.alternate === true;
+            // Per-shelf width / pattern, when the file has them (a Cellarion
+            // export); fitted to the shelf count the same way as shelfRows.
+            // A short list grows at the same end as shelfRows above, or a
+            // bottom-anchored file's narrow bottom shelf would be read as a
+            // full-width top one (audit 2026-09-16).
+            const grown = (list) => {
+              const kept = list.slice(0, rows);
+              const gap = rows - kept.length;
+              return gap > 0 && bottomAnchored ? [...Array(gap).fill(undefined), ...kept] : kept;
+            };
+            if (Array.isArray(cfg.typeConfig.shelfCols)) tc.shelfCols = cabinetShelfCols(rows, cols, { shelfCols: grown(cfg.typeConfig.shelfCols) });
+            if (Array.isArray(cfg.typeConfig.shelfAlternate)) tc.shelfAlternate = cabinetShelfAlternate(rows, { alternate: tc.alternate, shelfAlternate: grown(cfg.typeConfig.shelfAlternate) });
+          }
           if (Object.keys(tc).length > 0) entry.typeConfig = tc;
         }
 
@@ -1357,6 +1474,20 @@ router.post('/confirm', async (req, res) => {
             cols
           };
           if (override?.typeConfig) rackData.typeConfig = override.typeConfig;
+          // A cabinet is always stored with a list that matches its shelf count
+          // (the update route's shape gate would otherwise reject every later
+          // rename/group/zone edit — audit 2026-09-15).
+          if (safeType === 'cabinet') {
+            rackData.typeConfig = {
+              ...(rackData.typeConfig || {}),
+              shelfRows: cabinetShelfRows(rows, rackData.typeConfig),
+              twoDeep: rackData.typeConfig?.twoDeep !== false,
+              stagger: rackData.typeConfig?.stagger !== false,
+              alternate: rackData.typeConfig?.alternate === true,
+              ...(Array.isArray(rackData.typeConfig?.shelfCols) ? { shelfCols: cabinetShelfCols(rows, cols, rackData.typeConfig) } : {}),
+              ...(Array.isArray(rackData.typeConfig?.shelfAlternate) ? { shelfAlternate: cabinetShelfAlternate(rows, rackData.typeConfig) } : {}),
+            };
+          }
           const rack = new Rack(rackData);
           // Disabled positions beyond the created geometry address cells that
           // don't exist — drop them rather than storing dead entries.

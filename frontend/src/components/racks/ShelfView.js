@@ -2,7 +2,9 @@ import { useState, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import useSlotDrag from '../../hooks/useSlotDrag';
 import { isReserved } from '../../utils/reservation';
+import { swatchType } from '../../utils/wineColour';
 import { ReservedRibbon } from './RackRenderer';
+import { cabinetBays, cabinetBayUnits, cabinetRowWidth } from '../../utils/rackLayouts';
 import './ShelfView.css';
 
 const WINE_COLORS = {
@@ -21,10 +23,12 @@ const SHELF_PAD_Y = 12;
 const SHELF_LABEL_W = 64;
 
 /**
- * Top-down "shelf view" of a shelf rack. Renders bottles as ovals from above,
- * one row per shelf, with a Front/Back toggle for racks that have a back row.
+ * "Shelf view" of a shelf rack or a wine cabinet. Shelf racks: bottles as
+ * ovals from above, one row per shelf, with a Front/Back toggle for racks
+ * that have a back row. Cabinets: each shelf is a bay of stacked rows (row 1
+ * on the plank, higher levels above it); the Front/Back toggle picks the
+ * front or back row of every level when the cabinet is two deep.
  *
- * Designed for Oeno-style cabinets but works for any rack with type === 'shelf'.
  * Falls back to a friendly message for other rack types.
  */
 export default function ShelfView({ rack, activePosition, highlightPos, onSlotClick, getSlotStyle, onSlotMove }) {
@@ -44,51 +48,108 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
   );
 
   const isShelf = rack?.type === 'shelf';
+  const isCabinet = rack?.type === 'cabinet';
   const cols = rack?.cols || 0;
   const backCols = rack?.typeConfig?.backCols || 0;
   const bpc = rack?.typeConfig?.bottlesPerCell || 1;
   const rows = rack?.rows || 0;
-  const slotsPerShelf = (cols + backCols) * bpc;
-  const hasBack = backCols > 0;
+  const twoDeep = rack?.typeConfig?.twoDeep !== false;
+  const stagger = rack?.typeConfig?.stagger !== false;
+  const hasBack = isCabinet ? twoDeep : backCols > 0;
+  // Ovals per row on the active layer (drives the "no cells" message + width).
+  const layerCols = isCabinet ? cols : (layerMode === 'front' ? cols : backCols);
+  const rowPitch = BOTTLE_RY * 2 + BOTTLE_GAP;
+  const colPitch = BOTTLE_RX * 2 + BOTTLE_GAP;
 
-  // Per-shelf positions for the active layer.
+  // Per-shelf geometry for the active layer — every slot with its own centre.
   // Display order: highest shelf-NUMBER label at the top of the SVG (matches
-  // how a user faces the cabinet — top of view = top of cabinet).
-  // Position MAPPING: positions count row-major from the top, matching the
-  // Compact and 3D views (position 1 = top-left of the rack). So the top
-  // shelf shows the LOW positions, not the high ones.
-  const layerCols = layerMode === 'front' ? cols : backCols;
-  const layerBpc = bpc;
-  const shelfRowWidth = SHELF_LABEL_W + layerCols * layerBpc * (BOTTLE_RX * 2 + BOTTLE_GAP) + BOTTLE_GAP;
-  const shelfRowHeight = BOTTLE_RY * 2 + SHELF_PAD_Y * 2;
-  const totalHeight = rows * shelfRowHeight;
+  // how a user faces the cabinet: top of view = top of cabinet).
+  // Position MAPPING: positions count from the top, matching the Compact and
+  // 3D views (position 1 = top-left of the rack), so the top shelf shows the
+  // LOW positions. Cabinet bays follow rackLayouts.cabinetLayout's contract:
+  // position = cols × Σ shelfRows[k<i] + (row − 1) × cols + slot, row 1 on
+  // the plank; two-deep pairs odd (front) and even (back) rows per level. On
+  // an alternating cabinet the rows are cols / cols−1 wide in turn, so the
+  // position simply runs on row by row (Σ earlier widths + slot).
+  const geometry = useMemo(() => {
+    const slotX = (c) => SHELF_LABEL_W + BOTTLE_GAP + BOTTLE_RX + c * (BOTTLE_RX * 2 + BOTTLE_GAP);
+    const shelves = [];
+    let y = 0;
+    let perRow = 1;
+    if (isCabinet) {
+      const bays = cabinetBays(rows, cols, rack?.typeConfig);
+      const drawOpts = { twoDeep, stagger, backOffset: false };
+      // The view is as wide as the widest bay; narrower bays sit centred.
+      const units = Math.max(1, ...bays.map((b) => cabinetBayUnits(b, drawOpts)));
+      perRow = units;
+      let pos = 0; // positions handed out so far (rows on the other layer included)
+      bays.forEach((bay, i) => {
+        const rowCount = bay.rows;
+        const levels = twoDeep ? Math.ceil(rowCount / 2) : rowCount;
+        const height = SHELF_PAD_Y * 2 + levels * rowPitch - BOTTLE_GAP;
+        const nest = bay.alternate || stagger;
+        const x0 = ((units - cabinetBayUnits(bay, drawOpts)) / 2) * colPitch;
+        const slots = [];
+        for (let r = 1; r <= rowCount; r++) {
+          const width = cabinetRowWidth(r, bay.cols, { twoDeep, alternate: bay.alternate });
+          const start = pos;
+          pos += width;
+          const isBackRow = twoDeep && r % 2 === 0;
+          if (twoDeep && (layerMode === 'back') !== isBackRow) continue;
+          const level = twoDeep ? Math.ceil(r / 2) : r;
+          const cy = height - SHELF_PAD_Y - BOTTLE_RY - (level - 1) * rowPitch;
+          // Nested levels alternate half a bottle left and right; on an
+          // alternating bay it is the narrow rows that sit offset.
+          const nudge = bay.alternate
+            ? (width < bay.cols ? colPitch / 2 : 0)
+            : (nest && bay.cols > 1 && level % 2 === 0 ? colPitch / 2 : 0);
+          for (let c = 0; c < width; c++) {
+            slots.push({ position: start + c + 1, cx: x0 + slotX(c) + nudge, cy });
+          }
+        }
+        shelves.push({ number: bays.length - i, y, height, slots });
+        y += height;
+      });
+    } else {
+      const slotsPerShelf = (cols + backCols) * bpc;
+      const count = (layerMode === 'front' ? cols : backCols) * bpc;
+      const offset = layerMode === 'front' ? 0 : cols * bpc;
+      const height = BOTTLE_RY * 2 + SHELF_PAD_Y * 2;
+      perRow = Math.max(1, count);
+      for (let displayIdx = 0; displayIdx < rows; displayIdx++) {
+        const shelfBase = displayIdx * slotsPerShelf;
+        const slots = [];
+        for (let c = 1; c <= count; c++) {
+          slots.push({ position: shelfBase + offset + c, cx: slotX(c - 1), cy: height / 2 });
+        }
+        shelves.push({ number: rows - displayIdx, y, height, slots });
+        y += height;
+      }
+    }
+    // For a cabinet perRow already counts the half bottle a nested bay pokes
+    // out (cabinetBayUnits; the back row sits straight behind the front here).
+    const width = SHELF_LABEL_W + BOTTLE_GAP + perRow * (BOTTLE_RX * 2 + BOTTLE_GAP);
+    return { shelves, width, height: y };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCabinet, rows, cols, backCols, bpc, twoDeep, stagger, layerMode, rack?.typeConfig?.shelfRows,
+    rack?.typeConfig?.shelfCols, rack?.typeConfig?.shelfAlternate, rack?.typeConfig?.alternate, rowPitch, colPitch]);
 
   // Absolute svg coords of every visible oval on the active layer — the
   // drag hit map (mirrors the geometry in the render loop below).
   const slotCenters = useMemo(() => {
     const centers = [];
-    const count = (layerMode === 'front' ? cols : backCols) * bpc;
-    const offset = layerMode === 'front' ? 0 : cols * bpc;
-    for (let displayIdx = 0; displayIdx < rows; displayIdx++) {
-      const shelfBase = displayIdx * slotsPerShelf;
-      for (let c = 1; c <= count; c++) {
-        centers.push({
-          position: shelfBase + offset + c,
-          cx: SHELF_LABEL_W + BOTTLE_GAP + BOTTLE_RX + (c - 1) * (BOTTLE_RX * 2 + BOTTLE_GAP),
-          cy: displayIdx * shelfRowHeight + shelfRowHeight / 2,
-          r: BOTTLE_RY,
-        });
-      }
+    for (const sh of geometry.shelves) {
+      for (const sl of sh.slots) centers.push({ position: sl.position, cx: sl.cx, cy: sh.y + sl.cy, r: BOTTLE_RY });
     }
     return centers;
-  }, [rows, cols, backCols, bpc, slotsPerShelf, layerMode, shelfRowHeight]);
+  }, [geometry]);
 
   const { drag, startDrag, shouldSuppressClick } = useSlotDrag({
     svgRef,
     slotCenters,
     isValidTarget: (pos) => !disabledSet.has(pos),
     onMove: onSlotMove,
-    enabled: !!onSlotMove && isShelf,
+    enabled: !!onSlotMove && (isShelf || isCabinet),
   });
 
   // A click that lands right after a drop must not open the slot popup.
@@ -106,27 +167,18 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
     return m;
   }, [rack?.zones]);
 
-  if (!isShelf) {
+  if (!isShelf && !isCabinet) {
     return (
       <div className="shelf-view-empty">
-        Shelf view is only available for Open Shelf racks. Switch back to the compact view to see this rack.
+        Shelf view is only available for Open Shelf and Wine cabinet racks. Switch back to the compact view to see this rack.
       </div>
     );
   }
 
-  const shelves = [];
-  for (let displayIdx = 0; displayIdx < rows; displayIdx++) {
-    const shelfNumber = rows - displayIdx;
-    const shelfBase = displayIdx * slotsPerShelf;
-    const slotsForLayer = [];
-    const slotCount = layerMode === 'front' ? cols * bpc : backCols * bpc;
-    const offset = layerMode === 'front' ? 0 : cols * bpc;
-    for (let c = 1; c <= slotCount; c++) {
-      const position = shelfBase + offset + c;
-      slotsForLayer.push({ position, slot: slotMap[position] || null });
-    }
-    shelves.push({ number: shelfNumber, slots: slotsForLayer, y: displayIdx * shelfRowHeight });
-  }
+  const shelves = geometry.shelves.map((sh) => ({
+    ...sh,
+    slots: sh.slots.map((sl) => ({ ...sl, slot: slotMap[sl.position] || null })),
+  }));
 
   return (
     <div className="shelf-view">
@@ -151,7 +203,11 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
             </button>
           </div>
           <div className="shelf-view-hint">
-            Top-down view — bottle necks toward {layerMode === 'front' ? 'you' : 'the back of the rack'}
+            {isCabinet
+              ? (layerMode === 'front'
+                ? 'Front of the cabinet — the front row of every level'
+                : 'Front of the cabinet — the back row behind the front bottles')
+              : `Top-down view — bottle necks toward ${layerMode === 'front' ? 'you' : 'the back of the rack'}`}
           </div>
         </div>
       )}
@@ -162,7 +218,7 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
         <svg
           ref={svgRef}
           className={`shelf-view-svg ${drag ? 'shelf-view-svg--dragging' : ''}`}
-          viewBox={`0 0 ${shelfRowWidth} ${totalHeight}`}
+          viewBox={`0 0 ${geometry.width} ${geometry.height}`}
           width="100%"
         >
           {shelves.map(shelf => (
@@ -170,8 +226,8 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
               <rect
                 x={SHELF_LABEL_W - 4}
                 y={SHELF_PAD_Y / 2}
-                width={shelfRowWidth - SHELF_LABEL_W}
-                height={shelfRowHeight - SHELF_PAD_Y}
+                width={geometry.width - SHELF_LABEL_W}
+                height={shelf.height - SHELF_PAD_Y}
                 rx={6}
                 fill="#D4BA94"
                 stroke="#B89A6E"
@@ -180,16 +236,15 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
               />
               <text
                 x={SHELF_LABEL_W - 12}
-                y={shelfRowHeight / 2}
+                y={shelf.height / 2}
                 textAnchor="end"
                 dominantBaseline="central"
                 className="shelf-view-shelf-label"
               >
                 Shelf {shelf.number}
               </text>
-              {shelf.slots.map((s, i) => {
-                const cx = SHELF_LABEL_W + BOTTLE_GAP + BOTTLE_RX + i * (BOTTLE_RX * 2 + BOTTLE_GAP);
-                const cy = shelfRowHeight / 2;
+              {shelf.slots.map((s) => {
+                const { cx, cy } = s;
                 return (
                   <BottleOval
                     key={s.position}
@@ -215,7 +270,7 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
           {/* Drag ghost — a floating oval that follows the pointer */}
           {drag && (() => {
             const originSlot = slotMap[drag.from];
-            const wineType = originSlot?.bottle?.wineDefinition?.type || 'red';
+            const wineType = swatchType(originSlot?.bottle?.wineDefinition, 'red');
             const colors = WINE_COLORS[wineType] || WINE_COLORS.red;
             const custom = getSlotStyle && originSlot ? getSlotStyle(originSlot) : null;
             return (
@@ -242,7 +297,7 @@ function BottleOval({ cx, cy, slot, position, disabled, isActive, isHighlight, o
   const { t } = useTranslation();
   const bottle = slot?.bottle;
   const wine = bottle?.wineDefinition;
-  const wineType = wine?.type || 'red';
+  const wineType = swatchType(wine, 'red');
   const colors = bottle ? (WINE_COLORS[wineType] || WINE_COLORS.red) : null;
   const filled = !!bottle;
   // Lens/search style: overrides fill/stroke/text for filled ovals, dims

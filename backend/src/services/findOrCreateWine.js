@@ -28,6 +28,7 @@ const DRAFT_TTL_MS = DRAFT_TTL_DAYS * 24 * 60 * 60 * 1000;
 const { scoreAllMatches } = require('./wineMatching');
 const { canonicalizeWineName } = require('../utils/producerPrefix');
 const { computeCanonicalKey, canonicalSiblingPrefix } = require('../utils/wineIdentity');
+const { WINE_COLOURS } = require('../utils/wineColour');
 const { buildSurfaceForms, inferGrapeIds } = require('./grapeInference');
 const { isLabelVariant, grapeTokenSet } = require('./labelVariantMatch');
 const { resolveCanonicalProducerSpelling } = require('./producerSpelling');
@@ -98,6 +99,33 @@ const MAX_FIELD = 200;
 // Mirrors the route's cap so the import callers, which have none, get it too.
 const MAX_GRAPES = 20;
 
+/**
+ * The curated Appellation that a REGION-column string actually names, if any.
+ *
+ * Imports and label scans put appellations in the region column all the time
+ * ("Pauillac", "Fleurie", "Prosecco", "Cerasuolo d'Abruzzo"): the exporting
+ * app had one geography field, or the model thought at appellation
+ * granularity. The 2026-09-08 region review cleared 237 minted regions and
+ * 117 of them were appellations; the 09-12 import refilled the queue within
+ * a day. Country-scoped, canonical name or synonym, same key fold as the
+ * appellation resolver. Match-only: this never mints an Appellation.
+ */
+async function appellationInRegionColumn(rawName, countryId) {
+  const name = sanitizeTaxonomyName(rawName);
+  if (!name || isUnknownName(name) || !countryId) return null;
+  const key = normalizeAppellationKey(name);
+  if (!key) return null;
+  // Same ambiguity doctrine as regionForAppellation: TWO docs answering one
+  // key (a synonym collision) means the taxonomy holds a duplicate — never
+  // pick one arbitrarily; fall through to the ordinary region path instead
+  // (audit 2026-09-14 L5).
+  const hits = await Appellation.find({
+    country: countryId,
+    $or: [{ normalizedName: key }, { normalizedSynonyms: key }],
+  }).limit(2).lean();
+  return hits.length === 1 ? hits[0] : null;
+}
+
 async function findOrCreateRegion(rawName, countryId, userId) {
   const name = sanitizeTaxonomyName(rawName);
   // "Unknown"/placeholder → null region (the schema's representation of unknown)
@@ -111,6 +139,17 @@ async function findOrCreateRegion(rawName, countryId, userId) {
     $or: [{ normalizedName }, { normalizedSynonyms: normalizedName }],
   });
   if (region) return region;
+  // An appellation in the region column resolves to the region the
+  // appellation belongs to — "Fleurie" lands on Beaujolais, never on a new
+  // region called Fleurie. An appellation the taxonomy has not placed yet
+  // yields null: the string IS an appellation, so minting a region named
+  // after it would be wrong regardless (Johan, 2026-09-08; see
+  // appellationInRegionColumn). The wine's appellation field is filled by
+  // the create path, which knows whether it was empty.
+  const appellation = await appellationInRegionColumn(name, countryId);
+  if (appellation) {
+    return appellation.region ? Region.findOne({ _id: appellation.region }) : null;
+  }
   // Mint gates (registry audit 2026-07-26 RC-8). A comma means the caller
   // packed a hierarchy into one string ("Bordeaux, Haut-Médoc", "Niagara
   // Peninsula, Ontario") — never a region name; and a region that IS a
@@ -348,7 +387,7 @@ async function unpolluteEstateName({ name, producer, appellation, classification
 // re-runs them at publish), and the row keys into the per-creator 'draft~'
 // namespace. `excludeId`: the publish-time re-check passes the draft's own id
 // so no stage can match the draft against itself.
-async function findOrCreateWine({ name, producer, country, region, appellation, type, grapes, classification }, userId, { confirmCreate = false, skipSiblingMatch = false, matchOnly = false, createdVia = null, allowPending = false, provenance = null, draft = false, excludeId = null } = {}) {
+async function findOrCreateWine({ name, producer, country, region, appellation, type, colour, grapes, classification }, userId, { confirmCreate = false, skipSiblingMatch = false, matchOnly = false, createdVia = null, allowPending = false, provenance = null, draft = false, excludeId = null } = {}) {
   // Internal whitespace collapses too, not just the ends: a double space is
   // invisible in every UI and every normalized key, so "Wrights  Estate" and
   // "Wrights Estate" would otherwise coexist as two display spellings forever
@@ -421,6 +460,28 @@ async function findOrCreateWine({ name, producer, country, region, appellation, 
       trimmedName = shifted.name.slice(0, MAX_FIELD);
       trimmedAppellation = shifted.appellation || trimmedAppellation;
       classification = shifted.classification;
+    }
+  }
+
+  // An appellation typed in the REGION column fills an empty appellation
+  // field ("Fleurie" in region, nothing in appellation → appellation Fleurie;
+  // the region itself resolves to Beaujolais in findOrCreateRegion). Done
+  // BEFORE matching so the corrected identity drives the dedup keys: the
+  // same row imported twice must land on one record. Read-only country
+  // lookup — a country the taxonomy lacks has no appellations to match.
+  if (!trimmedAppellation && typeof region === 'string' && region.trim() && typeof country === 'string' && country.trim()) {
+    const countryForAppellation = await Country.findOne({ normalizedName: normalizeString(resolveCountryName(country.trim())) });
+    const fromRegionColumn = countryForAppellation
+      ? await appellationInRegionColumn(region, countryForAppellation._id)
+      : null;
+    if (fromRegionColumn) {
+      trimmedAppellation = fromRegionColumn.name;
+      // The value came from the region column, so the appellation's
+      // provenance is the region's — whatever the caller claimed for an
+      // appellation it never had ('model' is the import's default).
+      if (provenance && provenance.region) {
+        provenance = { ...provenance, appellation: provenance.region };
+      }
     }
   }
 
@@ -921,6 +982,10 @@ async function findOrCreateWine({ name, producer, country, region, appellation, 
 
   const validTypes = ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'];
   const wineType = validTypes.includes(type) ? type : 'red';
+  // A stated colour (sparkling/dessert/fortified only — the model hook drops it
+  // on any other type, and infers rosé from the name when none is stated).
+  // Stored on creates only, like classification: never matched or keyed on.
+  const wineColour = WINE_COLOURS.includes(colour) ? colour : null;
 
   // Classification is display/curation data, not identity: stored on creates
   // only, never matched or keyed on. Same whitespace fold + cap as the
@@ -937,6 +1002,7 @@ async function findOrCreateWine({ name, producer, country, region, appellation, 
     appellation: trimmedAppellation || null,
     classification: trimmedClassification,
     type: wineType,
+    colour: wineColour,
     grapes: grapeIds,
     normalizedKey: mintKey,
     createdBy: userId,
@@ -1004,6 +1070,7 @@ module.exports = {
   findOrCreateRegion,
   findOrCreateGrapes,
   regionForAppellation,
+  appellationInRegionColumn,
   pendingProducerKey,
   pendingWineKey,
   draftWineKey,

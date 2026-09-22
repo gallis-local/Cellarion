@@ -46,7 +46,7 @@ const { unlinkImageFiles, safeUploadPath } = require('./imageProcessor');
 const { sanitizeImageBuffer, detectImageFormat } = require('./imageSanitizer');
 const { ORIGINALS_DIR, PROCESSED_DIR } = require('../config/upload');
 const { planRackCreations, placeBottlesInRack, DEFAULT_ANCHOR } = require('../utils/rackImport');
-const { getMaxPosition } = require('../utils/rackGeometry');
+const { getMaxPosition, cabinetShelfRows, cabinetShelfCols, cabinetShelfAlternate } = require('../utils/rackGeometry');
 const { resolveRating } = require('../utils/ratingUtils');
 const { normalizeBottleSize, DEFAULT_SIZE } = require('../config/bottleSizes');
 const { stripHtml } = require('../utils/sanitize');
@@ -327,6 +327,19 @@ async function createRacks(cellarId, userId, cellar, items, result) {
       cols: clampDim(spec?.cols || inf.cols, 1),
     };
     if (spec?.typeConfig) rackData.typeConfig = spec.typeConfig;
+    // A cabinet from a (possibly hand-edited) export is stored with a fitted,
+    // bounded shelf list — never a missing, short or million-entry one.
+    if (safeType === 'cabinet') {
+      rackData.typeConfig = {
+        ...(rackData.typeConfig || {}),
+        shelfRows: cabinetShelfRows(rackData.rows, rackData.typeConfig),
+        twoDeep: rackData.typeConfig?.twoDeep !== false,
+        stagger: rackData.typeConfig?.stagger !== false,
+        alternate: rackData.typeConfig?.alternate === true,
+        ...(Array.isArray(rackData.typeConfig?.shelfCols) ? { shelfCols: cabinetShelfCols(rackData.rows, rackData.cols, rackData.typeConfig) } : {}),
+        ...(Array.isArray(rackData.typeConfig?.shelfAlternate) ? { shelfAlternate: cabinetShelfAlternate(rackData.rows, rackData.typeConfig) } : {}),
+      };
+    }
     if (typeof spec?.group === 'string' && spec.group.trim()) rackData.group = spec.group.trim().slice(0, 40);
     const rackDoc = new Rack(rackData);
     // Restore disabled (unusable) positions, clamped to the created geometry.
@@ -391,7 +404,7 @@ async function resolveWine(item, userId, cache, result, demoMode = false) {
       // of being minted as "Chardonnay — Chardonnay". Demo mode is matchOnly,
       // so it never reaches the mint and can't create pending rows either.
       { name, producer, country: item.country, region: item.region,
-        appellation: item.appellation, type: item.type,
+        appellation: item.appellation, type: item.type, colour: item.colour,
         grapes: Array.isArray(item.grapes) ? item.grapes : [] },
       userId,
       // demo: match existing only; else match >= 0.95 or create. allowPending:
