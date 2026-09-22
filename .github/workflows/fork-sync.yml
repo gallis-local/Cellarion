@@ -14,7 +14,7 @@ name: Sync fork with upstream
 
 on:
   schedule:
-    - cron: "17 13 * * *" # daily, offset off the hour
+    - cron: "17 13 * * 0" # weekly, Sunday, offset off the hour
   workflow_dispatch: {}
 
 permissions:
