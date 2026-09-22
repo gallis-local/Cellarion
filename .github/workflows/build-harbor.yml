@@ -4,15 +4,24 @@ name: Build & push to Harbor
 # which is what the gitops-argocd deployment actually pulls from (not GHCR --
 # see release-docker.yml, which pushes to GHCR only and predates this file).
 # GitHub-hosted runners cannot reach core.harbor.e.gallis.cloud (confirmed:
-# `context deadline exceeded`), so this uses the org's self-hosted runner pool
-# via the shared gallis-local/actions reusable workflow, same pattern as
-# gitops-ai's mcp-* build workflows.
+# `context deadline exceeded`), so this uses the org's self-hosted runner pool.
 #
-# version-strategy: github-release resolves the latest release tag on
-# jagduvi1/Cellarion (upstream) for image tagging/dedup -- it does NOT pull
-# upstream's code. This repo's own `main` must actually contain that release's
-# code for the tag to mean anything; see fork-sync.yml for how `main` stays
-# current.
+# Steps below are inlined from gallis-local/actions/.github/workflows/docker
+# -build.yml rather than called via `uses:` -- that repo is private, and
+# GitHub does not allow a forked repository to call a private reusable
+# workflow cross-repo even within the same org (confirmed: "error parsing
+# called workflow" / "workflow was not found", persisted with the source
+# repo's Access setting already correctly scoped to the gallis-local org).
+# Detaching Cellarion from its upstream fork relationship would have fixed
+# that, but at the cost of deleting and recreating the repo (losing PR/issue
+# history) just to keep re-using a shared template -- not worth it for what
+# amounts to convenience. If the shared workflow improves later, this file
+# won't automatically inherit that; re-sync by hand if it matters.
+#
+# The latest-release lookup (queries jagduvi1/Cellarion for image tagging/
+# dedup) does NOT pull upstream's code -- this repo's own `main` must
+# actually contain that release's code for the tag to mean anything; see
+# fork-sync.yml for how `main` stays current.
 
 on:
   push:
@@ -29,33 +38,117 @@ on:
         type: boolean
         default: false
 
+env:
+  REGISTRY: core.harbor.e.gallis.cloud
+  UPSTREAM_REPO: jagduvi1/Cellarion
+
 jobs:
-  backend:
-    uses: gallis-local/actions/.github/workflows/docker-build.yml@main
-    with:
-      image-name: gallis/cellarion-backend
-      build-context: ./backend
-      version-strategy: github-release
-      upstream-repo: jagduvi1/Cellarion
-      force-build: ${{ inputs.force-build || false }}
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: backend
+            context: ./backend
+            build_arg: ""
+          - image: frontend
+            context: ./frontend
+            build_arg: APP_VERSION
+          - image: rembg
+            context: ./rembg
+            build_arg: ""
+    runs-on: [self-hosted, x64]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE_NAME: gallis/cellarion-${{ matrix.image }}
 
-  frontend:
-    uses: gallis-local/actions/.github/workflows/docker-build.yml@main
-    with:
-      image-name: gallis/cellarion-frontend
-      build-context: ./frontend
-      version-strategy: github-release
-      upstream-repo: jagduvi1/Cellarion
-      force-build: ${{ inputs.force-build || false }}
-      # Frontend needs its own version baked in at build time (footer, API
-      # calls) -- matches release-docker.yml's existing APP_VERSION arg.
-      version-build-arg: APP_VERSION
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-  rembg:
-    uses: gallis-local/actions/.github/workflows/docker-build.yml@main
-    with:
-      image-name: gallis/cellarion-rembg
-      build-context: ./rembg
-      version-strategy: github-release
-      upstream-repo: jagduvi1/Cellarion
-      force-build: ${{ inputs.force-build || false }}
+      - name: Setup HashiCorp Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4
+        with:
+          url: ${{ vars.VAULT_ADDR }}
+          method: jwt
+          role: github-actions-role
+          path: github-actions
+          exportToken: false
+          secrets: |
+            prod-kubernetes/data/github/harbor/harbor-arm harbor-github-password | HARBOR_PASSWORD ;
+            prod-kubernetes/data/github/harbor/harbor-arm harbor-github-username | HARBOR_USERNAME ;
+
+      - name: Resolve version (latest jagduvi1/Cellarion release)
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(curl -sL -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" | jq -r '.tag_name')
+          [[ -n "$VERSION" && "$VERSION" != "null" ]] || { echo "Failed to resolve latest release on ${UPSTREAM_REPO}." >&2; exit 1; }
+          VERSION="${VERSION#v}"
+          echo "Resolved version: ${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if version already built
+        id: check_version
+        env:
+          FORCE_BUILD: ${{ inputs.force-build || false }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$FORCE_BUILD" == "true" || "${{ github.event_name }}" == "push" ]]; then
+            echo "Force build or push trigger -- proceeding with build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if docker manifest inspect "${REGISTRY}/${IMAGE_NAME}:${VERSION}" &> /dev/null; then
+            echo "${VERSION} already exists in registry -- skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: ${{ steps.check_version.outputs.should_build == 'true' }}
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          driver-opts: network=host
+
+      - name: Login to Harbor Registry
+        if: ${{ steps.check_version.outputs.should_build == 'true' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ env.HARBOR_USERNAME }}
+          password: ${{ env.HARBOR_PASSWORD }}
+
+      - name: Extract metadata for Docker
+        if: ${{ steps.check_version.outputs.should_build == 'true' }}
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push
+        if: ${{ steps.check_version.outputs.should_build == 'true' }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ${{ matrix.build_arg != '' && format('{0}={1}', matrix.build_arg, steps.version.outputs.version) || '' }}
+          provenance: false
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Build skipped (version already exists)
+        if: ${{ steps.check_version.outputs.should_build == 'false' }}
+        run: echo "Version ${{ steps.version.outputs.version }} already exists in registry -- skipped." >> "$GITHUB_STEP_SUMMARY"
