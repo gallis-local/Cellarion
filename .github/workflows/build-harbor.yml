@@ -1,0 +1,61 @@
+name: Build & push to Harbor
+
+# Builds backend/frontend/rembg and pushes to core.harbor.e.gallis.cloud/gallis/*,
+# which is what the gitops-argocd deployment actually pulls from (not GHCR --
+# see release-docker.yml, which pushes to GHCR only and predates this file).
+# GitHub-hosted runners cannot reach core.harbor.e.gallis.cloud (confirmed:
+# `context deadline exceeded`), so this uses the org's self-hosted runner pool
+# via the shared gallis-local/actions reusable workflow, same pattern as
+# gitops-ai's mcp-* build workflows.
+#
+# version-strategy: github-release resolves the latest release tag on
+# jagduvi1/Cellarion (upstream) for image tagging/dedup -- it does NOT pull
+# upstream's code. This repo's own `main` must actually contain that release's
+# code for the tag to mean anything; see fork-sync.yml for how `main` stays
+# current.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "rembg/**"
+      - ".github/workflows/build-harbor.yml"
+  workflow_dispatch:
+    inputs:
+      force-build:
+        description: "Rebuild even if this version already exists in Harbor"
+        type: boolean
+        default: false
+
+jobs:
+  backend:
+    uses: gallis-local/actions/.github/workflows/docker-build.yml@main
+    with:
+      image-name: gallis/cellarion-backend
+      build-context: ./backend
+      version-strategy: github-release
+      upstream-repo: jagduvi1/Cellarion
+      force-build: ${{ inputs.force-build || false }}
+
+  frontend:
+    uses: gallis-local/actions/.github/workflows/docker-build.yml@main
+    with:
+      image-name: gallis/cellarion-frontend
+      build-context: ./frontend
+      version-strategy: github-release
+      upstream-repo: jagduvi1/Cellarion
+      force-build: ${{ inputs.force-build || false }}
+      # Frontend needs its own version baked in at build time (footer, API
+      # calls) -- matches release-docker.yml's existing APP_VERSION arg.
+      version-build-arg: APP_VERSION
+
+  rembg:
+    uses: gallis-local/actions/.github/workflows/docker-build.yml@main
+    with:
+      image-name: gallis/cellarion-rembg
+      build-context: ./rembg
+      version-strategy: github-release
+      upstream-repo: jagduvi1/Cellarion
+      force-build: ${{ inputs.force-build || false }}
