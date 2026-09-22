@@ -1,0 +1,45 @@
+name: Sync fork with upstream
+
+# Fast-forwards main to jagduvi1/Cellarion's main. This fork carries zero
+# commits of its own (verified before this workflow was added: `gh api
+# repos/gallis-local/Cellarion/compare/main...jagduvi1:Cellarion:main` showed
+# ahead_by > 0 / behind_by 0), so a fast-forward is always safe and never
+# needs conflict handling -- if that ever stops being true (someone commits
+# directly to this fork), the push step below will simply fail non-fast-
+# -forward rather than silently discarding local work.
+#
+# A no-op run (already current) does not push, so it does not spuriously
+# trigger build-harbor.yml. No workflow anywhere else in gallis-local does
+# this today; it's fork-specific, not a copy of an existing pattern.
+
+on:
+  schedule:
+    - cron: "17 13 * * *" # daily, offset off the hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: [self-hosted, x64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fast-forward main to upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/jagduvi1/Cellarion.git
+          git fetch upstream main
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          if [[ "$BEHIND" == "0" ]]; then
+            echo "Already current with upstream."
+            exit 0
+          fi
+          echo "Fast-forwarding $BEHIND commit(s) from upstream/main."
+          git merge --ff-only upstream/main
+          git push origin main
