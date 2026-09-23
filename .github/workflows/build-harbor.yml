@@ -81,6 +81,13 @@ jobs:
             prod-kubernetes/data/github/harbor/harbor-arm harbor-github-password | HARBOR_PASSWORD ;
             prod-kubernetes/data/github/harbor/harbor-arm harbor-github-username | HARBOR_USERNAME ;
 
+      - name: Login to Harbor Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ env.HARBOR_USERNAME }}
+          password: ${{ env.HARBOR_PASSWORD }}
+
       - name: Resolve version (latest jagduvi1/Cellarion release)
         id: version
         run: |
@@ -104,6 +111,10 @@ jobs:
             echo "should_build=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Login above ensures this check is authenticated -- Harbor requires
+          # credentials to read manifests on this private project, so running
+          # this before login always looked like "not built yet" and defeated
+          # the dedup skip.
           if docker manifest inspect "${REGISTRY}/${IMAGE_NAME}:${VERSION}" &> /dev/null; then
             echo "${VERSION} already exists in registry -- skipping build."
             echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -116,14 +127,6 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
         with:
           driver-opts: network=host
-
-      - name: Login to Harbor Registry
-        if: ${{ steps.check_version.outputs.should_build == 'true' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ env.HARBOR_USERNAME }}
-          password: ${{ env.HARBOR_PASSWORD }}
 
       - name: Extract metadata for Docker
         if: ${{ steps.check_version.outputs.should_build == 'true' }}
