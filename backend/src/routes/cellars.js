@@ -159,6 +159,91 @@ async function loadBottlesInOrder(ids, populate = WINE_POPULATE_LIST) {
   return docs.sort((a, b) => order.get(a._id.toString()) - order.get(b._id.toString()));
 }
 
+// The history page's sections: why a bottle left, as the page groups it —
+// its consumedReason, else its status; anything unknown counts as other.
+const HISTORY_REASONS = ['drank', 'gifted', 'sold', 'other'];
+function reasonOf(b) {
+  const reason = b.consumedReason || b.status;
+  return HISTORY_REASONS.includes(reason) ? reason : 'other';
+}
+function countReasons(bottles) {
+  const counts = { drank: 0, gifted: 0, sold: 0, other: 0 };
+  for (const b of bottles) counts[reasonOf(b)] += 1;
+  return counts;
+}
+
+// The history's order: newest consumedAt first, a bottle without one last,
+// the newer _id first on a tie (a bulk "mark as drunk" or an import stamps
+// many bottles with one date). The same order as MongoDB's
+// .sort({ consumedAt: -1, _id: -1 }), so both can page one list.
+function historyOrder(a, b) {
+  const at = a.consumedAt ? new Date(a.consumedAt).getTime() : null;
+  const bt = b.consumedAt ? new Date(b.consumedAt).getTime() : null;
+  if (at !== bt) {
+    if (at === null) return 1;
+    if (bt === null) return -1;
+    return bt - at;
+  }
+  const ai = String(a._id);
+  const bi = String(b._id);
+  return ai < bi ? 1 : ai > bi ? -1 : 0;
+}
+
+// ?before=<consumedAt ISO, or empty>|<bottle id>: the last bottle a section
+// shows. Its next page starts after that bottle's place in the order, not
+// after a count, so a bottle consumed or restored between two pages — or a
+// page the app's cache kept from an earlier visit — can't make the next page
+// repeat or skip bottles.
+function parseHistoryCursor(value) {
+  if (typeof value !== 'string') return null;
+  const [at, id] = value.split('|');
+  if (!id || !mongoose.isValidObjectId(id)) return null;
+  const consumedAt = at ? new Date(at) : null;
+  if (consumedAt && Number.isNaN(consumedAt.getTime())) return null;
+  return { consumedAt, _id: id.toLowerCase() };
+}
+
+// One page of `list` (in the history's order): only one section's bottles
+// when `reason` is set, starting after `cursor`, else after `skip` bottles.
+function sliceHistory(list, { reason = null, cursor = null, skip = 0, limit }) {
+  const section = reason ? list.filter(b => reasonOf(b) === reason) : list;
+  let start = skip;
+  if (cursor) {
+    const at = section.findIndex(b => historyOrder(b, cursor) > 0);
+    start = at < 0 ? section.length : at;
+  }
+  const page = section.slice(start, start + limit);
+  return { page, remaining: Math.max(0, section.length - start - page.length) };
+}
+
+/**
+ * One page of a history: every matching bottle's order and reason first (four
+ * fields), then only the page in full. The total and per-reason counts cover
+ * everything `match` selects; `remaining` counts what comes after the page.
+ */
+async function pageHistory(match, paging) {
+  const light = await Bottle.find(match)
+    .select('_id consumedAt consumedReason status')
+    .sort({ consumedAt: -1, _id: -1 })
+    .limit(10000)
+    .lean();
+  const { page, remaining } = sliceHistory(light, paging);
+  const bottles = await loadBottlesInOrder(page.map(b => b._id));
+  return { bottles, total: light.length, reasonCounts: countReasons(light), remaining };
+}
+
+// ?limit pages a history. The first page is the newest bottles of every
+// section; a section's next page asks for ?reason=<section>&before=<its last
+// bottle>. (?skip pages by count, as elsewhere.) Only the first page carries
+// the filter modal's facets — the pages after it reuse them.
+function historyPaging(query) {
+  if (query.limit === undefined) return null;
+  const { limit, offset: skip } = parsePagination(query, { limit: 50, maxLimit: 200 });
+  const reason = HISTORY_REASONS.includes(query.reason) ? query.reason : null;
+  const cursor = parseHistoryCursor(query.before);
+  return { limit, skip, reason, cursor, continuing: !!(reason || cursor || skip > 0) };
+}
+
 // Resolve every cellar the user can read (owned + shared), as lean docs.
 async function resolveAccessibleCellars(userId) {
   return Cellar.find({
@@ -169,7 +254,8 @@ async function resolveAccessibleCellars(userId) {
 
 const MATURITY_RANK_MULTI = { declining: 0, late: 1, peak: 2, early: 3, 'not-ready': 4 };
 
-async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginate = true, version }) {
+// `history` (historyPaging's answer) pages a history instead of `paginate`.
+async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginate = true, history = null, version }) {
   // Coerce every query param to a string up front: Express turns repeated
   // (?sort=a&sort=b) or bracketed (?search[$gt]=x) params into arrays/objects,
   // which would blow up sort.startsWith / search.toLowerCase with a 500.
@@ -246,6 +332,20 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
       const items = await loadBottlesInOrder(found.ids.slice(skip, skip + limit));
       return { items, total: found.ids.length, limit, skip, maturityStatusMap: null, found };
     }
+  }
+
+  // ── HISTORY PAGE: as the single-cellar history pages — every match's order
+  // and reason (four fields), then only the page in full. The rating and
+  // chart filters (not offered on the history page) read whole bottles, so
+  // they take the path below.
+  if (history && !minRating && !maxRating && !extraFilters) {
+    const page = await pageHistory(found
+      ? { _id: { $in: found.ids } }
+      : { cellar: { $in: objectIds }, status: statusMongo }, history);
+    return { items: page.bottles, total: page.total, reasonCounts: page.reasonCounts, remaining: page.remaining, found };
+  }
+
+  if (found) {
     bottles = await loadBottlesInOrder(found.ids);
   } else {
     // ── LIST: no search — rating / maturity / chart filters or an in-memory sort ──
@@ -281,7 +381,7 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
   // ── Sort ──
   if (statusFilter === 'consumed') {
     // History is a chronological view — newest-consumed first, always.
-    bottles.sort((a, b) => new Date(b.consumedAt || 0) - new Date(a.consumedAt || 0));
+    bottles.sort(historyOrder);
   } else if (sortField === 'name') {
     bottles.sort((a, b) => {
       const av = (a.wineDefinition?.name || '').toLowerCase();
@@ -304,9 +404,13 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
   }
 
   const total = bottles.length;
-  const items = paginate ? bottles.slice(skip, skip + limit) : bottles;
+  // History pages show counts per reason for the whole (filtered) history.
+  const reasonCounts = statusFilter === 'consumed' ? countReasons(bottles) : undefined;
+  let items = paginate ? bottles.slice(skip, skip + limit) : bottles;
+  let remaining;
+  if (history) ({ page: items, remaining } = sliceHistory(bottles, history));
   // `found` carries the search's facet counts, so the caller needs no second pass.
-  return { items, total, limit, skip, maturityStatusMap, found };
+  return { items, total, limit, skip, maturityStatusMap, found, reasonCounts, remaining };
 }
 
 // Attach the same per-bottle image fields the single-cellar /:id route adds, so
@@ -566,11 +670,15 @@ router.get('/multi/history', async (req, res) => {
     const cellarIds = [...new Set(requested)].filter(id => accessibleMap.has(id));
     if (cellarIds.length === 0) return res.status(403).json({ error: 'No accessible cellars selected' });
 
-    const { items, found } = await queryBottlesAcrossCellars(req, {
-      cellarIds, statusFilter: 'consumed', paginate: false,
+    // ?limit pages it, as the single-cellar history does; without it, all.
+    const history = historyPaging(req.query);
+    const { items, found, total, reasonCounts, remaining } = await queryBottlesAcrossCellars(req, {
+      cellarIds, statusFilter: 'consumed', paginate: false, history,
       version: scopeVersion(cellarIds.map(id => accessibleMap.get(id).user)),
     });
-    const { facets, baseFacets, facetMeta } = await facetsAcrossCellars({ cellarIds, statusFilter: 'consumed', found });
+    const { facets, baseFacets, facetMeta } = history && history.continuing
+      ? {}
+      : await facetsAcrossCellars({ cellarIds, statusFilter: 'consumed', found });
 
     for (const b of items) {
       const c = accessibleMap.get(String(b.cellar));
@@ -584,6 +692,9 @@ router.get('/multi/history', async (req, res) => {
         return { _id: id, name: c.name, userColor: getUserColor(c, req.user.id) };
       }),
       bottles: items,
+      total,
+      reasonCounts,
+      remaining,
       facets, baseFacets, facetMeta,
     });
   } catch (error) {
@@ -780,8 +891,18 @@ router.get('/:id/history', async (req, res) => {
       : [];
     const hasSearchFilters = !!(search || type || country || region || grapes || vintage || appellation);
 
+    // ?limit pages the history (see historyPaging), with the total and the
+    // per-reason counts the page's summary shows. A history imported from
+    // another app can hold thousands of bottles, all sent and rendered at once
+    // before. Without ?limit, the whole history (up to 10k) as before, for
+    // callers that expect it.
+    const paging = historyPaging(req.query);
+
     let bottles;
     let found = null;
+    let total;
+    let reasonCounts;
+    let remaining;
     if (hasSearchFilters) {
       // Text search (typo-tolerant) + the wine filters — services/bottleSearch.
       found = await bottleSearch.searchBottles(search || '', {
@@ -797,6 +918,12 @@ router.get('/:id/history', async (req, res) => {
         offset: 0,
         version: scopeVersion([cellar.user]),
       });
+    }
+    if (paging) {
+      ({ bottles, total, reasonCounts, remaining } = await pageHistory(found
+        ? { _id: { $in: found.ids } }
+        : { cellar: req.params.id, status: { $in: CONSUMED_STATUSES } }, paging));
+    } else if (found) {
       bottles = await loadBottlesInOrder(found.ids);
       // History is a chronological view — newest-consumed first, not relevance.
       bottles.sort((a, b) => new Date(b.consumedAt || 0) - new Date(a.consumedAt || 0));
@@ -809,10 +936,17 @@ router.get('/:id/history', async (req, res) => {
         .limit(10000)
         .lean();
     }
+    if (!paging) {
+      total = bottles.length;
+      reasonCounts = countReasons(bottles);
+    }
 
     // Facets for the filter modal: the search counted them already; a plain
-    // history page counts them in one grouping query.
-    const facetSource = found || await bottleSearch.bottleFacets({ cellarId: req.params.id, statusFilter: 'consumed' });
+    // history page counts them in one grouping query. A section's next page
+    // needs none — the page keeps the first page's.
+    const facetSource = paging && paging.continuing
+      ? null
+      : found || await bottleSearch.bottleFacets({ cellarId: req.params.id, statusFilter: 'consumed' });
 
     const cellarObj = cellar.toObject();
     cellarObj.userRole = role;
@@ -820,9 +954,12 @@ router.get('/:id/history', async (req, res) => {
     res.json({
       cellar: cellarObj,
       bottles,
-      facets: facetSource.facetDistribution,
-      baseFacets: facetSource.baseFacetDistribution,
-      facetMeta: facetSource.facetMeta,
+      total,
+      reasonCounts,
+      remaining,
+      facets: facetSource?.facetDistribution,
+      baseFacets: facetSource?.baseFacetDistribution,
+      facetMeta: facetSource?.facetMeta,
     });
   } catch (error) {
     console.error('Get cellar history error:', error);
