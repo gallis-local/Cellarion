@@ -38,7 +38,8 @@ const ALLOWED_RATING_SCALES = ['5', '20', '100'];
 const ALLOWED_RACK_NAV = ['auto', 'room', 'rack'];
 const ALLOWED_RESTOCK_SCOPE = ['all', 'cellar'];
 const ALLOWED_VISIBILITY = ['public', 'private'];
-const { SUPPORT_CATEGORIES } = require('../config/constants');
+const { SUPPORT_CATEGORIES, CELLAR_SORTS } = require('../config/constants');
+const ALLOWED_CELLAR_SORTS = CELLAR_SORTS;
 
 const err = (status, message) => ({ status, message });
 
@@ -50,7 +51,7 @@ const err = (status, message) => ({ status, message });
  * the user. Returns { update } or { error }.
  */
 async function buildPreferencesUpdate(userId, body = {}) {
-  const { currency, language, ratingScale, rackNavigation, restockScope, defaultCellarId, notifications } = body;
+  const { currency, language, ratingScale, rackNavigation, restockScope, cellarSort, defaultCellarId, notifications } = body;
   const update = {};
 
   // Notifications: per-category × per-channel booleans, explicitly allow-listed
@@ -76,6 +77,17 @@ async function buildPreferencesUpdate(userId, body = {}) {
     const cf = notifications.communityFollow;
     if (cf && typeof cf === 'object') {
       if (cf.push !== undefined) setLeaf('communityFollow.push', cf.push);
+    }
+    const sr = notifications.supportReply;
+    if (sr && typeof sr === 'object') {
+      if (sr.email !== undefined) setLeaf('supportReply.email', sr.email);
+    }
+    // Turning any email back on withdraws the blanket objection the one-click
+    // unsubscribe recorded (User.emailOptOutAt): from here on the per-category
+    // switches decide. Turning one off never sets it — that is a per-category
+    // choice, the unsubscribe link is the objection (audit 2026-09-27 M7).
+    if (Object.entries(update).some(([k, v]) => k.endsWith('.email') && v === true)) {
+      update.emailOptOutAt = null;
     }
   }
 
@@ -112,6 +124,13 @@ async function buildPreferencesUpdate(userId, body = {}) {
       return { error: err(400, 'Invalid restock scope. Allowed: all, cellar') };
     }
     update['preferences.restockScope'] = restockScope;
+  }
+
+  if (cellarSort !== undefined) {
+    if (!ALLOWED_CELLAR_SORTS.includes(cellarSort)) {
+      return { error: err(400, `Invalid cellar sort. Allowed: ${ALLOWED_CELLAR_SORTS.join(', ')}`) };
+    }
+    update['preferences.cellarSort'] = cellarSort;
   }
 
   if (defaultCellarId !== undefined) {
@@ -314,17 +333,24 @@ function isOwnUploadUrl(value) {
   }
 }
 
-function validateImageRef(image) {
+// A wine record never stores its picture inline (allowInline: false): a
+// data: URI of up to half a megabyte rode along in every list and page that
+// showed the wine. A photo attached to a request becomes a file at approval
+// (routes/admin/wineRequests.js).
+function validateImageRef(image, { allowInline = true } = {}) {
+  const shapes = allowInline ? 'an http(s) link or an inline image' : 'an http(s) link or an uploaded file';
   if (image == null || image === '') return null;
-  if (typeof image !== 'string') return 'Image must be an http(s) link or an inline image';
+  if (typeof image !== 'string') return `Image must be ${shapes}`;
   if (image.length > MAX_IMAGE_REF_LENGTH) return 'Image reference is too large';
-  if (INLINE_IMAGE.test(image)) return null;
+  if (INLINE_IMAGE.test(image)) {
+    return allowInline ? null : 'A wine picture cannot be stored inline; upload it or use a link';
+  }
   if (image.startsWith('/')) {
-    return isOwnUploadPath(image) ? null : 'Image must be an http(s) link or an inline image';
+    return isOwnUploadPath(image) ? null : `Image must be ${shapes}`;
   }
   if (isOwnUploadUrl(image)) return null;
   const urlErr = validateSourceUrl(image);
-  if (urlErr) return `Image must be an http(s) link or an inline image (${urlErr})`;
+  if (urlErr) return `Image must be ${shapes} (${urlErr})`;
   return null;
 }
 
@@ -381,6 +407,7 @@ module.exports = {
   ALLOWED_RATING_SCALES,
   ALLOWED_RACK_NAV,
   ALLOWED_RESTOCK_SCOPE,
+  ALLOWED_CELLAR_SORTS,
   ALLOWED_VISIBILITY,
   SUPPORT_CATEGORIES,
 };

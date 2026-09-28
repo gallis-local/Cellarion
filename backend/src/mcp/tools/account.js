@@ -30,7 +30,7 @@ const RETRY_NOTE = (readBack) =>
 const {
   updatePreferences, updateProfile, createSupportTicket, replyToTicket, createWineRequest,
   ALLOWED_CURRENCIES, LANGUAGE_TAG, LANGUAGE_TAG_MAX, ALLOWED_RATING_SCALES,
-  ALLOWED_RACK_NAV, ALLOWED_RESTOCK_SCOPE, ALLOWED_VISIBILITY, SUPPORT_CATEGORIES,
+  ALLOWED_RACK_NAV, ALLOWED_RESTOCK_SCOPE, ALLOWED_CELLAR_SORTS, ALLOWED_VISIBILITY, SUPPORT_CATEGORIES,
   TICKET_REPLY_CAP,
 } = require('../../services/accountOps');
 
@@ -44,12 +44,14 @@ function prefsView(user) {
     rating_scale: p.ratingScale || '5',
     rack_navigation: p.rackNavigation || 'auto',
     restock_scope: p.restockScope || 'all',
+    cellar_sort: ALLOWED_CELLAR_SORTS.includes(p.cellarSort) ? p.cellarSort : '-createdAt',
     default_cellar_id: p.defaultCellarId || null,
     notifications: {
       drink_window: { enabled: n.drinkWindow?.enabled ?? true, email: !!n.drinkWindow?.email, push: !!n.drinkWindow?.push },
       community_reply: { email: !!n.communityReply?.email, push: n.communityReply?.push ?? true },
       community_mention: { email: !!n.communityMention?.email, push: n.communityMention?.push ?? true },
       community_follow: { push: n.communityFollow?.push ?? true },
+      support_reply: { email: n.supportReply?.email ?? true },
     },
   };
 }
@@ -80,6 +82,7 @@ const NOTIFICATION_SHAPE = z.object({
   communityReply: z.object({ email: z.boolean().optional(), push: z.boolean().optional() }).optional(),
   communityMention: z.object({ email: z.boolean().optional(), push: z.boolean().optional() }).optional(),
   communityFollow: z.object({ push: z.boolean().optional() }).optional(),
+  supportReply: z.object({ email: z.boolean().optional() }).optional(),
 }).optional();
 
 registerTool({
@@ -87,7 +90,8 @@ registerTool({
   title: 'Get account preferences',
   description:
     'The user\'s display and notification settings: preferred currency, interface language, rating scale ' +
-    '(5 / 20 / 100), rack-navigation mode, restock-alert scope, default cellar, and per-category email/push ' +
+    '(5 / 20 / 100), rack-navigation mode, restock-alert scope, the order a cellar\'s bottle list opens in, ' +
+    'default cellar, and per-category email/push ' +
     'notification toggles. Call this EARLY so you format money in their currency and ratings on their scale, and ' +
     'before changing any setting so you know the current value.',
   scope: 'read',
@@ -107,7 +111,8 @@ registerTool({
     `Changes one or more settings; send only the fields to change. currency (a 3-letter code from ${ALLOWED_CURRENCIES.slice(0, 6).join('/')}…), ` +
     `language (a language tag such as en/sv/fr — the interface falls back to English wherever that language ` +
     `is not translated yet), rating_scale (${ALLOWED_RATING_SCALES.join('/')}), rack_navigation ` +
-    `(${ALLOWED_RACK_NAV.join('/')}), restock_scope (${ALLOWED_RESTOCK_SCOPE.join('/')}), default_cellar_id (a cellar the ` +
+    `(${ALLOWED_RACK_NAV.join('/')}), restock_scope (${ALLOWED_RESTOCK_SCOPE.join('/')}), cellar_sort (the order a ` +
+    `cellar's bottle list opens in: ${ALLOWED_CELLAR_SORTS.join('/')}; a leading "-" is descending), default_cellar_id (a cellar the ` +
     'user owns, or null to clear), and notification email/push toggles. Confirm the change with the user first. ' +
     'Cosmetic and reversible — the response echoes the new settings, so set a value back to undo.',
   scope: 'write',
@@ -118,6 +123,7 @@ registerTool({
     rating_scale: z.enum(['5', '20', '100']).optional(),
     rack_navigation: z.enum(['auto', 'room', 'rack']).optional(),
     restock_scope: z.enum(['all', 'cellar']).optional(),
+    cellar_sort: z.enum(ALLOWED_CELLAR_SORTS).optional(),
     default_cellar_id: z.string().regex(/^[a-f0-9]{24}$/i).nullable().optional(),
     notifications: NOTIFICATION_SHAPE,
   },
@@ -130,6 +136,7 @@ registerTool({
     if (args.rating_scale !== undefined) body.ratingScale = args.rating_scale;
     if (args.rack_navigation !== undefined) body.rackNavigation = args.rack_navigation;
     if (args.restock_scope !== undefined) body.restockScope = args.restock_scope;
+    if (args.cellar_sort !== undefined) body.cellarSort = args.cellar_sort;
     if (args.default_cellar_id !== undefined) body.defaultCellarId = args.default_cellar_id;
     if (args.notifications !== undefined) body.notifications = args.notifications;
 
@@ -214,7 +221,7 @@ registerTool({
       ticket_id: ticket._id,
       category: ticket.category,
       status: ticket.status,
-      note: 'A Cellarion admin will respond — check back with list_my_tickets (replies also arrive as a notification and in the web app under Settings → Support).',
+      note: 'A Cellarion admin will respond — check back with list_my_tickets (replies also arrive as a notification, by email unless the user turned support-reply emails off, and in the web app under Settings → Support).',
     });
     await logAction(ctx, {
       tool: 'create_support_ticket', action: 'support_ticket',
@@ -336,7 +343,7 @@ registerTool({
   inputSchema: {
     wine_name: z.string().min(1).max(300).describe('The wine name as printed on the label / source'),
     source_url: z.string().min(1).max(2048).describe('An http(s) link to a page describing the wine (required)'),
-    image_url: z.string().max(500000).optional().describe('Optional image URL or data reference for the wine'),
+    image_url: z.string().max(500000).optional().describe('Optional picture of the wine: an http(s) link or an inline data:image. An admin reviews it; on approval it may become the picture of the wine in the shared registry, visible to all Cellarion users'),
     idempotency_key: IDEMPOTENCY_KEY,
   },
   handler: async (args, ctx) => {

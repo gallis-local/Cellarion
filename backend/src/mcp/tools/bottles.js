@@ -1,17 +1,12 @@
 // Bottle read tools: search/list, one-bottle detail, and the drinking log.
 //
-// Scoping contract — IDENTICAL on the Meili and Mongo paths (the search index
-// has no per-user field, so a user filter there could only run AFTER
-// pagination, silently shortening pages and inflating totals):
+// Scoping contract — IDENTICAL on the search and list paths (a scope applied
+// AFTER pagination would silently shorten pages and inflate totals):
 //  - without cellar_id → ALL bottles in cellars the user OWNS — the cellar-view
 //    semantics of the UI, including bottles shared-cellar editors added into
 //    the user's own cellars;
 //  - with cellar_id    → all bottles of that cellar after a member/owner
 //    access check (same as the per-cellar routes).
-//
-// services/search (Meilisearch) is required LAZILY inside the handler — the
-// meilisearch package is ESM-only and a top-level require would drag it into
-// every jest suite that loads the tool registry (the #702 failure mode).
 const { z } = require('zod');
 const Bottle = require('../../models/Bottle');
 const Cellar = require('../../models/Cellar');
@@ -24,6 +19,8 @@ const {
   wineSummary, bottleSummary, pageParams, hasContent,
 } = require('../toolUtil');
 const { photosForBottle, photoPresence } = require('../../services/photoState');
+const { openQuestionForRecipient } = require('../../services/ownerInquiryOps');
+const bottleSearch = require('../../services/bottleSearch');
 
 function statusToMongo(status) {
   if (status === 'all') return {};
@@ -48,17 +45,17 @@ registerTool({
   scope: 'read',
   annotations: { readOnlyHint: true, openWorldHint: false },
   // No min_rating filter on purpose: stored ratings are on per-bottle scales
-  // (5/20/100) and the search index holds the RAW value, so a server-side
-  // threshold compares across scales incorrectly (REST normalizes in memory).
-  // Ratings ship in every result; the calling model filters better than a
-  // wrong index query would. A normalized filter can come with Phase 3.
+  // (5/20/100) and the bottle carries the RAW value, so a server-side
+  // threshold would compare across scales incorrectly (REST normalizes in
+  // memory). Ratings ship in every result; the calling model filters better
+  // than a wrong query would. A normalized filter can come with Phase 3.
   inputSchema: {
     query: z.string().max(200).optional().describe('Free-text search (name, producer, region, grape…)'),
     cellar_id: objectId.optional().describe('Restrict to one cellar (any cellar you own or are a member of)'),
     status: z.enum(['active', 'consumed', 'all']).default('active'),
-    // Alphanumeric only: the search index silently DROPS non-alphanumeric
-    // vintage filters while Mongo would exact-match them — rejecting here
-    // keeps the two paths agreeing instead of quietly diverging.
+    // Alphanumeric only — a vintage is a year or "NV". The search path and
+    // the list path below both exact-match it; rejecting anything else here
+    // keeps a stray punctuation mark from reading as "no vintage matches".
     vintage: z.string().regex(/^[A-Za-z0-9]{1,10}$/, 'alphanumeric, e.g. "2015" or "NV"').optional()
       .describe('e.g. "2015" or "NV"'),
     type: z.enum(['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified']).optional(),
@@ -70,6 +67,10 @@ registerTool({
   handler: async (args, ctx) => {
     const { limit, offset } = pageParams(args, 20, 50);
     const warnings = [];
+    // Trimmed once, here: a whitespace-only query is no query — it must take
+    // the "newest first" default, not the ranked path with nothing to rank by
+    // (release audit 2026-09-27, L: it returned oldest-first).
+    const query = String(args.query || '').trim();
 
     // Resolve the cellar scope first (access model in the header comment).
     let cellarIds;
@@ -92,50 +93,42 @@ registerTool({
       });
     }
 
-    // Meilisearch path — handles text + all filters with correct pagination.
-    // The reserved filter lives only on the bottle document (not in the search
-    // index), and filtering after pagination would shorten pages and inflate
-    // totals — so a reserved filter forces the Mongo path, dropping free-text
-    // matching with an explicit warning (same degradation style as below).
-    const searchService = require('../../services/search');
-    if (args.query && args.reserved) {
+    // Search path — services/bottleSearch handles the text and the status /
+    // type / vintage filters with correct pagination (newest first when there
+    // is no text to rank by). The reserved filter lives only on the bottle
+    // document and filtering after pagination would shorten pages and inflate
+    // totals — so a reserved filter takes the list path below, dropping
+    // free-text matching with an explicit warning.
+    if (query && args.reserved) {
       warnings.push('reserved filter runs on the database path — free-text matching was skipped for this query.');
     }
-    if (args.query && !args.reserved && searchService.getIsAvailable()) {
-      try {
-        const res = await searchService.searchBottles(args.query, {
-          cellarIds: cellarIds.map(String),
-          statusFilter: args.status || 'active',
-          type: args.type,
-          vintage: args.vintage,
-          limit,
-          offset,
-        });
-        // Hydration re-asserts the SAME cellar scope the Meili query carried.
-        // That cannot shorten a page or inflate a total in normal operation
-        // (the ids already satisfy it) — it only drops a hit whose index
-        // document is stale, i.e. a bottle that has since moved out of scope,
-        // which is exactly what must never be shown. No OTHER filter belongs
-        // here: anything not in the Meili query would be filter-after-paginate.
-        const docs = await Bottle.find({ _id: { $in: res.ids }, cellar: { $in: cellarIds } })
-          .populate(WINE_POPULATE_LIST).lean();
-        const byId = new Map(docs.map((d) => [String(d._id), d]));
-        const ordered = res.ids.map((id) => byId.get(String(id))).filter(Boolean);
-        const items = await withPhotoFlag(ctx.user.id, ordered, warnings);
-        return ok(`${items.length} of ${res.estimatedTotalHits} matching bottle(s)`, items, {
-          page: { limit, offset, total: res.estimatedTotalHits },
-          ...(warnings.length ? { warnings } : {}),
-        });
-      } catch (err) {
-        warnings.push('Text search engine unavailable — fell back to basic filters without free-text matching.');
-      }
-    } else if (args.query && !args.reserved) {
-      warnings.push('Text search engine unavailable — fell back to basic filters without free-text matching.');
+    if ((query || args.type) && !args.reserved) {
+      const res = await bottleSearch.searchBottles(query, {
+        cellarIds: cellarIds.map(String),
+        statusFilter: args.status || 'active',
+        type: args.type,
+        vintage: args.vintage,
+        sort: query ? undefined : '-createdAt',
+        limit,
+        offset,
+      });
+      // Hydration re-asserts the SAME cellar scope the search ran on, so a
+      // bottle moved out of scope in between is never shown. No OTHER filter
+      // belongs here: anything not in the search would be filter-after-paginate.
+      const docs = await Bottle.find({ _id: { $in: res.ids }, cellar: { $in: cellarIds } })
+        .populate(WINE_POPULATE_LIST).lean();
+      const byId = new Map(docs.map((d) => [String(d._id), d]));
+      const ordered = res.ids.map((id) => byId.get(String(id))).filter(Boolean);
+      const items = await withPhotoFlag(ctx.user.id, ordered, warnings);
+      return ok(`${items.length} of ${res.total} matching bottle(s)`, items, {
+        page: { limit, offset, total: res.total },
+        ...(warnings.length ? { warnings } : {}),
+      });
     }
 
-    // Mongo fallback: cellar/status/vintage are DB-filterable; type lives on
-    // the populated wine, so it is dropped with an explicit warning rather
-    // than half-applied.
+    // List path: cellar/status/vintage/reserved are DB-filterable; type lives
+    // on the populated wine and the search cannot take the reserved filter, so
+    // type is dropped here with an explicit warning rather than half-applied.
     const filter = {
       cellar: { $in: cellarIds },
       ...statusToMongo(args.status),
@@ -154,7 +147,7 @@ registerTool({
       filter.reservedFor = { $in: [null, ''] };
       filter.reservedUntil = null;
     }
-    if (args.type) warnings.push('type filter requires the search engine — ignored in this response.');
+    if (args.type) warnings.push('type filter cannot be combined with reserved — ignored in this response.');
     const [total, docs] = await Promise.all([
       Bottle.countDocuments(filter),
       Bottle.find(filter).populate(WINE_POPULATE_LIST)
@@ -232,7 +225,9 @@ registerTool({
     'consumption info if consumed, and photos — every photo that applies to the bottle with its state (queued, ' +
     'processing, awaiting_review, published, rejected), so an upload can be confirmed and a duplicate avoided; ' +
     'photos.label_scans lists the frames the user scanned to identify the wine. The URLs are for people; to SEE ' +
-    'a photo yourself (read a label, check an ABV), pass its image_id to get_photo. ' +
+    'a photo yourself (read a label, check an ABV), pass its image_id to get_photo. open_curator_question, when ' +
+    'present, is a question a curator asked this user about the wine\'s record that they have not answered yet — ' +
+    'the bottle is in their hand, so relay it and answer with answer_curator_question. ' +
     'Call when the user asks about a specific bottle you already have a bottle_id for.',
   scope: 'read',
   annotations: { readOnlyHint: true, openWorldHint: false },
@@ -264,6 +259,27 @@ async function buildBottleDetail(userId, bottleId) {
     photos = await photosForBottle(userId, b);
   } catch (err) {
     photos = { error: 'photo lookup failed — retry get_bottle for the photo list' };
+  }
+  // A curator's unanswered question about this wine, addressed to this
+  // viewer (services/ownerInquiryOps): the moment they have the bottle in
+  // view is the moment they can read the back label. Absent, not null, when
+  // there is none — and the dossier never fails over it.
+  let openQuestion = null;
+  if (wd) {
+    try {
+      const q = await openQuestionForRecipient(userId, wd._id);
+      if (q) {
+        openQuestion = {
+          inquiry_id: q.inquiryId,
+          question: q.question,
+          asked_at: q.createdAt,
+          expires_at: q.expiresAt,
+          answer_with: 'answer_curator_question',
+        };
+      }
+    } catch (err) {
+      console.warn('[mcp] open-question lookup failed for bottle %s: %s', b._id, err.message);
+    }
   }
   return {
     summary: `${wd ? wd.name : 'Bottle'} ${b.vintage}`,
@@ -319,6 +335,7 @@ async function buildBottleDetail(userId, bottleId) {
       photos,
       cellar: { cellar_id: cellar._id, name: cellar.name, your_role: role },
       added_at: b.addedToCellarAt || b.createdAt,
+      ...(openQuestion ? { open_curator_question: openQuestion } : {}),
     },
   };
 }

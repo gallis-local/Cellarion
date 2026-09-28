@@ -182,6 +182,29 @@ describe('createEntry', () => {
     expect(PersonalDataEntry.create).not.toHaveBeenCalled();
   });
 
+  // Release audit 2026-09-27 (L): the key used to be minted before the value
+  // and the target's room were checked — a refused value left an orphan typed
+  // key with no entry, which then blocked the same name under another type.
+  test('a value the NEW key would refuse leaves no key behind', async () => {
+    PersonalDataKey.findOne.mockResolvedValue(null);
+    const res = await svc.createEntry(ME, bottle, {
+      level: 'wine', newKey: { name: 'ABV', type: 'decimal' }, value: 'strong',
+    });
+    expect(res).toMatchObject({ ok: false, code: 'invalid' });
+    expect(PersonalDataKey.create).not.toHaveBeenCalled();
+    expect(PersonalDataEntry.create).not.toHaveBeenCalled();
+  });
+
+  test('a full target refuses before a new key is minted', async () => {
+    PersonalDataKey.findOne.mockResolvedValue(null);
+    PersonalDataEntry.countDocuments.mockResolvedValue(svc.ENTRIES_PER_TARGET);
+    const res = await svc.createEntry(ME, bottle, {
+      level: 'wine', newKey: { name: 'ABV', type: 'decimal' }, value: 13.5,
+    });
+    expect(res).toMatchObject({ ok: false, code: 'limit' });
+    expect(PersonalDataKey.create).not.toHaveBeenCalled();
+  });
+
   test('per-target entry cap enforced', async () => {
     PersonalDataKey.findOne.mockResolvedValue(abvKey);
     PersonalDataEntry.countDocuments.mockResolvedValue(svc.ENTRIES_PER_TARGET);
@@ -196,6 +219,105 @@ describe('createEntry', () => {
     const res = await svc.createEntry(ME, bottle, { level: 'wine', keyId: KEY_ID, value: 13.5 });
     expect(res).toMatchObject({ ok: false, code: 'not_found' });
     expect(PersonalDataKey.findOne).toHaveBeenCalledWith({ _id: { $eq: KEY_ID }, user: ME });
+  });
+});
+
+/**
+ * The add-bottle form (user ticket 6ab05cca) posts the same WINE-level field
+ * once per bottle of a batch and re-posts it on a retry. Without this, a
+ * six-bottle add wrote six identical ABV rows onto one wine record.
+ */
+describe('createEntry — dedupe', () => {
+  const vintageBottle = { _id: BOTTLE_ID, wineDefinition: WINE, vintage: '2019' };
+
+  test('the SAME value in the same slot returns the existing row, not a second one', async () => {
+    PersonalDataKey.findOne.mockResolvedValue(abvKey);
+    PersonalDataEntry.findOne.mockReturnValue(chain(entryDoc()));
+
+    const res = await svc.createEntry(
+      ME, bottle, { level: 'wine', newKey: { name: 'ABV', type: 'decimal' }, value: 13.5 },
+      { dedupe: true }
+    );
+
+    expect(res).toMatchObject({ ok: true, deduped: true });
+    expect(res.entry.value).toBe(13.5);
+    expect(PersonalDataEntry.create).not.toHaveBeenCalled();
+  });
+
+  test('a DIFFERENT value is a conflict, never a silent discard', async () => {
+    // Swallowing it would lose what the user typed with no trace, and the add
+    // form cannot show them the value already stored to choose between them.
+    PersonalDataKey.findOne.mockResolvedValue(abvKey);
+    PersonalDataEntry.findOne.mockReturnValue(chain(entryDoc({ value: 14 })));
+
+    const res = await svc.createEntry(
+      ME, bottle, { level: 'wine', newKey: { name: 'ABV', type: 'decimal' }, value: 13.5 },
+      { dedupe: true }
+    );
+
+    expect(res).toMatchObject({ ok: false, code: 'conflict' });
+    expect(res.message).toMatch(/already recorded "ABV" here as 14/);
+    expect(PersonalDataEntry.create).not.toHaveBeenCalled();
+  });
+
+  test('the comparison is on the CAST value — "13,5" equals a stored 13.5', async () => {
+    PersonalDataKey.findOne.mockResolvedValue(abvKey);
+    PersonalDataEntry.findOne.mockReturnValue(chain(entryDoc({ value: 13.5 })));
+
+    const res = await svc.createEntry(
+      ME, bottle, { level: 'wine', newKey: { name: 'ABV', type: 'decimal' }, value: '13,5' },
+      { dedupe: true }
+    );
+
+    expect(res).toMatchObject({ ok: true, deduped: true });
+  });
+
+  test('matches on the VINTAGE slot — a 2019 override does not satisfy the wine-wide default', async () => {
+    PersonalDataKey.findOne.mockResolvedValue(abvKey);
+    PersonalDataEntry.findOne.mockReturnValue(chain(null));
+    PersonalDataEntry.create.mockResolvedValue(entryDoc({ vintage: '2019' }));
+
+    const res = await svc.createEntry(
+      ME, vintageBottle,
+      { level: 'wine', newKey: { name: 'ABV', type: 'decimal' }, value: 13.5, vintageScoped: true },
+      { dedupe: true }
+    );
+
+    expect(res.ok).toBe(true);
+    expect(res.deduped).toBeUndefined();
+    expect(PersonalDataEntry.findOne).toHaveBeenCalledWith({
+      author: ME, key: KEY_ID, wineDefinition: WINE, vintage: '2019',
+    });
+    expect(PersonalDataEntry.create).toHaveBeenCalledWith(
+      expect.objectContaining({ vintage: '2019' })
+    );
+  });
+
+  test('off by default — the bottle page keeps being allowed to repeat a key', async () => {
+    PersonalDataKey.findOne.mockResolvedValue(abvKey);
+    PersonalDataEntry.create.mockResolvedValue(entryDoc());
+
+    const res = await svc.createEntry(ME, bottle, {
+      level: 'wine', newKey: { name: 'ABV', type: 'decimal' }, value: 13.5,
+    });
+
+    expect(res.ok).toBe(true);
+    expect(PersonalDataEntry.findOne).not.toHaveBeenCalled();
+    expect(PersonalDataEntry.create).toHaveBeenCalled();
+  });
+
+  test('a deduped hit does not consume the per-target entry cap', async () => {
+    PersonalDataKey.findOne.mockResolvedValue(abvKey);
+    PersonalDataEntry.findOne.mockReturnValue(chain(entryDoc()));
+    // At the cap already: a fresh write would fail, a dedupe hit must not.
+    PersonalDataEntry.countDocuments.mockResolvedValue(20);
+
+    const res = await svc.createEntry(
+      ME, bottle, { level: 'wine', newKey: { name: 'ABV', type: 'decimal' }, value: 13.5 },
+      { dedupe: true }
+    );
+
+    expect(res).toMatchObject({ ok: true, deduped: true });
   });
 });
 

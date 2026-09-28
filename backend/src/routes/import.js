@@ -1497,7 +1497,9 @@ router.post('/confirm', async (req, res) => {
           }
           await rack.save();
           createdRacks.push({ name, type: safeType, rows, cols, typeConfig: override?.typeConfig });
-          logAudit(req, 'rack.create', { type: 'rack', id: rack._id }, { source: 'import', name });
+          // cellarId: an editor's import changes the OWNER's cellar, so the
+          // owner's caches (offline copy, search, stats) must move too.
+          logAudit(req, 'rack.create', { type: 'rack', id: rack._id, cellarId: cellar._id }, { source: 'import', name });
         }
       }
     } catch (err) {
@@ -1520,7 +1522,6 @@ router.post('/confirm', async (req, res) => {
     const wishlistSeen = new Set();
     const skipped = [];
     const errors = [];
-    const createdBottleIds = []; // Track IDs for Meilisearch bulk sync
     // Dedup map: "wineName|producer" -> WineRequest doc created in this batch
     const pendingRequestCache = new Map();
     // Dedup map for AI-proposed NEW wines confirmed at review: an import file
@@ -1792,8 +1793,6 @@ router.post('/confirm', async (req, res) => {
 
           await bottle.save();
           created++;
-          // Index every created bottle (consumed history rows too — H3).
-          createdBottleIds.push(bottle._id);
           if (item.addToHistory) {
             createdHistory++;
           } else {
@@ -1889,10 +1888,6 @@ router.post('/confirm', async (req, res) => {
 
         await bottle.save();
         created++;
-        // Index EVERY created bottle for Meilisearch, consumed history rows
-        // included — the History tab searches/filters via Meili, so leaving
-        // them out made imported consumed bottles unsearchable (grand-audit H3).
-        createdBottleIds.push(bottle._id);
         if (item.addToHistory) {
           createdHistory++;
         } else {
@@ -1914,9 +1909,6 @@ router.post('/confirm', async (req, res) => {
         errors.push({ index: i, reason: err.message });
       }
     }
-
-    // Bulk-index created bottles in Meilisearch (fire-and-forget)
-    searchService.bulkIndexBottles(createdBottleIds);
 
     // Per-rack two-pass placement: for each rack referenced in this import,
     // assign each item to its requested slot first (or, for shelf racks, the
@@ -1993,7 +1985,9 @@ router.post('/confirm', async (req, res) => {
       }
     }
 
-    logAudit(req, 'bottle.import', { type: 'cellar', id: cellarId }, {
+    // cellarId as well as id: that is what moves the owner's data version
+    // when an editor of a shared cellar imports (services/audit).
+    logAudit(req, 'bottle.import', { type: 'cellar', id: cellarId, cellarId: cellar._id }, {
       created,
       createdActive,
       createdHistory,

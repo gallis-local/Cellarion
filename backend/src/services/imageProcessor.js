@@ -1,8 +1,11 @@
 const fs = require('fs');
 const path = require('path');
+const { writeFileAtomic } = require('../utils/atomicWrite');
 const crypto = require('crypto');
 const { PROCESSED_DIR } = require('../config/upload');
 const BottleImage = require('../models/BottleImage');
+const { unlinkThumbFor, warmThumbFor, sweepOrphanThumbs } = require('./thumbnails');
+const { encodeKeptPhoto, prepareRembgInput, KEPT_EXTENSION } = require('./photoFormat');
 
 /**
  * SHA-256 (hex) of an image's bytes — the dedup key stored on BottleImage.contentHash.
@@ -62,6 +65,9 @@ async function unlinkIfUnreferenced(imageId, url) {
       console.warn(`[images] could not unlink ${url}:`, err.message);
     }
   }
+  // Its card thumbnail (services/thumbnails) goes with it — a no-op for a file
+  // that never had one.
+  await unlinkThumbFor(url);
   return true;
 }
 
@@ -108,6 +114,9 @@ async function discardOriginal(image) {
   if (image.originalUrl === image.processedUrl) return;
   const url = image.originalUrl;
   await unlinkIfUnreferenced(image._id, url);
+  // An original can have a thumbnail too (a card showed it while the photo
+  // was still 'uploaded'); it goes with the file.
+  await unlinkThumbFor(url);
   try {
     await BottleImage.updateOne({ _id: image._id, originalUrl: url }, { $set: { originalUrl: null } });
   } catch (err) {
@@ -116,7 +125,27 @@ async function discardOriginal(image) {
   image.originalUrl = null;
 }
 
+// Background removals in progress — graceful shutdown (services/shutdown)
+// lets them finish, so a deploy no longer strands a photo in 'processing'
+// until the hourly cleanup resets it for a manual retry.
+const inFlight = new Set();
+
 async function processImage(imageId) {
+  const run = runProcessImage(imageId);
+  inFlight.add(run);
+  try {
+    return await run;
+  } finally {
+    inFlight.delete(run);
+  }
+}
+
+/** Resolves once no background removal is running — including ones started while waiting. */
+async function whenProcessingIdle() {
+  while (inFlight.size > 0) await Promise.allSettled([...inFlight]);
+}
+
+async function runProcessImage(imageId) {
   const image = await BottleImage.findById(imageId);
   if (!image) return;
   // A label scan is curation evidence kept exactly as received — never sent
@@ -151,10 +180,14 @@ async function processImage(imageId) {
     const originalPath = safeUploadPath(image.originalUrl.replace('/api/uploads/', ''));
     const fileBuffer = fs.readFileSync(originalPath);
 
+    // rembg gets the frame scaled down to what is kept anyway — a full-size
+    // phone photo could exhaust its memory (services/photoFormat).
+    const input = await prepareRembgInput(fileBuffer);
+
     // Build multipart form data using Node 20 built-in fetch
     const formData = new FormData();
-    const blob = new Blob([fileBuffer], { type: 'image/jpeg' });
-    formData.append('image', blob, 'input.jpg');
+    const blob = new Blob([input.buffer], { type: input.type });
+    formData.append('image', blob, input.filename);
 
     const response = await fetch(`${REMBG_URL}/remove-bg`, {
       method: 'POST',
@@ -167,30 +200,39 @@ async function processImage(imageId) {
       throw new Error(`rembg returned ${response.status}: ${errText}`);
     }
 
-    // Save processed PNG
+    // rembg answers with a lossless PNG; what is kept is a WebP of it
+    // (services/photoFormat — about 8× smaller, transparency intact).
     const resultBuffer = Buffer.from(await response.arrayBuffer());
+    const keptBuffer = await encodeKeptPhoto(resultBuffer);
     const basename = path.basename(image.originalUrl, path.extname(image.originalUrl));
-    const processedFilename = `${basename}.png`;
+    const processedFilename = `${basename}.${KEPT_EXTENSION}`;
     const processedPath = path.join(PROCESSED_DIR, processedFilename);
 
-    fs.writeFileSync(processedPath, resultBuffer);
+    // Into a publicly served, immutably cached folder: never half-written.
+    await writeFileAtomic(processedPath, keptBuffer);
+    // A re-run (retry / admin reprocess) rewrites the same filename: drop the
+    // thumbnail rendered from the previous bytes so the next request re-renders.
+    await unlinkThumbFor(`/api/uploads/processed/${processedFilename}`);
+
+    // Official wine images (assignedToWine) may have been APPROVED before (or
+    // while) this job ran — admin-direct uploads are, and a web approval of an
+    // 'uploaded' image races it. Re-read the flag and the status (this job's
+    // doc snapshot predates the approval) BEFORE writing the settled status, so
+    // an approval that landed mid-run is kept rather than overwritten with
+    // 'processed' (release audit 2026-09-27, L); then upgrade the WINE's
+    // display image from the original to the clean processed version —
+    // previously an early approval pinned originalUrl on the wine forever.
+    const official = await BottleImage.findById(imageId).select('assignedToWine wineDefinition status');
 
     // Update document. The processed (cropped) image is now the version we keep
     // and export, so the dedup hash is computed from it (overriding the
     // original-bytes hash stamped at upload) — keeping it consistent with what a
     // cellar export carries and re-imports.
     image.processedUrl = `/api/uploads/processed/${processedFilename}`;
-    image.status = settledStatus;
-    image.contentHash = hashImageBytes(resultBuffer);
+    image.status = official?.status === 'approved' ? 'approved' : settledStatus;
+    image.contentHash = hashImageBytes(keptBuffer);
     await image.save();
 
-    // Official wine images (assignedToWine) may have been APPROVED before (or
-    // while) this job ran — admin-direct uploads are, and a web approval of an
-    // 'uploaded' image races it. Re-read the flag (this job's doc snapshot
-    // predates the approval), keep the approval, and upgrade the WINE's display
-    // image from the original to the clean processed version — previously an
-    // early approval pinned originalUrl on the wine forever.
-    const official = await BottleImage.findById(imageId).select('assignedToWine wineDefinition status');
     if (official?.assignedToWine && official.wineDefinition) {
       if (official.status !== 'approved') {
         await BottleImage.updateOne({ _id: imageId }, { status: 'approved' });
@@ -205,14 +247,24 @@ async function processImage(imageId) {
     // at a file that has just been deleted, even for a moment.
     await discardOriginal(image);
 
+    // Render the card thumbnail now, so the first cellar view after an upload
+    // reads a file instead of queueing a render. Best-effort: a miss here is
+    // rendered on first request as before.
+    await warmThumbFor(image.processedUrl);
+
     console.log(`Image ${imageId} processed successfully`);
   } catch (error) {
     console.error(`Image processing failed for ${imageId}:`, error.message);
     // Revert to the prior status so it can be retried (POST /api/images/:id/
     // retry accepts 'uploaded', and 'approved' with no processed file) — and
-    // never demote an official (assignedToWine) image's approval. The
-    // original stays on disk: it is the retry's source.
-    image.status = image.assignedToWine ? 'approved' : priorStatus;
+    // never demote an approval: an official (assignedToWine) image, or one
+    // approved while this job ran. Re-read, as the success path does: this
+    // job's doc snapshot can predate it (attachOfficialWineImage makes the row
+    // official right after starting this job). The original stays on disk:
+    // it is the retry's source.
+    const current = await BottleImage.findById(imageId).select('assignedToWine status').catch(() => null);
+    const keepApproved = image.assignedToWine || current?.assignedToWine || current?.status === 'approved';
+    image.status = keepApproved ? 'approved' : priorStatus;
     await image.save();
   }
 }
@@ -236,6 +288,13 @@ async function cleanupOrphanedImages() {
     );
     if (result.modifiedCount > 0) {
       console.log(`[cleanup] Reset ${result.modifiedCount} stuck processing images to uploaded`);
+    }
+
+    // Thumbnails whose source is gone (a deletion path that skipped
+    // unlinkThumbFor). Runs before the originals sweep, which can return early.
+    const thumbsRemoved = await sweepOrphanThumbs();
+    if (thumbsRemoved > 0) {
+      console.log(`[cleanup] Removed ${thumbsRemoved} orphaned thumbnails`);
     }
 
     // Remove orphaned files from disk (originals with no DB record)
@@ -277,4 +336,4 @@ async function cleanupOrphanedImages() {
   }
 }
 
-module.exports = { processImage, cleanupOrphanedImages, safeUploadPath, unlinkImageFiles, unlinkIfUnreferenced, discardOriginal, hashImageBytes };
+module.exports = { processImage, whenProcessingIdle, cleanupOrphanedImages, safeUploadPath, unlinkImageFiles, unlinkIfUnreferenced, discardOriginal, hashImageBytes };

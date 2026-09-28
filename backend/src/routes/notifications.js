@@ -11,8 +11,11 @@ router.use(requireAuth);
 router.get('/', async (req, res) => {
   try {
     const [notifications, unreadCount] = await Promise.all([
+      // _id breaks ties between rows created in the same millisecond (a burst
+      // of notifications), so the order — and the probe's newestId below — is
+      // stable between reads (release audit 2026-09-27, L).
       Notification.find({ user: req.user.id })
-        .sort({ createdAt: -1 })
+        .sort({ createdAt: -1, _id: -1 })
         .limit(30)
         .lean(),
       // Count across ALL rows, not just the returned page — older unread
@@ -27,13 +30,23 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET /api/notifications/unread-count - lightweight badge poll. The client
-// polls this instead of the full list so each tick is one indexed count
-// instead of 30 serialized documents.
+// GET /api/notifications/unread-count - lightweight probe. The client asks
+// this instead of the full list: the unread count for the badge, plus the id
+// of the newest notification. The id is what lets the client tell that the
+// list changed while the count stayed the same (one read on another device
+// while a new one arrives), so it can skip the list fetch when nothing did.
+// newestId uses the same index and sort as the list above, so it matches the
+// first row the list returns.
 router.get('/unread-count', async (req, res) => {
   try {
-    const unreadCount = await Notification.countDocuments({ user: req.user.id, read: false });
-    res.json({ unreadCount });
+    const [unreadCount, newest] = await Promise.all([
+      Notification.countDocuments({ user: req.user.id, read: false }),
+      Notification.findOne({ user: req.user.id })
+        .sort({ createdAt: -1, _id: -1 })
+        .select('_id')
+        .lean(),
+    ]);
+    res.json({ unreadCount, newestId: newest ? String(newest._id) : null });
   } catch (error) {
     console.error('Get unread count error:', error);
     res.status(500).json({ error: 'Failed to get unread count' });

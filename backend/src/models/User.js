@@ -1,5 +1,10 @@
 const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
+// Native bcrypt: hash/compare run on libuv's thread pool, so a login no longer
+// stalls every other request for ~0.3 s the way pure-JS bcryptjs did (scaling
+// audit 2026-09-25). Stored bcryptjs hashes ($2a$) verify unchanged, the
+// 72-byte truncation is the same, and bcryptjs can read the $2b$ hashes this
+// writes — see User.bcrypt.test.js.
+const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const { CURRENT_PRIVACY_POLICY_VERSION } = require('../config/legal');
 const { PLAN_NAMES } = require('../config/plans');
@@ -169,12 +174,30 @@ const userSchema = new mongoose.Schema({
         // New reply on a thread you're following (and didn't author).
         // Email skipped — would be too noisy.
         push:  { type: Boolean, default: true }
+      },
+      supportReply: {
+        // Support answered your ticket (2026-09-26). A service email about
+        // something you asked us, not a notification you opt into, so it is
+        // on by default: until now the answer only reached the in-app bell,
+        // and someone who asked and left never saw it. Settings turns it off,
+        // and so does the one-click unsubscribe (utils/notifications.js).
+        // No push: the bell already carries it inside the app.
+        email: { type: Boolean, default: true }
       }
     },
     restockScope: {
       type: String,
       enum: ['all', 'cellar'],
       default: 'all'
+    },
+    // The order the cellar page's bottle list opens in: the last sort the user
+    // picked there (support ticket 2026-09-26). Absent means newest first.
+    // Validated against CELLAR_SORTS in accountOps and deliberately not a
+    // schema enum: every sign-in saves the user document, so retiring a sort
+    // option later must never make an old stored value fail validation. The
+    // frontend ignores a value it doesn't offer.
+    cellarSort: {
+      type: String
     }
   },
   // One entry per signed-in device/browser (per-device sessions, 2026-09-04):
@@ -234,6 +257,17 @@ const userSchema = new mongoose.Schema({
   emailVerified: {
     type: Boolean,
     default: false
+  },
+  // When the user objected to ALL Cellarion email (the one-click unsubscribe
+  // link in every mail — utils/notifications.js). Every sender honours it on
+  // top of the per-category switches, so a category added after they clicked
+  // (support replies, 2026-09-26) is off for them too — the objection covers
+  // email as such, not the categories that existed that day (audit
+  // 2026-09-27 M7). Cleared when they turn any email back on in Settings
+  // (services/accountOps): from then on the per-category switches decide.
+  emailOptOutAt: {
+    type: Date,
+    default: null
   },
   emailVerificationTokenHash: {
     type: String,
@@ -451,8 +485,8 @@ userSchema.pre('save', async function(next) {
 
   // Ephemeral demo accounts skip the expensive bcrypt hash entirely: they never
   // password-login (JWT only, on an unroutable address), and under a burst of
-  // demo-logins N parallel cost-12 hashes on the single Node thread would degrade
-  // latency for everyone. The demo's random password is complexity-valid (so it
+  // demo-logins N parallel cost-12 hashes would eat the CPU (and the thread pool
+  // file and DNS work shares), degrading latency for everyone. The demo's random password is complexity-valid (so it
   // passes the schema validator, which re-runs on the later issueTokens save) but
   // is left UNHASHED — it is never used, and comparePassword returns false against
   // a non-bcrypt value, so it can never authenticate. (Do NOT substitute a fixed
@@ -550,6 +584,12 @@ userSchema.methods.toJSON = function() {
   // True when the user hasn't accepted the current privacy-policy version (older
   // version, never recorded, or not accepted at all) — the client prompts them to
   // review and acknowledge the update. Derived, never stored.
+  //
+  // Only the web app acts on it. An account used ONLY through an API token or
+  // an MCP connector never sees the prompt: those surfaces keep working after a
+  // policy bump, and the account's consent record stays on the old version
+  // until they next open the app (release audit 2026-09-27, L — recorded, not
+  // changed: blocking integrations on a re-acknowledgement is a product call).
   const pp = obj.gdprConsent?.privacyPolicy;
   obj.requiresPolicyReconsent = !pp?.accepted || (pp?.version || null) !== CURRENT_PRIVACY_POLICY_VERSION;
   // Surface the demo flag as a clean boolean so the frontend can show the

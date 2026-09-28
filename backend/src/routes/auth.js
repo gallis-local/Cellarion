@@ -1,6 +1,7 @@
 const express = require('express');
+const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const bcrypt = require('bcryptjs');
+const bcrypt = require('bcrypt');
 const rateLimit = require('express-rate-limit');
 const User = require('../models/User');
 const { requireAuth, requireNonDemo } = require('../middleware/auth');
@@ -11,7 +12,7 @@ const { revokeOAuthConnectionsForUser } = require('../services/mcpOAuth');
 const { CURRENT_PRIVACY_POLICY_VERSION } = require('../config/legal');
 const rateLimitsConfig = require('../config/rateLimits');
 const { sendVerificationEmail, sendPasswordResetEmail, sendAccountLockoutAlert, EMAIL_VERIFICATION_ENABLED } = require('../services/mailgun');
-const { isAccountLocked, recordLoginFailure, resetLoginAttempts } = require('../utils/loginAttempts');
+const { isAccountLocked, isAccountLockedNow, recordLoginFailure, resetLoginAttempts } = require('../utils/loginAttempts');
 const { rateLimitKey } = require('../utils/clientIp');
 // Token issuance + refresh-cookie handling and pending-share resolution are
 // extracted to services so the password flow (here) and the SSO flow
@@ -30,7 +31,7 @@ const router = express.Router();
 // cannot be used for account enumeration (L-1). It MUST be generated at
 // User.BCRYPT_COST (12) — a cheaper hash compares ~4x faster and reopens the
 // timing oracle. Regenerate if the cost ever changes:
-//   node -e "console.log(require('bcryptjs').hashSync(require('crypto').randomBytes(32).toString('hex'), 12))"
+//   node -e "console.log(require('bcrypt').hashSync(require('crypto').randomBytes(32).toString('hex'), 12))"
 const DUMMY_HASH = '$2a$12$KHe5z0O8iNPzEuBLuI.qQOzUxRhCDEIAkNnrno5lWxvC4andqTkfm';
 if (bcrypt.getRounds(DUMMY_HASH) !== User.BCRYPT_COST) {
   throw new Error(`DUMMY_HASH cost ${bcrypt.getRounds(DUMMY_HASH)} != BCRYPT_COST ${User.BCRYPT_COST} — regenerate DUMMY_HASH in routes/auth.js`);
@@ -185,9 +186,14 @@ router.post('/register', authLimiter, async (req, res) => {
     // Resolve any pending cellar shares for this email
     resolvePendingShares(user).catch(() => {});
 
+    // persistent, as /login and /refresh answer it: without it the app read the
+    // new account's session as browser-only and discarded the profile kept for
+    // an offline start (release audit 2026-09-27, L). Registration issues a
+    // "remember me" session (issueTokens' default).
     res.status(201).json({
       token: accessToken,
-      user: user.toJSON()
+      user: user.toJSON(),
+      persistent: true,
     });
   } catch (error) {
     if (error.name === 'ValidationError') {
@@ -226,7 +232,8 @@ router.post('/demo-login', demoLimiter, async (req, res) => {
 
     logAudit(req, 'auth.demo_login', { type: 'user', id: user._id }, { expiresAt: user.demoExpiresAt });
 
-    res.status(201).json({ token: accessToken, user: user.toJSON() });
+    // A session cookie (rememberMe: false above): never kept for an offline start.
+    res.status(201).json({ token: accessToken, user: user.toJSON(), persistent: false });
   } catch (error) {
     console.error('Demo login error:', error);
     res.status(500).json({ error: 'Could not start a demo session. Please try again.' });
@@ -262,7 +269,10 @@ router.post('/login', authLimiter, async (req, res) => {
     // to a wrong-password response — same 401, same generic message, same
     // latency (bcrypt already ran above). This deprives a credential-stuffing
     // attacker of any feedback signal about whether they've tripped the lock.
-    if (user && isAccountLocked(user)) {
+    // A correct password is checked against the lock as it stands NOW: guesses
+    // sent at the same moment all loaded the account before any of them locked
+    // it, and one finishing after the lock took effect must not get in.
+    if (user && (isAccountLocked(user) || (isMatch && await isAccountLockedNow(user._id)))) {
       logAudit(req, 'auth.login.locked',
         { type: 'user', id: user._id },
         { username: user.username }
@@ -284,11 +294,15 @@ router.post('/login', authLimiter, async (req, res) => {
     }
 
     if (!isMatch) {
-      // Record failure, check if it crossed the lockout threshold, fire alert
-      // email (deduped) if this is a new lockout event. Non-blocking: any
-      // failure in the email path is logged but doesn't affect the response.
-      const { lockedNow, shouldSendEmail } = recordLoginFailure(user);
-      try { await user.save(); } catch (err) { console.warn('Failed to persist login-failure counter:', err.message); }
+      // Record failure (one atomic update, so simultaneous guesses each
+      // count), check if it crossed the lockout threshold, fire alert email
+      // (deduped) if this is a new lockout event. Non-blocking: any failure in
+      // the counter or email path is logged but doesn't affect the response.
+      let lockedNow = false;
+      let shouldSendEmail = false;
+      try {
+        ({ lockedNow, shouldSendEmail } = await recordLoginFailure(user._id));
+      } catch (err) { console.warn('Failed to persist login-failure counter:', err.message); }
       if (lockedNow) {
         logAudit(req, 'auth.account_locked',
           { type: 'user', id: user._id },
@@ -338,6 +352,7 @@ router.post('/login', authLimiter, async (req, res) => {
 
     res.json({
       token: accessToken,
+      persistent: rememberMe !== false, // see POST /refresh
       user: loginUserJson
     });
   } catch (error) {
@@ -442,10 +457,33 @@ router.post('/resend-verification', resendLimiter, async (req, res) => {
   }
 });
 
-// Rate limiter for refresh — 30 per 15 min to prevent abuse
+// Rate limiters for refresh — 30 per 15 min for one refresh token.
+//
+// Keyed on the token, not the address (scaling audit 2026-09-25): many people
+// can share one address — a mobile carrier's NAT, an office — and a per-IP
+// bucket made their refreshes compete, with a 429 for whoever came last.
+// Every successful refresh rotates the token, so this bounds a client retrying
+// the SAME token (a retry loop against a failing server), which is what needs
+// bounding. A request without a cookie falls back to its address.
+const refreshKey = (req) => {
+  const raw = req.cookies?.refreshToken;
+  return raw ? `rt:${hashRefreshToken(raw).slice(0, 32)}` : `ip:${rateLimitKey(req)}`;
+};
 const refreshLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
+  keyGenerator: refreshKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ error: 'Too many refresh attempts, please try again later' });
+  }
+});
+// …plus a per-address ceiling far above any household or shared network, so
+// made-up cookies (each its own bucket above) can't hammer the session lookup.
+const refreshIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
   keyGenerator: (req) => rateLimitKey(req),
   standardHeaders: true,
   legacyHeaders: false,
@@ -455,7 +493,7 @@ const refreshLimiter = rateLimit({
 });
 
 // POST /api/auth/refresh - Issue new access token using httpOnly refresh token cookie
-router.post('/refresh', refreshLimiter, async (req, res) => {
+router.post('/refresh', refreshIpLimiter, refreshLimiter, async (req, res) => {
   const incomingToken = req.cookies?.refreshToken;
   if (!incomingToken) {
     return res.status(401).json({ error: 'No refresh token' });
@@ -508,11 +546,19 @@ router.post('/refresh', refreshLimiter, async (req, res) => {
     // detection, deadline preserved (legacy null backfilled to a fresh cap).
     const accessToken = await issueTokens(user, res, { session });
 
-    res.json({ token: accessToken });
+    // persistent: whether this device's session is a "remember me" one. The
+    // cookie is httpOnly, so the app cannot see it — offline mode (#1355) only
+    // allows an offline start for a session that survives closing the browser.
+    res.json({ token: accessToken, persistent: session.persistent !== false });
   } catch (error) {
+    // A server-side failure — the database mid-restart during a deploy, a
+    // save racing a login on another device — says nothing about the
+    // session. Answer "try again" and KEEP the cookie: nothing was rotated,
+    // so the token the client holds is still the live one. This used to
+    // clear the cookie and answer 401, signing people out on any hiccup.
     console.error('Refresh error:', error);
-    clearRefreshCookie(res);
-    res.status(401).json({ error: 'Invalid or expired refresh token' });
+    res.setHeader('Retry-After', '5');
+    res.status(503).json({ error: 'Could not refresh the session right now, please try again' });
   }
 });
 
@@ -588,15 +634,31 @@ router.post('/change-password', requireAuth, requireNonDemo, authLimiter, async 
 });
 
 // POST /api/auth/logout - Invalidate refresh token
-router.post('/logout', requireAuth, async (req, res) => {
+router.post('/logout', async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
+    // Who is signing out: the bearer token when there is a valid one, else the
+    // httpOnly refresh cookie itself. An offline session (#1355) has no access
+    // token; when this route required one, logging out there wiped the device
+    // but left the server session and cookie alive — the next online start
+    // signed the same account straight back in. The cookie is SameSite=Lax,
+    // so another site cannot post this with it.
+    const raw = req.cookies?.refreshToken;
+    const hash = raw ? hashRefreshToken(raw) : null;
+    let user = null;
+    const bearer = (req.get('Authorization') || '').replace(/^Bearer\s+/i, '');
+    if (bearer) {
+      try {
+        const decoded = jwt.verify(bearer, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+        user = await User.findById(decoded.id);
+      } catch { /* expired or invalid — fall back to the cookie */ }
+    }
+    if (!user && hash) {
+      user = await User.findOne({ $or: [{ 'sessions.hash': hash }, { 'sessions.prevHash': hash }, { refreshTokenHash: hash }] });
+    }
     if (user) {
       // Sign out THIS device only: drop the session its refresh cookie belongs
       // to (by current or just-rotated hash). Other devices keep their sessions.
       // A pre-sessions cookie still on the legacy field is cleared the same way.
-      const raw = req.cookies?.refreshToken;
-      const hash = raw ? hashRefreshToken(raw) : null;
       if (hash) {
         user.sessions = (user.sessions || []).filter((s) => s.hash !== hash && s.prevHash !== hash);
         if (user.refreshTokenHash === hash) {
@@ -609,9 +671,15 @@ router.post('/logout', requireAuth, async (req, res) => {
       // Open SSE event streams are per account, so close them only when no
       // device session is left. An integration holding valid credentials
       // simply reconnects.
-      if ((user.sessions || []).length === 0 && !user.refreshTokenHash) eventBus.dropUser(req.user.id);
+      if ((user.sessions || []).length === 0 && !user.refreshTokenHash) eventBus.dropUser(user._id);
     }
-    clearRefreshCookie(res);
+    // Clear the cookie only when one was presented. This route needs no token,
+    // so another site can make a browser POST here top-level; SameSite=Lax
+    // keeps the cookie out of that request — but the browser would still honour
+    // a deletion header in the response, signing the user out at their next
+    // refresh (and, read as a rejection, wiping their offline copy). With no
+    // cookie there is nothing to clear (audit 2026-09-27 M5).
+    if (hash) clearRefreshCookie(res);
     res.json({ message: 'Logged out' });
   } catch (error) {
     console.error('Logout error:', error);

@@ -1,0 +1,188 @@
+import {
+  OFFLINE_MODE_RELEASED,
+  needsOfflineChoice,
+  isOfflineModeEnabled,
+  setOfflineModePreference,
+  adoptOfflineChoice,
+  offlineChoiceOwner,
+  saveOfflineUser,
+  loadOfflineUser,
+  clearOfflineUser,
+  markPendingLogout,
+  hasPendingLogout,
+} from './offlineMode';
+
+const USER = {
+  _id: 'u1', id: 'u1', username: 'anna', displayName: 'Anna', roles: ['user'], plan: 'free',
+  preferences: { language: 'sv', currency: 'SEK' },
+  email: 'anna@example.com', bio: 'hello', isSuperAdmin: true, gdprConsent: { version: 'x' },
+};
+
+// Node >=22 ships a global localStorage stub that shadows jsdom's (no clear()).
+function memoryStorage() {
+  const m = new Map();
+  return {
+    getItem: (k) => (m.has(k) ? m.get(k) : null),
+    setItem: (k, v) => { m.set(k, String(v)); },
+    removeItem: (k) => { m.delete(k); },
+    clear: () => { m.clear(); },
+    key: (i) => [...m.keys()][i] ?? null,
+    get length() { return m.size; },
+  };
+}
+
+beforeEach(() => { vi.stubGlobal('localStorage', memoryStorage()); });
+afterEach(() => vi.unstubAllGlobals());
+
+describe('offline mode switch', () => {
+  it('is released: off by default in a plain browser tab', () => {
+    expect(OFFLINE_MODE_RELEASED).toBe(true);
+    expect(isOfflineModeEnabled()).toBe(false);
+  });
+
+  it('the installed app is off until the user says yes — it asks once (also after a reload that loses the app marker)', () => {
+    const mm = window.matchMedia;
+    window.matchMedia = (q) => ({ matches: q === '(display-mode: standalone)' });
+    try {
+      expect(isOfflineModeEnabled()).toBe(false); // nothing stored before a yes
+      expect(needsOfflineChoice()).toBe(true);
+    } finally {
+      window.matchMedia = mm;
+    }
+    // A later load where the app isn't recognisable (the TWA referrer is gone):
+    expect(needsOfflineChoice()).toBe(true);
+    // Answered → never asked again, and the answer is what counts.
+    localStorage.setItem('cellarion-offline', 'on');
+    expect(needsOfflineChoice()).toBe(false);
+    expect(isOfflineModeEnabled()).toBe(true);
+    localStorage.setItem('cellarion-offline', 'off');
+    expect(needsOfflineChoice()).toBe(false);
+    expect(isOfflineModeEnabled()).toBe(false);
+  });
+
+  it('a browser tab never asks', () => {
+    expect(needsOfflineChoice()).toBe(false);
+  });
+
+  it('can be switched on (and off) for this browser', () => {
+    localStorage.setItem('cellarion-offline', 'on');
+    expect(isOfflineModeEnabled()).toBe(true);
+    localStorage.setItem('cellarion-offline', 'off');
+    expect(isOfflineModeEnabled()).toBe(false);
+  });
+});
+
+// Audit 2026-09-27 M3: the choice used to be the browser's, so on a shared
+// device the next account to sign in was copied to the device without ever
+// being asked — "nothing stored before a yes" held for the first account only.
+describe('one account\'s choice', () => {
+  it('the choice records who made it; the default forgets it', () => {
+    setOfflineModePreference('on', 'u1');
+    expect(localStorage.getItem('cellarion-offline')).toBe('on');
+    expect(offlineChoiceOwner()).toBe('u1');
+    setOfflineModePreference(null);
+    expect(localStorage.getItem('cellarion-offline')).toBeNull();
+    expect(offlineChoiceOwner()).toBeNull();
+  });
+
+  it('the same account signing in keeps it; another account drops it and is asked again', () => {
+    setOfflineModePreference('on', 'u1');
+    expect(adoptOfflineChoice('u1')).toBe(true);
+    expect(isOfflineModeEnabled()).toBe(true);
+
+    expect(adoptOfflineChoice('u2')).toBe(false);
+    expect(isOfflineModeEnabled()).toBe(false);
+    expect(localStorage.getItem('cellarion-offline')).toBeNull();
+    expect(offlineChoiceOwner()).toBeNull();
+  });
+
+  it('"off" is a choice too — another account is asked, not silently kept off', () => {
+    setOfflineModePreference('off', 'u1');
+    expect(adoptOfflineChoice('u2')).toBe(false);
+    expect(localStorage.getItem('cellarion-offline')).toBeNull();
+  });
+
+  it('a choice stored before owners were recorded is taken to be the signing-in account\'s, once', () => {
+    localStorage.setItem('cellarion-offline', 'on');
+    expect(adoptOfflineChoice('u1')).toBe(true);
+    expect(offlineChoiceOwner()).toBe('u1');
+    expect(isOfflineModeEnabled()).toBe(true);
+    expect(adoptOfflineChoice('u2')).toBe(false);
+  });
+
+  it('no choice, or no account id: nothing to adopt, nothing changed', () => {
+    expect(adoptOfflineChoice('u1')).toBe(true);
+    expect(offlineChoiceOwner()).toBeNull();
+    setOfflineModePreference('on', 'u1');
+    expect(adoptOfflineChoice(null)).toBe(true);
+    expect(isOfflineModeEnabled()).toBe(true);
+    expect(offlineChoiceOwner()).toBe('u1');
+  });
+});
+
+describe('profile kept for an offline start', () => {
+  it('is only kept while offline mode is on', () => {
+    saveOfflineUser(USER, { persistent: true });
+    expect(localStorage.getItem('cellarion-offline-user')).toBeNull();
+    localStorage.setItem('cellarion-offline', 'on');
+    expect(loadOfflineUser()).toBeNull();
+  });
+
+  it('keeps only what the UI needs — no email, bio, consent or super-admin flag', () => {
+    localStorage.setItem('cellarion-offline', 'on');
+    saveOfflineUser(USER, { persistent: true });
+    const kept = loadOfflineUser();
+    expect(kept).toEqual({
+      _id: 'u1', id: 'u1', username: 'anna', displayName: 'Anna', roles: ['user'], plan: 'free',
+      preferences: { language: 'sv', currency: 'SEK' },
+    });
+  });
+
+  it('is not handed out once offline mode is switched off', () => {
+    localStorage.setItem('cellarion-offline', 'on');
+    saveOfflineUser(USER, { persistent: true });
+    localStorage.setItem('cellarion-offline', 'off');
+    expect(loadOfflineUser()).toBeNull();
+  });
+
+  it('clearOfflineUser removes it; a corrupt entry reads as none', () => {
+    localStorage.setItem('cellarion-offline', 'on');
+    saveOfflineUser(USER, { persistent: true });
+    clearOfflineUser();
+    expect(loadOfflineUser()).toBeNull();
+    localStorage.setItem('cellarion-offline-user', '{not json');
+    expect(loadOfflineUser()).toBeNull();
+  });
+});
+
+describe('audit fixes — who may start offline', () => {
+  beforeEach(() => localStorage.setItem('cellarion-offline', 'on'));
+
+  it('a browser-only ("remember me" off) session is never kept for an offline start', () => {
+    saveOfflineUser(USER, { persistent: true });
+    saveOfflineUser(USER, { persistent: false });
+    expect(localStorage.getItem('cellarion-offline-user')).toBeNull();
+    expect(loadOfflineUser()).toBeNull();
+  });
+
+  it('a profile the server has not confirmed for 30 days is not used', () => {
+    saveOfflineUser(USER, { persistent: true });
+    const kept = JSON.parse(localStorage.getItem('cellarion-offline-user'));
+    kept._verifiedAt = Date.now() - 31 * 24 * 60 * 60 * 1000;
+    localStorage.setItem('cellarion-offline-user', JSON.stringify(kept));
+    expect(loadOfflineUser()).toBeNull();
+  });
+
+  it('the verification stamp is not handed out as a user field', () => {
+    saveOfflineUser(USER, { persistent: true });
+    expect(loadOfflineUser()._verifiedAt).toBeUndefined();
+  });
+
+  it('a logout that could not reach the server is remembered until done', () => {
+    expect(hasPendingLogout()).toBe(false);
+    markPendingLogout(true);
+    expect(hasPendingLogout()).toBe(true);
+    markPendingLogout(false);
+    expect(hasPendingLogout()).toBe(false);
+  });
+});

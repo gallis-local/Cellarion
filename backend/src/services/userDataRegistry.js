@@ -34,6 +34,7 @@ const BridgeKey = require('../models/BridgeKey');
 const BRIDGE_REGISTRY_NOTE = 'From the shared registry (cellarion.app)';
 const BridgeUsageDay = require('../models/BridgeUsageDay');
 const ExportLink = require('../models/ExportLink');
+const IdempotencyRecord = require('../models/IdempotencyRecord');
 const OAuthAuthCode = require('../models/OAuthAuthCode');
 const McpActionLog = require('../models/McpActionLog');
 const AiUsage = require('../models/AiUsage');
@@ -154,6 +155,9 @@ const REGISTRY = [
           preferences: u.preferences,
           profileVisibility: u.profileVisibility,
           emailVerified: u.emailVerified,
+          // When they objected to all Cellarion email (the unsubscribe link) —
+          // processing history, like supporterThankYouSentAt above.
+          emailOptOutAt: u.emailOptOutAt || null,
           gdprConsent: u.gdprConsent,
           createdAt: u.createdAt,
           contribution: u.contribution || { totalScore: 0, categories: {}, tier: 'newcomer', specialty: null },
@@ -176,14 +180,10 @@ const REGISTRY = [
   // ── Core wine data ──────────────────────────────────────────────────────
   {
     model: Bottle, category: 'personal-data', userFields: ['user'],
-    // Collect the ids BEFORE deleteMany so the Meilisearch documents (which
-    // carry the user's free-text notes/location) can be removed too — there
-    // is no scheduled resync, so skipping this leaves personal data in the
-    // search index indefinitely.
+    // Collect the ids BEFORE deleteMany — the rack slots below still need them.
     purge: async (ctx) => {
       const bottleIds = await Bottle.find({ user: ctx.userId }).distinct('_id');
       await Bottle.deleteMany({ user: ctx.userId });
-      await searchService.removeBottles(bottleIds);
       // The Rack entry below only purges racks in the user's OWN cellars, so a
       // deleted bottle placed in ANOTHER owner's cellar would leave a dangling
       // slot ref in that cellar's racks — pull those slots too.
@@ -196,21 +196,23 @@ const REGISTRY = [
   },
   {
     model: BottleImage, category: 'personal-data', userFields: ['uploadedBy', 'reviewedBy'],
-    // An image the user promoted to a SHARED wine (assignedToWine) backs the
-    // WineDefinition.image that OTHER users see, so it must NOT be deleted on
-    // the uploader's account deletion — anonymise it (re-point uploadedBy to the
-    // [deleted] sentinel, like forum content) so the shared wine image survives
-    // and stays managed. Only the user's own non-shared images are hard-deleted.
-    // Also clear this user's reviewedBy ref off OTHER users' images.
-    // Unlink the on-disk files (originals + processed PNGs) for the user's own
-    // non-shared images BEFORE deleting the docs — those docs are the only
-    // reference to the files, so deleting them first would orphan the files on
-    // disk forever. Shared (assignedToWine) images are anonymised, not deleted,
-    // so their files are kept. Returned as a single self-contained promise so
-    // the inner DB ops are awaited (an async fn returning an *array* would not
-    // await the queries inside it).
+    // A photo the registry keeps (services/photoRetention: the wine's chosen
+    // picture, or any photo an admin approved as PUBLIC — policy 2026-09-27)
+    // is seen by OTHER users, so it must NOT be deleted on the uploader's
+    // account deletion — anonymise it (re-point uploadedBy to the [deleted]
+    // sentinel, like forum content) and detach it from the bottle that is
+    // going, so the shared photo survives and stays managed. Only the user's
+    // own photos (pending, private, rejected, every label scan) are
+    // hard-deleted. Also clear this user's reviewedBy ref off OTHER users'
+    // images. Unlink the on-disk files for the user's own photos BEFORE
+    // deleting the docs — those docs are the only reference to the files, so
+    // deleting them first would orphan the files on disk forever. Kept photos
+    // are anonymised, not deleted, so their files stay. Returned as a single
+    // self-contained promise so the inner DB ops are awaited (an async fn
+    // returning an *array* would not await the queries inside it).
     purge: async (ctx) => {
-      const own = await BottleImage.find({ uploadedBy: ctx.userId, assignedToWine: { $ne: true } })
+      const { OWN_PHOTO, REGISTRY_PHOTO } = require('./photoRetention');
+      const own = await BottleImage.find({ uploadedBy: ctx.userId, ...OWN_PHOTO })
         .select('originalUrl processedUrl').lean();
       for (const img of own) await unlinkImageFiles(img);
       // Label-scan images (kind:'label-scan') are in that hard-delete set —
@@ -227,8 +229,8 @@ const REGISTRY = [
       // each pointer is nulled only where it names a deleted image.
       const ownIds = own.map((i) => i._id);
       await Promise.all([
-        BottleImage.deleteMany({ uploadedBy: ctx.userId, assignedToWine: { $ne: true } }),
-        BottleImage.updateMany({ uploadedBy: ctx.userId, assignedToWine: true }, { $set: { uploadedBy: ctx.deletedUserId } }),
+        BottleImage.deleteMany({ uploadedBy: ctx.userId, ...OWN_PHOTO }),
+        BottleImage.updateMany({ uploadedBy: ctx.userId, ...REGISTRY_PHOTO }, { $set: { uploadedBy: ctx.deletedUserId }, $unset: { bottle: '' } }),
         BottleImage.updateMany({ reviewedBy: ctx.userId }, { $unset: { reviewedBy: '' } }),
         // Reports this user filed on OTHER people's photos (ticket 6a865f60).
         // The report is the user's own statement, so it leaves with them — but
@@ -280,21 +282,22 @@ const REGISTRY = [
       // (legacy data — bottle.user is set to the cellar owner on every current
       // creation path, but older/moved rows can differ) are missed by the
       // user-scoped Bottle purge and would survive pointing at a deleted
-      // cellar. Delete them too, cleaning their images + search docs the same
+      // cellar. Delete them too, cleaning their images the same
       // reference-safe way as the Bottle/BottleImage entries: ids collected
       // before deleteMany, files unlinked before their only referencing docs
-      // go, shared (assignedToWine) images kept with the bottle ref detached.
+      // go, registry photos (services/photoRetention) kept with the bottle
+      // ref detached.
       const orphanIds = await Bottle.find({ cellar: { $in: ctx.cellarIds }, user: { $ne: ctx.userId } }).distinct('_id');
       if (orphanIds.length > 0) {
-        const imgs = await BottleImage.find({ bottle: { $in: orphanIds }, assignedToWine: { $ne: true } })
+        const { OWN_PHOTO, REGISTRY_PHOTO } = require('./photoRetention');
+        const imgs = await BottleImage.find({ bottle: { $in: orphanIds }, ...OWN_PHOTO })
           .select('originalUrl processedUrl').lean();
         for (const img of imgs) await unlinkImageFiles(img);
         await Promise.all([
-          BottleImage.deleteMany({ bottle: { $in: orphanIds }, assignedToWine: { $ne: true } }),
-          BottleImage.updateMany({ bottle: { $in: orphanIds }, assignedToWine: true }, { $unset: { bottle: '' } }),
+          BottleImage.deleteMany({ bottle: { $in: orphanIds }, ...OWN_PHOTO }),
+          BottleImage.updateMany({ bottle: { $in: orphanIds }, ...REGISTRY_PHOTO }, { $unset: { bottle: '' } }),
           Bottle.deleteMany({ _id: { $in: orphanIds } }),
         ]);
-        await searchService.removeBottles(orphanIds);
       }
       await Promise.all([
         Cellar.deleteMany({ user: ctx.userId }),
@@ -871,6 +874,17 @@ const REGISTRY = [
     // through its own registry entries (cellars, account, …). Nothing to export
     // here (and the tokenHash, like ApiToken's, never leaves the DB).
     purge: (ctx) => ExportLink.deleteMany({ user: ctx.userId }),
+    exportFragment: null,
+  },
+
+  // ── Idempotent-write records (offline queue, #1355) ──────────────────────
+  {
+    model: IdempotencyRecord, category: 'personal-data', userFields: ['user'],
+    // Hard-delete on erasure. The stored outcome of a write sent with an
+    // Idempotency-Key, kept 8 days (TTL) so a resent write is not applied twice.
+    // Nothing to export: a transient technical record of a request whose
+    // effect is already in the exported data (bottles, racks).
+    purge: (ctx) => IdempotencyRecord.deleteMany({ user: ctx.userId }),
     exportFragment: null,
   },
 

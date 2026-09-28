@@ -27,6 +27,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { writeFileAtomicSync } = require('../utils/atomicWrite');
 
 const Cellar = require('../models/Cellar');
 const Bottle = require('../models/Bottle');
@@ -39,11 +40,12 @@ const { findOrCreatePendingRequest, pickImportHints } = require('./wineRequestIn
 const Review = require('../models/Review');
 const WineVintageProfile = require('../models/WineVintageProfile');
 
-const searchService = require('./search');
 const { findOrCreateWine } = require('./findOrCreateWine');
 const { logAudit } = require('./audit');
 const { unlinkImageFiles, safeUploadPath } = require('./imageProcessor');
+const { REGISTRY_PHOTO, OWN_PHOTO } = require('./photoRetention');
 const { sanitizeImageBuffer, detectImageFormat } = require('./imageSanitizer');
+const { encodeKeptPhoto, KEPT_EXTENSION } = require('./photoFormat');
 const { ORIGINALS_DIR, PROCESSED_DIR } = require('../config/upload');
 const { planRackCreations, placeBottlesInRack, DEFAULT_ANCHOR } = require('../utils/rackImport');
 const { getMaxPosition, cabinetShelfRows, cabinetShelfCols, cabinetShelfAlternate } = require('../utils/rackGeometry');
@@ -237,13 +239,15 @@ async function clearCellarContents(cellarId) {
   if (bottleIds.length) {
     // Bottle deletion does NOT cascade images/reviews — clean those up ourselves
     // before deleting the bottles (else they dangle pointing at deleted bottles).
-    const images = await BottleImage.find({ bottle: { $in: bottleIds } });
+    // Registry photos (services/photoRetention: the wine's picture, or any
+    // photo approved as public) are seen by other people: kept and detached,
+    // as every other cascade does. Until 2026-09-27 an overwrite import
+    // deleted even the wine's chosen picture.
+    const images = await BottleImage.find({ bottle: { $in: bottleIds }, ...OWN_PHOTO });
     for (const img of images) await unlinkImageFiles(img); // reference-safe (dedup-shared files survive)
-    await BottleImage.deleteMany({ bottle: { $in: bottleIds } });
+    await BottleImage.deleteMany({ bottle: { $in: bottleIds }, ...OWN_PHOTO });
+    await BottleImage.updateMany({ bottle: { $in: bottleIds }, ...REGISTRY_PHOTO }, { $unset: { bottle: '' } });
     await Review.deleteMany({ bottle: { $in: bottleIds } });
-    for (const id of bottleIds) {
-      try { await searchService.removeBottle(id); } catch { /* keep Meili clean, best-effort */ }
-    }
     await Bottle.deleteMany({ cellar: cellarId });
   }
   await Rack.deleteMany({ cellar: cellarId });
@@ -569,6 +573,7 @@ async function attachImages(bottle, images, userId, getFileBuffer, result, dedup
     let originalUrl = null;
     let processedUrl = null;
     let deduped = false;
+    let storedHash = null; // of the bytes written (or matched) below; the archive hash until then
 
     // Dedup: does this user already have a byte-identical image still on disk?
     const existing = await BottleImage.findOne({ uploadedBy: userId, contentHash: hash })
@@ -597,15 +602,54 @@ async function attachImages(bottle, images, userId, getFileBuffer, result, dedup
       }
       const uuid = crypto.randomUUID();
       const ext = { jpeg: '.jpg', png: '.png', webp: '.webp' }[detectImageFormat(safeBuf)] || '.jpg';
+      // The bytes that will be on disk, and the address they get.
+      let stored;
+      let storedDir;
+      let storedName;
+      let storedUrl;
       if (procBuf) {
-        const procName = `${uuid}${ext}`;
-        fs.writeFileSync(path.join(PROCESSED_DIR, procName), safeBuf);
-        processedUrl = `/api/uploads/processed/${procName}`;
+        // Stored the way every kept photo is (services/photoFormat: WebP, at
+        // most 2048 px) — an older export carries the full-size PNG. Encoded
+        // from the archive bytes the sanitizer has just accepted, not from its
+        // re-encode: one lossy step, not two, for a re-imported export. The
+        // encode drops EXIF/GPS the same way.
+        try {
+          stored = await encodeKeptPhoto(primaryBuf);
+        } catch {
+          result.imagesSkipped++;
+          result.errors.push({ index: sourceIndex, reason: `Image "${procArchive}" skipped: it could not be converted` });
+          continue;
+        }
+        storedDir = PROCESSED_DIR;
+        storedName = `${uuid}.${KEPT_EXTENSION}`;
+        storedUrl = `/api/uploads/processed/${storedName}`;
       } else {
         // Original-only image (never cropped) — keep it so the photo isn't lost.
-        const origName = `${uuid}${ext}`;
-        fs.writeFileSync(path.join(ORIGINALS_DIR, origName), safeBuf);
-        originalUrl = `/api/uploads/originals/${origName}`;
+        stored = safeBuf;
+        storedDir = ORIGINALS_DIR;
+        storedName = `${uuid}${ext}`;
+        storedUrl = `/api/uploads/originals/${storedName}`;
+      }
+
+      // The record's hash is that of the STORED bytes, as the live upload path
+      // stamps it: an export of this cellar carries exactly those bytes, so a
+      // re-import of it matches on the first try instead of adding a copy
+      // (release audit 2026-09-27, L — hashing the archive bytes while storing
+      // a re-encode meant every export→import round wrote a new file). A
+      // repeat import of the SAME archive still dedupes: the encode is
+      // deterministic, so its stored bytes hash to the record's hash again.
+      storedHash = crypto.createHash('sha256').update(stored).digest('hex');
+      const twin = storedHash !== hash
+        ? await BottleImage.findOne({ uploadedBy: userId, contentHash: storedHash }).select('originalUrl processedUrl').lean()
+        : null;
+      if (twin && (fileOnDisk(twin.processedUrl) || fileOnDisk(twin.originalUrl))) {
+        processedUrl = fileOnDisk(twin.processedUrl) ? twin.processedUrl : null;
+        originalUrl = fileOnDisk(twin.originalUrl) ? twin.originalUrl : null;
+        deduped = true;
+      } else {
+        // Into a publicly served, immutably cached folder: never half-written.
+        writeFileAtomicSync(path.join(storedDir, storedName), stored);
+        if (procBuf) processedUrl = storedUrl; else originalUrl = storedUrl;
       }
     }
 
@@ -617,7 +661,7 @@ async function attachImages(bottle, images, userId, getFileBuffer, result, dedup
       status: 'approved',   // already-processed export image → skip rembg
       visibility: 'private',
       credit: (img && img.credit) || null,
-      contentHash: hash,
+      contentHash: storedHash || hash,
     });
     if (deduped) result.imagesDeduped++; else result.imagesAttached++;
     if (cacheKey) dedupCache.set(cacheKey, doc._id);
@@ -775,8 +819,7 @@ async function createLayout(cellarId, layout, result) {
  * Build all of a cellar's content — racks, 3D room layout, then bottles (+ their
  * wines, images, reviews and maturity windows) and finally rack placement — into
  * the cellar identified by `cellarId`. Per-bottle problems are collected into
- * `result`; only an unexpected failure rejects. Returns the ids of the active
- * bottles created, for search indexing.
+ * `result`; only an unexpected failure rejects.
  */
 async function buildCellarContents({ cellarId, ownerId, userId, cellar, items, imagesByIndex, anchor, getFileBuffer, defaultCurrency, result, demoMode = false, canCurate = false, audit = null }) {
   // Racks (exact geometry, fallback inference), then the 3D room layout.
@@ -785,7 +828,6 @@ async function buildCellarContents({ cellarId, ownerId, userId, cellar, items, i
 
   // Bottles + wines + images. Collect placement intents.
   const requestCache = new Map();
-  const createdActiveIds = [];
   const pendingPlacements = [];
   const seenMaturity = new Set(); // wine+vintage pairs already reconstituted
   const seenPendingProfile = new Set(); // wine+vintage pairs already queued for a somm
@@ -859,7 +901,6 @@ async function buildCellarContents({ cellarId, ownerId, userId, cellar, items, i
 
       await bottle.save();
       result.bottlesCreated++;
-      if (bottle.status === 'active') createdActiveIds.push(bottle._id);
 
       await attachImages(bottle, imagesByIndex[i], userId, getFileBuffer, result, wineImageDedup, i);
       // Demo clones deliberately create NOTHING in the shared registry: no
@@ -924,8 +965,6 @@ async function buildCellarContents({ cellarId, ownerId, userId, cellar, items, i
       }
     }
   }
-
-  return createdActiveIds;
 }
 
 /**
@@ -989,10 +1028,9 @@ async function importCellar(userId, cellar, opts) {
   if (!liveCellar) result.mode = 'create';
 
   // 2. Build everything into buildCellar; 3. swap onto the live cellar (overwrite).
-  let createdActiveIds = [];
   let swapStarted = false;
   try {
-    createdActiveIds = await buildCellarContents({
+    await buildCellarContents({
       cellarId: buildCellar._id, ownerId: buildCellar.user, userId, cellar,
       items, imagesByIndex, anchor, getFileBuffer,
       defaultCurrency: opts.defaultCurrency, result,
@@ -1027,10 +1065,6 @@ async function importCellar(userId, cellar, opts) {
     }
     throw err;
   }
-
-  // 4. Index the new active bottles (fire-and-forget) — after any swap so their
-  //    cellar pointer is final.
-  if (createdActiveIds.length) searchService.bulkIndexBottles(createdActiveIds);
 
   return result;
 }

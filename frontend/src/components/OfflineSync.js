@@ -1,0 +1,112 @@
+import { useEffect, useState } from 'react';
+import { useAuth, API_MUTATION_EVENT } from '../contexts/AuthContext';
+import { isOfflineModeEnabled, OFFLINE_MODE_EVENT } from '../utils/offlineMode';
+import { getOfflineStatus, primeOfflineStatus, refreshSnapshot } from '../utils/offlineSnapshot';
+import { flushQueue, getQueueStatus, refreshQueueStatus, QUEUE_CHANGED_EVENT } from '../utils/offlineQueue';
+
+const REFRESH_EVERY_MS = 15 * 60 * 1000;
+const STALE_ON_START_MS = 2 * 60 * 1000;
+const AFTER_CHANGE_MS = 4000;
+const RESEND_EVERY_MS = 30 * 1000;
+
+// Writes that change what the offline copy holds: cellars, bottles, racks and
+// bottle photos. Marking a notification read, saving a setting or posting in
+// the forum does not, and used to rebuild the whole copy anyway (scaling audit
+// 2026-09-25, item 11). A write the event doesn't name (the offline queue's own
+// sends) counts as a change.
+const COPY_PATHS = /^\/api\/(bottles|cellars|racks|images)(\/|$)/;
+export function changesOfflineCopy(url) {
+  if (!url) return true;
+  try {
+    return COPY_PATHS.test(new URL(String(url), 'http://offline.invalid').pathname);
+  } catch {
+    return true;
+  }
+}
+
+const ageOf = () => {
+  const { savedAt } = getOfflineStatus();
+  return savedAt ? Date.now() - Date.parse(savedAt) : Infinity;
+};
+
+/**
+ * Keeps the device's offline copy of the user's cellars fresh (#1355):
+ * on start when it is more than a couple of minutes old, every 15 minutes
+ * while the app is visible, when the app comes back to the foreground after
+ * that long, and a few seconds after the user changes something. Online and
+ * signed in only; renders nothing. Mounted once, in App.
+ */
+export default function OfflineSync() {
+  const { user, token, offlineSession, apiFetch, getSessionGeneration } = useAuth();
+  // Re-read the switch when Settings flips it.
+  const [, setModeTick] = useState(0);
+  useEffect(() => {
+    const onMode = () => setModeTick((n) => n + 1);
+    window.addEventListener(OFFLINE_MODE_EVENT, onMode);
+    return () => window.removeEventListener(OFFLINE_MODE_EVENT, onMode);
+  }, []);
+  const userId = user ? String(user.id || user._id || '') || null : null;
+  const enabled = isOfflineModeEnabled();
+  const live = enabled && !!userId && !!token && !offlineSession;
+
+  // The banner's "saved at" time and change counts, from the device alone
+  // (works offline too).
+  useEffect(() => {
+    if (enabled && userId) {
+      primeOfflineStatus(userId);
+      refreshQueueStatus(userId);
+    }
+  }, [enabled, userId]);
+
+  // Send changes made offline: now, when the network returns, when a change is
+  // queued, and every 30 s while any wait (a 5xx or a busy server).
+  useEffect(() => {
+    if (!live) return undefined;
+    // Sending stops the moment this session ends (logout, another account).
+    const generation = getSessionGeneration();
+    const isActive = () => getSessionGeneration() === generation;
+    const send = () => {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      flushQueue(apiFetch, userId, isActive);
+    };
+    send();
+    const timer = setInterval(() => { if (getQueueStatus().pending > 0) send(); }, RESEND_EVERY_MS);
+    window.addEventListener('online', send);
+    window.addEventListener(QUEUE_CHANGED_EVENT, send);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('online', send);
+      window.removeEventListener(QUEUE_CHANGED_EVENT, send);
+    };
+  }, [live, userId, apiFetch]);
+
+  useEffect(() => {
+    if (!live) return undefined;
+    let stopped = false;
+    let debounce;
+    const refresh = () => {
+      if (stopped || document.visibilityState === 'hidden') return;
+      refreshSnapshot(apiFetch, userId);
+    };
+    primeOfflineStatus(userId).then(() => { if (ageOf() > STALE_ON_START_MS) refresh(); });
+
+    const timer = setInterval(refresh, REFRESH_EVERY_MS);
+    const onVisible = () => { if (document.visibilityState === 'visible' && ageOf() > REFRESH_EVERY_MS) refresh(); };
+    const onMutation = (e) => {
+      if (!changesOfflineCopy(e?.detail?.url)) return;
+      clearTimeout(debounce);
+      debounce = setTimeout(refresh, AFTER_CHANGE_MS);
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener(API_MUTATION_EVENT, onMutation);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      clearTimeout(debounce);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener(API_MUTATION_EVENT, onMutation);
+    };
+  }, [live, userId, apiFetch]);
+
+  return null;
+}

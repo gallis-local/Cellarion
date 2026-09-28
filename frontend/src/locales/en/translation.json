@@ -299,6 +299,7 @@
       "communityReply": "Replies, quotes",
       "communityMention": "@mentions",
       "communityFollow": "Followed thread activity",
+      "supportReply": "Answers to your support tickets",
       "pushUnsupported": "Push notifications are not supported in this browser.",
       "pushBlocked": "Push notifications are blocked. Enable them in your browser settings.",
       "pushNotConfigured": "Push notifications are not configured on this server.",
@@ -562,6 +563,28 @@
       "revertingBtn": "Reverting…",
       "errorLoad": "Failed to load AI activity.",
       "errorRevert": "Couldn't revert that change. It may have already been undone or changed since."
+    },
+    "groups": {
+      "account": {
+        "title": "Account",
+        "summary": "Profile, password and supporter tier"
+      },
+      "preferences": {
+        "title": "Preferences",
+        "summary": "Notifications, display and offline mode"
+      },
+      "connections": {
+        "title": "AI & connections",
+        "summary": "Connect your AI assistant, API tokens, AI activity, registry bridge and climate sensors"
+      },
+      "data": {
+        "title": "Your data",
+        "summary": "Download your data, or take your cellars with you"
+      },
+      "danger": {
+        "title": "Delete account",
+        "summary": "Permanently delete your account and all your data"
+      }
     }
   },
   "climate": {
@@ -918,6 +941,15 @@
     "peakBeforeWindow": "Peak cannot start before the drink window",
     "peakAfterWindow": "Peak cannot end after the drink window",
     "drinkWindowHint": "Optional: your own drink-from/to years for this bottle. When set, they take precedence over the sommelier window.",
+    "customFields": "Custom fields",
+    "customFieldsIntro": "Anything else worth recording — ABV, a classification, a score from elsewhere. You can add more later on the bottle page.",
+    "customFieldsKnown": "Already in the wine record:",
+    "customFieldsRegistry": "Add:",
+    "customFieldName": "Field name",
+    "customFieldRemove": "Remove field",
+    "customFieldAdd": "+ Add a field",
+    "customFieldsNotSaved": "Some custom fields were not saved",
+    "customFieldsNotSavedBody": "The bottles were added. These fields were not — you can add them on the bottle page.",
     "drinkFrom": "From (year)",
     "drinkFromPlaceholder": "e.g. 2028",
     "drinkTo": "To (year)",
@@ -1656,6 +1688,7 @@
       "selectAppellation": "Select appellation",
       "grapesLabel": "Grapes",
       "imageUrlLabel": "Image URL",
+      "useRequestPhoto": "Use the photo from the request as the wine's picture",
       "adminNotesLabel": "Admin Notes",
       "dupTitle": "Possible duplicates found",
       "dupHint": "Link the request to one of these instead — or create anyway if it is genuinely different.",
@@ -2058,6 +2091,7 @@
         "rejectedWith": "Rejected: {{reason}}",
         "statusApproved": "Approved",
         "statusRejected": "Rejected",
+        "statusClosed": "Closed",
         "loadError": "Failed to load proposals",
         "approveError": "Failed to approve the proposal",
         "rejectError": "Failed to reject the proposal",
@@ -2132,6 +2166,7 @@
       "reindexSearch": "Reindex search",
       "reindexSearchTitle": "Rebuild the search indexes from the database — required after restoring a backup, or whenever search results look stale",
       "reindexDone": "Search reindexed ({{winesMs}} ms wines, {{bottlesMs}} ms bottles)",
+      "reindexDoneTotal": "Search reindexed in {{ms}} ms",
       "reindexFailed": "Reindex failed",
       "incompleteGeo": {
         "button": "Missing region",
@@ -2432,6 +2467,7 @@
     "unit": "Unit (optional)",
     "unitPlaceholder": "e.g. %, °C, kr",
     "enumOptions": "Allowed values (comma-separated)",
+    "enumOptionsRule": "Between 2 and 20 options, each up to 40 characters",
     "enumPlaceholder": "e.g. cork, screwcap, crown",
     "value": "Value",
     "choose": "Choose…",
@@ -4801,6 +4837,8 @@
     "messagePlaceholder": "Describe your issue or question in detail...",
     "sending": "Sending…",
     "sendTicket": "Send Ticket",
+    "emailNotice": "We'll email you our answer as well. You can turn this off in <settings>Settings</settings>.",
+    "emailNoticeOff": "Answer emails are off, so our answer will be here under Support and in the notification bell. You can turn them back on in <settings>Settings</settings>.",
     "subjectRequired": "Subject is required",
     "messageRequired": "Message is required",
     "submitFailed": "Failed to submit ticket"
@@ -5061,5 +5099,67 @@
     "transferWarning": "You cannot undo this yourself — afterwards only the new owner can transfer it back. Export a copy first if you want your own record of this cellar.",
     "transferExportLink": "Export this cellar",
     "transferCancel": "Cancel"
+  },
+  "offline": {
+    "bannerSavedToday": "Offline — showing your cellar as saved at {{time}}",
+    "bannerSavedEarlier": "Offline — showing your cellar as saved on {{time}}",
+    "bannerNoCopy": "Offline — your cellar hasn't been saved on this device yet",
+    "pending_one": "{{count}} change waiting to sync",
+    "pending_other": "{{count}} changes waiting to sync",
+    "syncing_one": "Syncing {{count}} change…",
+    "syncing_other": "Syncing {{count}} changes…",
+    "attention_one": "{{count}} change needs your attention",
+    "attention_other": "{{count}} changes need your attention",
+    "review": "Review",
+    "logoutConfirm_one": "{{count}} change made offline hasn't been synced yet. Log out anyway? It will be lost.",
+    "logoutConfirm_other": "{{count}} changes made offline haven't been synced yet. Log out anyway? They will be lost.",
+    "attentionTitle": "Changes that need your attention",
+    "attentionIntro": "These changes were made offline, but the cellar had changed by the time they reached the server.",
+    "theirs": "now",
+    "mine": "yours",
+    "keepMine": "Keep mine",
+    "keepTheirs": "Keep theirs",
+    "applyAnyway": "Apply anyway",
+    "retry": "Try again",
+    "discard": "Discard",
+    "op": {
+      "aBottle": "a bottle",
+      "consume": "Remove {{wine}} from the cellar",
+      "open": "Open {{wine}}",
+      "edit": "Edit {{fields}} on {{wine}}",
+      "place": "Place {{wine}} in {{rack}}, slot {{position}}",
+      "clear": "Take {{wine}} out of {{rack}}, slot {{position}}",
+      "move": "Move {{wine}} in {{rack}} from slot {{position}} to {{toPosition}}",
+      "pour": "Pour a glass of {{wine}}"
+    },
+    "settings": {
+      "title": "Offline mode",
+      "betaAdmin": "(beta — admins only)",
+      "intro": "Keep a copy of your cellars, racks and bottles on this device, so you can browse them — and consume, open, place or move bottles — where there is no signal. Changes are sent when you are back online.",
+      "appHint": "You are using the installed app.",
+      "browserHint": "On a shared or borrowed computer, leave this off: the copy stays on the device until you log out or turn it off.",
+      "toggle": "Keep my cellar available offline on this device",
+      "saving": "Saving your cellar on this device…",
+      "ready": "Ready — your cellar is saved on this device.",
+      "notYet": "Turned on. Your cellar will be saved the next time you are online.",
+      "cleared": "Turned off. The offline copy has been deleted from this device.",
+      "savedAt": "Saved: {{time}}",
+      "notSaved": "Not saved yet",
+      "usage": "Space used on this device: {{size}}"
+    },
+    "page": {
+      "title": "You're offline",
+      "needsConnection": "This page needs an internet connection. It will load by itself as soon as you are back online.",
+      "whatWorks": "Your cellars, racks and bottles are saved on this device and work offline.",
+      "toCellars": "Go to my cellars",
+      "modeHint": "Turn on offline mode in Settings to keep your cellar available without a connection."
+    },
+    "prompt": {
+      "title": "Use Cellarion without a signal?",
+      "body": "Keep a copy of your cellars, racks and bottles on this phone, so you can browse them — and take out, open or move bottles — where there is no signal. Changes are sent when you are back online.",
+      "where": "The copy stays on this phone only and is deleted when you log out. You can change this any time in Settings → Offline mode.",
+      "no": "No thanks",
+      "yes": "Yes, keep it offline"
+    }
   }
 }

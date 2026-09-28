@@ -6,7 +6,8 @@ const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const { rateLimitKey } = require('./utils/clientIp');
 const { requireAuth } = require('./middleware/auth');
-const { uploadsGuard, uploadsCacheHeaders } = require('./middleware/uploadsStatic');
+const { uploadsGuard, uploadsCacheHeaders, convertedPhotoFallback } = require('./middleware/uploadsStatic');
+const { thumbnailHandler } = require('./services/thumbnails');
 const healthRoute = require('./routes/health');
 const siteRoute = require('./routes/site');
 const authRoute = require('./routes/auth');
@@ -43,6 +44,7 @@ const wineReportsRoute = require('./routes/wineReports');
 const importRoute = require('./routes/import');
 const cellarImportRoute = require('./routes/cellarImport');
 const racksRoute = require('./routes/racks');
+const offlineRoute = require('./routes/offline');
 const cellarLayoutRoute = require('./routes/cellarLayout');
 const imagesRoute = require('./routes/images');
 const sommMaturityRoute = require('./routes/somm/maturity');
@@ -91,6 +93,7 @@ const rateLimitsConfig = require('./config/rateLimits');
 const aiConfig = require('./config/aiConfig');
 const announcementConfig = require('./config/announcement');
 const { logAudit, logger } = require('./services/audit');
+const { drainingConnectionClose } = require('./services/shutdown');
 
 const app = express();
 
@@ -129,6 +132,9 @@ app.use(helmet({
 }));
 
 // Middleware
+// During a graceful shutdown (services/shutdown) every response closes its
+// connection, so keep-alive clients reconnect to the next process.
+app.use(drainingConnectionClose);
 app.use(compression());
 app.use(cookieParser()); // lgtm[js/missing-token-validation] — auth uses JWT Bearer tokens, not cookies; CSRF does not apply
 // Stripe webhook needs the raw body for signature verification — must be before express.json()
@@ -299,7 +305,13 @@ app.use('/api/', writeLimiter);
 // Serve uploaded images — no auth required (filenames are random UUIDs).
 // Long cache for a file that EXISTS (setHeaders runs only on a hit); a miss
 // stays no-store, so a 404 can never be cached by a CDN — see uploadsStatic.
-app.use('/api/uploads', uploadsGuard, express.static('/app/uploads', { setHeaders: uploadsCacheHeaders }));
+// Card-size WebP thumbnails of processed photos, rendered on first request
+// (services/thumbnails). Mounted first so a thumbnail path never reaches the
+// plain static mount. A miss on a photo's pre-WebP address (x.png) is answered
+// with its converted file (x.webp) — convertedPhotoFallback, after the static
+// mount so it only runs on a miss.
+app.use('/api/uploads/thumbs', thumbnailHandler);
+app.use('/api/uploads', uploadsGuard, express.static('/app/uploads', { setHeaders: uploadsCacheHeaders }), convertedPhotoFallback);
 
 // Routes
 app.use('/api/health', healthRoute);
@@ -345,6 +357,7 @@ app.use('/api/wine-reports', wineReportsRoute);
 app.use('/api/bottles/import', importRoute);
 app.use('/api/cellar-import', cellarImportRoute);
 app.use('/api/racks', racksRoute);
+app.use('/api/offline', offlineRoute);
 app.use('/api/cellar-layout', cellarLayoutRoute);
 app.use('/api/images', imagesRoute);
 app.use('/api/somm/maturity', sommMaturityRoute);

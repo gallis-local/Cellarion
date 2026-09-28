@@ -34,6 +34,12 @@ vi.mock('../hooks/useLabelScanner', () => ({
 }));
 vi.mock('../components/ImageUpload', () => ({ default: () => <div /> }));
 vi.mock('../components/RatingInput', () => ({ default: () => <div /> }));
+// The custom-fields block reads the key vocabulary through apiFetch; these
+// tests route apiFetch positionally, so a stub keeps them about the bottles.
+vi.mock('../components/bottle/AddBottleCustomFields', () => ({
+  default: () => <div />,
+  buildPersonalDataPayload: () => [],
+}));
 
 vi.mock('react-i18next', () => {
   const t = (key) => key;
@@ -87,7 +93,8 @@ describe('AddBottle — "Place your bottles now?" (issue #1055)', () => {
 
     await waitFor(() => expect(screen.getByText('addBottle.placePrompt.title')).toBeInTheDocument());
     expect(navigateMock).not.toHaveBeenCalled(); // skippable, never automatic
-    expect(apiFetchMock.mock.calls.some(([url]) => url === '/api/racks?cellar=cellar1')).toBe(true);
+    // The offer only needs to know racks exist — the light summary, not every bottle.
+    expect(apiFetchMock.mock.calls.some(([url]) => url === '/api/racks?cellar=cellar1&summary=1')).toBe(true);
 
     fireEvent.click(screen.getByTestId('place-now'));
     expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1/racks', { state: { placeQueue: ['b1', 'b2'] } });

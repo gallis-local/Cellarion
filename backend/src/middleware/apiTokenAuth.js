@@ -4,9 +4,15 @@ const { logAudit } = require('../services/audit');
 
 const { TOKEN_PREFIX } = ApiToken;
 
-// How often lastUsedAt is persisted (and token.used audited) per token. Keeps
-// a polling integration from turning every authenticated request into a write.
+// How often lastUsedAt is persisted per token. Keeps a polling integration
+// from turning every authenticated request into a write.
 const LAST_USED_THROTTLE_MS = 60 * 60 * 1000; // 1 hour
+
+// token.used is audited once per token per UTC day — on the day's first use —
+// not with every hourly lastUsedAt write. Integrations polling around the
+// clock made the hourly row 41% of all audit rows (scaling audit 2026-09-25)
+// while it said nothing a daily one doesn't; lastUsedAt keeps its hour.
+const utcDay = (d) => d.toISOString().slice(0, 10);
 
 /**
  * Scope → route allowlist. DEFAULT-DENY: an API token is accepted ONLY on the
@@ -194,10 +200,18 @@ async function authenticateApiToken(req, res, next, rawToken) {
     req.apiToken = { id: token._id.toString(), scopes: token.scopes };
 
     // Throttled usage bookkeeping — fire-and-forget, never blocks the request.
-    if (!token.lastUsedAt || Date.now() - token.lastUsedAt.getTime() > LAST_USED_THROTTLE_MS) {
-      ApiToken.updateOne({ _id: token._id }, { $set: { lastUsedAt: new Date() } }).catch(() => {});
-      // Audit the token id, never the token itself.
-      logAudit(req, 'token.used', { type: 'apiToken', id: token._id }, {});
+    // The daily audit is checked on its own, not only when the hour is up: a
+    // token used at 23:50 and again at 00:20 used to miss the new day's entry
+    // when that was its only use that day (release audit 2026-09-27, L).
+    const now = new Date();
+    const hourUp = !token.lastUsedAt || now.getTime() - token.lastUsedAt.getTime() > LAST_USED_THROTTLE_MS;
+    const newDay = !token.lastUsedAt || utcDay(token.lastUsedAt) !== utcDay(now);
+    if (hourUp || newDay) {
+      ApiToken.updateOne({ _id: token._id }, { $set: { lastUsedAt: now } }).catch(() => {});
+      // Audit the token id, never the token itself — once a day (see utcDay).
+      if (newDay) {
+        logAudit(req, 'token.used', { type: 'apiToken', id: token._id }, {});
+      }
     }
 
     next();

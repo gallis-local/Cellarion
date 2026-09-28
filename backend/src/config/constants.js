@@ -29,13 +29,39 @@ const WINE_POPULATE = [
 // of 30 bottles ships the same card data at a fraction of the payload. Detail
 // routes (GET /api/bottles/:id etc.) keep the full WINE_POPULATE — the bottle
 // page renders aiProfile.
+//
+// Also left out: the registry's internal bookkeeping no card reads and no
+// cellar member — a viewer included — has any business with: who contributed
+// the wine and from which instance (contribution), how it was created
+// (createdVia), the canary flag and the identity provenance (release audit
+// 2026-09-27, L; the registry-UI rule: never show who contributed).
+const WINE_LIST_SELECT = `-aiProfile -normalizedKey -lwin -productNumber -productNumberShort -createdBy -contribution -createdVia -canary -identityProvenance ${SCAN_EVIDENCE_EXCLUDE}`;
 const WINE_POPULATE_LIST = [
   {
     path: 'wineDefinition',
-    select: `-aiProfile -normalizedKey -lwin -productNumber -productNumberShort -createdBy ${SCAN_EVIDENCE_EXCLUDE}`,
+    select: WINE_LIST_SELECT,
     populate: ['country', 'region', 'grapes']
   },
   { path: 'pendingWineRequest', select: 'wineName producer' }
+];
+
+// The same, with each country, region and grape cut to what a bottle card and
+// the cellar page's filters show: the name (the filters use the id); slug and
+// code kept for links and flags, colour for grape dots. The full rows carry
+// long descriptions, copied onto every bottle — most of a big grouped cellar
+// page (scaling audit 2026-09-25, item 11). The cellar page and the offline
+// copy use it: the offline screens render the very same components from it.
+const WINE_POPULATE_CARDS = [
+  {
+    path: 'wineDefinition',
+    select: WINE_LIST_SELECT,
+    populate: [
+      { path: 'country', select: 'name slug code' },
+      { path: 'region', select: 'name slug country' },
+      { path: 'grapes', select: 'name slug color' },
+    ],
+  },
+  { path: 'pendingWineRequest', select: 'wineName producer' },
 ];
 
 // ─── Import thresholds ───────────────────────────────────────────────────────
@@ -99,13 +125,22 @@ const MCP_PERSONAL_SCOPES = ['read', 'consume', 'write'];
 // accountOps validation, and the MCP tool's input schema (grand-audit M9).
 const SUPPORT_CATEGORIES = ['bug', 'help', 'feature', 'other'];
 
+// The orders a cellar's bottle list can open in: the values of the cellar
+// page's sort select (the frontend's utils/cellarSort.js keeps the same list).
+// Remembered per account as preferences.cellarSort, validated in accountOps
+// and offered by the MCP update_preferences tool.
+const CELLAR_SORTS = ['-createdAt', 'createdAt', 'name', '-name', 'vintage', '-vintage', 'price', '-price', 'maturity'];
+
 module.exports = {
+  CELLAR_SORTS,
   CONSUMED_STATUSES,
   MCP_PERSONAL_SCOPES,
   SUPPORT_CATEGORIES,
   MS_PER_DAY,
   WINE_POPULATE,
   WINE_POPULATE_LIST,
+  WINE_POPULATE_CARDS,
+  WINE_LIST_SELECT,
   IMPORT_EXACT_THRESHOLD,
   IMPORT_FUZZY_THRESHOLD,
   MAX_IMPORT_SIZE,

@@ -1,5 +1,6 @@
 const express = require('express');
 const { requireAuth } = require('../middleware/auth');
+const { idempotency } = require('../middleware/idempotency');
 const { requireCellarAccess } = require('../middleware/cellarAccess');
 const Rack = require('../models/Rack');
 const { RACK_TYPES } = require('../models/Rack');
@@ -17,8 +18,35 @@ const { ARRANGE_STRATEGIES, buildArrangePlan } = require('../utils/rackArrange')
 const { isValidId } = require('../utils/validation');
 const { logAudit } = require('../services/audit');
 const { classifyMaturity, buildProfileMap } = require('../utils/maturityUtils');
+const { WINE_LIST_SELECT } = require('../config/constants');
 
 const router = express.Router();
+
+// What a rack view needs of each placed bottle: the bottle, and its wine as
+// the cellar list sends it (WINE_LIST_SELECT — never the AI profile, internal
+// keys, the wine's creator or another user's label-scan evidence) with only the
+// NAMES of its country, region and grapes. Until 2026-09 every rack response
+// populated whole documents: a large cellar came to about 5 MB, most of it
+// taxonomy descriptions, and every shared wine's scan evidence rode along
+// (scaling audit 2026-09-25). Lean: thousands of bottles as plain objects,
+// while the rack itself stays a document, so schema defaults (zones,
+// disabledPositions, …) still fill racks saved before those fields existed.
+const SLOT_BOTTLES = {
+  path: 'slots.bottle',
+  options: { lean: true },
+  populate: [
+    {
+      path: 'wineDefinition',
+      select: WINE_LIST_SELECT,
+      populate: [
+        { path: 'country', select: 'name' },
+        { path: 'region', select: 'name' },
+        { path: 'grapes', select: 'name' },
+      ],
+    },
+    { path: 'pendingWineRequest', select: 'wineName producer' },
+  ],
+};
 
 const MAX_MODULES = 50;
 // Mirrors the Rack schema's rows/cols bounds (models/Rack.js). Checked at the
@@ -80,15 +108,22 @@ router.get('/nfc/:id', requireAuth, async (req, res) => {
 });
 
 router.use(requireAuth);
+// Writes sent with an Idempotency-Key (the offline queue, #1355) apply at
+// most once; without the header nothing changes.
+router.use(idempotency);
 
 // GET /api/racks?cellar=:id  — list racks for a cellar (owner, editor, viewer)
+// ?summary=1: each slot carries only its bottle id — the racks' names, shapes
+// and what sits where, which is all the cellar page, the add-bottle "place
+// them now?" offer and the import picker read. No bottles, wines or maturity.
 router.get('/', requireCellarAccess('viewer'), async (req, res) => {
   try {
-    const racks = await Rack.find({ cellar: req.cellar._id, deletedAt: null })
-      .populate({
-        path: 'slots.bottle',
-        populate: { path: 'wineDefinition', populate: ['country', 'region', 'grapes'] }
-      });
+    if (req.query.summary === '1') {
+      const racks = await Rack.find({ cellar: req.cellar._id, deletedAt: null });
+      return res.json({ racks: racks.map((r) => r.toObject()) });
+    }
+
+    const racks = await Rack.find({ cellar: req.cellar._id, deletedAt: null }).populate(SLOT_BOTTLES);
 
     res.json({ racks: await withMaturity(racks) });
   } catch (err) {
@@ -323,10 +358,7 @@ router.put('/:id', async (req, res) => {
     }
 
     await rack.save();
-    await rack.populate({
-      path: 'slots.bottle',
-      populate: { path: 'wineDefinition', populate: ['country', 'region', 'grapes'] }
-    });
+    await rack.populate(SLOT_BOTTLES);
 
     // cellarId so the update shows on the cellar's audit page like rack.create.
     const shapeAfter = shapeOf(rack);
@@ -389,13 +421,27 @@ router.delete('/:id', async (req, res) => {
       { $pull: { rackPlacements: { rack: rack._id } } }
     );
 
-    logAudit(req, 'rack.delete', { type: 'rack', id: rack._id });
+    logAudit(req, 'rack.delete', { type: 'rack', id: rack._id, cellarId: rack.cellar });
     res.json({ message: 'Rack deleted' });
   } catch (err) {
     console.error('Delete rack error:', err);
     res.status(500).json({ error: 'Failed to delete rack' });
   }
 });
+
+// Offline-queue preconditions (#1355): a write queued offline carries what the
+// user saw when they made it — the occupant of each slot it touches (a bottle
+// id, or null for an empty slot). If the rack has changed since (a partner
+// placed a bottle there meanwhile), the write is refused with 409 instead of
+// silently displacing that bottle. Not sent (undefined) → not checked: every
+// live client is unaffected.
+const SLOT_CHANGED = { error: 'This slot has changed since — check the rack and try again.', code: 'slot_changed' };
+function slotChanged(rack, position, expected) {
+  if (expected === undefined) return false;
+  const slot = rack.slots.find((s) => s.position === position);
+  const actual = slot && slot.bottle ? String(slot.bottle) : null;
+  return actual !== (expected ? String(expected) : null);
+}
 
 // PUT /api/racks/:id/slots/:position  — assign a bottle to a slot (owner or editor)
 router.put('/:id/slots/:position', async (req, res) => {
@@ -414,15 +460,13 @@ router.put('/:id/slots/:position', async (req, res) => {
     if (!role || role === 'viewer') {
       return res.status(403).json({ error: 'Not authorized to modify rack slots' });
     }
+    if (slotChanged(rack, position, req.body.expectOccupant)) return res.status(409).json(SLOT_CHANGED);
 
     // Placement invariants + slot write are shared with the MCP place tool.
     const result = await placeBottleInRack(rack, position, bottleId, req);
     if (result.error) return res.status(result.error.status).json({ error: result.error.message });
 
-    await rack.populate({
-      path: 'slots.bottle',
-      populate: { path: 'wineDefinition', populate: ['country', 'region', 'grapes'] }
-    });
+    await rack.populate(SLOT_BOTTLES);
     res.json({ rack: await withMaturity(rack) });
   } catch (err) {
     console.error('Assign slot error:', err);
@@ -461,6 +505,9 @@ router.post('/:id/slots/:position/move', async (req, res) => {
       return res.status(400).json({ error: 'This slot is disabled' });
     }
 
+    if (slotChanged(rack, from, req.body?.expectFrom) || slotChanged(rack, to, req.body?.expectTo)) {
+      return res.status(409).json(SLOT_CHANGED);
+    }
     const fromSlot = rack.slots.find(s => s.position === from);
     if (!fromSlot) return res.status(400).json({ error: 'Source slot is empty' });
     const toSlot = rack.slots.find(s => s.position === to);
@@ -469,12 +516,9 @@ router.post('/:id/slots/:position/move', async (req, res) => {
     if (toSlot) toSlot.position = from; // occupied target → swap
     await rack.save();
 
-    await rack.populate({
-      path: 'slots.bottle',
-      populate: { path: 'wineDefinition', populate: ['country', 'region', 'grapes'] }
-    });
+    await rack.populate(SLOT_BOTTLES);
 
-    logAudit(req, 'rack.slot_move', { type: 'rack', id: rack._id }, { from, to, swapped: !!toSlot });
+    logAudit(req, 'rack.slot_move', { type: 'rack', id: rack._id, cellarId: rack.cellar }, { from, to, swapped: !!toSlot });
     res.json({ rack: await withMaturity(rack) });
   } catch (err) {
     if (err.name === 'VersionError') {
@@ -608,10 +652,7 @@ router.post('/:id/arrange/apply', async (req, res) => {
     const applied = await applyArrangement(rack, target, req, { via: 'web', moved: target.length });
     if (applied.error) return res.status(applied.error.status).json({ error: applied.error.message });
 
-    await rack.populate({
-      path: 'slots.bottle',
-      populate: { path: 'wineDefinition', populate: ['country', 'region', 'grapes'] }
-    });
+    await rack.populate(SLOT_BOTTLES);
     res.json({ rack: await withMaturity(rack) });
   } catch (err) {
     console.error('Arrange apply error:', err);
@@ -635,13 +676,14 @@ router.delete('/:id/slots/:position', async (req, res) => {
       return res.status(403).json({ error: 'Not authorized to modify rack slots' });
     }
 
+    // ?expect=<bottleId> — the bottle the user saw in the slot (offline queue).
+    if (req.query.expect !== undefined && slotChanged(rack, position, String(req.query.expect))) {
+      return res.status(409).json(SLOT_CHANGED);
+    }
     const result = await clearRackSlot(rack, position, req);
     if (result.error) return res.status(result.error.status).json({ error: result.error.message });
 
-    await rack.populate({
-      path: 'slots.bottle',
-      populate: { path: 'wineDefinition', populate: ['country', 'region', 'grapes'] }
-    });
+    await rack.populate(SLOT_BOTTLES);
     res.json({ rack: await withMaturity(rack) });
   } catch (err) {
     console.error('Clear slot error:', err);
@@ -680,12 +722,9 @@ router.post('/:id/slots/:position/disable', async (req, res) => {
       await rack.save();
     }
 
-    await rack.populate({
-      path: 'slots.bottle',
-      populate: { path: 'wineDefinition', populate: ['country', 'region', 'grapes'] }
-    });
+    await rack.populate(SLOT_BOTTLES);
 
-    logAudit(req, 'rack.slot_disable', { type: 'rack', id: rack._id });
+    logAudit(req, 'rack.slot_disable', { type: 'rack', id: rack._id, cellarId: rack.cellar });
     res.json({ rack: await withMaturity(rack) });
   } catch (err) {
     if (err.name === 'VersionError') {
@@ -717,12 +756,9 @@ router.delete('/:id/slots/:position/disable', async (req, res) => {
       await rack.save();
     }
 
-    await rack.populate({
-      path: 'slots.bottle',
-      populate: { path: 'wineDefinition', populate: ['country', 'region', 'grapes'] }
-    });
+    await rack.populate(SLOT_BOTTLES);
 
-    logAudit(req, 'rack.slot_enable', { type: 'rack', id: rack._id });
+    logAudit(req, 'rack.slot_enable', { type: 'rack', id: rack._id, cellarId: rack.cellar });
     res.json({ rack: await withMaturity(rack) });
   } catch (err) {
     if (err.name === 'VersionError') {

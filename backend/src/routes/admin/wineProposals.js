@@ -28,7 +28,6 @@ const router = express.Router();
 const WineCorrectionProposal = require('../../models/WineCorrectionProposal');
 const WineDefinition = require('../../models/WineDefinition');
 const WineVintageProfile = require('../../models/WineVintageProfile');
-const Bottle = require('../../models/Bottle');
 const Country = require('../../models/Country');
 const Grape = require('../../models/Grape');
 const { requireAuth, requireRole } = require('../../middleware/auth');
@@ -55,8 +54,10 @@ const { notifyProposer } = require('../../services/wineCorrectionNotify');
 router.use(requireAuth, requireRole('admin'));
 
 // Keep in sync with the WineCorrectionProposal schema enums. 'decided' is a
-// list-only alias for approved+rejected (the review modal's second tab).
-const PROPOSAL_STATUSES = ['pending', 'approved', 'rejected'];
+// list-only alias for everything that is no longer pending — approved,
+// rejected and closed (the review modal's second tab). 'closed' = the wine was
+// merged away or deleted while the proposal waited; no reviewer decided it.
+const PROPOSAL_STATUSES = ['pending', 'approved', 'rejected', 'closed'];
 // `grapes` is deliberately NOT here: it is a LIST, and the diff/drift shape
 // this list feeds is string-to-string. It is rendered by joining the names,
 // alongside these, in the diff builder below.
@@ -94,7 +95,7 @@ router.get('/', async (req, res) => {
     if (statusIdx !== -1) {
       filter.status = PROPOSAL_STATUSES[statusIdx];
     } else if (String(req.query.status || '') === 'decided') {
-      filter.status = { $in: [PROPOSAL_STATUSES[1], PROPOSAL_STATUSES[2]] };
+      filter.status = { $in: PROPOSAL_STATUSES.slice(1) };
     }
 
     // Pending-first needs a derived sort key: the status enum does not sort
@@ -394,15 +395,11 @@ async function approveProposal(proposalId, req, { deferFollowThrough = false } =
           throw err;
         }
 
-        // The PUT's follow-through: registry index, the bottles' denormalized
-        // search docs (no scheduled resync exists), the embedding text — and
+        // The PUT's follow-through: registry index, the embedding text — and
         // the IndexNow ping (an approved identity fix changes the public wine
         // page exactly like a PUT rename; parity per audit 2026-08-10).
         submitUrls(`/wines/${wine._id}`);
         searchService.indexWine(wine._id);
-        Bottle.distinct('_id', { wineDefinition: wine._id })
-          .then((ids) => searchService.bulkIndexBottles(ids))
-          .catch((err) => console.error('Bottle re-index after proposal apply failed:', err.message));
         // And the PUT's re-enrich (parity gap found live 2026-08-16: approving
         // "Fabelhaft" → "Niepoort" left the négociant-fiction profile attached
         // until a manual force re-enrich). Real-change only, curator-safe —

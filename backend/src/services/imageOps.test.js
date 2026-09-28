@@ -17,18 +17,25 @@ jest.mock('../services/imageProcessor', () => ({
   processImage: jest.fn(() => Promise.resolve()),
   hashImageBytes: jest.fn(() => 'deadbeef'),
 }));
+jest.mock('../services/photoFormat', () => ({
+  encodeKeptPhoto: jest.fn(async () => Buffer.from('KEPT-WEBP')),
+  KEPT_EXTENSION: 'webp',
+}));
 // attachOfficialWineImage lazy-requires search (ESM meilisearch — unparseable
 // by jest) — mock at top level like every other suite.
 jest.mock('../services/search', () => ({ indexWine: jest.fn(), indexBottle: jest.fn() }));
 
 const fs = require('fs');
+// Kept files are written to a temp name and renamed into place (utils/atomicWrite).
 jest.spyOn(fs.promises, 'writeFile').mockResolvedValue();
+jest.spyOn(fs.promises, 'rename').mockResolvedValue();
 
 const BottleImage = require('../models/BottleImage');
 jest.mock('../models/BottleImage');
 
 const { sanitizeImageBuffer, detectImageFormat } = require('../services/imageSanitizer');
-const { processImage } = require('../services/imageProcessor');
+const { processImage, hashImageBytes } = require('../services/imageProcessor');
+const { encodeKeptPhoto } = require('../services/photoFormat');
 const { ingestBottleImage } = require('./imageOps');
 
 const REQ = { user: { id: 'u1' } };
@@ -36,6 +43,7 @@ const REQ = { user: { id: 'u1' } };
 beforeEach(() => {
   jest.clearAllMocks();
   fs.promises.writeFile.mockResolvedValue();
+  fs.promises.rename.mockResolvedValue();
   sanitizeImageBuffer.mockResolvedValue(Buffer.from('CLEAN-BYTES'));
   detectImageFormat.mockReturnValue('jpeg');
   BottleImage.countDocuments = jest.fn().mockResolvedValue(0);
@@ -50,15 +58,18 @@ test('happy path: sanitises, writes a sniffed-extension file, saves the row, kic
   expect(res.error).toBeUndefined();
   expect(sanitizeImageBuffer).toHaveBeenCalledWith(Buffer.from('RAW'));
   // The CLEAN (re-encoded) bytes are persisted, never the caller's raw input.
-  const [, written] = fs.promises.writeFile.mock.calls[0];
+  const [tmpPath, written] = fs.promises.writeFile.mock.calls[0];
   expect(written.toString()).toBe('CLEAN-BYTES');
-  // Extension comes from the sniffed format.
-  const [writtenPath] = fs.promises.writeFile.mock.calls[0];
+  // Written to a temp name, renamed into place; the extension comes from the sniffed format.
+  const [renamedFrom, writtenPath] = fs.promises.rename.mock.calls[0];
+  expect(renamedFrom).toBe(tmpPath);
   expect(writtenPath).toMatch(/\.jpg$/);
   expect(res.image.originalUrl).toMatch(/^\/api\/uploads\/originals\/.*\.jpg$/);
   expect(res.image.bottle).toBe('b1');
   expect(res.image.save).toHaveBeenCalled();
   expect(processImage).toHaveBeenCalledWith('img-new');
+  // rembg's source stays the full sanitised frame — only kept photos are re-encoded.
+  expect(encodeKeptPhoto).not.toHaveBeenCalled();
 });
 
 // Support ticket 6a97f870 (2026-09-02): a user's label-only photos came back
@@ -70,9 +81,28 @@ test('keepBackground: no bg-removal hand-off, the original is the kept image and
   expect(processImage).not.toHaveBeenCalled();
   expect(res.image.keepBackground).toBe(true);
   expect(res.image.status).toBe('processed');
-  expect(res.image.originalUrl).toMatch(/^\/api\/uploads\/originals\/.+\.jpg$/); // sniffed jpeg → .jpg
   expect(res.image.processedUrl).toBe(res.image.originalUrl);
   expect(res.image.save).toHaveBeenCalledTimes(1);
+});
+
+test('keepBackground: the kept photo is stored like every kept photo — the WebP of the clean bytes', async () => {
+  const res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'u1', bottle: { _id: 'b1' }, keepBackground: true }, REQ);
+  expect(encodeKeptPhoto).toHaveBeenCalledWith(Buffer.from('CLEAN-BYTES'));
+  const [, written] = fs.promises.writeFile.mock.calls[0];
+  const [, writtenPath] = fs.promises.rename.mock.calls[0];
+  expect(String(writtenPath)).toMatch(/\.webp$/);
+  expect(written.toString()).toBe('KEPT-WEBP');
+  expect(res.image.originalUrl).toMatch(/^\/api\/uploads\/originals\/.+\.webp$/);
+  // The dedup hash is taken on the bytes that are kept (and exported).
+  expect(hashImageBytes).toHaveBeenCalledWith(Buffer.from('KEPT-WEBP'));
+});
+
+test('keepBackground: a photo that cannot be encoded is rejected, nothing written or saved', async () => {
+  encodeKeptPhoto.mockRejectedValueOnce(new Error('bad'));
+  const res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'u1', keepBackground: true }, REQ);
+  expect(res.error.status).toBe(400);
+  expect(fs.promises.writeFile).not.toHaveBeenCalled();
+  expect(BottleImage).not.toHaveBeenCalled();
 });
 
 test('keepBackground must be literally true — a truthy string does not opt out', async () => {

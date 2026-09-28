@@ -45,6 +45,10 @@ const { mapBottlesForExport } = require('./cellarExport');
 const WineVintageProfile = require('../models/WineVintageProfile');
 const BottleImage = require('../models/BottleImage');
 
+// Real encodes of full-size photos: quick alone, but past the 5 s default
+// when every Jest worker is encoding at once.
+jest.setTimeout(30000);
+
 // Valid 24-hex ObjectIds so buildBottle's `new Bottle({...})` casts cleanly.
 const OID = {
   cellar: '64b0000000000000000000bb',
@@ -381,6 +385,7 @@ describe('attachImages sanitization (SECURITY_AUDIT L-13)', () => {
   // strip) before fs.writeFileSync — and a bad image must be SKIPPED with a
   // recorded warning, never fail the import.
   let writeSpy;
+  let renameSpy; // kept files are written to a temp name and renamed into place (utils/atomicWrite)
 
   const freshResult = () => ({
     imagesAttached: 0, imagesDeduped: 0, imagesSkipped: 0, errors: [],
@@ -390,12 +395,13 @@ describe('attachImages sanitization (SECURITY_AUDIT L-13)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     writeSpy = jest.spyOn(fs, 'writeFileSync').mockImplementation(() => {});
+    renameSpy = jest.spyOn(fs, 'renameSync').mockImplementation(() => {});
     // No byte-identical image on record → always take the write path.
     BottleImage.findOne.mockReturnValue({ select: () => ({ lean: () => Promise.resolve(null) }) });
     BottleImage.create.mockImplementation(async (doc) => ({ _id: 'img1', ...doc }));
   });
 
-  afterEach(() => writeSpy.mockRestore());
+  afterEach(() => { writeSpy.mockRestore(); renameSpy.mockRestore(); });
 
   async function jpegWithExif() {
     return sharp({
@@ -445,7 +451,8 @@ describe('attachImages sanitization (SECURITY_AUDIT L-13)', () => {
       () => good, result, new Map(), 0
     );
 
-    const [writtenPath, writtenBuf] = writeSpy.mock.calls[0];
+    const [, writtenBuf] = writeSpy.mock.calls[0];
+    const [, writtenPath] = renameSpy.mock.calls[0]; // the temp name is renamed to the final one
     expect(writtenBuf).not.toEqual(good);
     const meta = await sharp(writtenBuf).metadata();
     expect(meta.exif).toBeUndefined();
@@ -454,8 +461,8 @@ describe('attachImages sanitization (SECURITY_AUDIT L-13)', () => {
   });
 
   test('the file extension follows the actual bytes, not the archive filename', async () => {
-    // A real JPEG smuggled under a "processed …png" archive name must be
-    // written as .jpg (the sanitizer preserves the decoded format).
+    // A real JPEG smuggled under a "processed …png" archive name: the kept
+    // file is the WebP it is converted to, named for what it really is.
     const jpeg = await jpegWithExif();
     const result = freshResult();
 
@@ -464,12 +471,95 @@ describe('attachImages sanitization (SECURITY_AUDIT L-13)', () => {
       () => jpeg, result, new Map(), 0
     );
 
-    const [writtenPath] = writeSpy.mock.calls[0];
-    expect(String(writtenPath)).toMatch(/\.jpg$/);
+    const [, writtenBuf] = writeSpy.mock.calls[0];
+    const [, writtenPath] = renameSpy.mock.calls[0]; // the temp name is renamed to the final one
+    expect(String(writtenPath)).toMatch(/\.webp$/);
+    const meta = await sharp(writtenBuf).metadata();
+    expect(meta.format).toBe('webp');
+    // Encoded from the accepted archive bytes — EXIF/GPS still never land on disk.
+    expect(meta.exif).toBeUndefined();
     expect(BottleImage.create).toHaveBeenCalledWith(
-      expect.objectContaining({ processedUrl: expect.stringMatching(/\.jpg$/) })
+      expect.objectContaining({ processedUrl: expect.stringMatching(/^\/api\/uploads\/processed\/.+\.webp$/) })
     );
     expect(result.imagesAttached).toBe(1);
+  });
+
+  test('a processed image that fails the sanitizer is never encoded or written', async () => {
+    const result = freshResult();
+    await attachImages(
+      freshBottle(), [{ processed: 'images/processed/evil.png' }], 'u1',
+      () => Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'), result, new Map(), 0
+    );
+    expect(result.imagesSkipped).toBe(1);
+    expect(writeSpy).not.toHaveBeenCalled();
+  });
+
+  test('a cut-out photo from an older export (full-size PNG) is kept as a WebP of at most 2048 px, transparency intact', async () => {
+    const png = await sharp({ create: { width: 900, height: 3000, channels: 4, background: { r: 90, g: 10, b: 30, alpha: 0.5 } } })
+      .png()
+      .toBuffer();
+    const result = freshResult();
+
+    await attachImages(
+      freshBottle(), [{ processed: 'images/processed/old.png' }], 'u1',
+      () => png, result, new Map(), 0
+    );
+
+    const [, writtenBuf] = writeSpy.mock.calls[0];
+    const [, writtenPath] = renameSpy.mock.calls[0]; // the temp name is renamed to the final one
+    expect(String(writtenPath)).toMatch(/processed[\\/][^\\/]+\.webp$/);
+    const meta = await sharp(writtenBuf).metadata();
+    expect(meta.format).toBe('webp');
+    expect(meta.height).toBe(2048);
+    expect(meta.hasAlpha).toBe(true);
+    // The record's hash is that of the STORED bytes (release audit 2026-09-27,
+    // L): an export of this cellar carries exactly those, so a re-import of it
+    // matches on the first try. A repeat import of the SAME archive matches
+    // too — the encode is deterministic (next test).
+    expect(BottleImage.create).toHaveBeenCalledWith(expect.objectContaining({
+      contentHash: require('crypto').createHash('sha256').update(writtenBuf).digest('hex'),
+    }));
+  });
+
+  test('a repeat import of the same archive matches the stored bytes and writes nothing', async () => {
+    const png = await sharp({ create: { width: 300, height: 400, channels: 4, background: { r: 90, g: 10, b: 30, alpha: 0.5 } } })
+      .png()
+      .toBuffer();
+    // First import: nothing on record → written.
+    await attachImages(freshBottle(), [{ processed: 'images/processed/old.png' }], 'u1', () => png, freshResult(), new Map(), 0);
+    const storedHash = BottleImage.create.mock.calls[0][0].contentHash;
+    const archiveHash = require('crypto').createHash('sha256').update(png).digest('hex');
+    expect(storedHash).not.toBe(archiveHash);
+    jest.clearAllMocks();
+    // Second import of the same archive: the archive-hash lookup misses (the
+    // record carries the stored hash), the stored-hash lookup finds the file.
+    const existing = { processedUrl: '/api/uploads/processed/kept.webp', originalUrl: null };
+    BottleImage.findOne
+      .mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve(null) }) })
+      .mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve(existing) }) });
+    const onDisk = jest.spyOn(fs, 'existsSync').mockReturnValue(true);
+    const result = freshResult();
+
+    await attachImages(freshBottle(), [{ processed: 'images/processed/old.png' }], 'u1', () => png, result, new Map(), 0);
+
+    expect(BottleImage.findOne.mock.calls[1][0]).toEqual({ uploadedBy: 'u1', contentHash: storedHash });
+    expect(writeSpy).not.toHaveBeenCalled();
+    expect(result.imagesDeduped).toBe(1);
+    expect(BottleImage.create).toHaveBeenCalledWith(expect.objectContaining({ processedUrl: existing.processedUrl, contentHash: storedHash }));
+    onDisk.mockRestore();
+  });
+
+  test('an original-only photo (never cut out) is kept in its own format — it may still go to rembg', async () => {
+    const jpeg = await jpegWithExif();
+    const result = freshResult();
+
+    await attachImages(
+      freshBottle(), [{ original: 'images/originals/raw.jpg' }], 'u1',
+      () => jpeg, result, new Map(), 0
+    );
+
+    const [, writtenPath] = renameSpy.mock.calls[0]; // the temp name is renamed to the final one
+    expect(String(writtenPath)).toMatch(/originals[\\/][^\\/]+\.jpg$/);
   });
 
   test('all images bad → nothing written, import result still sane', async () => {

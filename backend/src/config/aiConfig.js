@@ -9,8 +9,8 @@
  * -------
  * chatEnabled          – master switch; false blocks POST /api/chat
  * embeddingModel       – Voyage AI model name used for new embeddings
- * vectorIndex          – active Qdrant collection version suffix ('v1', 'v2', …)
- * chatTopK             – how many Qdrant results to retrieve before filtering to user's cellar
+ * vectorIndex          – index version the vectors are stored under ('v1', 'v2', …)
+ * chatTopK             – how many vector hits to retrieve before filtering to user's cellar
  * chatMaxResults       – max wines shown in the final AI answer
  * embeddingBatchDelayMs– ms to sleep between embedding calls during batch jobs
  *                        (helps stay within Voyage free-tier 3 RPM)
@@ -430,6 +430,12 @@ const defaults = {
   // experience and the product. These two are conveniences for one operator.
   sommMaturitySuggestEnabled: true,
   sommPriceSuggestEnabled: true,
+  // Prompt caching (2026-09-25): the label-scan instructions and the import
+  // lookup's fixed rules carry Anthropic's cache marker, so a repeat call
+  // within the cache lifetime pays 10% for that part. A pure cost switch: the
+  // prompt the model reads is the same whether it is on or off (SuperAdmin →
+  // AI, no deploy needed). See services/labelScan.systemBlock.
+  promptCaching: true,
 };
 
 const ENRICHMENT_ON_ADD_MODES = ['always', 'sufficient', 'off'];
@@ -484,6 +490,8 @@ async function load() {
           ? doc.value.sommMaturitySuggestEnabled : defaults.sommMaturitySuggestEnabled,
         sommPriceSuggestEnabled: typeof doc.value.sommPriceSuggestEnabled === 'boolean'
           ? doc.value.sommPriceSuggestEnabled : defaults.sommPriceSuggestEnabled,
+        promptCaching: typeof doc.value.promptCaching === 'boolean'
+          ? doc.value.promptCaching : defaults.promptCaching,
       };
 
       // One-time migration: a stored config from before the embedding-quality

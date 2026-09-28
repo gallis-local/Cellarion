@@ -1,12 +1,184 @@
 /* eslint-disable no-restricted-globals */
 
 const CACHE_NAME = 'cellarion-v4';
-const API_CACHE_NAME = 'cellarion-api-v1';
+// API responses are cached PER USER: one cache per account, named
+// `${API_CACHE_PREFIX}<userId>`. The Cache API matches on URL alone and ignores
+// the Authorization header, so a single shared cache let the next person on a
+// shared device be served the previous account's cellar straight from the
+// cache — the server's access check never ran. v1 was that shared cache; the
+// activate step deletes it. The page wipes every API cache on logout
+// (clearApiCaches in serviceWorkerRegistration.js).
+const API_CACHE_PREFIX = 'cellarion-api-v2-';
+
+// The account a request is made as, read from its bearer token. The payload is
+// NOT verified here — it does not need to be: it only picks which of this
+// device's caches to use, and the server still authorises the network request.
+// No token (or an unreadable one) → null → the request is never cached.
+function apiCacheNameFor(request) {
+  const match = /^Bearer\s+[^.\s]+\.([^.\s]+)\.[^.\s]+$/.exec(request.headers.get('Authorization') || '');
+  if (!match) return null;
+  try {
+    const payload = JSON.parse(atob(match[1].replace(/-/g, '+').replace(/_/g, '/')));
+    const id = String(payload && payload.id);
+    return /^[a-f0-9]{24}$/i.test(id) ? API_CACHE_PREFIX + id : null;
+  } catch {
+    return null;
+  }
+}
+
+function deleteApiCaches() {
+  return caches.keys().then((names) =>
+    Promise.all(names.filter((name) => name.startsWith(API_CACHE_PREFIX)).map((name) => caches.delete(name)))
+  );
+}
+
+// ── Offline app shell (#1355) ──────────────────────────────────────────────
+// BUILD is stamped in by the build (vite-plugins/swPrecache.js): this build's
+// version and every file of it — /index.html plus all hashed JS/CSS/woff2.
+// It stays null on the dev server, where nothing is precached.
+const BUILD = /*__CELLARION_BUILD__*/null;
+// The whole app is kept in ONE cache per build version, index.html together
+// with the exact bundles it references — so an offline shell can never point at
+// assets a later deploy deleted (why the shell used to be left uncached).
+// Offline mode is opt-in: the page asks for it ('offline-enable'), and the
+// existence of any shell cache is what remembers the choice across updates.
+const SHELL_CACHE_PREFIX = 'cellarion-shell-';
+const SHELL_COMPLETE = '/__cellarion-shell-complete__';
+const shellCacheName = BUILD ? SHELL_CACHE_PREFIX + BUILD.version : null;
+
+function shellCacheNames() {
+  return caches.keys().then((names) => names.filter((name) => name.startsWith(SHELL_CACHE_PREFIX)));
+}
+
+async function isShellComplete(name) {
+  if (!name || !(await caches.has(name))) return false;
+  const cache = await caches.open(name);
+  return !!(await cache.match(SHELL_COMPLETE));
+}
+
+// Download this build into its shell cache. Idempotent: a complete cache is
+// left alone, so a page asking on every load costs nothing after the first.
+// Hashed files never change under their name, so any already on the device
+// (an older build's shell, the static cache) are copied rather than downloaded
+// — a deploy that touched three chunks downloads three chunks, not 5 MB.
+// index.html is always fetched fresh. Only a complete run sets the marker.
+// One file into the shell cache: reused when already on the device (hashed
+// files never change under their name), else fetched. index.html is always
+// fetched, and must be the very index.html of THIS build — during a deploy an
+// older worker could otherwise pair the new shell with its old bundles.
+async function storeShellFile(cache, url) {
+  if (url !== '/index.html') {
+    if (await cache.match(url)) return;
+    const have = await caches.match(url);
+    if (have) { await cache.put(url, have); return; }
+  }
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`${url} → ${res.status}`);
+  if (url === '/index.html' && Array.isArray(BUILD.indexRefs)) {
+    const html = await res.clone().text();
+    if (!BUILD.indexRefs.every((ref) => html.includes(ref))) throw new Error('index.html is from another build');
+  }
+  await cache.put(url, res);
+}
+
+// Download this build into its shell cache. Idempotent: a complete cache is
+// left alone, so a page asking on every load costs nothing after the first.
+// File by file, a few at a time — on a flaky connection each file that made it
+// is kept, and the next attempt continues from there. Only a run in which every
+// file is in place sets the completion marker.
+async function precacheShell() {
+  if (!BUILD) return false;
+  if (await isShellComplete(shellCacheName)) return true;
+  const cache = await caches.open(shellCacheName);
+  const queue = [...BUILD.files];
+  let failed = null;
+  await Promise.all(Array.from({ length: 4 }, async () => {
+    while (queue.length) {
+      const url = queue.shift();
+      try { await storeShellFile(cache, url); } catch (err) { failed = failed || err; }
+    }
+  }));
+  if (failed) throw failed;
+  await cache.put(SHELL_COMPLETE, new Response('ok'));
+  return true;
+}
+
+// Once this build's shell is complete, older builds' shells are dead weight.
+// Until then they stay: an older complete shell still opens the app offline.
+async function pruneOldShells() {
+  // Only the worker in charge, and not while a newer one is installing: an
+  // outgoing worker must never delete the incoming build's shell.
+  const reg = self.registration;
+  if (reg && (reg.installing || reg.waiting)) return;
+  if (reg && self.serviceWorker && reg.active && reg.active !== self.serviceWorker) return;
+  if (!(await isShellComplete(shellCacheName))) return;
+  const names = await shellCacheNames();
+  await Promise.all(names.filter((name) => name !== shellCacheName).map((name) => caches.delete(name)));
+}
+
+async function deleteShellCaches() {
+  const names = await shellCacheNames();
+  await Promise.all(names.map((name) => caches.delete(name)));
+}
+
+// A page load. Network first, as always. With a complete stored app, a load
+// that has not answered within NAV_WAIT_MS (one bar of signal hangs rather
+// than fails) opens the stored app instead of a blank screen for minutes.
+const NAV_WAIT_MS = 4000;
+async function navigate(request) {
+  const network = fetch(request);
+  const shell = await offlineShell();
+  if (!shell) return network.catch(() => caches.match('/offline.html'));
+  let timer;
+  const first = await Promise.race([
+    network.then((r) => ({ r }), () => ({ failed: true })),
+    new Promise((resolve) => { timer = setTimeout(() => resolve({ slow: true }), NAV_WAIT_MS); }),
+  ]);
+  clearTimeout(timer);
+  if (first.r) return first.r;
+  network.catch(() => {}); // a late answer is simply dropped
+  return shell;
+}
+
+// The shell for an offline navigation: this build's, else any complete older one.
+async function offlineShell() {
+  if (await isShellComplete(shellCacheName)) {
+    return (await caches.open(shellCacheName)).match('/index.html');
+  }
+  for (const name of await shellCacheNames()) {
+    if (await isShellComplete(name)) return (await caches.open(name)).match('/index.html');
+  }
+  return undefined;
+}
+
+// ── Offline photos (#1355) ─────────────────────────────────────────────────
+// The page (utils/offlineSnapshot.syncPhotos) keeps the card-size thumbnails
+// of the user's bottles in this cache. Here they are served from it, and when
+// a full-size photo can't be fetched offline its thumbnail stands in — so the
+// bottle page still shows the bottle without ever storing full-size photos.
+const PHOTO_CACHE = 'cellarion-photos';
+// Both folders photos are served from have thumbnails (services/thumbnails.js).
+const UPLOADED_PHOTO = /^\/api\/uploads\/(processed|originals)\/([A-Za-z0-9_-]+\.(?:png|jpe?g|webp))$/i;
+
+async function servePhoto(request, url) {
+  if (url.pathname.startsWith('/api/uploads/thumbs/')) {
+    const saved = await caches.match(request, { cacheName: PHOTO_CACHE });
+    return saved || fetch(request);
+  }
+  try {
+    return await fetch(request);
+  } catch (err) {
+    const m = UPLOADED_PHOTO.exec(url.pathname);
+    const thumb = m && await caches.match(`/api/uploads/thumbs/${m[1]}/${m[2]}.webp`, { cacheName: PHOTO_CACHE });
+    if (thumb) return thumb;
+    throw err;
+  }
+}
 
 // App shell files to pre-cache on install
-// Only truly static, un-hashed assets are precached. The HTML shell ('/' and
-// '/index.html') is deliberately NOT precached — it maps to build-hashed
-// bundles, so a frozen shell would request deleted assets (404) after a deploy.
+// Only truly static, un-hashed assets are precached here. The HTML shell and
+// the hashed bundles are precached only for offline mode, per build version,
+// in the shell cache above.
 const PRECACHE_URLS = [
   '/offline.html',
   '/manifest.json'
@@ -20,25 +192,71 @@ const CACHEABLE_API_PATTERNS = [
   '/api/bottles/',   // bottle detail
 ];
 
+// Except a history section's next page ("Load more": ?reason / ?before). It
+// always asks the server: a copy kept from an earlier visit could say nothing
+// is left after that bottle when bottles were logged elsewhere since, and every
+// position would add one more entry to the cache. The person just asked for
+// more, so there is nothing to gain from an instant stale answer.
+function isHistoryNextPage(url) {
+  return /\/history$/.test(url.pathname) && (url.searchParams.has('reason') || url.searchParams.has('before'));
+}
+
 // Install: pre-cache app shell
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE_URLS))
-  );
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.addAll(PRECACHE_URLS);
+    // Offline mode on (a shell cache exists): bring the new build down now, so
+    // the app still opens offline after this update. A failure must not block
+    // the update — the page asks again on its next load.
+    if ((await shellCacheNames()).length > 0) {
+      try { await precacheShell(); } catch { /* retried via 'offline-enable' */ }
+    }
+  })());
   self.skipWaiting();
 });
 
 // Activate: clean up old caches
 self.addEventListener('activate', (event) => {
-  const validCaches = new Set([CACHE_NAME, API_CACHE_NAME]);
   event.waitUntil(
     caches.keys().then((names) =>
       Promise.all(
-        names.filter((name) => !validCaches.has(name)).map((name) => caches.delete(name))
+        names
+          .filter((name) => name !== CACHE_NAME && name !== PHOTO_CACHE && !name.startsWith(API_CACHE_PREFIX) && !name.startsWith(SHELL_CACHE_PREFIX))
+          .map((name) => caches.delete(name))
       )
-    )
+    ).then(pruneOldShells).then(pruneStaticAssets)
   );
   self.clients.claim();
+});
+
+// The static cache keeps every hashed file it ever served, deploy after deploy.
+// Once this build is known, bundles that aren't part of it go. (A tab still on
+// an older build that then needs one reloads — see index.js, vite:preloadError.)
+async function pruneStaticAssets() {
+  if (!BUILD || !(await caches.has(CACHE_NAME))) return;
+  const keep = new Set(BUILD.files);
+  const cache = await caches.open(CACHE_NAME);
+  for (const req of await cache.keys()) {
+    const path = new URL(req.url).pathname;
+    if (path.startsWith('/assets/') && !keep.has(path)) await cache.delete(req);
+  }
+}
+
+// The page turns offline mode on or off (utils/offlineMode.js). A reply goes
+// back on the MessageChannel port when the page sent one.
+self.addEventListener('message', (event) => {
+  const type = event.data && event.data.type;
+  const reply = (msg) => { if (event.ports && event.ports[0]) event.ports[0].postMessage(msg); };
+  if (type === 'offline-enable') {
+    event.waitUntil(
+      precacheShell()
+        .then((ok) => pruneOldShells().then(() => reply({ type: 'offline-shell', ok })))
+        .catch(() => reply({ type: 'offline-shell', ok: false }))
+    );
+  } else if (type === 'offline-disable') {
+    event.waitUntil(deleteShellCaches().then(() => reply({ type: 'offline-shell', ok: false })));
+  }
 });
 
 // ── Push Notifications ──────────────────────────────────────────────────────
@@ -89,8 +307,12 @@ self.addEventListener('fetch', (event) => {
   // Any non-GET request to a cached API path means data changed (add/remove/update bottle, etc.)
   // — wipe the API cache so the next page load fetches fresh data instead of showing stale content.
   if (request.method !== 'GET') {
-    if (url.pathname.startsWith('/api/')) {
-      caches.delete(API_CACHE_NAME);
+    // Our own API only — a POST to another origin's /api/ (the analytics
+    // beacon) must not wipe every account's cache.
+    if (url.origin === self.location.origin && url.pathname.startsWith('/api/')) {
+      // A write can change what other accounts see too (a shared cellar), so
+      // every account's cache on this device goes, not only the writer's.
+      deleteApiCaches();
     }
     return;
   }
@@ -98,13 +320,22 @@ self.addEventListener('fetch', (event) => {
   // ── Cacheable API requests: stale-while-revalidate ──
   // Serve the cached response instantly (eliminates the API wait on repeat visits),
   // then update the cache in the background so the next load is fresh.
-  if (url.pathname.startsWith('/api/') && CACHEABLE_API_PATTERNS.some((p) => url.pathname.startsWith(p))) {
+  const apiCacheName = url.pathname.startsWith('/api/') && CACHEABLE_API_PATTERNS.some((p) => url.pathname.startsWith(p))
+    && !isHistoryNextPage(url)
+    ? apiCacheNameFor(request)
+    : null;
+  if (apiCacheName) {
     event.respondWith(
-      caches.open(API_CACHE_NAME).then((cache) =>
+      caches.open(apiCacheName).then((cache) =>
         cache.match(request).then((cached) => {
           const networkFetch = fetch(request).then((response) => {
             if (response.ok) {
               cache.put(request, response.clone());
+            } else if (response.status === 403 || response.status === 404) {
+              // Access withdrawn (a share revoked) or the thing is gone: stop
+              // serving the stale copy on the next visit. (Not 401 — that is
+              // only an expired access token, and apiFetch retries at once.)
+              cache.delete(request);
             }
             return response;
           });
@@ -115,16 +346,22 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
+  // Photos: saved thumbnails first; offline, a thumbnail for a full-size photo.
+  if (url.pathname.startsWith('/api/uploads/')) {
+    event.respondWith(servePhoto(request, url));
+    return;
+  }
+
   // Skip other API requests — always go to network
   if (url.pathname.startsWith('/api/')) return;
 
-  // Navigation requests (HTML pages): always network-first, NEVER cached. The
-  // SPA shell references build-hashed bundles, so a cached shell would request
-  // deleted assets (404) after a deploy. Fall back to offline.html only offline.
+  // Navigation requests (HTML pages): always network-first, never cached here.
+  // The SPA shell references build-hashed bundles, so a shell cached on its own
+  // would request deleted assets (404) after a deploy. Offline, fall back to
+  // offline.html — or, with offline mode on, to the precached shell of a complete
+  // build, whose bundles sit in the same cache — the app itself opens.
   if (request.mode === 'navigate') {
-    event.respondWith(
-      fetch(request).catch(() => caches.match('/offline.html'))
-    );
+    event.respondWith(navigate(request));
     return;
   }
 
@@ -139,7 +376,11 @@ self.addEventListener('fetch', (event) => {
         return response;
       });
 
-      return cached || networkFetch;
+      if (cached) {
+        networkFetch.catch(() => {}); // offline: the cached copy stands
+        return cached;
+      }
+      return networkFetch;
     })
   );
 });

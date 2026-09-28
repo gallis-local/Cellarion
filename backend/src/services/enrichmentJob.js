@@ -15,7 +15,7 @@
  * full                  – re-enrich every wine, overwriting existing profiles
  *
  * After a profile is written, the wine's active (wine, vintage) pairs are
- * re-embedded immediately (embedSinglePair) so the new taste data reaches Qdrant
+ * re-embedded immediately (embedSinglePair) so the new taste data reaches the vectors
  * without a separate manual embedding job. The textHash check inside
  * embedSinglePair means this only does real work when the text actually changed.
  */
@@ -373,7 +373,8 @@ async function runJob(cfg) {
     // an AI spend on a row strangers cannot see, whose output would then be
     // presented as the registry's tasting note the moment it is promoted.
     // The promoting write re-enriches (runPromotionFollowThrough), which is
-    // when the wine genuinely enters.
+    // when the wine genuinely enters — unless wine data is somm-owned
+    // (enrichmentOnAdd 'off'), when the sommelier writes that profile instead.
     // Canaries (registry lockdown L4) carry hand-written profiles and are never regenerated.
     // A wine copied from the shared registry (Registry Bridge, registryId set)
     // carries the registry's profile and is refreshed from there — the local
@@ -485,7 +486,7 @@ async function runJob(cfg) {
 /**
  * Enrich one wine: ask Claude for a vintage-neutral tasting profile, store it on
  * the WineDefinition, then re-embed the wine's active vintages so the new taste
- * data reaches Qdrant immediately.
+ * data reaches the vectors immediately.
  *
  * @param {object} wine   – populated WineDefinition (country/region/grapes names)
  * @param {string} model  – embedding/enrichment model label to stamp on the profile
@@ -826,7 +827,7 @@ async function enrichWine(wine, model, { publishSuspect = false, curatorContext 
     );
     // Re-embed on HOLD too (audit 2026-08-16): a force re-enrich that ends in
     // a hold has just nulled a previously PUBLISHED profile, and without this
-    // the old description keeps living in the Qdrant vectors — cellar chat
+    // the old description keeps living in the stored vectors — cellar chat
     // would keep retrieving the wine by the very claims the hold silenced.
     // embedSinglePair rebuilds from the now-profile-less text (textHash makes
     // it a no-op for never-published rows). Best-effort, like the publish path.
@@ -897,7 +898,7 @@ async function enrichWine(wine, model, { publishSuspect = false, curatorContext 
     }
   );
 
-  // Re-embed this wine's active vintages so the new profile reaches Qdrant
+  // Re-embed this wine's active vintages so the new profile reaches the vectors
   // immediately. embedSinglePair is a no-op when the text/hash is unchanged and
   // self-skips during a batch embedding job. Best-effort — never fail enrichment.
   try {

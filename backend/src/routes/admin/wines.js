@@ -32,6 +32,7 @@ const Discussion = require('../../models/Discussion');
 const DiscussionReply = require('../../models/DiscussionReply');
 const WineEmbedding = require('../../models/WineEmbedding');
 const WineNotDuplicate = require('../../models/WineNotDuplicate');
+const { bumpDataVersion } = require('../../services/dataVersion');
 // Pending correction proposals close with their wine THROUGH this service, so
 // a user who filed one is told what happened (it owns the model access).
 const { closePendingForWine } = require('../../services/wineCorrectionNotify');
@@ -45,7 +46,6 @@ const JournalEntry = require('../../models/JournalEntry');
 const Recommendation = require('../../models/Recommendation');
 const RestockAlert = require('../../models/RestockAlert');
 const WineRequest = require('../../models/WineRequest');
-const vectorStore = require('../../services/vectorStore');
 const { unlinkImageFiles } = require('../../services/imageProcessor');
 const { embedSinglePair } = require('../../services/embeddingJob');
 const searchService = require('../../services/search');
@@ -260,9 +260,10 @@ router.post('/', async (req, res) => {
     const normalizedKey = generateWineKey(cleanName, producerToStore, cleanAppellation);
 
     // The image lands on a public page and in every viewer's AuthImage, so it
-    // has to be a real http(s) link, an inline image or one of our own upload
-    // paths (audit 2026-09 S7-1 / F06-1).
-    const imageErr = validateImageRef(image);
+    // has to be a real http(s) link or one of our own upload paths (audit
+    // 2026-09 S7-1 / F06-1) — never an inline image (a picture is a file;
+    // POST /:id/image uploads one).
+    const imageErr = validateImageRef(image, { allowInline: false });
     if (imageErr) return res.status(400).json({ error: `Wine image: ${imageErr}` });
 
     const wine = new WineDefinition({
@@ -723,6 +724,16 @@ router.post('/:id/profile-reviewed', async (req, res) => {
     // admin instead agrees the identity is wrong, the fix is the wine editor
     // — the identity edit re-enriches.
     if (wine.aiProfile?.heldAt) {
+      // Somm-owned wine data (enrichmentOnAdd 'off', 2026-08-22): the AI writes
+      // no profile, and a release is a forced regeneration. Refused with the
+      // way out — writing the profile by hand replaces the held one and clears
+      // the hold (services/wineProfileOps.applyProfilePatch). The MCP twin,
+      // review_held_profile, refuses the same way.
+      if (require('../../config/aiConfig').get().enrichmentOnAdd === 'off') {
+        return res.status(409).json({
+          error: 'Automatic AI profiles are switched off (SuperAdmin → AI Spend Controls), so a held profile is not regenerated. Write the profile by hand instead — that replaces the held one and clears the hold.',
+        });
+      }
       const { releaseHeldProfile } = require('../../services/enrichmentJob');
       releaseHeldProfile(wine._id).catch(() => {});
       logAudit(req, 'admin.wine.profileReviewed', { type: 'wine', id: wine._id },
@@ -1493,7 +1504,10 @@ router.put('/:id', async (req, res) => {
     // label-scan URL bug left wines in this state after Remove default image).
     if (image !== undefined) {
       if (image) {
-        const imageErr = validateImageRef(image);
+        // A new picture is never stored inline. An unchanged one passes, so an
+        // unrelated edit of a wine still holding an inline picture from before
+        // works (scripts/convert-inline-wine-images.js converts those).
+        const imageErr = validateImageRef(image, { allowInline: image === wine.image });
         if (imageErr) return res.status(400).json({ error: `Wine image: ${imageErr}` });
         wine.image = image;
       } else {
@@ -1536,18 +1550,9 @@ router.put('/:id', async (req, res) => {
     const profileInputsChanged = profileInputsSnapshot(wine) !== beforeProfileInputs;
     await wine.populate(['country', 'region', 'grapes']);
 
-    // Sync to search index (fire-and-forget). Bottle documents denormalize
-    // wineName/producer/country/region/grape names — without re-indexing
-    // them, cellar search keeps matching the old values indefinitely (no
-    // scheduled resync exists; full-sync only runs on an empty index).
+    // Sync to the registry index (fire-and-forget). Cellar search
+    // (services/bottleSearch) reads the wine live from MongoDB.
     searchService.indexWine(wine._id);
-    if (name !== undefined || producer !== undefined || country !== undefined ||
-        region !== undefined || appellation !== undefined || grapes !== undefined ||
-        type !== undefined) {
-      Bottle.distinct('_id', { wineDefinition: wine._id })
-        .then(ids => searchService.bulkIndexBottles(ids))
-        .catch(err => console.error('Bottle re-index after wine update failed:', err.message));
-    }
 
     logAudit(req, 'admin.wine.update',
       { type: 'wine', id: wine._id },
@@ -1587,7 +1592,7 @@ router.put('/:id', async (req, res) => {
 // recommendations) — deleting under those would orphan or silently vanish
 // other people's data; merge re-points references and is the right tool.
 // Registry-side/derived data that only exists FOR the wine (maturity
-// profiles, price snapshots/opt-ins, community prices, embeddings + Qdrant
+// profiles, price snapshots/opt-ins, community prices, embeddings with their
 // vectors, restock alerts, reports) is cascade-deleted with it.
 router.delete('/:id', async (req, res) => {
   try {
@@ -1642,7 +1647,7 @@ router.delete('/:id', async (req, res) => {
         { wine, actorId: req.user?.id }),
       // Active owner inquiries have nothing left to verify — same closure.
       closeInquiriesForWineDelete(id, req),
-      // Qdrant points + WineEmbedding bookkeeping rows (same helper as merge).
+      // WineEmbedding rows, which hold the vectors (same helper as merge).
       purgeSourceVectors(id),
     ]);
 
@@ -1891,27 +1896,9 @@ async function performWineMerge(sourceId, targetId, req) {
 
 // ── Merge embedding / enrichment consistency helpers ─────────────────────────
 
-// Delete a merged-away source's vectors from BOTH Qdrant and the WineEmbedding
-// bookkeeping. Deleting the rows alone would orphan the real vectors in Qdrant
-// (and discard the point ids needed to ever target them), so we delete the
-// Qdrant points first — grouped by the index version (collection) they live in —
-// then drop the rows. Best-effort: a Qdrant hiccup must not fail the merge.
+// Delete a merged-away (or deleted) wine's vectors: they live on its
+// WineEmbedding rows, so dropping the rows is the whole job.
 async function purgeSourceVectors(sourceId) {
-  try {
-    const embs = await WineEmbedding.find({ wineDefinition: sourceId })
-      .select('qdrantPointId indexVersion').lean();
-    const byIndex = new Map();
-    for (const e of embs) {
-      if (!e.qdrantPointId) continue;
-      if (!byIndex.has(e.indexVersion)) byIndex.set(e.indexVersion, []);
-      byIndex.get(e.indexVersion).push(e.qdrantPointId);
-    }
-    for (const [indexVersion, ids] of byIndex) {
-      await vectorStore.deletePoints(indexVersion, ids).catch(() => {});
-    }
-  } catch (err) {
-    console.warn('[merge] purge source vectors failed (%s):', sourceId, err.message);
-  }
   await WineEmbedding.deleteMany({ wineDefinition: sourceId });
 }
 
@@ -2064,7 +2051,11 @@ async function reassignRestockSimilar(sourceId, keeperId) {
 // (updateMany by wineDefinition) and does NOT delete the source, so it's safe
 // to re-run after a partial failure. Returns the number of bottles moved.
 async function reassignWineRefs(sourceId, keeperId) {
+  const owners = await Bottle.distinct('user', { wineDefinition: sourceId });
   const bottleRes = await Bottle.updateMany({ wineDefinition: sourceId }, { $set: { wineDefinition: keeperId } });
+  // Their owners' statistics change with it; after the write, so no cache
+  // pairs the new version with the old data (services/dataVersion).
+  owners.forEach(bumpDataVersion);
   await Promise.all([
     reassignWineListEntries(sourceId, keeperId),
     BottleImage.updateMany({ wineDefinition: sourceId }, { $set: { wineDefinition: keeperId } }),
@@ -2074,7 +2065,7 @@ async function reassignWineRefs(sourceId, keeperId) {
     WineReport.updateMany({ wineDefinition: sourceId }, { $set: { wineDefinition: keeperId } }),
     Discussion.updateMany({ wineDefinition: sourceId }, { $set: { wineDefinition: keeperId } }),
     DiscussionReply.updateMany({ wineDefinition: sourceId }, { $set: { wineDefinition: keeperId } }),
-    // Delete the source's vectors from Qdrant too, not just the bookkeeping rows.
+    // Delete the source's vectors (its WineEmbedding rows).
     purgeSourceVectors(sourceId),
     // Drop any "not duplicate" decisions referencing the disappearing source.
     WineNotDuplicate.deleteMany({ $or: [{ wineA: sourceId }, { wineB: sourceId }] }),
@@ -2214,14 +2205,6 @@ router.post('/merge', async (req, res) => {
       searchService.removeWine(src._id.toString());
     }
     searchService.indexWine(keeper._id.toString());
-
-    // Re-index the keeper's bottles: reassignWineRefs re-pointed the sources'
-    // bottles, but their search documents still carry the DELETED source
-    // wine's denormalized name/producer/taxonomy — without this, cellar
-    // search keeps matching/faceting them under the old wine forever.
-    Bottle.distinct('_id', { wineDefinition: keeperOid })
-      .then(ids => searchService.bulkIndexBottles(ids))
-      .catch(err => console.error('Bottle re-index after merge failed:', err.message));
 
     // Re-embed the keeper's vintages so semantic search reflects the merged wine.
     reembedKeeper(keeper._id);

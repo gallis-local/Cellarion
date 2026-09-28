@@ -8,7 +8,7 @@
 # (Krypton) is Active LTS until 2026-10-20, maintenance to 2028-04-30.
 # Dependabot will offer Current releases (26 before 2026-10-28) — those are
 # ignored in .github/dependabot.yml rather than tracked.
-FROM node:24-alpine@sha256:50c8e8ca1d27439048670df5883f32d57cf81cff6233222c893fd0d9884cbd81
+FROM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
 
 # Bake production mode into the image: the refresh-cookie Secure flag and
 # 5xx error redaction key off NODE_ENV, and Express itself runs faster with
@@ -26,7 +26,9 @@ RUN npm ci --omit=dev
 # require() time from the @img/sharp-linuxmusl-* optional deps, so a lockfile
 # regenerated off-alpine (which drops them) breaks only when the first image
 # upload hits imageProcessor. A Node major bump is exactly when that can slip.
-RUN node -e "require('sharp')"
+# bcrypt is native the same way (its musl build ships inside the package):
+# checked here too, or a broken binary would first show as failed logins.
+RUN node -e "require('sharp'); require('bcrypt')"
 
 COPY . .
 

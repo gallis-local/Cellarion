@@ -94,11 +94,13 @@ jest.mock('../services/search', () => ({
 }));
 
 // Give every request a UNIQUE rate-limit key so the real express-rate-limit
-// limiters are mounted (their wiring is exercised) but never trip mid-suite.
+// limiters are mounted (their wiring is exercised) but never trip mid-suite —
+// unless a test pins one address (mockFixedIp) to exercise a limit.
+let mockFixedIp = null;
 jest.mock('../utils/clientIp', () => {
   let n = 0;
   return {
-    rateLimitKey: () => `test-key-${n++}`,
+    rateLimitKey: () => mockFixedIp || `test-key-${n++}`,
     getClientIp: (req) => (req && req.ip) || '127.0.0.1',
   };
 });
@@ -248,6 +250,7 @@ const request = ({ method = 'POST', path, body, cookie, bearer }) => new Promise
         status: res.statusCode,
         body: raw ? JSON.parse(raw) : null,
         setCookies: res.headers['set-cookie'] || [],
+        headers: res.headers,
       });
     });
   });
@@ -303,7 +306,10 @@ describe('POST /api/auth/refresh — rotation', () => {
     const res = await request({ path: '/api/auth/refresh', cookie: `refreshToken=${oldRaw}` });
 
     expect(res.status).toBe(200);
-    expect(Object.keys(res.body)).toEqual(['token']); // no user object leaks on refresh
+    // no user object leaks on refresh — only the token and whether this
+    // device's session is a "remember me" one (offline mode, #1355)
+    expect(Object.keys(res.body).sort()).toEqual(['persistent', 'token']);
+    expect(typeof res.body.persistent).toBe('boolean');
 
     // The access token is a real HS256 JWT carrying id/roles/plan
     const decoded = jwt.verify(res.body.token, 'test-secret', { algorithms: ['HS256'] });
@@ -417,6 +423,42 @@ describe('POST /api/auth/refresh — rotation', () => {
     expectClearedCookies(res);
   });
 
+  // A server-side failure is not a verdict on the session (scaling audit
+  // 2026-09-25): it used to clear the cookie and answer 401, signing the user
+  // out whenever the database blinked — a deploy, a restart.
+  test('a database failure → 503 "try again" with Retry-After, and the cookie is KEPT', async () => {
+    const user = makeUserDoc();
+    const raw = plantRefreshToken(user);
+    User.findOne.mockRejectedValueOnce(new Error('connection closed'));
+    const error = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await request({ path: '/api/auth/refresh', cookie: `refreshToken=${raw}` });
+
+    expect(res.status).toBe(503);
+    expect(res.headers['retry-after']).toBe('5');
+    expect(res.setCookies).toEqual([]);
+    expect(sessionOf(user, raw)).toBeDefined();
+
+    // …and the same cookie works as soon as the database answers again.
+    const again = await request({ path: '/api/auth/refresh', cookie: `refreshToken=${raw}` });
+    expect(again.status).toBe(200);
+    expect(typeof again.body.token).toBe('string');
+    error.mockRestore();
+  });
+
+  test('a save that fails mid-rotation (e.g. racing a login on another device) → 503, cookie kept', async () => {
+    const user = makeUserDoc();
+    const raw = plantRefreshToken(user);
+    user.save.mockRejectedValueOnce(Object.assign(new Error('No matching document found'), { name: 'VersionError' }));
+    const error = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await request({ path: '/api/auth/refresh', cookie: `refreshToken=${raw}` });
+
+    expect(res.status).toBe(503);
+    expect(refreshCookies(res)).toEqual([]); // no new token, and the old one is not cleared
+    error.mockRestore();
+  });
+
   test('a rotated token replayed within 60 s is a lost tab race: generic 401, nothing revoked', async () => {
     const user = makeUserDoc();
     const tokenA = plantRefreshToken(user);
@@ -499,6 +541,42 @@ describe('POST /api/auth/refresh — rotation', () => {
   });
 });
 
+// 30 per 15 min for one refresh TOKEN — not one address, which many people
+// can share (a carrier's NAT, an office) — plus a per-address ceiling of 300
+// so made-up cookies can't flood the session lookup (scaling audit 2026-09-25).
+// The clock is frozen, so a window never resets: every test here uses cookies
+// and addresses no other test uses.
+describe('POST /api/auth/refresh — rate limits', () => {
+  const madeUpCookie = () => `refreshToken=${crypto.randomBytes(64).toString('hex')}`;
+  afterEach(() => { mockFixedIp = null; });
+
+  test('the limit follows the refresh token: a 31st try with the same token is 429, another token from the same address is not', async () => {
+    mockFixedIp = '198.51.100.1';
+    const cookie = madeUpCookie();
+    for (let i = 0; i < 30; i++) expect((await request({ path: '/api/auth/refresh', cookie })).status).toBe(401); // unknown, but counted
+    expect((await request({ path: '/api/auth/refresh', cookie })).status).toBe(429);
+    // Someone else behind the same address is unaffected.
+    expect((await request({ path: '/api/auth/refresh', cookie: madeUpCookie() })).status).toBe(401);
+  });
+
+  test('without a cookie the limit falls back to the address', async () => {
+    mockFixedIp = '198.51.100.2';
+    for (let i = 0; i < 30; i++) expect((await request({ path: '/api/auth/refresh' })).status).toBe(401);
+    expect((await request({ path: '/api/auth/refresh' })).status).toBe(429);
+  });
+
+  test('one address is capped at 300 refreshes per window, however many cookies it makes up', async () => {
+    mockFixedIp = '198.51.100.3';
+    const statuses = [];
+    for (let i = 0; i < 300; i++) statuses.push((await request({ path: '/api/auth/refresh', cookie: madeUpCookie() })).status);
+    expect(statuses.every((s) => s === 401)).toBe(true);
+    expect((await request({ path: '/api/auth/refresh', cookie: madeUpCookie() })).status).toBe(429);
+    // A different address still gets through.
+    mockFixedIp = '198.51.100.4';
+    expect((await request({ path: '/api/auth/refresh', cookie: madeUpCookie() })).status).toBe(401);
+  });
+});
+
 describe('POST /api/auth/logout', () => {
   test('revokes ONLY this device\'s session (by its cookie) and clears the cookie on both paths', async () => {
     const user = makeUserDoc();
@@ -541,7 +619,7 @@ describe('POST /api/auth/logout', () => {
     expect(user.refreshTokenExpiresAt).toBeNull();
   });
 
-  test('without a cookie nothing can be identified server-side: sessions untouched, cookie still cleared', async () => {
+  test('without a cookie nothing can be identified server-side: sessions untouched, and no cookie is cleared', async () => {
     const user = makeUserDoc();
     plantRefreshToken(user);
 
@@ -549,14 +627,62 @@ describe('POST /api/auth/logout', () => {
 
     expect(res.status).toBe(200);
     expect(user.sessions).toHaveLength(1);
-    expectClearedCookies(res);
+    expect(refreshCookies(res)).toHaveLength(0);
   });
 
-  test('requires authentication (real requireAuth middleware) → 401 without a bearer token', async () => {
+  // Offline mode (#1355): an offline session has no access token. A logout
+  // that required one left the server session and cookie alive, and the next
+  // online start signed the same account back in.
+  test('without a bearer token the cookie alone identifies and ends this device\'s session', async () => {
+    const user = makeUserDoc();
+    const laptop = plantRefreshToken(user, { client: 'Windows / Chrome' });
+    const phone = plantRefreshToken(user, { client: 'Android / Chrome' });
+
+    const res = await request({ path: '/api/auth/logout', cookie: `refreshToken=${phone}` });
+
+    expect(res.status).toBe(200);
+    expect(sessionOf(user, phone)).toBeUndefined();
+    expect(sessionOf(user, laptop)).toBeDefined();
+    expectClearedCookies(res);
+    expect((await request({ path: '/api/auth/refresh', cookie: `refreshToken=${phone}` })).status).toBe(401);
+  });
+
+  test('an expired bearer token falls back to the cookie', async () => {
+    const user = makeUserDoc();
+    const raw = plantRefreshToken(user);
+    const expired = jwt.sign({ id: 'u1', roles: ['user'] }, process.env.JWT_SECRET, { algorithm: 'HS256', expiresIn: -10 });
+
+    const res = await request({ path: '/api/auth/logout', bearer: expired, cookie: `refreshToken=${raw}` });
+
+    expect(res.status).toBe(200);
+    expect(user.sessions).toHaveLength(0);
+  });
+
+  // Audit 2026-09-27 M5: the route needs no token, so another site can make a
+  // browser POST here top-level. SameSite=Lax keeps the cookie out of that
+  // request — but a deletion header in the response would still be honoured,
+  // signing the victim out at their next refresh (and wiping their offline
+  // copy, since that reads as a rejection). No cookie presented → none cleared.
+  test('neither token nor cookie → nothing to end, and NO cookie deletion is sent (cross-site sign-out)', async () => {
+    const user = makeUserDoc();
+    plantRefreshToken(user);
+
     const res = await request({ path: '/api/auth/logout' });
 
-    expect(res.status).toBe(401);
-    expect(res.body).toEqual({ error: 'No token provided' });
+    expect(res.status).toBe(200);
+    expect(user.sessions).toHaveLength(1);
+    expect(refreshCookies(res)).toHaveLength(0);
+  });
+
+  test('a cookie that matches no session is still cleared — it was presented by this browser', async () => {
+    const user = makeUserDoc();
+    plantRefreshToken(user);
+
+    const res = await request({ path: '/api/auth/logout', cookie: 'refreshToken=stale-token-of-a-revoked-session' });
+
+    expect(res.status).toBe(200);
+    expect(user.sessions).toHaveLength(1);
+    expectClearedCookies(res);
   });
 });
 

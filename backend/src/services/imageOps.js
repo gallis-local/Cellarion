@@ -16,15 +16,31 @@
  */
 const path = require('path');
 const fs = require('fs');
+const { writeFileAtomic } = require('../utils/atomicWrite');
 const crypto = require('crypto');
 const BottleImage = require('../models/BottleImage');
 const { ORIGINALS_DIR } = require('../config/upload');
 const { sanitizeImageBuffer, detectImageFormat } = require('./imageSanitizer');
 const { processImage, hashImageBytes } = require('./imageProcessor');
+const { encodeKeptPhoto, KEPT_EXTENSION } = require('./photoFormat');
 const { stripHtml } = require('../utils/sanitize');
 
 const MAX_IMAGES_PER_BOTTLE = 20;
 const EXT_FOR = { jpeg: 'jpg', png: 'png', webp: 'webp' };
+const INLINE_IMAGE = /^data:image\/(?:png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=]+)$/;
+
+/**
+ * The bytes of an inline `data:image/…;base64,` reference (a photo attached to
+ * a wine request, or a wine picture stored inline before pictures became
+ * files), or null for anything else. Not validated here: they go through
+ * ingestBottleImage like any upload.
+ */
+function decodeInlineImage(value) {
+  const m = typeof value === 'string' ? value.match(INLINE_IMAGE) : null;
+  if (!m) return null;
+  const buffer = Buffer.from(m[1], 'base64');
+  return buffer.length ? buffer : null;
+}
 
 /**
  * Image credits (attribution on wine-library photos) are ADMIN-only, on every
@@ -78,13 +94,34 @@ async function ingestBottleImage({ buffer, userId, userRoles = [], bottle = null
     return { error: { status: 400, message: 'Image format could not be verified' } };
   }
 
-  const filename = `${crypto.randomUUID()}.${EXT_FOR[format]}`;
+  // keepBackground (ticket 6a97f870): the uploader opted out of background
+  // removal — a label-only photo or a product shot, which rembg would cut up.
+  // The original is then the kept image from the start: processedUrl points at
+  // it so every consumer that prefers processedUrl (exports, the wine's
+  // display image, the upload preview) works unchanged, and the row is
+  // 'processed' immediately, so nothing polls for a job that never runs.
+  // It is stored the way every kept photo is (services/photoFormat: WebP,
+  // at most 2048 px) — the full frame is only needed as rembg's source.
+  const keep = keepBackground === true;
+  let stored = clean;
+  let extension = EXT_FOR[format];
+  if (keep) {
+    try {
+      stored = await encodeKeptPhoto(clean);
+      extension = KEPT_EXTENSION;
+    } catch {
+      return { error: { status: 400, message: 'Image could not be processed — it must be a JPEG, PNG or WebP within normal dimensions' } };
+    }
+  }
+
+  const filename = `${crypto.randomUUID()}.${extension}`;
   // Join against the fixed uploads dir with a server-generated basename — no
   // caller-controlled path segment exists. A disk failure (EACCES, ENOSPC) is
   // an INFRA fault, not the caller's — surface a clean 500 rather than letting
   // it throw out of the tool as a non-JSON crash.
   try {
-    await fs.promises.writeFile(path.join(ORIGINALS_DIR, filename), clean);
+    // Into a publicly served, immutably cached folder: never half-written.
+    await writeFileAtomic(path.join(ORIGINALS_DIR, filename), stored);
   } catch (err) {
     console.error('[imageOps] failed to persist image:', err.message);
     return { error: { status: 500, message: 'Could not save the image right now — please try again later' } };
@@ -93,15 +130,8 @@ async function ingestBottleImage({ buffer, userId, userRoles = [], bottle = null
   // Content hash of the stored bytes (export/re-import dedup). Best-effort —
   // a hash failure must never block the upload.
   let contentHash = null;
-  try { contentHash = hashImageBytes(clean); } catch { /* non-fatal */ }
+  try { contentHash = hashImageBytes(stored); } catch { /* non-fatal */ }
 
-  // keepBackground (ticket 6a97f870): the uploader opted out of background
-  // removal — a label-only photo or a product shot, which rembg would cut up.
-  // The original is then the kept image from the start: processedUrl points at
-  // it so every consumer that prefers processedUrl (exports, the wine's
-  // display image, the upload preview) works unchanged, and the row is
-  // 'processed' immediately, so nothing polls for a job that never runs.
-  const keep = keepBackground === true;
   const originalUrl = `/api/uploads/originals/${filename}`;
   const image = new BottleImage({
     bottle: bottle ? bottle._id : null,
@@ -196,7 +226,7 @@ async function persistLabelScan({ buffer, userId, side = 'front' }) {
     const format = detectImageFormat(buffer);
     if (!format) return null;
     const filename = `${crypto.randomUUID()}.${EXT_FOR[format]}`;
-    await fs.promises.writeFile(path.join(ORIGINALS_DIR, filename), buffer);
+    await writeFileAtomic(path.join(ORIGINALS_DIR, filename), buffer);
     let contentHash = null;
     try { contentHash = hashImageBytes(buffer); } catch { /* non-fatal */ }
     const image = new BottleImage({
@@ -218,4 +248,4 @@ async function persistLabelScan({ buffer, userId, side = 'front' }) {
   }
 }
 
-module.exports = { ingestBottleImage, attachOfficialWineImage, persistLabelScan, MAX_IMAGES_PER_BOTTLE };
+module.exports = { ingestBottleImage, attachOfficialWineImage, persistLabelScan, decodeInlineImage, MAX_IMAGES_PER_BOTTLE };

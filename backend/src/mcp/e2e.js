@@ -1,4 +1,4 @@
-/* Full-stack MCP e2e — drives the RUNNING backend (real Mongo/Meili/Qdrant)
+/* Full-stack MCP e2e — drives the RUNNING backend (real Mongo/Meili)
  * with the real SDK client. The Docker smoke for the MCP surface:
  *
  *   docker-compose up -d           # then, if the DB is fresh:
@@ -83,7 +83,7 @@ async function main() {
   const bottles = parse(await client.callTool({ name: 'search_bottles', arguments: { cellar_id: cellarId, limit: 5 } }));
   okLog(`search_bottles(cellar) → ${bottles.summary}`);
   const text = parse(await client.callTool({ name: 'search_bottles', arguments: { query: 'cloudy', limit: 5 } }));
-  okLog(`search_bottles(query) → ${text.summary}${text.warnings ? ' [fallback]' : ' (Meili)'}`);
+  okLog(`search_bottles(query) → ${text.summary}`);
 
   if (bottles.data.length) {
     const bottleId = String(bottles.data[0].bottle_id);

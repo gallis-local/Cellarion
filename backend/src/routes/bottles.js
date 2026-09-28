@@ -1,5 +1,6 @@
 const express = require('express');
 const { requireAuth, requireNonDemo } = require('../middleware/auth');
+const { idempotency } = require('../middleware/idempotency');
 const { requireBottleAccess, ROLE_LEVELS } = require('../middleware/bottleAccess');
 const Bottle = require('../models/Bottle');
 const Cellar = require('../models/Cellar');
@@ -28,6 +29,7 @@ const { stripHtml, escapeRegex } = require('../utils/sanitize');
 const { toNormalized } = require('../utils/ratingUtils');
 const { classifyMaturity, buildProfileMap, parseMaturityFilter, matchesMaturityFilter } = require('../utils/maturityUtils');
 const { parsePagination } = require('../utils/pagination');
+const personalData = require('../services/personalData');
 // Read-surface decoration: populated grapes gain `displayName` — the
 // regionally correct label for the bottle's wine (Tinta Roriz on a Douro
 // Port) — while `name` stays canonical for storage/filters/stats.
@@ -35,7 +37,6 @@ const { parsePagination } = require('../utils/pagination');
 // the card displays must be what search matches.
 const { decorateGrapes, resolveGrapeDisplayName } = require('../utils/grapeDisplay');
 const mongoose = require('mongoose');
-const searchService = require('../services/search');
 // add/update/consume/restore/remove logic + rack-slot freeing live in the
 // shared service so the REST routes and the MCP tools can never drift (§7).
 const {
@@ -47,11 +48,45 @@ const {
 // wishlist route; findOrCreateWine itself is lazy-required inside the service.
 const { resolveOrMintWine } = require('../services/wineCommit');
 const { moveBottleToCellar } = require('../services/rackOps');
+const { getDataVersion } = require('../services/dataVersion');
+const { REGISTRY_PHOTO, OWN_PHOTO } = require('../services/photoRetention');
 
 const router = express.Router();
 
+// Machine polling: Home Assistant asks `?maturity=…&limit=…` every few minutes
+// and again after every change nudge, and the maturity path loads and
+// classifies the whole collection per request (scaling audit 2026-09-25).
+// API-token requests are answered from memory while the user's data version
+// (services/dataVersion, moved by every audited bottle./cellar. change) is the
+// one the answer was computed at; the max age bounds registry edits, curated
+// drink windows, photos and anything else the version cannot see. Browser
+// lists are never cached — they show fresh photos.
+const tokenListCache = new Map(); // `${userId}|${query}` -> { at, version, body, bytes }
+const TOKEN_LIST_MAX_AGE_MS = 30 * 60 * 1000;
+const TOKEN_LIST_CACHE_MAX_ENTRIES = 2000;
+// Bounded in bytes as well as entries: a big cellar's page is hundreds of KB,
+// and 2,000 of those would be most of the process's memory (release audit
+// 2026-09-27, L). One answer larger than the whole bound is not kept.
+const TOKEN_LIST_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+let tokenListCacheBytes = 0;
+// The params in a stable order, encoded so that no value can look like another
+// key (`a=1&b=2` typed as one value used to read like two params) and so that a
+// repeated param (?limit=10&limit=20 — parsePagination reads it) is part of the
+// key instead of dropped. The handler ignores everything else.
+const canonicalQuery = (query) => JSON.stringify(Object.keys(query).sort()
+  .filter((k) => typeof query[k] === 'string' || Array.isArray(query[k]))
+  .map((k) => [k, query[k]]));
+
+// Custom fields accepted on one bottle create. The service enforces the real
+// cap per target (personalData.ENTRIES_PER_TARGET); this only bounds the loop
+// so a long array cannot turn one POST into unbounded work.
+const MAX_CUSTOM_FIELDS = 20;
+
 // All routes require authentication
 router.use(requireAuth);
+// Writes sent with an Idempotency-Key (the offline queue, #1355) apply at
+// most once; without the header nothing changes.
+router.use(idempotency);
 
 // GET /api/bottles — list the authenticated user's active bottles across all
 // cellars they OWN (shared/read-only cellars are excluded, matching the
@@ -76,6 +111,17 @@ router.use(requireAuth);
 router.get('/', async (req, res) => {
   try {
     const { isValidObjectId } = mongoose;
+
+    // Version read BEFORE anything is loaded, so a change landing mid-compute
+    // leaves the stored answer already out of date (see tokenListCache).
+    const listCacheKey = req.apiToken ? `${req.user.id}|${canonicalQuery(req.query)}` : null;
+    const listVersion = getDataVersion(req.user.id);
+    if (listCacheKey) {
+      const hit = tokenListCache.get(listCacheKey);
+      if (hit && hit.version === listVersion && Date.now() - hit.at < TOKEN_LIST_MAX_AGE_MS) {
+        return res.json(hit.body);
+      }
+    }
 
     const cellarIds = await Cellar.find({ user: req.user.id, deletedAt: null }).distinct('_id');
     const { limit, offset: skip } = parsePagination(req.query, { limit: 30, maxLimit: 200 });
@@ -374,7 +420,7 @@ router.get('/', async (req, res) => {
       ...(maturityMap ? { maturityStatus: maturityMap.get(b._id.toString()) || null } : {}),
     }));
 
-    res.json({
+    const body = {
       bottles: {
         count: items.length,
         total: totalCount,
@@ -382,7 +428,21 @@ router.get('/', async (req, res) => {
         skip,
         items,
       },
-    });
+    };
+    if (listCacheKey) {
+      const bytes = JSON.stringify(body).length;
+      if (bytes <= TOKEN_LIST_CACHE_MAX_BYTES) {
+        const previous = tokenListCache.get(listCacheKey);
+        if (previous) tokenListCacheBytes -= previous.bytes;
+        if (tokenListCache.size >= TOKEN_LIST_CACHE_MAX_ENTRIES || tokenListCacheBytes + bytes > TOKEN_LIST_CACHE_MAX_BYTES) {
+          tokenListCache.clear();
+          tokenListCacheBytes = 0;
+        }
+        tokenListCache.set(listCacheKey, { at: Date.now(), version: listVersion, body, bytes });
+        tokenListCacheBytes += bytes;
+      }
+    }
+    res.json(body);
   } catch (err) {
     console.error('GET /api/bottles error:', err);
     res.status(500).json({ error: 'Failed to load bottles' });
@@ -419,7 +479,7 @@ router.get('/', async (req, res) => {
 // semantics to the old find-or-create route, so the UI dialog is unchanged).
 router.post('/', requireNonDemo, async (req, res) => {
   try {
-    const { cellar, wineDefinition, newWine, price, currency } = req.body;
+    const { cellar, wineDefinition, newWine, price, currency, personalData: customFields } = req.body;
 
     if (!cellar || (!wineDefinition && !newWine)) {
       return res.status(400).json({ error: 'Cellar and a wine (wineDefinition or newWine) are required' });
@@ -494,6 +554,58 @@ router.post('/', requireNonDemo, async (req, res) => {
     const { bottle } = result;
     await bottle.populate(WINE_POPULATE);
 
+    // Custom fields typed in the add form (user ticket 6ab05cca — "adding ABV
+    // when adding bottles"). Same typed key/value data the bottle page writes,
+    // through the same service, so the two surfaces cannot drift; the add form
+    // is only a second entry point to it.
+    //
+    // NOT fatal: the bottle exists by now, so a rejected field cannot undo it
+    // and a 400 here would be a lie. Each failure is reported back the way
+    // priceWarnings are, and the form shows them without losing the add.
+    const customFieldErrors = [];
+    if (Array.isArray(customFields) && customFields.length > 0) {
+      // Say what was dropped. A silent truncation is the one failure mode the
+      // caller cannot see: the bottle is 201 and the field simply is not there.
+      // One line for all of them: echoing one per dropped element let a 64 kB
+      // body come back as ~1.5 MB of repeats (release audit 2026-09-27, L).
+      if (customFields.length > MAX_CUSTOM_FIELDS) {
+        const dropped = customFields.length - MAX_CUSTOM_FIELDS;
+        customFieldErrors.push({
+          key: null,
+          error: `Too many custom fields in one add (max ${MAX_CUSTOM_FIELDS}) — ${dropped} not saved`,
+        });
+      }
+      for (const field of customFields.slice(0, MAX_CUSTOM_FIELDS)) {
+        const spec = {
+          level: field?.level === 'wine' ? 'wine' : 'bottle',
+          keyId: field?.keyId,
+          newKey: field?.newKey,
+          value: field?.value,
+          vintageScoped: field?.vintageScoped === true,
+        };
+        try {
+          // dedupe: an N-bottle add posts the same WINE-level field once per
+          // bottle (they share one wine record), and a retry after a partial
+          // failure re-posts what the first attempt already wrote.
+          const entryRes = await personalData.createEntry(req.user.id, bottle, spec, { dedupe: true });
+          if (!entryRes.ok) {
+            customFieldErrors.push({ key: spec.newKey?.name || null, error: entryRes.message });
+            continue;
+          }
+          if (entryRes.deduped) continue;
+          logAudit(
+            req,
+            'personal_data.entry_create',
+            { type: spec.level, id: entryRes.entry._id, cellarId: cellarDoc._id },
+            { key: entryRes.entry.key.name, keyCreated: entryRes.keyCreated, via: 'add-bottle' }
+          );
+        } catch (err) {
+          console.warn('Custom field on bottle create failed (non-fatal):', err.message);
+          customFieldErrors.push({ key: spec.newKey?.name || null, error: 'Could not be saved' });
+        }
+      }
+    }
+
     // Non-blocking sanity warnings on the entered price — a REST-only response
     // affordance (the add form highlights a likely mistake — 100×, cents-as-
     // units, etc. — without rejecting the save). See utils/priceValidation.
@@ -514,7 +626,11 @@ router.post('/', requireNonDemo, async (req, res) => {
       }
     }
 
-    res.status(201).json({ bottle, priceWarnings });
+    res.status(201).json({
+      bottle,
+      priceWarnings,
+      ...(customFieldErrors.length > 0 ? { customFieldErrors } : {}),
+    });
   } catch (error) {
     console.error('Create bottle error:', error);
     res.status(500).json({ error: 'Failed to create bottle' });
@@ -717,6 +833,25 @@ router.put('/:id', requireBottleAccess('editor'), async (req, res) => {
   try {
     const { bottle } = req;
 
+    // ifUnchanged (offline queue, #1355): the values of notes / rating /
+    // ratingScale the user saw when they edited offline. A field someone else
+    // has changed since — and not to the same new value — is a conflict: 409
+    // with the current values, so the user chooses instead of one edit
+    // silently overwriting the other. Absent → not checked (live clients).
+    const { ifUnchanged } = req.body || {};
+    if (ifUnchanged !== undefined) {
+      delete req.body.ifUnchanged;
+      if (ifUnchanged && typeof ifUnchanged === 'object') {
+        const same = (a, b) => (a ?? null) === (b ?? null);
+        const conflicts = ['notes', 'rating', 'ratingScale'].filter((k) => k in ifUnchanged
+          && !same(bottle[k], ifUnchanged[k]) && !same(bottle[k], req.body[k]));
+        if (conflicts.length) {
+          const current = Object.fromEntries(conflicts.map((k) => [k, bottle[k] ?? null]));
+          return res.status(409).json({ error: 'Changed elsewhere since your edit', code: 'field_changed', current });
+        }
+      }
+    }
+
     // ONE shared implementation with the MCP update_bottle tool (plan §7):
     // validation, vintage/size coercion, change detection, priceSetAt
     // anchoring, notifier-marker reset, re-index, vintage re-embed and the
@@ -825,7 +960,13 @@ router.post('/:id/consume', requireBottleAccess('editor'), async (req, res) => {
     // today (support ticket 2026-09-13: "how do I set the consumed date?").
     // The service validates it (a real date, not in the future); absent →
     // now, as before. The bulk action has taken the same field since v1.200.
-    const { reason = 'drank', note, rating, consumedRatingScale, consumedAt } = req.body;
+    const { reason = 'drank', note, rating, consumedRatingScale, consumedAt, ifActive } = req.body;
+    // ifActive (offline queue, #1355): only consume a bottle still in the
+    // cellar — one consumed elsewhere meanwhile must not have its record
+    // overwritten by a queued consume. Absent → unchanged behaviour.
+    if (ifActive === true && req.bottle.status !== 'active') {
+      return res.status(409).json({ error: 'This bottle has already left the cellar', code: 'state_changed' });
+    }
     const result = await consumeBottle(req.bottle, { reason, note, rating, ratingScale: consumedRatingScale, consumedAt }, req);
     if (result.error) return res.status(result.error.status).json({ error: result.error.message });
     res.json({ bottle: result.bottle });
@@ -845,7 +986,9 @@ router.post('/:id/consume', requireBottleAccess('editor'), async (req, res) => {
 // POST /api/bottles/:id/open — mark an active bottle as opened (owner or editor)
 router.post('/:id/open', requireBottleAccess('editor'), async (req, res) => {
   try {
-    const result = await openBottle(req.bottle, { preservationMethod: req.body?.preservationMethod }, req);
+    // openedAt: when it was really opened — an open queued offline (#1355) is
+    // sent later. Validated by the service (not future, at most 90 days back).
+    const result = await openBottle(req.bottle, { preservationMethod: req.body?.preservationMethod, openedAt: req.body?.openedAt }, req);
     if (result.error) return res.status(result.error.status).json({ error: result.error.message });
     res.json({ bottle: result.bottle });
   } catch (error) {
@@ -1227,23 +1370,26 @@ router.delete('/:id', requireBottleAccess('editor'), async (req, res) => {
     // Remove bottle from any rack slot that references it
     await removeFromRacks(bottle._id);
 
-    // Remove from Meilisearch before deleting
-    searchService.removeBottle(bottle._id);
-
-    const ownImages = await BottleImage.find({ bottle: bottle._id, assignedToWine: false })
+    // The user's own photos go with the bottle; registry photos (the wine's
+    // picture, or any photo approved as public — services/photoRetention)
+    // are kept and detached, other people see them.
+    const ownImages = await BottleImage.find({ bottle: bottle._id, ...OWN_PHOTO })
       .select('originalUrl processedUrl').lean();
     for (const img of ownImages) await unlinkImageFiles(img);
-    await BottleImage.deleteMany({ bottle: bottle._id, assignedToWine: false });
+    await BottleImage.deleteMany({ bottle: bottle._id, ...OWN_PHOTO });
     await BottleImage.updateMany(
-      { bottle: bottle._id, assignedToWine: true },
+      { bottle: bottle._id, ...REGISTRY_PHOTO },
       { $set: { bottle: null } }
     );
+    await bottle.deleteOne();
+
+    // After the delete, as every other writer audits: the audit moves the
+    // data version, and a search reading the new version before the bottle
+    // is gone would keep it for its whole cache window.
     logAudit(req, 'bottle.delete',
       { type: 'bottle', id: bottle._id, cellarId: bottle.cellar },
       {}
     );
-
-    await bottle.deleteOne();
 
     // Only when THIS was the last bottle waiting on the request — see the
     // same guard in services/bottleOps.removeBottleCascade for the full
