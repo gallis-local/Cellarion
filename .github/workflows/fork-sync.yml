@@ -1,12 +1,18 @@
 name: Sync fork with upstream
 
-# Fast-forwards main to jagduvi1/Cellarion's main. This fork carries zero
-# commits of its own (verified before this workflow was added: `gh api
-# repos/gallis-local/Cellarion/compare/main...jagduvi1:Cellarion:main` showed
-# ahead_by > 0 / behind_by 0), so a fast-forward is always safe and never
-# needs conflict handling -- if that ever stops being true (someone commits
-# directly to this fork), the push step below will simply fail non-fast-
-# -forward rather than silently discarding local work.
+# Merges jagduvi1/Cellarion's main into this fork's main. This fork DOES carry
+# its own commits (the CI workflows themselves, plus this file), so `main`
+# permanently diverges from upstream's linear history the moment those land --
+# a strict fast-forward (the original approach here) can never succeed again
+# after that point. Confirmed the hard way: the first scheduled run after
+# those commits landed failed with "Not possible to fast-forward, aborting."
+# A real merge handles both cases (fast-forwards when possible, merges when
+# not) without ever discarding local work.
+#
+# If upstream and this fork's own commits ever actually conflict, the merge
+# step below fails loudly and leaves `main` untouched -- resolve by hand
+# (clone, `git merge upstream/main`, fix conflicts, push) rather than letting
+# CI guess.
 #
 # A no-op run (already current) does not push, so it does not spuriously
 # trigger build-harbor.yml. No workflow anywhere else in gallis-local does
@@ -37,10 +43,12 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fast-forward main to upstream
+      - name: Merge upstream into main
         id: sync
         run: |
           set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/jagduvi1/Cellarion.git
           git fetch upstream main
           BEHIND=$(git rev-list --count HEAD..upstream/main)
@@ -49,8 +57,8 @@ jobs:
             echo "synced=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "Fast-forwarding $BEHIND commit(s) from upstream/main."
-          git merge --ff-only upstream/main
+          echo "Merging $BEHIND commit(s) from upstream/main."
+          git merge upstream/main --no-edit
           git push origin main
           echo "synced=true" >> "$GITHUB_OUTPUT"
 
