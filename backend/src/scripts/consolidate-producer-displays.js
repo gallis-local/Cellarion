@@ -47,6 +47,12 @@ const { normalizeString, generateWineKey, isIdentitySentinel } = require('../uti
 const { computeCanonicalKey, producerSegment } = require('../utils/wineIdentity');
 const { logAudit } = require('../services/audit');
 
+// Every field profileInputsSnapshot() compares (name, producer, country,
+// region, appellation, classification, type, grapes) and the profile whose
+// snapshot follows a spelling change, plus what the planner and the save hooks
+// read. Guarded by consolidate-producer-displays.test.js.
+const WINE_SELECT = 'name producer appellation country region classification type grapes aiProfile normalizedKey canonicalKey slug nonWine createdAt verifiedChecks crossChecksCleared';
+
 // Estate-title and decoration vocabularies for the TARGET rule only (bucket
 // membership itself comes from producerSegment — one fold, shared with the
 // mint-time resolver). Title tokens mark "the fullest estate form"; legal
@@ -78,8 +84,12 @@ const hasLegal = (s) => toks(s).some((t) => LEGAL.has(t));
   const apply = process.argv.includes('--apply');
   await mongoose.connect(process.env.MONGO_URI || 'mongodb://mongo:27017/winecellar');
 
+  // The projection must carry every field profileInputsSnapshot() reads plus
+  // aiProfile itself, or the snapshot refresh below never sees a current
+  // snapshot and the next enrichment sweep regenerates every renamed
+  // profile as stale (release audit 2026-09-29).
   const wines = await WineDefinition.find({ pendingIdentity: { $ne: true } })
-    .select('name producer appellation country normalizedKey canonicalKey slug nonWine createdAt verifiedChecks crossChecksCleared');
+    .select(WINE_SELECT);
   const countries = await Country.find({}).select('name').lean();
   const countryName = new Map(countries.map((c) => [String(c._id), c.name]));
 
@@ -207,10 +217,17 @@ const hasLegal = (s) => toks(s).some((t) => LEGAL.has(t));
   const searchService = require('../services/search');
   await searchService.initialize();
   let written = 0, failed = 0;
+  // A spelling is not a new identity: a profile that described the record
+  // still does, so its input snapshot follows the spelling — otherwise the
+  // next enrichment sweep regenerates it as stale (review 2026-09-28).
+  const { profileInputsSnapshot } = require('../services/enrichmentJob');
   for (const p of planned) {
     if (p.blocked) continue;
+    const snapshotWasCurrent = Boolean(p.doc.aiProfile?.inputsSnapshot)
+      && p.doc.aiProfile.inputsSnapshot === profileInputsSnapshot(p.doc);
     p.doc.producer = p.group.target;
     p.doc.normalizedKey = p.newKey;
+    if (snapshotWasCurrent) p.doc.aiProfile.inputsSnapshot = profileInputsSnapshot(p.doc);
     try {
       await p.doc.save();
       written += 1;

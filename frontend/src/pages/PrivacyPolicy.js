@@ -21,7 +21,7 @@ function PrivacyPolicy() {
       </Helmet>
       <div className="privacy-container">
         <h1>Privacy Policy</h1>
-        <p className="privacy-updated">Last updated: 25 September 2026 — Version 2026-09-25</p>
+        <p className="privacy-updated">Last updated: 3 October 2026 — Version 2026-10-03</p>
 
         <p>
           Cellarion ("we", "us", or "our") operates the Cellarion wine cellar management
@@ -54,6 +54,7 @@ function PrivacyPolicy() {
           <li><strong>Community / forum data:</strong> discussions and replies you post, reactions you add to other users' replies, threads you subscribe to ("watch"), and read-state markers tracking which threads you've opened (used to drive the unread indicator).</li>
           <li><strong>Activity logs:</strong> actions you take in the app (e.g. adding a bottle, logging in) are logged with your user ID, IP address, and browser user-agent for security and service maintenance purposes.</li>
           <li><strong>Consent records:</strong> timestamps of when you accepted this privacy policy and consented to data processing.</li>
+          <li><strong>How you found Cellarion:</strong> when you create an account we record, once, where your visit came from — the name of the referring website (for example reddit.com, never the full address), any campaign tags on the link you arrived through (such as <code>utm_source</code>), and which section of the site you landed on. It is used only to see which channels bring people who find Cellarion useful, is included in your data export, and is deleted with your account.</li>
           <li><strong>AI-connector records:</strong> if you connect an AI assistant (see section 5), we store the connection's metadata (name, permission scopes, a hashed credential — never the plain token — and last-used time) and an action log of what the assistant did in your account (which tool ran, what changed, and the undo snapshot).</li>
         </ul>
 
@@ -62,6 +63,7 @@ function PrivacyPolicy() {
           <li>To provide and operate the Cellarion service, including authentication and cellar management.</li>
           <li>To send you notifications you have opted into (drink-window alerts, email digests, push notifications).</li>
           <li>To process bottle label images for wine identification (when you use the label scanning feature).</li>
+          <li>To answer support requests you send us, in the app and by email. Each emailed answer has a link that stops these emails, and you can also turn them off in Settings.</li>
           <li>To maintain security, prevent abuse, and investigate incidents via activity logs.</li>
           <li>To operate AI-assistant connections you set up yourself (see section 5), including the action trail that lets you review and undo changes a connected assistant made.</li>
         </ul>
@@ -199,7 +201,7 @@ function PrivacyPolicy() {
           <li><strong>Right to erasure (Art. 17):</strong> you can delete your account and all associated personal data from Settings. Deletion takes effect after a 7-day cooling-off period, and removes your data from the live service at once; encrypted backup copies then age out within six months (see Data retention). Forum posts are anonymised rather than hard-deleted (your authorship is severed) so other users' conversations stay intact; contact support if you need specific posts fully removed.</li>
           <li><strong>Right to data portability (Art. 20):</strong> you can export all your data as JSON from Settings at any time.</li>
           <li><strong>Right to restrict processing (Art. 18):</strong> you can disable all notifications and set your profile to private to restrict how your data is used.</li>
-          <li><strong>Right to object (Art. 21):</strong> you can opt out of all email and push notifications in Settings, or use the one-click unsubscribe link in any email.</li>
+          <li><strong>Right to object (Art. 21):</strong> you can opt out of all email and push notifications in Settings, or use the one-click unsubscribe link in any email. Emailed answers to your support requests also carry a link that stops only those emails.</li>
           <li><strong>Right to withdraw consent (Art. 7):</strong> you can withdraw consent for optional data processing at any time by disabling the relevant features, revoking a connected AI assistant in Settings, or deleting your account.</li>
         </ul>
         <p>
@@ -214,7 +216,12 @@ function PrivacyPolicy() {
           This cookie is strictly necessary for the service to function and does not require
           separate consent. On the hosted cellarion.app, Cloudflare may also set a strictly-necessary
           security cookie to distinguish humans from bots. No tracking, analytics, or advertising
-          cookies are used (our Umami analytics is cookieless).
+          cookies are used (our Umami analytics is cookieless). Besides page views, Umami counts a few
+          anonymous actions — for example that an account was created, a bottle added or an import
+          finished — as numbers and categories only, never your name, email or what is in your cellar.
+          If you sign up with Google or another single sign-on provider, where your visit came from (see
+          section 3) is kept in your browser's session storage for that one round trip to the provider
+          and removed when you return.
         </p>
         <h3>Offline mode (storage on your device)</h3>
         <p>

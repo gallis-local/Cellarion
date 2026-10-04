@@ -27,7 +27,8 @@ const { bumpWineOwners } = require('../../services/dataVersion');
 const { SUPPORTED_CURRENCIES } = require('../../config/currencies');
 const { isValidId } = require('../../utils/validation');
 const { stripHtml } = require('../../utils/sanitize');
-const { normalizeString, sanitizeTaxonomyName } = require('../../utils/normalize');
+const { normalizeString, sanitizeTaxonomyName, resolveCountryName } = require('../../utils/normalize');
+const { otherProducerSpellings, displaySpelling } = require('../../services/producerSpelling');
 const { classifyProposal } = require('../../services/proposalDirectApply');
 const { WINE_COLOURS, colourTypeConflict } = require('../../utils/wineColour');
 const { ok, fail, objectId, pageParams } = require('../toolUtil');
@@ -2126,7 +2127,9 @@ registerTool({
     'already filed. MERGE proposals are decided in Admin → Wines on the web, DELIBERATELY not over MCP: a wine ' +
     'merge moves bottles and rewrites references (same stance as taxonomy merge), and the merge DELETES the absorbed '
     + 'record — there is no unmerge. undo_last withdraws a proposal that is still pending; one that already applied is '
-    + 'changed by filing a further correction.',
+    + 'changed by filing a further correction. A producer spelled unlike the rest of that producer in the registry '
+    + 'comes back with registry_spellings: use the registry\'s spelling unless it is the wrong one, and say which in '
+    + 'the reason.',
   scope: 'write',
   requireRole: SOMM_ROLES,
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -2344,6 +2347,28 @@ registerTool({
       }
     }
 
+    // A producer spelled unlike the rest of that producer in the registry
+    // (same key, same country) — said now, while the curator can still
+    // re-file with the registry's spelling; otherwise the admin has to pick
+    // one at approval (routes/admin/wineProposals, 2026-09-28: curator
+    // corrections split 9 producers in one week this way).
+    // Judged where the wine will BE: a proposed country moves it into that
+    // country's spellings (the same bucket the approve checks).
+    let registrySpellings = [];
+    if (!applied && args.kind === 'field_correction' && (proposedFields?.producer || proposedFields?.country)) {
+      const producer = proposedFields.producer ? proposedFields.producer.trim() : wine.producer;
+      const currentCountry = wine.country?._id || wine.country;
+      let country = currentCountry;
+      if (proposedFields.country) {
+        const Country = require('../../models/Country');
+        const doc = await Country.findOne({ normalizedName: normalizeString(resolveCountryName(proposedFields.country)) });
+        if (doc) country = doc._id;
+      }
+      if (displaySpelling(producer) !== displaySpelling(wine.producer) || String(country) !== String(currentCountry)) {
+        registrySpellings = await otherProducerSpellings(producer, country, { excludeWineId: wine._id });
+      }
+    }
+
     const kindLabel = args.kind === 'merge'
       ? `merge into ${target.producer ? `${target.producer} — ` : ''}${target.name}`
       : args.kind === 'non_wine' ? 'non-wine quarantine' : 'identity-field correction';
@@ -2372,6 +2397,12 @@ registerTool({
         ...(target ? { merge_target: { wine_id: target._id, name: target.name, producer: target.producer || null } } : {}),
         evidence_url: evidenceUrl || null,
         ...(reviewReason ? { why_reviewed: reviewReason } : {}),
+        ...(registrySpellings.length ? {
+          registry_spellings: registrySpellings,
+          spelling_note: `The registry already spells this producer ${registrySpellings.map((s) => `"${s.spelling}" (${s.count} wine${s.count === 1 ? '' : 's'})`).join(', ')}. `
+            + 'If that spelling is right, withdraw this with undo_last and re-file using it. If yours is right, say so in '
+            + 'the reason — the admin can rename them all when approving. If they are different producers, say that.',
+        } : {}),
         note: 'Nothing has changed — the wine stays as-is until an admin reviews the diff and approves.',
         undo: 'undo_last withdraws the proposal while it is still pending',
       },
