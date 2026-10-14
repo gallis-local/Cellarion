@@ -3,6 +3,7 @@ import { lazy } from '../utils/lazyWithReload';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
+import { httpError } from '../utils/friendlyError';
 import { getJournalEntries, deleteJournalEntry } from '../api/journal';
 import ConfirmModal from '../components/ConfirmModal';
 import LoadError from '../components/LoadError';
@@ -106,12 +107,13 @@ export default function Journal() {
     }
   };
 
+  // A refused or failed delete throws, so the confirm dialog stays open and
+  // says why — it used to close as if the entry had gone.
   const handleDelete = async (id) => {
     const res = await deleteJournalEntry(apiFetch, id);
-    if (res.ok) {
-      setEntries(prev => prev.filter(e => e._id !== id));
-      setTotal(prev => prev - 1);
-    }
+    if (!res.ok) throw httpError(res, await res.json().catch(() => null));
+    setEntries(prev => prev.filter(e => e._id !== id));
+    setTotal(prev => prev - 1);
     setConfirmDeleteId(null);
   };
 

@@ -11,6 +11,7 @@ import { PLANS } from '../config/plans';
 import { SCALE_META, VALID_SCALES } from '../utils/ratingUtils';
 import { isPushSupported, getPushPermissionState, subscribeToPush, unsubscribeFromPush, getCurrentEndpoint, getDeviceStatus, sendTestPush } from '../utils/pushSubscription';
 import { downloadBlobObject } from '../utils/downloadBlob';
+import { friendlyError, httpError } from '../utils/friendlyError';
 import ApiTokensSection from '../components/ApiTokensSection';
 import LanguagePicker from '../components/LanguagePicker';
 import AiConnectSection from '../components/AiConnectSection';
@@ -325,13 +326,13 @@ function Settings() {
     try {
       const res = await apiFetch('/api/users/me/export');
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || 'Export failed');
+        const data = await res.json().catch(() => null);
+        throw httpError(res, data, 'Export failed');
       }
       const blob = await res.blob();
       downloadBlobObject(blob, `cellarion-data-export-${user?.username || 'user'}.json`);
     } catch (err) {
-      setExportError(err.message);
+      setExportError(friendlyError(err, t));
     } finally {
       setExporting(false);
     }
