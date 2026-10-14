@@ -1,10 +1,12 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
+import useHandedOverState from '../hooks/useHandedOverState';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import WineImage from '../components/WineImage';
 import CellarNav from '../components/CellarNav';
 import CellarPageHeader from '../components/CellarPageHeader';
+import BottleUndoNotice from '../components/BottleUndoNotice';
 import { getCellarOnOrder } from '../api/cellars';
 import { markBottleArrived, bulkArriveBottles, bulkUpdateBottles } from '../api/bottles';
 import {
@@ -31,6 +33,9 @@ function CellarOnOrder() {
   const [error, setError] = useState(null);
   // { count } after a delivery was marked — the "now in your cellar" note.
   const [arrived, setArrived] = useState(null);
+  // An order the bottle page just cancelled (it went to Recently deleted),
+  // said here with Undo — handed over once (hooks/useHandedOverState).
+  const [bottleNotice, setBottleNotice] = useHandedOverState('bottleNotice');
 
   const load = async () => {
     try {
@@ -91,6 +96,9 @@ function CellarOnOrder() {
             ✕
           </button>
         </div>
+      )}
+      {bottleNotice && (
+        <BottleUndoNotice notice={bottleNotice} cellarId={id} onUndone={load} onDismiss={() => setBottleNotice(null)} />
       )}
       <CellarPageHeader
         backTo={`/cellars/${id}`}

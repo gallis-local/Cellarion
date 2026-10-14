@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, Suspense, Fragment } from 'react';
 import { lazy } from '../utils/lazyWithReload';
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom';
+import useHandedOverState from '../hooks/useHandedOverState';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { getCellar, getCellarStatistics, listCellars, getMultiCellarBottles } from '../api/cellars';
@@ -19,6 +20,7 @@ import { CELLAR_SORTS, DEFAULT_CELLAR_SORT, preferredCellarSort } from '../utils
 import { formatArrivalMonth, isArrivalLate } from '../utils/onOrder';
 import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
 import { useFeature } from '../utils/featureFlags';
+import BottleUndoNotice from '../components/BottleUndoNotice';
 import { CARD_FIELDS, cardDetails, readCardFields, storeCardFields } from '../utils/cardDetails';
 import { summarizeSelection } from '../utils/bulkSelection';
 import LoadError from '../components/LoadError';
@@ -103,6 +105,9 @@ function CellarDetail() {
   const userCurrency = user?.preferences?.currency || 'USD';
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  // A bottle the bottle page just took away (drunk, or "Added by mistake"),
+  // said here with Undo — handed over once (hooks/useHandedOverState).
+  const [bottleNotice, setBottleNotice] = useHandedOverState('bottleNotice');
   const [cellar, setCellar] = useState(null);
   const [bottles, setBottles] = useState([]);
   const [bottlesTotal, setBottlesTotal] = useState(0);
@@ -469,6 +474,14 @@ function CellarDetail() {
             ✕
           </button>
         </div>
+      )}
+      {bottleNotice && (
+        <BottleUndoNotice
+          notice={bottleNotice}
+          cellarId={id}
+          onUndone={() => { fetchCellarData(0); fetchStatistics(); fetchRacks(); }}
+          onDismiss={() => setBottleNotice(null)}
+        />
       )}
       {/* ── Header — shared shape so the nav anchors at the same Y everywhere ── */}
       <CellarPageHeader
