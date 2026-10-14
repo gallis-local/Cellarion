@@ -134,13 +134,17 @@ router.post('/register', authLimiter, async (req, res) => {
       return res.status(400).json({ error: 'You must accept the privacy policy and consent to data processing to register' });
     }
 
-    // Check if user already exists (use generic message to prevent account enumeration)
+    // Check if user already exists (use generic message to prevent account enumeration).
+    // Trimmed like the schema stores them, or "anna " would miss "anna" here
+    // and only collide at save (a 500 instead of this answer).
     const existingUser = await User.findOne({
-      $or: [{ email: email.toLowerCase() }, { username: username.toLowerCase() }]
+      $or: [{ email: email.trim().toLowerCase() }, { username: uname.toLowerCase() }]
     });
 
     if (existingUser) {
-      return res.status(400).json({ error: 'Registration failed. Please check your details and try again.' });
+      // The code lets the app say what to try next in the user's language; it
+      // is the same for a taken username and a taken email (no enumeration).
+      return res.status(400).json({ error: 'Registration failed. Please check your details and try again.', code: 'REGISTRATION_REJECTED' });
     }
 
     // Create new user
@@ -149,6 +153,8 @@ router.post('/register', authLimiter, async (req, res) => {
       email,
       password,
       roles: ['user'],
+      // The first sign-in saves the browser's language + currency (User.js).
+      localeDefaultsPending: true,
       gdprConsent: {
         privacyPolicy: { accepted: true, acceptedAt: new Date(), version: CURRENT_PRIVACY_POLICY_VERSION },
         dataProcessing: { accepted: true, acceptedAt: new Date() }
@@ -207,6 +213,11 @@ router.post('/register', authLimiter, async (req, res) => {
       const messages = Object.values(error.errors).map(e => e.message);
       return res.status(400).json({ error: messages.join(', ') });
     }
+    // Two registrations racing for one username/email: the loser collides on
+    // the unique index. Same answer as the pre-check, not a 500.
+    if (error.code === 11000) {
+      return res.status(400).json({ error: 'Registration failed. Please check your details and try again.', code: 'REGISTRATION_REJECTED' });
+    }
     console.error('Registration error:', error);
     res.status(500).json({ error: 'Registration failed' });
   }
@@ -260,9 +271,11 @@ router.post('/login', authLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Username and password are required' });
     }
 
-    // Find user by username or email
+    // Find user by username or email. Trimmed: a phone keyboard adds a space
+    // after an autocompleted address, and both fields are stored trimmed.
+    const identifier = username.trim().toLowerCase();
     const user = await User.findOne({
-      $or: [{ username: username.toLowerCase() }, { email: username.toLowerCase() }]
+      $or: [{ username: identifier }, { email: identifier }]
     });
 
     // Always run bcrypt.compare to prevent timing-based user enumeration
