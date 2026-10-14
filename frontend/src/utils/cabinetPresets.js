@@ -25,7 +25,8 @@
  * in front of 6); it changes capacity, so a preset carrying it is one whose
  * maker stacks that way. `shelfCols` / `shelfAlternate` give a shelf its own
  * width and pattern where the maker's layout is not uniform. `shelfSideways`
- * says how a shelf's bottles lie (drawing only); `feature` names the early
+ * says how a shelf's bottles lie (drawing only, except a bottle across the
+ * front of a stacked one-deep shelf: rackLayouts.cabinetRowWidth); `feature` names the early
  * access flag a preset needs to be listed (the create form hides it
  * without). Whatever the preset says, the owner then edits every shelf —
  * rows, width, pattern — exactly as for a custom shape.
@@ -116,14 +117,17 @@ export const CABINET_PRESETS = [
   // diagram — top shelf 8 (one level on top), six Burgundy shelves of 5 (4
   // front to back + 1 lying across the front), the upper floor 5, six
   // Bordeaux shelves of 6 (5 + 1 across), and a bottom bin of 7 lying across
-  // (piled 4 / 3). The diagram's top shelf is 5 with 3 on top; 2 × 4 lands
-  // on the same 8. Shown only with early access 'cabinetSideways', which
-  // draws the bottles that lie across.
+  // (piled 4 / 3). The top shelf is the diagram's own: 4 front to back + 1
+  // across, with 3 in the grooves on top — 5 wide, alternating, the level
+  // above counted from the 4 behind the bottle across (rackLayouts
+  // .cabinetRowWidth; it used to be drawn as 2 × 4, the same 8 stacked 4 on
+  // 3). Shown only with early access 'cabinetSideways', which draws the
+  // bottles that lie across.
   {
     key: 'kingsbottleAtelierDuo', group: 'kingsbottle', feature: 'cabinetSideways', shelves: 15, cols: 6, twoDeep: false,
     shelfRows: [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
-    shelfCols: [4, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 4],
-    shelfAlternate: [false, false, false, false, false, false, false, false, false, false, false, false, false, false, true],
+    shelfCols: [5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 4],
+    shelfAlternate: [true, false, false, false, false, false, false, false, false, false, false, false, false, false, true],
     shelfSideways: ['front', 'front', 'front', 'front', 'front', 'front', 'front', '', 'front', 'front', 'front', 'front', 'front', 'front', 'all'],
     capacity: 86,
   },
