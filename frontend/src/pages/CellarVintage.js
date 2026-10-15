@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, Suspense } from 'react';
 import { lazy } from '../utils/lazyWithReload';
 import { useParams, Link } from 'react-router-dom';
+import BottleUndoNotice, { bottleNoticeName } from '../components/BottleUndoNotice';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { getCellarVintage } from '../api/cellars';
@@ -47,7 +48,10 @@ function CellarVintage() {
   const [drinkOpen, setDrinkOpen] = useState(false);
   const [windowOpen, setWindowOpen] = useState(false);
   const [journalBottle, setJournalBottle] = useState(null);
-  const [notice, setNotice] = useState(null);
+  // The bottle just taken out here, said with Undo (components/BottleUndoNotice).
+  // It belongs to this vintage: another vintage ends it.
+  const [drunkNotice, setDrunkNotice] = useState(null);
+  useEffect(() => { setDrunkNotice(null); }, [id, wineId, vintageParam]);
 
   const vintage = decodeURIComponent(vintageParam || 'NV');
 
@@ -138,7 +142,8 @@ function CellarVintage() {
 
   const handleDrunk = (bottle, reason) => {
     setDrinkOpen(false);
-    setNotice(t('cellarVintage.drunkNote', 'Logged. One bottle fewer of this vintage.'));
+    // Said with Undo (the 2-day restore), not just "Logged".
+    setDrunkNotice({ kind: 'consumed', reason, bottleId: bottle._id, name: bottleNoticeName({ ...bottle, wineDefinition: wine || bottle.wineDefinition }), at: Date.now() });
     if (reason === 'drank' && !journalPromptOptedOut()) setJournalBottle(bottle);
     else load();
   };
@@ -164,11 +169,15 @@ function CellarVintage() {
 
       <CellarNav cellarId={id} />
 
-      {notice && (
-        <div className="alert alert-success cellar-vintage-notice" role="status">
-          <span>{notice}</span>
-          <button type="button" className="cellar-vintage-notice-close" aria-label={t('common.close', 'Close')} onClick={() => setNotice(null)}>✕</button>
-        </div>
+      {drunkNotice && (
+        <BottleUndoNotice
+          key={`${drunkNotice.bottleId}:${drunkNotice.at}`}
+          floating
+          notice={drunkNotice}
+          cellarId={id}
+          onUndone={load}
+          onDismiss={() => setDrunkNotice(null)}
+        />
       )}
 
       {loading ? (

@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef, Suspense } from 'react';
 import { lazy } from '../utils/lazyWithReload';
 import { useParams, Link } from 'react-router-dom';
+import BottleUndoNotice, { bottleNoticeName } from '../components/BottleUndoNotice';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { useFeature } from '../utils/featureFlags';
@@ -102,6 +103,12 @@ function CellarVintageBeta() {
   const [suggestSignal, setSuggestSignal] = useState(0);
   const [journalBottle, setJournalBottle] = useState(null);
   const [notice, setNotice] = useState(null);
+  // The bottle just taken out here, said with Undo (components/BottleUndoNotice).
+  // It belongs to this vintage and this moment: another vintage, or another
+  // notice taking its place, ends it.
+  const [drunkNotice, setDrunkNotice] = useState(null);
+  useEffect(() => { setDrunkNotice(null); }, [id, wineId, vintageParam]);
+  useEffect(() => { if (notice) setDrunkNotice(null); }, [notice]);
 
   const vintage = safeDecode(vintageParam || 'NV');
   const pagePath = `/cellars/${id}/vintages/${wineId}/${encodeURIComponent(vintage)}`;
@@ -288,7 +295,9 @@ function CellarVintageBeta() {
 
   const handleDrunk = (bottle, reason) => {
     setModal(null);
-    setNotice(t('cellarVintage.drunkNote', 'Logged. One bottle fewer of this vintage.'));
+    // The line now offers Undo (the 2-day restore), not just "Logged".
+    setNotice(null);
+    setDrunkNotice({ kind: 'consumed', reason, bottleId: bottle._id, name: bottleNoticeName({ ...bottle, wineDefinition: wine || bottle.wineDefinition }), at: Date.now() });
     if (reason === 'drank' && !journalPromptOptedOut()) setJournalBottle(bottle);
     else load();
   };
@@ -442,6 +451,16 @@ function CellarVintageBeta() {
           <span>{notice}</span>
           <button type="button" className="cellar-vintage-notice-close" aria-label={t('common.close', 'Close')} onClick={() => setNotice(null)}>✕</button>
         </div>
+      )}
+      {drunkNotice && (
+        <BottleUndoNotice
+          key={`${drunkNotice.bottleId}:${drunkNotice.at}`}
+          floating
+          notice={drunkNotice}
+          cellarId={id}
+          onUndone={load}
+          onDismiss={() => setDrunkNotice(null)}
+        />
       )}
 
       {loading ? (

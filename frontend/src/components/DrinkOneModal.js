@@ -15,20 +15,16 @@ import { slotLabel as slotWords } from '../utils/slotLabel';
  * One bottle, one request: the group's other bottles are never touched.
  *
  * `rackMap` (cellar list) or `bottle.rackInfo` (vintage page) names the slot.
- * With a single bottle the picker is skipped. onDone(bottle, reason) fires
+ * With a single bottle the picker is skipped — and so it is when every row
+ * would read the same (same place, purchase and reservation): three rows of
+ * "Not in a rack · Oct 2026" are a choice with nothing to choose (live
+ * walkthrough 2026-10-15). onDone(bottle, reason) fires
  * after the server confirmed, so the caller can refresh and offer the
  * journal prompt as the bottle page does.
  */
-export default function DrinkOneModal({ bottles, rackMap, wineName, onClose, onDone }) {
+export default function DrinkOneModal({ bottles, rackMap, wineName, onClose, onDone, placesKnown = true }) {
   const { t, i18n } = useTranslation();
   const { apiFetch, user } = useAuth();
-  const [picked, setPicked] = useState(() => (bottles.length === 1 ? bottles[0] : null));
-  const [error, setError] = useState(null);
-  // Once the picker has been shown (a refusal sends a single bottle back to
-  // it too), Cancel in the form returns to the picker, not out of the modal.
-  const [pickerShown, setPickerShown] = useState(bottles.length !== 1);
-  const titleId = useId();
-  const boxRef = useDialogA11y(onClose);
 
   const slotOf = (b) => b.rackInfo || rackMap?.get(String(b._id)) || null;
   const slotLabel = (b) => slotWords(slotOf(b), t);
@@ -39,6 +35,23 @@ export default function DrinkOneModal({ bottles, rackMap, wineName, onClose, onD
     if (b.purchaseLocation) parts.push(b.purchaseLocation);
     return parts.join(' · ');
   };
+  // What a row of the picker shows — equal for every bottle means the picker
+  // would offer identical rows, so any of them is the answer. Only when the
+  // places are KNOWN: the cellar list fills rackMap after the racks load, and
+  // until then (or if that load failed) every bottle reads "Not in a rack" —
+  // skipping then could free the wrong slot. An opened bottle is never the
+  // same as a sealed one.
+  const rowText = (b) => [slotLabel(b), purchaseLabel(b), isReserved(b) ? reservationSummary(b, t) : '', b.openedAt ? 'open' : ''].join('|');
+  const nothingToChoose = bottles.length === 1
+    || (placesKnown && bottles.every((b) => rowText(b) === rowText(bottles[0])));
+
+  const [picked, setPicked] = useState(() => (nothingToChoose ? bottles[0] : null));
+  const [error, setError] = useState(null);
+  // Once the picker has been shown (a refusal sends a single bottle back to
+  // it too), Cancel in the form returns to the picker, not out of the modal.
+  const [pickerShown, setPickerShown] = useState(!nothingToChoose);
+  const titleId = useId();
+  const boxRef = useDialogA11y(onClose);
 
   // A refusal goes back to the picker, which is where the error shows — the
   // consume form has no room for one. With a single bottle too: the picker
@@ -89,6 +102,7 @@ export default function DrinkOneModal({ bottles, rackMap, wineName, onClose, onD
                 <button type="button" className="drink-one__row" onClick={() => setPicked(b)}>
                   <span className="drink-one__slot">{slotLabel(b)}</span>
                   <span className="drink-one__meta">
+                    {b.openedAt && <span className="drink-one__opened">{t('drinkOne.opened', 'Opened')}</span>}
                     {purchaseLabel(b)}
                     {reserved && <span className="reserved-badge"><span aria-hidden="true">🔖</span> {reservationSummary(b, t)}</span>}
                   </span>
