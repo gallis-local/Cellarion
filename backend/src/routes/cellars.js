@@ -131,8 +131,8 @@ async function loadGroupedBottlePage({ cellarId, excludeSet, onlyIds = null, sor
     ]).allowDiskUse(true),
     Bottle.aggregate([
       { $match: match },
-      { $group: { _id: groupId } },
-      { $count: 'total' },
+      { $group: { _id: groupId, n: { $sum: 1 } } },
+      { $group: { _id: null, total: { $sum: 1 }, bottles: { $sum: '$n' } } },
     ]).allowDiskUse(true),
   ]);
 
@@ -161,6 +161,7 @@ async function loadGroupedBottlePage({ cellarId, excludeSet, onlyIds = null, sor
     groupsForPage,
     bottles: groupsForPage.flatMap(g => g.bottles),
     totalCount: countResult[0]?.total || 0,
+    bottleTotal: countResult[0]?.bottles || 0,
   };
 }
 
@@ -682,7 +683,11 @@ router.get('/multi/bottles', async (req, res) => {
     let { total } = result;
     let items = result.items;
     let groupsForPage = null;
+    // Grouped, `total` counts cards; the filter's "Show n bottles" needs the
+    // bottles behind them.
+    let bottleTotal = null;
     if (grouped) {
+      bottleTotal = items.length;
       const allGroups = groupIdenticalBottles(items, { byCellar: true });
       total = allGroups.length;
       groupsForPage = allGroups.slice(skip, skip + limit);
@@ -718,7 +723,7 @@ router.get('/multi/bottles', async (req, res) => {
         const c = accessibleMap.get(id);
         return { _id: id, name: c.name, userColor: getUserColor(c, req.user.id) };
       }),
-      bottles: { count: items.length, total, limit, skip, grouped, items },
+      bottles: { count: items.length, total, limit, skip, grouped, items, ...(grouped ? { bottleTotal } : {}) },
       facets, baseFacets, facetMeta,
     });
   } catch (error) {
@@ -774,6 +779,65 @@ router.get('/multi/history', async (req, res) => {
 });
 
 // GET /api/cellars/:id/statistics - Get cellar statistics (active bottles only)
+// GET /api/cellars/:id/maturity-counts — how many bottles are at each stage,
+// for the counts on the filter's maturity buttons (#1291: they were never
+// sent, so the buttons showed none). The filter asks as it opens; this groups
+// only what the classification reads — not the cellar's other statistics. The
+// same classification the list's maturity filter uses, so a button's count is
+// what choosing it shows (without the other filters).
+router.get('/:id/maturity-counts', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
+    const cellar = await Cellar.findById(req.params.id);
+    const role = getCellarRole(cellar, req.user.id);
+    if (!role || cellar.deletedAt) {
+      return res.status(404).json({ error: 'Cellar not found' });
+    }
+    // One grouping query, like the statistics: bottles that share what the
+    // classification reads — wine, vintage, their own window, and the year
+    // an NV window counts from (bottleAnchorYear: bought, else added) — are
+    // classified once and weighed by their number.
+    const anchorDate = { $convert: { input: { $ifNull: ['$purchaseDate', '$createdAt'] }, to: 'date', onError: null, onNull: null } };
+    const groups = await Bottle.aggregate([
+      { $match: { cellar: cellar._id, status: { $nin: NOT_IN_CELLAR_STATUSES } } },
+      {
+        $group: {
+          _id: {
+            wineDefinition: '$wineDefinition',
+            vintage: '$vintage',
+            drinkFrom: '$drinkFrom',
+            drinkTo: '$drinkTo',
+            peakFrom: '$peakFrom',
+            peakUntil: '$peakUntil',
+            anchorYear: { $year: anchorDate },
+          },
+          count: { $sum: 1 },
+        },
+      },
+    ]).allowDiskUse(true);
+    const rows = groups.map((g) => ({
+      ...g._id,
+      // Mid-year, so the UTC year read back is the year grouped on.
+      purchaseDate: g._id.anchorYear != null ? new Date(Date.UTC(g._id.anchorYear, 6, 1)) : null,
+      count: g.count,
+    }));
+    const profileMap = await buildProfileMap(rows);
+    const maturity = { declining: 0, late: 0, peak: 0, early: 0, notReady: 0, noProfile: 0 };
+    let total = 0;
+    for (const b of rows) {
+      total += b.count;
+      const status = classifyMaturity(b, profileMap);
+      if (!status) maturity.noProfile += b.count;
+      else if (status === 'not-ready') maturity.notReady += b.count;
+      else if (Object.hasOwn(maturity, status)) maturity[status] += b.count;
+    }
+    res.json({ maturity, total });
+  } catch (error) {
+    console.error('Get maturity counts error:', error);
+    res.status(500).json({ error: 'Failed to get maturity counts' });
+  }
+});
+
 router.get('/:id/statistics', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
@@ -1336,6 +1400,8 @@ router.get('/:id', async (req, res) => {
     let found = null;
     let bottles;
     let totalCount;
+    // Grouped: the bottles behind the `totalCount` cards.
+    let bottleTotal = null;
     let canPaginateInDb;
     let groupsForPage = null;
 
@@ -1346,7 +1412,7 @@ router.get('/:id', async (req, res) => {
       && !minRating && !maxRating && !ratingBandParam && !maturityFilter && !reservedOnly && !extraFilters
       && ['createdAt', 'vintage', 'price', 'rating'].includes(sortField);
     if (groupedInDb) {
-      ({ groupsForPage, bottles, totalCount } = await loadGroupedBottlePage({
+      ({ groupsForPage, bottles, totalCount, bottleTotal } = await loadGroupedBottlePage({
         cellarId: req.params.id, excludeSet, onlyIds, sortField, sortDir, skip, limit,
         populate: WINE_POPULATE_CARDS,
       }));
@@ -1391,6 +1457,7 @@ router.get('/:id', async (req, res) => {
             _id: h.id, wineDefinition: h.wineDefinition, vintage: h.vintage, bottleSize: h.bottleSize,
           })));
           totalCount = allGroups.length;
+          bottleTotal = hits.length;
           const pageGroups = allGroups.slice(skip, skip + limit);
           const docs = await loadBottlesInOrder(pageGroups.flatMap(g => g.bottles.map(b => b._id)), WINE_POPULATE_CARDS);
           const byId = new Map(docs.map(d => [d._id.toString(), d]));
@@ -1526,6 +1593,7 @@ router.get('/:id', async (req, res) => {
       // Wine + vintage + bottle size, so a magnum and a 750ml stay apart.
       const allGroups = groupIdenticalBottles(bottles);
       totalCount = allGroups.length;                  // total = number of groups
+      bottleTotal = bottles.length;                   // …and the bottles in them
       groupsForPage = allGroups.slice(skip, skip + limit);
       bottles = groupsForPage.flatMap(g => g.bottles); // flatten so image attach below works
     } else if (!canPaginateInDb && !groupsForPage && !pageReady) {
@@ -1592,6 +1660,9 @@ router.get('/:id', async (req, res) => {
         limit,
         skip,
         grouped,
+        // Grouped, `total` counts cards; the filter's "Show n bottles" needs
+        // the bottles behind them (support ticket 2026-10-14).
+        ...(grouped ? { bottleTotal } : {}),
         items: responseItems
       },
       ...(facets ? { facets, baseFacets, facetMeta } : {})

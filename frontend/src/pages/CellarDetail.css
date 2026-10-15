@@ -468,6 +468,8 @@
 }
 
 .active-filter-chip-remove {
+  position: relative;
+  --tap-reach: -4px -12px; /* touch tap area, styles/common.css */
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -586,6 +588,8 @@
 }
 
 .view-toggle-btn {
+  position: relative;
+  --tap-reach: -6px -2px; /* touch tap area, styles/common.css */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1089,6 +1093,8 @@
 .bulk-bar-link:disabled { color: var(--color-text-muted); cursor: default; }
 
 .bulk-bar-close {
+  position: relative;
+  --tap-reach: -6px; /* touch tap area, styles/common.css */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1100,6 +1106,7 @@
   color: var(--color-text-muted);
   cursor: pointer;
 }
+
 .bulk-bar-close:hover { background: var(--color-primary-light); color: var(--color-primary); }
 
 .bulk-bar-actions {

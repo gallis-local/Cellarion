@@ -132,6 +132,8 @@ a.cellar-vintage-aux:hover {
 }
 
 .cellar-vintage-notice-close {
+  position: relative;
+  --tap-reach: -12px; /* touch tap area, styles/common.css */
   margin-left: auto;
   background: none;
   border: none;

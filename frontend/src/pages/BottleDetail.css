@@ -358,6 +358,7 @@
 }
 
 .bd-contribute__dismiss {
+  --tap-reach: -12px; /* touch tap area, styles/common.css */
   position: absolute;
   top: 0.5rem;
   right: 0.6rem;
@@ -370,6 +371,7 @@
   padding: 0;
   transition: color 0.15s;
 }
+
 .bd-contribute__dismiss:hover { color: var(--color-text-muted); }
 
 .bd-contribute__body {

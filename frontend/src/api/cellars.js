@@ -8,6 +8,10 @@ export const getCellar = (apiFetch, id, params = '') =>
 export const getCellarStatistics = (apiFetch, id, currency) =>
   apiFetch(`/api/cellars/${id}/statistics?currency=${currency}`);
 
+/** Bottles per maturity stage, for the filter's maturity buttons: { maturity, total }. */
+export const getCellarMaturityCounts = (apiFetch, id) =>
+  apiFetch(`/api/cellars/${id}/maturity-counts`);
+
 export const getCellarAudit = (apiFetch, id) =>
   apiFetch(`/api/cellars/${id}/audit`);
 
