@@ -7,7 +7,9 @@
 // moved on since the action; nothing here trusts that `row` is the newest.
 const McpActionLog = require('../models/McpActionLog');
 const Bottle = require('../models/Bottle');
-const { CONSUMED_STATUSES } = require('../config/constants');
+const { CONSUMED_STATUSES, ORDERED_STATUS } = require('../config/constants');
+const Rack = require('../models/Rack');
+const { logAudit } = require('../services/audit');
 const { consumeBottle, restoreBottle, RESTORE_WINDOW_MS } = require('../services/bottleOps');
 const { logAction } = require('./actionLedger');
 const { resolveBottleAccess } = require('./toolUtil');
@@ -26,7 +28,7 @@ async function unclaim(rowId) {
 }
 
 const CONSUME_REVERSIBLE = ['consume', 'restore', 'open', 'pour', 'close'];
-const WRITE_REVERSIBLE = ['add', 'update', 'lot_update', 'bulk_add', 'somm_maturity', 'somm_maturity_remove',
+const WRITE_REVERSIBLE = ['add', 'update', 'lot_update', 'bulk_add', 'arrive', 'somm_maturity', 'somm_maturity_remove',
   'somm_wine_profile', 'somm_price', 'somm_price_decline', 'somm_proposal',
   'cellar_create', 'rack_create', 'place', 'unplace', 'move', 'arrange', 'tasting_note', 'attach_image',
   'winelist_add', 'winelist_price', 'personal_data', 'delete', 'change_wine', 'default_image'];
@@ -1014,6 +1016,31 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
     if (result.error) return fail('conflict', `Cannot undo that consume: ${result.error.message}`);
     envelope = { summary: `Undid consume — ${bottleLabel(bottle)} is back in the cellar (unplaced)`, data: { undone: 'consume_bottle', bottle_id: bottle._id, status: 'active' } };
     reverseEntry = { action: 'restore', prev: prevSnapshot };
+  } else if (row.action === 'arrive') {
+    // Back on order — only while it is still simply in the cellar it arrived
+    // in: not drunk, opened or moved to another cellar since, and not placed
+    // in a rack (a bottle on order never sits in one).
+    if (bottle.status !== 'active' || String(bottle.cellar) !== String(row.cellar) || bottle.openedAt || (bottle.pours && bottle.pours.length)) {
+      return fail('conflict', 'That arrival cannot be undone: the bottle has been drunk, opened or moved since it arrived. Nothing was changed.');
+    }
+    if (await Rack.exists({ 'slots.bottle': bottle._id })) {
+      return fail('conflict', 'That arrival cannot be undone: the bottle has been placed in a rack since — take it out of the rack first. Nothing was changed.');
+    }
+    const prev = row.prev || {};
+    bottle.status = ORDERED_STATUS;
+    bottle.arrivedAt = undefined;
+    bottle.addedToCellarAt = prev.addedToCellarAt || undefined;
+    // The "has it arrived?" reminder: as it was, so it is not sent twice.
+    bottle.arrivalNotifiedAt = prev.arrivalNotifiedAt || undefined;
+    try {
+      await bottle.save();
+    } catch (err) {
+      if (err?.name === 'VersionError') return fail('conflict', 'The bottle was changed by another request just now; nothing was undone. Try again.');
+      throw err;
+    }
+    logAudit(ctx.req, 'bottle.arrive.undo', { type: 'bottle', id: bottle._id, cellarId: bottle.cellar }, { via: 'mcp' });
+    envelope = { summary: `Undid arrival — ${bottleLabel(bottle)} is on order again`, data: { undone: 'mark_arrived', bottle_id: bottle._id, status: ORDERED_STATUS } };
+    reverseEntry = { action: 'unarrive', prev: null };
   } else { // restore
     if (CONSUMED_STATUSES.includes(bottle.status)) {
       return fail('conflict', 'That restore cannot be undone: the bottle has been consumed again since. Nothing was changed.');

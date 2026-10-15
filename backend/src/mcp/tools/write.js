@@ -21,7 +21,9 @@ const { registerTool } = require('../registry');
 // services/search → the ESM-only meilisearch package, which jest cannot parse
 // — a top-level require here would break every suite that loads the tool
 // registry (the #702 failure mode).
-const { addBottle, updateBottleFields } = require('../../services/bottleOps');
+const { addBottle, updateBottleFields, markArrived } = require('../../services/bottleOps');
+const { parseExpectedArrival } = require('../../utils/onOrder');
+const { ORDERED_STATUS } = require('../../config/constants');
 const { findLotSiblings, pickLotFields, LOT_FIELDS, LOT_FIELDS_ON_REQUEST, LOT_LIMIT } = require('../../services/bottleLot');
 const { logAudit } = require('../../services/audit');
 const { isValidId } = require('../../utils/validation');
@@ -103,7 +105,10 @@ registerTool({
     'undo_last. Pass an idempotency_key when retrying. With new_wine, draft:true keeps the new wine as the user\'s ' +
     'PRIVATE DRAFT — visible only to them, editable with update_wine_draft without any review, published to the ' +
     'shared registry with publish_wine when the record is complete (an untouched draft holding bottles publishes ' +
-    'by itself after 7 days). Prefer it when the user is still gathering the facts of a wine the registry does not know.',
+    'by itself after 7 days). Prefer it when the user is still gathering the facts of a wine the registry does not know. ' +
+    'on_order:true adds a bottle that is bought but not delivered yet (en primeur, a pre-order, a delivery on its way): it ' +
+    'stays out of the cellar counts, racks and suggestions until mark_arrived; expected_arrival is its month (YYYY-MM, ' +
+    'update_bottle changes it). One call adds one bottle — call it again for each further bottle of an order.',
   scope: 'write',
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   inputSchema: {
@@ -124,6 +129,8 @@ registerTool({
     drink_to: z.number().int().optional(),
     peak_from: z.number().int().optional().describe('Optional peak start inside the drink window ("drinkable ≠ peak")'),
     peak_until: z.number().int().optional().describe('Optional peak end inside the drink window'),
+    on_order: z.boolean().optional().describe('Bought but not delivered yet: the bottle waits "on order" (search_bottles status on_order) until it arrives'),
+    expected_arrival: z.string().regex(/^\d{4}-\d{2}$/).optional().describe('With on_order: the month it is expected, YYYY-MM'),
     idempotency_key: z.string().max(100).optional(),
   },
   handler: async (args, ctx) => {
@@ -144,6 +151,12 @@ registerTool({
     // audit 2026-10-13).
     const currencyCheck = parseCurrency(args.currency);
     if (!currencyCheck.ok) return fail('invalid_input', currencyCheck.error);
+    // The same for an order's month (a real month, not too far off): checked
+    // before a new_wine is minted, so a refusal leaves no wine behind.
+    if (args.on_order === true) {
+      const monthCheck = parseExpectedArrival(args.expected_arrival);
+      if (!monthCheck.ok) return fail('invalid_input', monthCheck.error);
+    }
 
     const access = await resolveCellarAccess(ctx.user.id, args.cellar_id, 'editor');
     if (!access) return fail('not_found', MSG_CELLAR_NOT_FOUND);
@@ -228,6 +241,8 @@ registerTool({
       drinkTo: args.drink_to,
       peakFrom: args.peak_from,
       peakUntil: args.peak_until,
+      onOrder: args.on_order === true,
+      expectedArrival: args.on_order === true ? args.expected_arrival : undefined,
     }, ctx.req);
     if (result.error) return fail('invalid_input', result.error.message);
     const { bottle } = result;
@@ -237,7 +252,7 @@ registerTool({
     // meaning — the producer was missing and a curator finishes the row.
     const pendingIdentity = wineDoc.pendingIdentity === true && !wineDraft;
     const envelope = {
-      summary: `Added ${wineDoc.name} ${bottle.vintage} to "${access.cellar.name}"${wineDraft ? (wineCreated ? ' (private draft wine — only you can see it; publish_wine when the record is complete)' : ' (on your private draft wine)') : wineCreated ? (pendingIdentity ? ' (registry wine filed for sommelier completion — no producer)' : ' (new registry wine created)') : ''}`,
+      summary: `Added ${wineDoc.name} ${bottle.vintage} to "${access.cellar.name}"${bottle.status === ORDERED_STATUS ? ' — on order, not in the cellar until it arrives (mark_arrived)' : ''}${wineDraft ? (wineCreated ? ' (private draft wine — only you can see it; publish_wine when the record is complete)' : ' (on your private draft wine)') : wineCreated ? (pendingIdentity ? ' (registry wine filed for sommelier completion — no producer)' : ' (new registry wine created)') : ''}`,
       data: {
         bottle_id: bottle._id,
         wine: { ...wineSummary(wineDoc) },
@@ -246,7 +261,7 @@ registerTool({
         // shared registry content until a curator completes the identity.
         ...(pendingIdentity ? {
           wine_pending_identity: true,
-          note: 'The wine could not be fully identified, so it is filed for sommelier completion: the bottle is in the cellar and works normally, but the wine is invisible to other users until a curator finishes it.',
+          note: `The wine could not be fully identified, so it is filed for sommelier completion: the bottle is ${bottle.status === ORDERED_STATUS ? 'saved on order' : 'in the cellar'} and works normally, but the wine is invisible to other users until a curator finishes it.`,
         } : {}),
         ...(wineDraft ? {
           wine_draft: true,
@@ -272,11 +287,12 @@ registerTool({
 });
 
 // The bottle fields the MCP can edit — every field of the shared service's
-// UPDATABLE_FIELDS except expectedArrival (an order's month, set in the app)
-// and barcode (read by the camera on the bottle page).
+// UPDATABLE_FIELDS except barcode (read by the camera on the bottle page).
+// expected_arrival is an order's month: the shared update keeps it on a
+// bottle on order only.
 // Named here, next to the inputSchema it must mirror, so description and
 // schema can't drift apart.
-const MCP_UPDATE_PARAMS = ['vintage', 'bottle_size', 'price', 'currency', 'purchase_date', 'purchase_location', 'purchase_url', 'location', 'notes', 'occasion', 'rating', 'rating_scale', 'drink_from', 'drink_to', 'peak_from', 'peak_until', 'reserved_for', 'reserved_until'];
+const MCP_UPDATE_PARAMS = ['vintage', 'bottle_size', 'price', 'currency', 'purchase_date', 'purchase_location', 'purchase_url', 'location', 'notes', 'occasion', 'rating', 'rating_scale', 'drink_from', 'drink_to', 'peak_from', 'peak_until', 'reserved_for', 'reserved_until', 'expected_arrival'];
 // What apply_to_lot copies: the lot's own fields plus the ones a case shares
 // when asked (services/bottleLot) — notes and the purchase.
 const MCP_LOT_FIELDS = [...LOT_FIELDS, ...LOT_FIELDS_ON_REQUEST];
@@ -334,6 +350,7 @@ registerTool({
     peak_until: z.number().int().nullable().optional().describe('Peak end inside the drink window (null clears)'),
     reserved_for: z.string().max(200).nullable().optional().describe('Who/what the bottle is held for (null clears)'),
     reserved_until: z.number().int().nullable().optional().describe('Year the reservation runs to, e.g. 2034 (null clears)'),
+    expected_arrival: z.string().regex(/^\d{4}-\d{2}$/).nullable().optional().describe('A bottle on order only: the month it is expected, YYYY-MM (null clears)'),
     apply_to_lot: z.boolean().optional().describe('Also apply the drink window / price / currency / notes / purchase date, location and url of this call to every other active bottle of the same wine and vintage in the user\'s own cellars. Other fields (vintage, size, storage, rating, occasion, reservation) stay on this bottle.'),
     idempotency_key: z.string().max(100).optional(),
   },
@@ -344,6 +361,13 @@ registerTool({
     const access = await resolveBottleAccess(ctx.user.id, args.bottle_id, 'editor');
     if (!access) return fail('not_found', MSG_BOTTLE_NOT_FOUND);
     const { bottle } = access;
+
+    // The shared update keeps an order's month on a bottle on order only and
+    // drops it elsewhere — say so rather than answer "no changes".
+    if (args.expected_arrival !== undefined && bottle.status !== ORDERED_STATUS) {
+      await releaseClaim(ctx, args.idempotency_key, 'update_bottle');
+      return fail('invalid_input', 'expected_arrival applies only to a bottle on order; this one is not on order.');
+    }
 
     let bottleSize;
     if (args.bottle_size !== undefined) {
@@ -373,6 +397,7 @@ registerTool({
       peakUntil: args.peak_until,
       reservedFor: args.reserved_for,
       reservedUntil: args.reserved_until,
+      expectedArrival: args.expected_arrival,
     };
     // The lot is found BEFORE the update: a vintage change in this same call
     // would otherwise look up the NEW vintage's bottles — another case — and
@@ -464,3 +489,58 @@ registerTool({
 
 // Shared with tools/bulk.js so batch items validate identically to singles.
 module.exports = { NEW_WINE_SHAPE };
+
+// A bottle bought but not delivered yet has arrived — the MCP twin of the
+// On order page's "Mark as arrived" (bottleOps.markArrived, the same rules).
+// Undoable: undo_last puts it back on order while it is still simply in the
+// cellar it arrived in (not placed, opened, drunk or moved since).
+registerTool({
+  name: 'mark_arrived',
+  title: 'Mark a bottle on order as arrived',
+  description:
+    'A bottle bought but not delivered yet (add_bottle on_order:true; search_bottles status on_order lists them) has ' +
+    'arrived: it enters its cellar UNPLACED and from then on counts like any bottle (racks, statistics, suggestions). ' +
+    'arrived_on is the day it came (YYYY-MM-DD; default today; not in the future, not before it was ordered). One ' +
+    'bottle per call — for a delivery of several, call it for each. Confirm with the user first. Reversible via undo_last.',
+  scope: 'write',
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  inputSchema: {
+    bottle_id: objectId,
+    arrived_on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('The day it arrived, YYYY-MM-DD (default today)'),
+    idempotency_key: z.string().max(100).optional(),
+  },
+  handler: async (args, ctx) => {
+    const replayed = await replay(ctx, args.idempotency_key, 'mark_arrived');
+    if (replayed) return replayed;
+    const access = await resolveBottleAccess(ctx.user.id, args.bottle_id, 'editor');
+    if (!access) {
+      await releaseClaim(ctx, args.idempotency_key, 'mark_arrived');
+      return fail('not_found', MSG_BOTTLE_NOT_FOUND);
+    }
+    const { bottle } = access;
+    // What the undo puts back: the "added to cellar" date and whether the
+    // "has it arrived?" reminder had already gone out.
+    const prev = { addedToCellarAt: bottle.addedToCellarAt || null, arrivalNotifiedAt: bottle.arrivalNotifiedAt || null };
+    const result = await markArrived(bottle, { arrivedAt: args.arrived_on }, ctx.req);
+    if (result.error) {
+      await releaseClaim(ctx, args.idempotency_key, 'mark_arrived');
+      return fail(result.error.code === 'not_on_order' ? 'conflict' : 'invalid_input', result.error.message);
+    }
+    const arrived = result.bottle;
+    const envelope = {
+      summary: `Arrived: ${arrived.vintage || 'NV'} bottle is now in "${access.cellar.name}" (unplaced — place it in a rack in the app or with place_bottle)`,
+      data: { bottle_id: arrived._id, status: arrived.status, arrived_at: arrived.arrivedAt },
+    };
+    await logAction(ctx, {
+      tool: 'mark_arrived',
+      action: 'arrive',
+      bottle: arrived._id,
+      cellar: arrived.cellar,
+      prev,
+      detail: { vintage: arrived.vintage },
+      idempotencyKey: args.idempotency_key || null,
+      result: envelope,
+    });
+    return ok(envelope.summary, envelope.data);
+  },
+});

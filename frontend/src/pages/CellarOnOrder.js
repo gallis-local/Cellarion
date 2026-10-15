@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import useHandedOverState from '../hooks/useHandedOverState';
 import { useTranslation } from 'react-i18next';
@@ -6,9 +6,11 @@ import { useAuth } from '../contexts/AuthContext';
 import WineImage from '../components/WineImage';
 import CellarNav from '../components/CellarNav';
 import CellarPageHeader from '../components/CellarPageHeader';
-import BottleUndoNotice from '../components/BottleUndoNotice';
+import BottleUndoNotice, { bottleNoticeName } from '../components/BottleUndoNotice';
 import { getCellarOnOrder } from '../api/cellars';
-import { markBottleArrived, bulkArriveBottles, bulkUpdateBottles } from '../api/bottles';
+import { markBottleArrived, bulkArriveBottles, bulkUpdateBottles, createBottle, bulkDeleteBottles } from '../api/bottles';
+import { TRASH_DAYS } from '../utils/trash';
+import { bottleCopyPayload, MAX_COPIES } from '../utils/bottleCopy';
 import {
   groupOnOrder, formatArrivalMonth, isArrivalLate, totalsByCurrency, todayInput, toMonthInput,
 } from '../utils/onOrder';
@@ -21,7 +23,8 @@ import './CellarOnOrder.css';
  * of the cellar's counts, racks and drinking suggestions until they are
  * marked as arrived here (or on the bottle page), which makes them ordinary
  * unplaced bottles. A delivery's expected month is changed here too, for
- * all its bottles at once.
+ * all its bottles at once, and so is how many bottles it holds (more bought,
+ * or fewer delivered than ordered).
  */
 function CellarOnOrder() {
   const { t, i18n } = useTranslation();
@@ -76,6 +79,14 @@ function CellarOnOrder() {
     setBottles((prev) => prev.map((b) => (set.has(String(b._id)) ? { ...b, expectedArrival: value } : b)));
   };
 
+  // Bottles taken off an order went to Recently deleted: off the list, and
+  // said with Undo (which brings them back on order).
+  const handleTakenOff = (ids, notice) => {
+    const gone = new Set(ids.map(String));
+    setBottles((prev) => prev.filter((b) => !gone.has(String(b._id))));
+    if (ids.length > 0) setBottleNotice({ kind: 'deleted', onOrder: true, ...notice, count: ids.length, at: Date.now() });
+  };
+
   // An action failed — perhaps because the list was out of date (another
   // member already marked bottles as arrived): say so and re-read it.
   const handleFailure = (message) => {
@@ -98,7 +109,8 @@ function CellarOnOrder() {
         </div>
       )}
       {bottleNotice && (
-        <BottleUndoNotice notice={bottleNotice} cellarId={id} onUndone={load} onDismiss={() => setBottleNotice(null)} />
+        // Keyed per notice: a new one starts fresh, never as an earlier one's "undone".
+        <BottleUndoNotice key={`${bottleNotice.bottleId}:${bottleNotice.at || ''}`} notice={bottleNotice} cellarId={id} onUndone={load} onDismiss={() => setBottleNotice(null)} />
       )}
       <CellarPageHeader
         backTo={`/cellars/${id}`}
@@ -140,6 +152,8 @@ function CellarOnOrder() {
                 canEdit={canEdit}
                 onArrived={handleArrived}
                 onMonthChanged={handleMonthChanged}
+                onAdded={load}
+                onTakenOff={handleTakenOff}
                 onFailure={handleFailure}
               />
             ))}
@@ -150,9 +164,9 @@ function CellarOnOrder() {
   );
 }
 
-function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onFailure }) {
+function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onAdded, onTakenOff, onFailure }) {
   const { t, i18n } = useTranslation();
-  const { apiFetch } = useAuth();
+  const { apiFetch, user } = useAuth();
   const first = group.bottles[0];
   const count = group.bottles.length;
   const ids = group.bottles.map((b) => b._id);
@@ -162,8 +176,12 @@ function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onF
   const month = formatArrivalMonth(first.expectedArrival, i18n.language);
   const late = isArrivalLate(first.expectedArrival);
 
-  // null | 'arrive' | 'month'
+  // null | 'arrive' | 'month' | 'qty'
   const [panel, setPanel] = useState(null);
+  const [newQty, setNewQty] = useState(count);
+  // More bottles copy a registry wine (one still waiting for review has none
+  // yet) and need an account that may add bottles (not the demo's).
+  const canAdd = !!wine?._id && !user?.isDemo;
   const [howMany, setHowMany] = useState(count);
   const [date, setDate] = useState(todayInput);
   const [newMonth, setNewMonth] = useState(() => toMonthInput(first.expectedArrival));
@@ -207,6 +225,82 @@ function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onF
     }
   };
 
+  // Change how many bottles this order holds. More (up to MAX_COPIES at a
+  // time, like "Add more bottles"): copies of the most recent purchase on this
+  // line, on order for the same month. Fewer: the most recently added go to
+  // Recently deleted (Undo brings them back on order). Nothing happens on a
+  // number outside the range — never a guess at what was meant.
+  const byNewest = [...group.bottles].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  const newest = byNewest[0];
+  // One line can hold more than one purchase (same wine, vintage, size and
+  // month, bought at different prices or shops): say which one is copied.
+  // The purchase DAY: a bottle added without one is stamped with the moment
+  // it was saved, so bottles added together differ by milliseconds.
+  const purchaseKey = (b) => [b.price ?? '', b.currency || '', b.purchaseLocation || '', String(b.purchaseDate || '').slice(0, 10)].join('|');
+  const mixedPurchases = new Set(group.bottles.map(purchaseKey)).size > 1;
+  const maxQty = canAdd ? count + MAX_COPIES : count;
+  const parsedQty = Number(newQty);
+  const validQty = String(newQty).trim() !== '' && Number.isInteger(parsedQty) && parsedQty >= 1 && parsedQty <= maxQty;
+  const qtyFailed = () => t('onOrder.qtyFailed', 'Could not change how many bottles are on order. Please try again.');
+  const saving = useRef(false);
+  const saveQty = async () => {
+    if (!validQty || saving.current) return;
+    if (parsedQty === count) { setPanel(null); return; }
+    saving.current = true;
+    setBusy(true);
+    const wanted = parsedQty - count;
+    let added = 0;
+    try {
+      if (parsedQty > count) {
+        const payload = {
+          ...bottleCopyPayload(newest, { copyNotes: false }),
+          cellar: cellarId,
+          onOrder: true,
+          expectedArrival: toMonthInput(newest.expectedArrival) || undefined,
+        };
+        for (; added < wanted; added += 1) {
+          const res = await createBottle(apiFetch, payload);
+          if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            const msg = data.error || qtyFailed();
+            onFailure(added > 0 ? t('addBottle.partialAdded', { msg, count: added, total: wanted, remaining: wanted - added }) : msg);
+            return;
+          }
+        }
+        setPanel(null);
+        onAdded();
+      } else {
+        const surplus = byNewest.slice(0, count - parsedQty).map((b) => b._id);
+        // Only bottles still on order: the list may be out of date (another
+        // member marked some as arrived meanwhile) — those are left alone.
+        const res = await bulkDeleteBottles(apiFetch, surplus, { onlyOnOrder: true });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { onFailure(data.error || qtyFailed()); return; }
+        setPanel(null);
+        const deletedIds = data.deletedIds || [];
+        onTakenOff(deletedIds, { batchId: data.batchId, name: bottleNoticeName(newest), bottleId: deletedIds[0] || surplus[0] });
+        if ((data.skipped || []).some((s) => s.reason === 'not_on_order')) {
+          onFailure(t('onOrder.qtyArrivedMeanwhile', 'Some of these bottles had already arrived, so they were left in the cellar. The list is up to date now.'));
+        }
+      }
+    } catch {
+      const msg = qtyFailed();
+      onFailure(added > 0 ? t('addBottle.partialAdded', { msg, count: added, total: wanted, remaining: wanted - added }) : msg);
+    } finally {
+      saving.current = false;
+      setBusy(false);
+    }
+  };
+  const qtyHint = !validQty
+    ? t('onOrder.qtyRange', 'Enter a number from 1 to {{max}}.', { max: maxQty })
+    : parsedQty > count
+      ? (mixedPurchases
+        ? t('onOrder.qtyAddHintMixed', 'This line holds bottles bought at different prices or shops: the new bottles copy the most recent purchase, with the expected month.')
+        : t('onOrder.qtyAddHint', 'The new bottles get this order’s price, shop and expected month.'))
+      : parsedQty < count
+        ? t('onOrder.qtyRemoveHint', 'The most recently added bottles go to Recently deleted. You can bring them back for {{days}} days.', { days: TRASH_DAYS })
+        : (!canAdd ? t('onOrder.qtyOnlyFewer', 'Bottles can only be taken off this order here.') : null);
+
   return (
     <div className={`on-order-card${late ? ' is-late' : ''}`}>
       <div className="on-order-main">
@@ -233,11 +327,14 @@ function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onF
         </div>
         {canEdit && !panel && (
           <div className="on-order-actions">
-            <button type="button" className="btn btn-primary btn-small on-order-arrive-btn" onClick={() => setPanel('arrive')}>
+            <button type="button" className="btn btn-primary btn-small on-order-arrive-btn" onClick={() => { setHowMany(count); setPanel('arrive'); }}>
               {t('onOrder.markArrived')}
             </button>
             <button type="button" className="btn btn-secondary btn-small" onClick={() => setPanel('month')}>
               {t('onOrder.changeMonth')}
+            </button>
+            <button type="button" className="btn btn-secondary btn-small" onClick={() => { setNewQty(count); setPanel('qty'); }}>
+              {t('onOrder.changeQty', 'Change quantity')}
             </button>
           </div>
         )}
@@ -265,6 +362,31 @@ function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onF
           <div className="on-order-arrive-actions">
             <button type="button" className="btn btn-primary btn-small" onClick={confirmArrived} disabled={busy}>
               {busy ? t('common.saving', 'Saving…') : t('onOrder.confirmArrived')}
+            </button>
+            <button type="button" className="btn btn-secondary btn-small" onClick={() => setPanel(null)} disabled={busy}>
+              {t('common.cancel')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {canEdit && panel === 'qty' && (
+        <div className="on-order-arrive-panel">
+          <label className="on-order-field">
+            <span>{t('onOrder.qtyLabel', 'Bottles on this order')}</span>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={maxQty}
+              value={newQty}
+              onChange={(e) => setNewQty(e.target.value)}
+            />
+            {qtyHint && <span className="on-order-field-hint">{qtyHint}</span>}
+          </label>
+          <div className="on-order-arrive-actions">
+            <button type="button" className="btn btn-primary btn-small" onClick={saveQty} disabled={busy || !validQty}>
+              {busy ? t('common.saving', 'Saving…') : t('onOrder.saveQty', 'Save')}
             </button>
             <button type="button" className="btn btn-secondary btn-small" onClick={() => setPanel(null)} disabled={busy}>
               {t('common.cancel')}

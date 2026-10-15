@@ -11,7 +11,9 @@ jest.mock('../models/Bottle', () => ({ exists: jest.fn().mockResolvedValue(true)
 jest.mock('../models/McpActionLog', () => ({ findOne: jest.fn(), findOneAndUpdate: jest.fn(), updateOne: jest.fn() }));
 jest.mock('../services/embeddingJob', () => ({ reembedActiveVintages: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../models/WineList', () => ({ findOne: jest.fn() }));
-jest.mock('../config/constants', () => ({ CONSUMED_STATUSES: ['drank', 'gifted', 'sold', 'other'] }));
+jest.mock('../config/constants', () => ({ CONSUMED_STATUSES: ['drank', 'gifted', 'sold', 'other'], ORDERED_STATUS: 'ordered' }));
+jest.mock('../models/Rack', () => ({ exists: jest.fn() }));
+jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../services/bottleOps', () => ({
   RESTORE_WINDOW_MS: 5 * 86400000,
   removeBottleCascade: jest.fn(),
@@ -324,6 +326,47 @@ describe('revertLedgerRow dispatch', () => {
     const res = await revertLedgerRow({ _id: 'r', action: 'update', bottle: 'b1', prev: {} }, ctx(), H);
     expect(res).toMatchObject({ ok: false, code: 'conflict' });
     expect(bottleOps.updateBottleFields).not.toHaveBeenCalled();
+  });
+
+  test('arrive (mark_arrived) → back on order, its "added to cellar" date as before', async () => {
+    const Rack = require('../models/Rack');
+    Rack.exists.mockResolvedValue(null);
+    const before = new Date('2026-09-01T10:00:00Z');
+    const notified = new Date('2026-09-02T08:00:00Z');
+    const bottle = { _id: 'b1', vintage: 2023, cellar: 'c1', status: 'active', arrivedAt: new Date(), addedToCellarAt: new Date(), save: jest.fn() };
+    resolveBottleAccess.mockResolvedValue({ bottle });
+    McpActionLog.findOneAndUpdate.mockResolvedValue({ _id: 'r' });
+    const res = await revertLedgerRow({ _id: 'r', action: 'arrive', bottle: 'b1', cellar: 'c1', prev: { addedToCellarAt: before, arrivalNotifiedAt: notified } }, ctx(), H);
+    expect(bottle.status).toBe('ordered');
+    expect(bottle.arrivedAt).toBeUndefined();
+    expect(bottle.addedToCellarAt).toBe(before);
+    // The "has it arrived?" reminder is not sent a second time.
+    expect(bottle.arrivalNotifiedAt).toBe(notified);
+    expect(bottle.save).toHaveBeenCalled();
+    expect(res.data).toMatchObject({ undone: 'mark_arrived', status: 'ordered' });
+  });
+
+  test('arrive → refused once the bottle has been moved to another cellar or opened since', async () => {
+    const Rack = require('../models/Rack');
+    Rack.exists.mockResolvedValue(null);
+    for (const changed of [{ cellar: 'c2' }, { openedAt: new Date() }]) {
+      const bottle = { _id: 'b1', vintage: 2023, cellar: 'c1', status: 'active', save: jest.fn(), ...changed };
+      resolveBottleAccess.mockResolvedValue({ bottle });
+      const res = await revertLedgerRow({ _id: 'r', action: 'arrive', bottle: 'b1', cellar: 'c1', prev: {} }, ctx(), H);
+      expect(res).toMatchObject({ ok: false, code: 'conflict' });
+      expect(bottle.save).not.toHaveBeenCalled();
+    }
+  });
+
+  test('arrive → refused once the bottle has been placed in a rack (an order never sits in one)', async () => {
+    const Rack = require('../models/Rack');
+    Rack.exists.mockResolvedValue({ _id: 'rack1' });
+    const bottle = { _id: 'b1', vintage: 2023, cellar: 'c1', status: 'active', save: jest.fn() };
+    resolveBottleAccess.mockResolvedValue({ bottle });
+    const res = await revertLedgerRow({ _id: 'r', action: 'arrive', bottle: 'b1', cellar: 'c1', prev: {} }, ctx(), H);
+    expect(res).toMatchObject({ ok: false, code: 'conflict' });
+    expect(bottle.save).not.toHaveBeenCalled();
+    expect(bottle.status).toBe('active');
   });
 
   test('consume → restoreBottle, reverse row can re-consume', async () => {
