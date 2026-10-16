@@ -27,6 +27,8 @@ import './AddBottle.css';
 import { backLabel } from '../utils/backLabel';
 import { useBackToClose } from '../utils/useBackToClose';
 import { bottleNoticeName } from '../components/BottleUndoNotice';
+import { handOverBack } from '../hooks/useHandedOverState';
+import { afterPopupEntryGone, isOnPopupEntry } from '../utils/useBackToClose';
 
 // How this device last started adding a bottle: 'camera' (the label photo, the
 // default) or 'search' (typing the name). Per device on purpose — the same
@@ -130,10 +132,13 @@ function AddBottle() {
     ratingScale: user?.preferences?.ratingScale || '5',
     dateAdded: ''
   });
-  const [addToHistory, setAddToHistory] = useState(false);
+  // "Add another bottle" after an add on order or to the history opens the
+  // next one the same way (components/BottleAddedNotice → addMode).
+  const startMode = useRef(window.history.state?.usr?.addMode || null).current;
+  const [addToHistory, setAddToHistory] = useState(startMode === 'history');
   // "Not delivered yet": the bottles are added ON ORDER (status 'ordered'),
   // with an optional expected month ('YYYY-MM').
-  const [onOrder, setOnOrder] = useState(false);
+  const [onOrder, setOnOrder] = useState(startMode === 'onOrder');
   const [expectedArrival, setExpectedArrival] = useState('');
   const [historyData, setHistoryData] = useState({
     consumedAt: '',
@@ -163,7 +168,8 @@ function AddBottle() {
   // response could overwrite the current wine's count with a stale one. Keying
   // makes both unrepresentable. Absent key = not fetched yet.
   const [wineImageCounts, setWineImageCounts] = useState({});
-  const [showDetails, setShowDetails] = useState(false);
+  // Open when the mode was carried over, so its ticked box is in sight.
+  const [showDetails, setShowDetails] = useState(startMode === 'onOrder' || startMode === 'history');
 
   // Whether the user has worked the toggle themselves. Auto-expanding is a
   // suggestion, not a policy — once someone closes the panel deliberately,
@@ -881,10 +887,7 @@ function AddBottle() {
   // few wines in a row had to find the add button again after every save
   // (newcomer walkthrough 2026-10-15). The name is the wine the server filed
   // the bottles under (a "did you mean?" pick at commit can differ from what
-  // was typed). Straight from the form the add page is REPLACED in the
-  // history, so Back from the list never lands on an emptied form; from the
-  // "Place them now?" dialog it is an ordinary push, which the dialog's own
-  // Back entry needs (utils/useBackToClose: Back from the new page skips it).
+  // was typed).
   const addedNotice = () => {
     const created = createdBottlesRef.current.filter(Boolean);
     const first = created[0] || {};
@@ -893,12 +896,51 @@ function AddBottle() {
       pendingWineRequest: first.pendingWineRequest,
       vintage: first.vintage || bottleData.vintage,
     });
-    return { name, count: created.length, history: !!addToHistory };
+    return { name, count: created.length, history: !!addToHistory, onOrder: !!onOrder && !addToHistory };
   };
-  const goToCellarAdded = ({ replace = true } = {}) => {
-    navigate(`/cellars/${cellarId}`, { replace, state: { addedNotice: addedNotice() } });
+  // Where the bottles now are, said there. Opened from that very list (its
+  // add buttons pass `cameFrom`), the page goes BACK to it — the list keeps
+  // its place and Back from it leaves it, where a second copy of the list
+  // made the first Back dead (release audit 2026-10-16) — and the notice is
+  // handed over through sessionStorage. Otherwise the add page is replaced,
+  // so Back never lands on an emptied form.
+  // From a closing pop-up ("Place them now?", "did you mean?", the custom-
+  // field notice) it first waits until that pop-up's own Back entry is gone;
+  // still on it after the wait, going back would only close that entry, so
+  // it replaces instead.
+  const cameFromHere = (path) => {
+    const entry = window.history.state || {};
+    return entry.usr?.cameFrom === path && Number.isInteger(entry.idx) && entry.idx > 0 && !isOnPopupEntry();
   };
-  const leavePlacePrompt = () => goToCellarAdded({ replace: false });
+  const leaveTo = (path) => afterPopupEntryGone(() => {
+    const notice = addedNotice();
+    if (cameFromHere(path)) {
+      handOverBack('addedNotice', path, notice);
+      navigate(-1);
+    } else {
+      navigate(path, { replace: true, state: { addedNotice: notice } });
+    }
+  });
+  const listPath = () => (onOrder && !addToHistory ? `/cellars/${cellarId}/on-order` : `/cellars/${cellarId}`);
+  const goToCellarAdded = () => leaveTo(`/cellars/${cellarId}`);
+  const leavePlacePrompt = () => { setPlacePrompt(null); goToCellarAdded(); };
+  // Leaving without saving (Cancel, the back link): back to the list it came
+  // from too — a pushed copy of it made the first Back land on the emptied
+  // form. Bottles already saved (a save that stopped part-way) are said there.
+  const leaveUnsaved = (e) => {
+    if (createdBottlesRef.current.some(Boolean)) {
+      e?.preventDefault?.();
+      leaveTo(listPath());
+      return;
+    }
+    const from = window.history.state?.usr?.cameFrom;
+    if (from && cameFromHere(from)) {
+      e?.preventDefault?.();
+      navigate(-1);
+      return;
+    }
+    if (!e) navigate(`/cellars/${cellarId}`);
+  };
 
   // What happens once every bottle exists: link the photos, then either offer
   // to place them or go to the cellar. Extracted so the custom-field notice
@@ -914,7 +956,7 @@ function AddBottle() {
     // one on order: it is placed once it arrives, and its list is where the
     // user goes next.
     if (onOrder && !addToHistory) {
-      navigate(`/cellars/${cellarId}/on-order`, { replace: true, state: { addedNotice: addedNotice() } });
+      leaveTo(`/cellars/${cellarId}/on-order`);
       return;
     }
     if (newIds.length > 0 && !addToHistory) {
@@ -1198,7 +1240,7 @@ function AddBottle() {
       )}
 
       <div className="add-bottle-header">
-        <Link to={`/cellars/${cellarId}`} className="back-link">
+        <Link to={`/cellars/${cellarId}`} className="back-link" onClick={leaveUnsaved}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
           {backLabel(t('addBottle.backToCellar'))}
         </Link>
@@ -1473,7 +1515,7 @@ function AddBottle() {
             <>
               <div className="wine-select-manual-header">
                 <h2>{t('addBottle.searchForWine')}</h2>
-                <button type="button" className="btn-link-muted" onClick={() => { setShowTextSearch(false); setSearch(''); setWines([]); setSearchedFor(''); setSearchFailed(false); setAiSearchError(null); }}>
+                <button type="button" className="btn-link-muted" onClick={() => { searchSeq.current += 1; setLoading(false); setShowTextSearch(false); setSearch(''); setWines([]); setSearchedFor(''); setSearchFailed(false); setAiSearchError(null); }}>
                   ← {t('addBottle.useCameraInstead', 'Use camera instead')}
                 </button>
               </div>
@@ -1486,7 +1528,7 @@ function AddBottle() {
                     type="text"
                     placeholder={t('addBottle.searchPlaceholder')}
                     value={search}
-                    onChange={(e) => { setSearch(e.target.value); setWines([]); setSearchedFor(''); setSearchFailed(false); setAiSearchError(null); setError(null); clearAi(); }}
+                    onChange={(e) => { searchSeq.current += 1; setLoading(false); setSearch(e.target.value); setWines([]); setSearchedFor(''); setSearchFailed(false); setAiSearchError(null); setError(null); clearAi(); }}
                     onKeyDown={handleSearchKeyDown}
                     className="search-input-large"
                     enterKeyHint="search"
@@ -2150,7 +2192,7 @@ function AddBottle() {
                   added: those bottles exist. */}
               <button
                 type="button"
-                onClick={() => (createdBottlesRef.current.some(Boolean) ? goToCellarAdded() : navigate(`/cellars/${cellarId}`))}
+                onClick={() => leaveUnsaved()}
                 className="btn btn-secondary"
               >
                 {t('common.cancel')}
@@ -2208,7 +2250,7 @@ function AddBottle() {
         <div className="modal-overlay">
           <DialogBox
             className="modal-box"
-            onClose={() => { setCustomFieldNotice(null); finishAdd(); }}
+            onClose={() => { setCustomFieldNotice(null); afterPopupEntryGone(finishAdd); }}
             label={t('addBottle.customFieldsNotSaved', 'Some custom fields were not saved')}
           >
             <h2>{t('addBottle.customFieldsNotSaved', 'Some custom fields were not saved')}</h2>
@@ -2220,7 +2262,7 @@ function AddBottle() {
               <button
                 type="button"
                 className="btn btn-primary"
-                onClick={() => { setCustomFieldNotice(null); finishAdd(); }}
+                onClick={() => { setCustomFieldNotice(null); afterPopupEntryGone(finishAdd); }}
               >
                 {t('common.close')}
               </button>

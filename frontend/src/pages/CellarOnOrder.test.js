@@ -282,3 +282,57 @@ test('bottles just added on order are announced with "Add another bottle"', asyn
   expect(await screen.findByRole('link', { name: /Add another bottle|bottleNotice\.addAnother/ })).toHaveAttribute('href', '/cellars/c1/add-bottle');
   expect(screen.getByRole('status')).toHaveTextContent(/bottleNotice\.added|Barolo 2016/);
 });
+
+// Release audit 2026-10-16: after a raise that stopped part-way, Save waits
+// until the list is read again — a retry on the stale count added the whole
+// difference again (2 → 7 ended at 10).
+test('a raise that stopped part-way waits for the list, then adds only the rest', async () => {
+  let posts = 0;
+  let created = 0;
+  let offline = false;
+  api.mockImplementation(async (url, opts) => {
+    if (url === '/api/cellars/c1/on-order') {
+      if (offline) throw new TypeError('Failed to fetch');
+      const extra = Array.from({ length: created }, (_, i) => ordered(`n${i}`, MARCH));
+      return ok({ cellar: CELLAR, bottles: [ordered('b1', MARCH), ordered('b2', MARCH), ...extra], total: 2 + created });
+    }
+    if (url === '/api/bottles' && opts?.method === 'POST') {
+      posts += 1;
+      if (posts === 4) { offline = true; throw new TypeError('Failed to fetch'); }
+      created += 1;
+      return { ok: true, status: 201, json: async () => ({ bottle: { _id: `n${posts}` } }) };
+    }
+    return ok({});
+  });
+  renderPage();
+  fireEvent.click(await screen.findByText('onOrder.changeQty'));
+  fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '7' } });
+  fireEvent.click(screen.getByText('onOrder.saveQty'));
+  // 3 added, the 4th failed, and the list could not be read again: Save waits.
+  expect(await screen.findByText('onOrder.loadFailed')).toBeInTheDocument();
+  expect(await screen.findByText('onOrder.qtyWaitList', { exact: false })).toBeInTheDocument();
+  expect(screen.getByText('onOrder.saveQty').closest('button')).toBeDisabled();
+
+  offline = false;
+  fireEvent.click(screen.getByText('onOrder.qtyReadAgain'));
+  expect(await screen.findByText(/onOrder.qty:5/)).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByText('onOrder.saveQty').closest('button')).toBeEnabled());
+  fireEvent.click(screen.getByText('onOrder.saveQty'));
+  // 5 are there: 2 more make 7.
+  await waitFor(() => expect(posts).toBe(6));
+  await new Promise((r) => setTimeout(r, 50));
+  expect(posts).toBe(6);
+});
+
+test('a lowering that took nothing off says so (no silent no-op)', async () => {
+  api.mockImplementation(async (url) => {
+    if (url === '/api/cellars/c1/on-order') return ok({ cellar: CELLAR, bottles: [ordered('b1', MARCH), ordered('b2', MARCH), ordered('b3', MARCH)], total: 3 });
+    if (url === '/api/bottles/bulk-delete') return ok({ deleted: 0, deletedIds: [], skipped: [{ id: 'b3', reason: 'not_found' }] });
+    return ok({});
+  });
+  renderPage();
+  fireEvent.click(await screen.findByText('onOrder.changeQty'));
+  fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '2' } });
+  fireEvent.click(screen.getByText('onOrder.saveQty'));
+  expect(await screen.findByText('onOrder.qtyFailed')).toBeInTheDocument();
+});

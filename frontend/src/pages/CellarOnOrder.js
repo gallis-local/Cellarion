@@ -251,8 +251,15 @@ function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onA
   const validQty = String(newQty).trim() !== '' && Number.isInteger(parsedQty) && parsedQty >= 1 && parsedQty <= maxQty;
   const qtyFailed = () => t('onOrder.qtyFailed', 'Could not change how many bottles are on order. Please try again.');
   const saving = useRef(false);
+  // A raise that stopped part-way added bottles this list does not show
+  // yet: until it has been read again, `count` is stale and a retry would
+  // add the whole difference again (release audit 2026-10-16 — 2 → 7 ended
+  // at 10). Save waits for the re-read; the count then is the live one.
+  const [staleAt, setStaleAt] = useState(null);
+  useEffect(() => { if (staleAt !== null && count !== staleAt) setStaleAt(null); }, [count, staleAt]);
+  const waitingForList = staleAt !== null && staleAt === count;
   const saveQty = async () => {
-    if (!validQty || saving.current) return;
+    if (!validQty || saving.current || waitingForList) return;
     if (parsedQty === count) { setPanel(null); return; }
     saving.current = true;
     setBusy(true);
@@ -271,6 +278,7 @@ function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onA
           if (!res.ok) {
             const data = await res.json().catch(() => ({}));
             const msg = data.error || qtyFailed();
+            if (added > 0) setStaleAt(count);
             onFailure(added > 0 ? t('addBottle.partialAdded', { msg, count: added, total: wanted, remaining: wanted - added }) : msg);
             return;
           }
@@ -289,10 +297,14 @@ function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onA
         onTakenOff(deletedIds, { batchId: data.batchId, name: bottleNoticeName(newest), bottleId: deletedIds[0] || surplus[0] });
         if ((data.skipped || []).some((s) => s.reason === 'not_on_order')) {
           onFailure(t('onOrder.qtyArrivedMeanwhile', 'Some of these bottles had already arrived, so they were left in the cellar. The list is up to date now.'));
+        } else if (deletedIds.length < surplus.length) {
+          // Gone meanwhile, or refused one by one: never a silent no-op.
+          onFailure(qtyFailed());
         }
       }
     } catch {
       const msg = qtyFailed();
+      if (added > 0) setStaleAt(count);
       onFailure(added > 0 ? t('addBottle.partialAdded', { msg, count: added, total: wanted, remaining: wanted - added }) : msg);
     } finally {
       saving.current = false;
@@ -392,8 +404,16 @@ function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onA
             />
             {qtyHint && <span className="on-order-field-hint">{qtyHint}</span>}
           </label>
+          {waitingForList && (
+            <p className="on-order-field-hint">
+              {t('onOrder.qtyWaitList', 'Some bottles were added before it stopped. Read the list again first, so the number is right.')}{' '}
+              <button type="button" className="btn btn-secondary btn-small" onClick={onAdded}>
+                {t('onOrder.qtyReadAgain', 'Read the list again')}
+              </button>
+            </p>
+          )}
           <div className="on-order-arrive-actions">
-            <button type="button" className="btn btn-primary btn-small" onClick={saveQty} disabled={busy || !validQty}>
+            <button type="button" className="btn btn-primary btn-small" onClick={saveQty} disabled={busy || !validQty || waitingForList}>
               {busy ? t('common.saving', 'Saving…') : t('onOrder.saveQty', 'Save')}
             </button>
             <button type="button" className="btn btn-secondary btn-small" onClick={() => setPanel(null)} disabled={busy}>
