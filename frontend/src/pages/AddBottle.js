@@ -26,6 +26,7 @@ import { swatchType, wineTypeLabel, isStyleType, colourLabel, WINE_COLOURS } fro
 import './AddBottle.css';
 import { backLabel } from '../utils/backLabel';
 import { useBackToClose } from '../utils/useBackToClose';
+import { bottleNoticeName } from '../components/BottleUndoNotice';
 
 // How this device last started adding a bottle: 'camera' (the label photo, the
 // default) or 'search' (typing the name). Per device on purpose — the same
@@ -871,6 +872,34 @@ function AddBottle() {
     });
   };
 
+  // The wine on screen came from a scanned barcode (not just a barcode kept
+  // for a wine picked by hand).
+  const foundByBarcode = !!barcodeWineId && selectedWine?._id === barcodeWineId;
+
+  // What the page that lists the new bottles says — "“X 2019” added" with
+  // "Add another bottle" (components/BottleAddedNotice). A newcomer adding a
+  // few wines in a row had to find the add button again after every save
+  // (newcomer walkthrough 2026-10-15). The name is the wine the server filed
+  // the bottles under (a "did you mean?" pick at commit can differ from what
+  // was typed). Straight from the form the add page is REPLACED in the
+  // history, so Back from the list never lands on an emptied form; from the
+  // "Place them now?" dialog it is an ordinary push, which the dialog's own
+  // Back entry needs (utils/useBackToClose: Back from the new page skips it).
+  const addedNotice = () => {
+    const created = createdBottlesRef.current.filter(Boolean);
+    const first = created[0] || {};
+    const name = bottleNoticeName({
+      wineDefinition: { name: first.wineDefinition?.name || selectedWine?.name },
+      pendingWineRequest: first.pendingWineRequest,
+      vintage: first.vintage || bottleData.vintage,
+    });
+    return { name, count: created.length, history: !!addToHistory };
+  };
+  const goToCellarAdded = ({ replace = true } = {}) => {
+    navigate(`/cellars/${cellarId}`, { replace, state: { addedNotice: addedNotice() } });
+  };
+  const leavePlacePrompt = () => goToCellarAdded({ replace: false });
+
   // What happens once every bottle exists: link the photos, then either offer
   // to place them or go to the cellar. Extracted so the custom-field notice
   // can hold it back for one dialog and then resume exactly the same flow.
@@ -885,7 +914,7 @@ function AddBottle() {
     // one on order: it is placed once it arrives, and its list is where the
     // user goes next.
     if (onOrder && !addToHistory) {
-      navigate(`/cellars/${cellarId}/on-order`);
+      navigate(`/cellars/${cellarId}/on-order`, { replace: true, state: { addedNotice: addedNotice() } });
       return;
     }
     if (newIds.length > 0 && !addToHistory) {
@@ -899,7 +928,7 @@ function AddBottle() {
       setPlacePrompt({ ids: newIds, count: newIds.length });
       return;
     }
-    navigate(`/cellars/${cellarId}`);
+    goToCellarAdded();
   };
 
   // Create the bottle records that are still missing. wineRef is EITHER
@@ -1655,23 +1684,11 @@ function AddBottle() {
               {t('addBottle.changeWine')}
             </button>
           </div>
-          {barcodeWineId && selectedWine?._id === barcodeWineId ? (
+          {/* Which wine this is: said right under it. */}
+          {foundByBarcode && (
             <p className="selected-wine-barcode-note">
               {t('addBottle.barcodeFound', 'Found by its barcode. Not this wine? Use Change wine.')}
             </p>
-          ) : barcode ? (
-            <p className="selected-wine-barcode-note">
-              {t('addBottle.barcodeThanks', 'Thank you — the barcode is saved with this bottle, so the next member who scans it finds this wine straight away.')}
-            </p>
-          ) : (
-            // The registry learns barcodes only from bottles added with one, so
-            // ask — once, quietly, at the one step every add path reaches.
-            <div className="barcode-help">
-              <p>{t('addBottle.barcodeHelp', "Help the community: we're building Cellarion's barcode list together, and it's still small. Scan the barcode on this bottle, and the next member who scans it will find this wine straight away.")}</p>
-              <button type="button" className="btn btn-ghost btn-small" onClick={startBarcodeScan}>
-                {t('addBottle.barcodeHelpBtn', 'Scan barcode')}
-              </button>
-            </div>
           )}
 
           {/* A wine the registry does not know yet will be MINTED with this
@@ -1831,6 +1848,28 @@ function AddBottle() {
               />
               <p className="photo-section-notice">{t('addBottle.photosNotice')}</p>
             </div>
+
+            {/* The registry learns barcodes only from bottles added with one, so
+                ask — once, quietly, at the one step every add path reaches. Below
+                the fields and the photo, next to the other way to help: a
+                newcomer's first job here is the vintage (newcomer walkthrough
+                2026-10-15). The thanks lands where the scan was asked for. */}
+            {!foundByBarcode && (
+              <div className="barcode-ask">
+                {barcode ? (
+                  <p className="selected-wine-barcode-note">
+                    {t('addBottle.barcodeThanks', 'Thank you — the barcode is saved with this bottle, so the next member who scans it finds this wine straight away.')}
+                  </p>
+                ) : (
+                  <div className="barcode-help">
+                    <p>{t('addBottle.barcodeHelp', "Help the community: we're building Cellarion's barcode list together, and it's still small. Scan the barcode on this bottle, and the next member who scans it will find this wine straight away.")}</p>
+                    <button type="button" className="btn btn-ghost btn-small" onClick={startBarcodeScan}>
+                      {t('addBottle.barcodeHelpBtn', 'Scan barcode')}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* ── More details toggle ── */}
             <button
@@ -2107,9 +2146,11 @@ function AddBottle() {
               <button type="submit" className="btn btn-success" disabled={saving}>
                 {saving ? t('common.saving', 'Saving…') : addToHistory ? t('addBottle.addToHistoryBtn') : onOrder ? t('addBottle.addOnOrderBtn') : t('addBottle.addBottleBtn')}
               </button>
+              {/* Cancel after a save that stopped part-way still says what was
+                  added: those bottles exist. */}
               <button
                 type="button"
-                onClick={() => navigate(`/cellars/${cellarId}`)}
+                onClick={() => (createdBottlesRef.current.some(Boolean) ? goToCellarAdded() : navigate(`/cellars/${cellarId}`))}
                 className="btn btn-secondary"
               >
                 {t('common.cancel')}
@@ -2190,17 +2231,17 @@ function AddBottle() {
 
       {/* Post-add placing offer (issue #1055) — skippable, never blocking */}
       {placePrompt && (
-        <div className="modal-overlay" onClick={() => navigate(`/cellars/${cellarId}`)}>
+        <div className="modal-overlay" onClick={leavePlacePrompt}>
           <DialogBox
             className="modal-box"
             onClick={e => e.stopPropagation()}
-            onClose={() => navigate(`/cellars/${cellarId}`)}
+            onClose={leavePlacePrompt}
             label={t('addBottle.placePrompt.title', { count: placePrompt.count })}
           >
             <h2>{t('addBottle.placePrompt.title', { count: placePrompt.count })}</h2>
             <p>{t('addBottle.placePrompt.body')}</p>
             <div className="modal-actions">
-              <button type="button" className="btn btn-secondary" onClick={() => navigate(`/cellars/${cellarId}`)}>
+              <button type="button" className="btn btn-secondary" onClick={leavePlacePrompt}>
                 {t('addBottle.placePrompt.notNow')}
               </button>
               <button
