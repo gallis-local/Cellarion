@@ -13,6 +13,9 @@ import RoomScene from '../components/room/RoomScene';
 import { getRackHeight, clampToRoom } from '../utils/roomConstants';
 import WineImage from '../components/WineImage';
 import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
+import { ConsumeModal } from '../components/ConsumeModal';
+import { bottleNoticeName } from '../components/BottleUndoNotice';
+import { isReserved, reservationSummary } from '../utils/reservation';
 import { LENSES, getLensStyle, getLensLegend, bottleMatchesSearch } from '../utils/rackLens';
 import CellarNav from '../components/CellarNav';
 import CellarPageHeader from '../components/CellarPageHeader';
@@ -958,11 +961,24 @@ export default function CellarRoom() {
 
   // "Just a glass — keep the bottle": escape hatch out of the remove flow
   // (see CellarRacks.handlePartial for the rationale).
+  // "Just a glass": pour one from an open bottle, or open it first, then
+  // show the bottle. A refusal says why and stays here — nothing changed, so
+  // the bottle page would have nothing to show. Opened but the glass refused:
+  // the bottle page shows it open, where a glass is one tap.
   const handlePartial = async (bottle) => {
     setConsumeModal(null);
     setSelectedBottle(null);
     if (bottle.openedAt) {
-      try { await pourBottle(apiFetch, bottle._id); } catch { /* bottle page shows truth */ }
+      try {
+        const res = await pourBottle(apiFetch, bottle._id);
+        if (!res.ok) {
+          failed(res, await res.json().catch(() => ({})), t('racks.errors.pour', 'The glass could not be recorded.'));
+          return;
+        }
+      } catch (err) {
+        setActionError(friendlyError(err, t));
+        return;
+      }
       navigate(`/cellars/${id}/bottles/${bottle._id}`, { state: backHere });
     } else {
       setPartialPicker({ bottleId: bottle._id });
@@ -974,10 +990,18 @@ export default function CellarRoom() {
     setPartialBusy(true);
     try {
       const res = await openBottle(apiFetch, bottleId, method);
-      if (res.ok) await pourBottle(apiFetch, bottleId);
-    } catch { /* bottle page shows truth */ }
-    setPartialBusy(false);
-    setPartialPicker(null);
+      if (!res.ok) {
+        failed(res, await res.json().catch(() => ({})), t('racks.errors.open', 'The bottle could not be opened.'));
+        return;
+      }
+      await pourBottle(apiFetch, bottleId).catch(() => {});
+    } catch (err) {
+      setActionError(friendlyError(err, t));
+      return;
+    } finally {
+      setPartialBusy(false);
+      setPartialPicker(null);
+    }
     navigate(`/cellars/${id}/bottles/${bottleId}`, { state: backHere });
   };
 
@@ -1419,24 +1443,18 @@ export default function CellarRoom() {
             );
           })()}
 
-          {/* Consume modal */}
+          {/* The one "take out of the cellar" dialog (components/ConsumeModal),
+              as on the racks page: "Just a glass" on top, the reservation
+              warning when the bottle is spoken for. */}
           {consumeModal && (
-            <div className="room-consume-overlay" onClick={() => setConsumeModal(null)}>
-              <DialogBox
-                className="room-consume-modal"
-                onClick={e => e.stopPropagation()}
-                onClose={() => setConsumeModal(null)}
-                label={t('bottleDetail.removeBottleTitle', 'Take out of the cellar')}
-              >
-                <RoomConsumeForm
-                  onSubmit={handleConsumeSubmit}
-                  onCancel={() => setConsumeModal(null)}
-                  onPartial={consumeModal.bottle ? () => handlePartial(consumeModal.bottle) : undefined}
-                  defaultRatingScale={user?.preferences?.ratingScale}
-                  t={t}
-                />
-              </DialogBox>
-            </div>
+            <ConsumeModal
+              wineName={bottleNoticeName(consumeModal.bottle)}
+              defaultRatingScale={user?.preferences?.ratingScale || '5'}
+              reservationText={isReserved(consumeModal.bottle) ? reservationSummary(consumeModal.bottle, t) : undefined}
+              onConfirm={handleConsumeSubmit}
+              onCancel={() => setConsumeModal(null)}
+              onJustAGlass={() => handlePartial(consumeModal.bottle)}
+            />
           )}
 
           {/* Post-consume "add to journal?" prompt */}
@@ -1684,96 +1702,4 @@ function leaveBackPastThisPage() {
   window.addEventListener('popstate', onPop);
   arm();
   window.history.back();
-}
-
-const roomToday = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-};
-
-// onSubmit(reason, note, rating, ratingScale, consumedAt) — the third consume
-// dialog (after components/ConsumeModal and the racks view's own); the day the
-// bottle was actually drunk rides along like on the other two (audit 2026-09-14).
-function RoomConsumeForm({ onSubmit, onCancel, onPartial, defaultRatingScale, t }) {
-  const [reason, setReason] = useState('drank');
-  const [note, setNote] = useState('');
-  const [rating, setRating] = useState('');
-  const [ratingScale, setRatingScale] = useState(defaultRatingScale || '5');
-  const [date, setDate] = useState(roomToday);
-  const [saving, setSaving] = useState(false);
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setSaving(true);
-    try {
-      await onSubmit(reason, note || undefined, rating || undefined, ratingScale, date || undefined);
-    } finally {
-      // Always re-enable the button — a rejected onSubmit must not leave the
-      // form stuck on "Saving...".
-      setSaving(false);
-    }
-  };
-
-  return (
-    <form onSubmit={handleSubmit}>
-      <h3>{t('bottleDetail.removeBottleTitle', 'Take out of the cellar')}</h3>
-      {onPartial && (
-        <div className="consume-partial-row">
-          <button type="button" className="btn btn-secondary consume-partial-btn" onClick={onPartial}>
-            🍷 {t('openBottle.partialOption', 'Just a glass — keep the bottle')}
-          </button>
-          <span className="consume-partial-or">{t('openBottle.partialOr', 'or remove it completely:')}</span>
-        </div>
-      )}
-      <div className="form-group">
-        <label>{t('common.reason', 'Reason')}</label>
-        <select value={reason} onChange={e => setReason(e.target.value)}>
-          <option value="drank">{t('bottleDetail.drinkReason', 'Drank')}</option>
-          <option value="gifted">{t('bottleDetail.giftedReason', 'Gifted')}</option>
-          <option value="sold">{t('bottleDetail.soldReason', 'Sold')}</option>
-          <option value="other">{t('bottleDetail.otherReason', 'Other')}</option>
-        </select>
-      </div>
-      <label className="form-group">
-        <span>{t('bulk.consumeDate', 'Date')}</span>
-        <input type="date" value={date} max={roomToday()} onChange={e => setDate(e.target.value)} disabled={saving} />
-      </label>
-      {reason === 'drank' && (
-        <div className="form-group">
-          <label>{t('common.rating', 'Rating')}</label>
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-            <input
-              type="number"
-              min={0}
-              max={Number(ratingScale)}
-              step={0.5}
-              value={rating}
-              onChange={e => setRating(e.target.value)}
-              placeholder="—"
-              style={{ width: '70px' }}
-            />
-            <span>/ </span>
-            <select value={ratingScale} onChange={e => setRatingScale(e.target.value)} style={{ width: '60px' }}>
-              <option value="5">5</option>
-              <option value="10">10</option>
-              <option value="20">20</option>
-              <option value="100">100</option>
-            </select>
-          </div>
-        </div>
-      )}
-      <div className="form-group">
-        <label>{t('common.notes', 'Notes')}</label>
-        <textarea value={note} onChange={e => setNote(e.target.value)} rows={2} />
-      </div>
-      <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.75rem' }}>
-        <button type="button" className="btn btn-secondary btn-small" onClick={onCancel}>
-          {t('common.cancel', 'Cancel')}
-        </button>
-        <button type="submit" className="btn btn-consume btn-small" disabled={saving}>
-          {saving ? t('common.saving', 'Saving...') : t('common.confirm', 'Confirm')}
-        </button>
-      </div>
-    </form>
-  );
 }
