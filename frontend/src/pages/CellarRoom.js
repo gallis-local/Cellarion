@@ -14,7 +14,7 @@ import { getRackHeight, clampToRoom } from '../utils/roomConstants';
 import WineImage from '../components/WineImage';
 import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
 import { ConsumeModal } from '../components/ConsumeModal';
-import { bottleNoticeName } from '../components/BottleUndoNotice';
+import BottleUndoNotice, { bottleNoticeName } from '../components/BottleUndoNotice';
 import { isReserved, reservationSummary } from '../utils/reservation';
 import { LENSES, getLensStyle, getLensLegend, bottleMatchesSearch } from '../utils/rackLens';
 import CellarNav from '../components/CellarNav';
@@ -80,6 +80,9 @@ export default function CellarRoom() {
   const slotTimerRef = useRef(null);
   const [consumeModal, setConsumeModal] = useState(null); // { bottleId, bottle }
   const [journalBottle, setJournalBottle] = useState(null); // consumed bottle awaiting journal prompt
+  // The bottle just taken out, said with Undo — as on the racks page
+  // (components/BottleUndoNotice), with its slot for handleUndone.
+  const [drunkNotice, setDrunkNotice] = useState(null);
 
   // "just a glass" partial flow (see CellarRacks.handlePartial)
   const [partialPicker, setPartialPicker] = useState(null); // { bottleId }
@@ -1028,6 +1031,10 @@ export default function CellarRoom() {
         })));
         setConsumeModal(null);
         setSelectedBottle(null);
+        setDrunkNotice({
+          kind: 'consumed', reason, bottleId: consumeModal.bottleId, slot: consumeModal.slot,
+          name: bottleNoticeName(consumeModal.bottle), at: Date.now(),
+        });
         if (reason === 'drank' && !journalPromptOptedOut()) {
           setJournalBottle(consumeModal.bottle);
         }
@@ -1039,6 +1046,37 @@ export default function CellarRoom() {
       setActionError(friendlyError(err, t));
     }
   }, [consumeModal, apiFetch, failed, t]);
+
+  // After an Undo, as on the racks page (CellarRacks handleUndone): the
+  // journal prompt for that bottle closes, and the bottle goes back into its
+  // slot when that slot is still free (the server checks: expectOccupant
+  // null), else it stays unplaced. Only the racks are read again — the room
+  // layout may hold unsaved edits.
+  const refreshRacks = useCallback(async () => {
+    try {
+      const res = await getRacks(apiFetch, id);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) setRacks(data.racks || []);
+    } catch { /* the room keeps what it shows */ }
+  }, [apiFetch, id]);
+  const handleUndone = async (notice) => {
+    setJournalBottle((prev) => (prev && String(prev._id) === String(notice.bottleId) ? null : prev));
+    const { slot } = notice;
+    const rack = slot && racks.find((r) => r._id === slot.rackId);
+    const free = !!rack && !(rack.disabledPositions || []).includes(slot.position)
+      && !rack.slots.some((s) => s.position === slot.position && s.bottle);
+    if (free) {
+      try {
+        const res = await updateSlot(apiFetch, slot.rackId, slot.position, { bottleId: notice.bottleId, expectOccupant: null });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.rack) {
+          setRacks((prev) => prev.map((r) => (r._id === slot.rackId ? data.rack : r)));
+          return;
+        }
+      } catch { /* it stays unplaced */ }
+    }
+    await refreshRacks();
+  };
 
   // Backend search for slot picker
   const fetchSlotBottles = useCallback(async (term) => {
@@ -1078,6 +1116,16 @@ export default function CellarRoom() {
   return (
     <div className="cellar-room-page">
       <ActionNotice message={actionError} onDismiss={() => setActionError(null)} />
+      {drunkNotice && (
+        <BottleUndoNotice
+          key={`${drunkNotice.bottleId}:${drunkNotice.at}`}
+          floating
+          notice={drunkNotice}
+          cellarId={id}
+          onUndone={() => handleUndone(drunkNotice)}
+          onDismiss={() => setDrunkNotice(null)}
+        />
+      )}
       {/* View mode uses the shared header so the nav anchors like every other
           cellar page. Edit mode keeps its own full-bleed working toolbar (and
           the nav is hidden while arranging racks). */}
@@ -1387,7 +1435,11 @@ export default function CellarRoom() {
                     <button
                       className="btn btn-consume btn-small"
                       onClick={() => {
-                        setConsumeModal({ bottleId: bottle._id, bottle });
+                        setConsumeModal({
+                          bottleId: bottle._id,
+                          bottle,
+                          slot: { rackId: selectedBottle.rackId, position: selectedBottle.slot.position },
+                        });
                       }}
                     >
                       {t('racks.remove', 'Drink')}

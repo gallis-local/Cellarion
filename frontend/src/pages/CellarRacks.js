@@ -24,7 +24,7 @@ import {
 } from '../utils/cabinetPresets';
 import { cabinetShelfCols, cabinetShelfAlternate, cabinetShelfSideways } from '../utils/rackLayouts';
 import { ConsumeModal } from '../components/ConsumeModal';
-import { bottleNoticeName } from '../components/BottleUndoNotice';
+import BottleUndoNotice, { bottleNoticeName } from '../components/BottleUndoNotice';
 import { isReserved, reservationSummary } from '../utils/reservation';
 import WineImage from '../components/WineImage';
 import ConfirmModal from '../components/ConfirmModal';
@@ -216,6 +216,11 @@ function CellarRacks() {
 
   // consumed bottle awaiting the "add to journal?" prompt, or null
   const [journalBottle, setJournalBottle] = useState(null);
+  // The bottle just taken out of a slot, said with Undo (components/
+  // BottleUndoNotice) — a member could not undo a drink from the racks page.
+  // It floats above the journal prompt, as on the cellar list. It remembers
+  // the slot, so Undo can put the bottle back there (handleUndone).
+  const [drunkNotice, setDrunkNotice] = useState(null);
 
   // NFC modal: { rackId } or null
   const [nfcModal, setNfcModal] = useState(null);
@@ -516,7 +521,7 @@ function CellarRacks() {
 
   // --- soft-remove bottle via the shared consume endpoint ---
   const handleConsumeSubmit = async (reason, note, rating, consumedRatingScale, consumedAt) => {
-    const { bottleId, bottle } = consumeModal;
+    const { bottleId, bottle, slot } = consumeModal;
     try {
       const res = await consumeBottle(apiFetch, bottleId, { reason, note, rating, consumedRatingScale, consumedAt });
       const data = await res.json();
@@ -531,6 +536,7 @@ function CellarRacks() {
         })));
         setConsumeModal(null);
         setActionError(null);
+        setDrunkNotice({ kind: 'consumed', reason, bottleId, slot, name: bottleNoticeName(bottle), at: Date.now() });
         if (reason === 'drank' && !journalPromptOptedOut()) {
           setJournalBottle(bottle);
         }
@@ -543,6 +549,32 @@ function CellarRacks() {
       // Don't rethrow — ConsumeModal awaits this and must reach setSaving(false)
       setActionError(friendlyError(err, t));
     }
+  };
+
+  // After an Undo from the drunk notice. The journal prompt for that bottle
+  // closes (it was not drunk after all). The bottle goes back into the slot it
+  // came from when that slot is still free — the server checks it is still
+  // empty (expectOccupant: null), so a bottle placed there meanwhile is never
+  // displaced; otherwise it stays unplaced, which the notice's "back in the
+  // cellar" covers, and the racks are read again quietly (reloadRacks — a
+  // failed re-read keeps what is shown, never the whole-page error).
+  const handleUndone = async (notice) => {
+    setJournalBottle((prev) => (prev && String(prev._id) === String(notice.bottleId) ? null : prev));
+    const { slot } = notice;
+    const rack = slot && racks.find((r) => r._id === slot.rackId);
+    const free = !!rack && !(rack.disabledPositions || []).includes(slot.position)
+      && !rack.slots.some((s) => s.position === slot.position && s.bottle);
+    if (free) {
+      try {
+        const res = await updateSlot(apiFetch, slot.rackId, slot.position, { bottleId: notice.bottleId, expectOccupant: null });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.rack) {
+          setRacks((prev) => prev.map((r) => (r._id === slot.rackId ? data.rack : r)));
+          return;
+        }
+      } catch { /* it stays unplaced */ }
+    }
+    await reloadRacks();
   };
 
   // --- drag & drop: move a bottle to another slot / swap two bottles ---
@@ -964,6 +996,16 @@ function CellarRacks() {
   return (
     <div className="cellar-racks-page">
       <ActionNotice message={actionError} onDismiss={() => setActionError(null)} />
+      {drunkNotice && (
+        <BottleUndoNotice
+          key={`${drunkNotice.bottleId}:${drunkNotice.at}`}
+          floating
+          notice={drunkNotice}
+          cellarId={id}
+          onUndone={() => handleUndone(drunkNotice)}
+          onDismiss={() => setDrunkNotice(null)}
+        />
+      )}
       <CellarPageHeader
         backTo={`/cellars/${id}`}
         backLabel={t('racks.backToCellar')}
@@ -1275,7 +1317,11 @@ function CellarRacks() {
                     setActionError(null);
                   } : undefined}
                   onConsume={() => {
-                    setConsumeModal({ bottleId: activePopup.slot.bottle._id, bottle: activePopup.slot.bottle });
+                    setConsumeModal({
+                      bottleId: activePopup.slot.bottle._id,
+                      bottle: activePopup.slot.bottle,
+                      slot: { rackId: activePopup.rackId, position: activePopup.position },
+                    });
                     setActivePopup(null);
                   }}
                   onClose={() => setActivePopup(null)}
