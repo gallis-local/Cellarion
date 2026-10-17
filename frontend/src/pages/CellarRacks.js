@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef, Suspense } from 'rea
 import { lazy } from '../utils/lazyWithReload';
 import { useParams, Link, useSearchParams, useNavigate, useLocation } from 'react-router-dom';
 import { useBackHere } from '../utils/useBackHere';
+import { useBackToClose } from '../utils/useBackToClose';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { getCellar } from '../api/cellars';
@@ -149,6 +150,21 @@ function CellarRacks() {
   // slot sent two requests, and the second came back as a conflict alert for
   // a move that had in fact worked. Other slots stay usable meanwhile.
   const slotActionsBusy = useRef(new Set());
+  // Move mode — "Move" in a filled slot's popup, then a tap on the slot the
+  // bottle should go to: { rackId, position, bottle } or null (handleMoveTap).
+  const [moving, setMoving] = useState(null);
+  const movingOn = !!moving;
+  // The phone's Back and Escape leave it, as they close a pop-up. Escape with
+  // a pop-up open over the page is that pop-up's.
+  useBackToClose(() => setMoving(null), movingOn);
+  useEffect(() => {
+    if (!movingOn) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'Escape' && !document.querySelector('[role="dialog"]')) setMoving(null);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [movingOn]);
 
   // --- post-add placing mode (issue #1055) — HOOKS live up here, before the
   // page's early `if (error) return` (audit 2026-09-14 H: hooks declared after
@@ -188,6 +204,8 @@ function CellarRacks() {
   // after the move can change which rack the page has selected (a ?highlight
   // follows its bottle into the target).
   const moveRackOn = useFeature('rackMoveBottles');
+  // Early access: "Move" in a slot's pop-up, then a tap on the slot it goes to.
+  const slotMoveOn = useFeature('rackSlotMove');
   const [moveOpen, setMoveOpen] = useState(null);
 
   // Zone editor modal
@@ -206,6 +224,8 @@ function CellarRacks() {
   const [deleteConfirm, setDeleteConfirm] = useState(null);
 
   useEffect(() => {
+    // A move begun in another cellar must never reach this one's racks.
+    setMoving(null);
     fetchAll();
   }, [id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -261,6 +281,20 @@ function CellarRacks() {
       setError('Network error');
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Re-read the racks after a move refused because a rack changed meanwhile,
+  // so the next try works on the real layout. Quietly: the notice already
+  // says why, and a failed re-read keeps what is shown (never the page error).
+  const reloadRacks = async () => {
+    try {
+      const res = await getRacks(apiFetch, id);
+      if (!res.ok) return;
+      const data = await res.json();
+      setRacks(data.racks || []);
+    } catch {
+      // keep what is shown
     }
   };
 
@@ -369,6 +403,7 @@ function CellarRacks() {
         const remaining = racks.filter(r => r._id !== rackId);
         setRacks(remaining);
         setActionError(null);
+        setMoving(m => (m?.rackId === rackId ? null : m));
         if (selectedRackId === rackId) {
           setSelectedRackId(remaining.length > 0 ? remaining[0]._id : null);
         }
@@ -511,19 +546,29 @@ function CellarRacks() {
   };
 
   // --- drag & drop: move a bottle to another slot / swap two bottles ---
-  const handleSlotMove = (rackId, fromPosition, toPosition) => slotAction(`${rackId}:${fromPosition}`, async () => {
+  // Also the move mode's, which passes `expect` (what it saw in both slots).
+  const handleSlotMove = (rackId, fromPosition, toPosition, expect) => slotAction(`${rackId}:${fromPosition}`, async () => {
     try {
-      const res = await moveSlot(apiFetch, rackId, fromPosition, toPosition);
+      const res = await moveSlot(apiFetch, rackId, fromPosition, toPosition, expect);
       const data = await res.json();
       if (res.ok) {
         setRacks(prev => prev.map(r => r._id === rackId ? data.rack : r));
       } else {
         failed(res, data, t('racks.errors.move', 'The bottle could not be moved.'));
+        // The move mode's 409: the rack is not what the page shows.
+        if (expect && res.status === 409) await reloadRacks();
       }
     } catch (err) {
       setActionError(friendlyError(err, t));
     }
   });
+
+  // A drop (mouse/pen) of the bottle the move mode is moving — or onto its
+  // slot — has moved it already: the mode ends.
+  const handleDrop = (rackId, fromPosition, toPosition) => {
+    setMoving(m => (m?.rackId === rackId && (m.position === fromPosition || m.position === toPosition) ? null : m));
+    return handleSlotMove(rackId, fromPosition, toPosition);
+  };
 
   // "Just a glass — keep the bottle": escape hatch out of the remove flow.
   // Already-open bottles pour immediately; unopened ones ask for the
@@ -860,6 +905,62 @@ function CellarRacks() {
     }
   };
 
+  // --- move mode: the way to move a bottle without dragging (drag & drop is
+  // mouse/pen only — hooks/useSlotDrag). Within the bottle's own rack a tap
+  // does what a drop does: an empty slot takes it, an occupied one swaps. In
+  // another rack (its tab chosen while the mode stays on) an empty slot takes
+  // it and the server clears its old slot. The mode ends after one try at a
+  // move, done or refused by the server (a 409 re-reads the racks), and on a
+  // tap on the bottle's own slot, Cancel, Escape or Back. Only a slot refused
+  // here before any request (unusable, or occupied in another rack) keeps it
+  // on, for another pick.
+  // Returns true when the tap was consumed by the move mode.
+  const handleMoveTap = async (targetRack, pos, slotData) => {
+    if (!moving || !canEdit) return false;
+    const { rackId: fromRackId, position: from, bottle } = moving;
+    const done = () => setMoving(m => (m === moving ? null : m));
+    if (targetRack._id === fromRackId && pos === from) { done(); return true; }
+    if ((targetRack.disabledPositions || []).includes(pos)) {
+      setActionError(t('racks.disabledSlotNote'));
+      return true;
+    }
+    const bottleId = String(bottle._id || bottle);
+    const occupant = slotData ? String(slotData.bottle?._id || slotData.bottle) : null;
+    if (targetRack._id === fromRackId) {
+      // The mode can stay open a while: send what the person saw, so a rack
+      // changed meanwhile is refused instead of moving or swapping a bottle
+      // they did not pick.
+      await handleSlotMove(fromRackId, from, pos, { expectFrom: bottleId, expectTo: occupant });
+      done();
+      return true;
+    }
+    // Across racks a placement would push the other bottle out, not swap it.
+    if (occupant) {
+      setActionError(t('racks.moveMode.otherRackFilled', 'In another rack, choose an empty slot — bottles only swap places within one rack.'));
+      return true;
+    }
+    await slotAction(`${fromRackId}:${from}`, async () => {
+      try {
+        const res = await updateSlot(apiFetch, targetRack._id, pos, { bottleId, expectOccupant: null });
+        const data = await res.json();
+        if (res.ok) {
+          // The server took the bottle out of its old rack too.
+          setRacks(prev => prev.map(r => r._id === targetRack._id ? data.rack : {
+            ...r,
+            slots: r.slots.filter(s => String(s.bottle?._id || s.bottle) !== bottleId),
+          }));
+        } else {
+          failed(res, data, t('racks.errors.move', 'The bottle could not be moved.'));
+          if (res.status === 409) await reloadRacks();
+        }
+      } catch (err) {
+        setActionError(friendlyError(err, t));
+      }
+    });
+    done();
+    return true;
+  };
+
   return (
     <div className="cellar-racks-page">
       <ActionNotice message={actionError} onDismiss={() => setActionError(null)} />
@@ -900,6 +1001,22 @@ function CellarRacks() {
               {placeQueue.length > 0 ? t('racks.placeQueue.leaveMode') : t('common.done', 'Done')}
             </button>
           </span>
+        </div>
+      )}
+
+      {/* Move mode: which bottle, and the way out */}
+      {moving && !loading && (
+        <div className="alert alert-info place-queue-bar" role="status">
+          <span>
+            {t('racks.moveMode.hint', 'Tap the slot to move {{name}} to', { name: bottleNoticeName(moving.bottle) || t('common.unknown') })}
+            {racks.length > 1 && <> · {t('racks.moveMode.otherRackHint', 'for another rack, open its tab first')}</>}
+          </span>
+          <span className="place-queue-bar__actions">
+            <button type="button" className="btn btn-small" onClick={() => setMoving(null)}>
+              {t('common.cancel')}
+            </button>
+          </span>
+          <BetaBadge feature="rackSlotMove" note={t('racks.moveMode.betaNote', 'Moving a bottle by tapping is in early access.')} />
         </div>
       )}
 
@@ -1008,7 +1125,9 @@ function CellarRacks() {
               </div>
               {canEdit && (
                 <p className="rack-drag-hint">
-                  {t('rackLens.dragHint', 'Tip: drag a bottle to an empty slot to move it, onto another bottle to swap them.')}
+                  {slotMoveOn
+                    ? t('rackLens.dragHintMove', 'Tip: drag a bottle to an empty slot to move it, onto another bottle to swap them — or tap the bottle and choose Move.')
+                    : t('rackLens.dragHint', 'Tip: drag a bottle to an empty slot to move it, onto another bottle to swap them.')}
                 </p>
               )}
             </>
@@ -1046,6 +1165,8 @@ function CellarRacks() {
           {(rack.type === 'shelf' || rack.type === 'cabinet') && !rack.isModular && (viewMode === 'shelf' || viewMode === '3d') ? (
             (() => {
               const handleClick = async (pos, slotData) => {
+                // Move mode consumes every tap while it is on.
+                if (moving && await handleMoveTap(rack, pos, slotData)) return;
                 // Placing mode consumes a tap on a free slot (issue #1055).
                 if (placeQueue.length && await handlePlaceTap(rack, pos, slotData)) return;
                 const isDisabled = (rack.disabledPositions || []).includes(pos);
@@ -1057,33 +1178,38 @@ function CellarRacks() {
                   setActivePopup({ rackId: rack._id, position: pos, slot: slotData || null });
                 }
               };
+              const movingPos = moving?.rackId === rack._id ? moving.position : null;
               const commonProps = {
                 rack,
                 activePosition: activePopup?.rackId === rack._id ? activePopup.position : null,
                 highlightPos: highlightPos?.rackId === rack._id ? highlightPos.position : null,
                 onSlotClick: handleClick,
                 getSlotStyle,
-                onSlotMove: canEdit ? (from, to) => handleSlotMove(rack._id, from, to) : undefined,
+                onSlotMove: canEdit ? (from, to) => handleDrop(rack._id, from, to) : undefined,
               };
               if (viewMode === '3d') {
+                // 3D has no selected-slot ring (its "selected" note points at
+                // the popup): the bottle being moved glows like a highlight.
                 return (
                   <Suspense fallback={<div className="loading">{t('common.loading')}</div>}>
-                    <ShelfView3D key={rack._id} {...commonProps} />
+                    <ShelfView3D key={rack._id} {...commonProps} highlightPos={movingPos ?? commonProps.highlightPos} />
                   </Suspense>
                 );
               }
-              return <ShelfView key={rack._id} {...commonProps} />;
+              return <ShelfView key={rack._id} {...commonProps} activePosition={movingPos ?? commonProps.activePosition} />;
             })()
           ) : (
             <RackRenderer
               rack={rack}
               canEdit={canEdit}
-              activeRackId={activePopup?.rackId}
-              activePosition={activePopup?.position}
+              activeRackId={(moving || activePopup)?.rackId}
+              activePosition={(moving || activePopup)?.position}
               highlightPos={highlightPos?.rackId === rack._id ? highlightPos.position : null}
               getSlotStyle={getSlotStyle}
-              onSlotMove={canEdit ? (from, to) => handleSlotMove(rack._id, from, to) : undefined}
+              onSlotMove={canEdit ? (from, to) => handleDrop(rack._id, from, to) : undefined}
               onSlotClick={async (pos, slotData) => {
+                // Move mode consumes every tap while it is on.
+                if (moving && await handleMoveTap(rack, pos, slotData)) return;
                 // Placing mode consumes a tap on a free slot (issue #1055).
                 if (placeQueue.length && await handlePlaceTap(rack, pos, slotData)) return;
                 // Viewers can only inspect filled or disabled slots, not interact with empty ones
@@ -1143,6 +1269,11 @@ function CellarRacks() {
                   canEdit={canEdit}
                   onPour={() => handlePour(activePopup.rackId, (activePopup.slot.bottle?._id || activePopup.slot.bottle).toString())}
                   onRemoveFromRack={() => handleRemoveFromRack(activePopup.rackId, activePopup.position)}
+                  onMove={slotMoveOn ? () => {
+                    setMoving({ rackId: activePopup.rackId, position: activePopup.position, bottle: activePopup.slot.bottle });
+                    setActivePopup(null);
+                    setActionError(null);
+                  } : undefined}
                   onConsume={() => {
                     setConsumeModal({ bottleId: activePopup.slot.bottle._id, bottle: activePopup.slot.bottle });
                     setActivePopup(null);
@@ -2083,7 +2214,7 @@ function DisabledSlotContent({ position, canEdit, onEnable, onClose }) {
 }
 
 // ---- Content for filled slot: show bottle info + actions ----
-function FilledSlotContent({ position, slot, zone, canEdit, onRemoveFromRack, onConsume, onPour, onClose }) {
+function FilledSlotContent({ position, slot, zone, canEdit, onRemoveFromRack, onMove, onConsume, onPour, onClose }) {
   const { t } = useTranslation();
   const bottle = slot.bottle;
   const wine = bottle?.wineDefinition;
@@ -2134,6 +2265,12 @@ function FilledSlotContent({ position, slot, zone, canEdit, onRemoveFromRack, on
           {bottle?.openedAt && onPour && (
             <button className="btn btn-primary btn-small" onClick={onPour} disabled={remainingMl(bottle) <= 0}>
               {t('racks.pourGlass', 'Pour a glass')}
+            </button>
+          )}
+          {/* Then a tap on the slot it should go to — dragging is mouse/pen only */}
+          {onMove && (
+            <button className="btn btn-secondary btn-small" onClick={onMove}>
+              {t('racks.moveMode.button', 'Move')}
             </button>
           )}
           <button className="btn btn-secondary btn-small" onClick={onRemoveFromRack}>
