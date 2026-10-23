@@ -1,5 +1,6 @@
 const cron = require('node-cron');
 const { runDrinkWindowCheck } = require('./drinkWindowNotifier');
+const { runNewMemberEmails } = require('./newMemberEmails');
 const { runCellarValueSnapshots } = require('./cellarValueSnapshotJob');
 const { runCommunityPriceAggregation } = require('./communityPriceJob');
 const { runUserDeletionJob } = require('./userDeletionJob');
@@ -33,6 +34,16 @@ function startScheduler() {
       await runDrinkWindowCheck();
     } catch (err) {
       console.error('[scheduler] Drink window check failed:', err);
+    }
+  });
+
+  // New-member emails: daily at 17:00 UTC, early evening in Europe, when most
+  // members use the app. Off until an admin turns them on (newMemberEmails).
+  cron.schedule('0 17 * * *', async () => {
+    try {
+      await runNewMemberEmails();
+    } catch (err) {
+      console.error('[scheduler] New-member emails failed:', err);
     }
   });
 
@@ -290,7 +301,7 @@ function startScheduler() {
     }
   });
 
-  console.log('[scheduler] Cron jobs registered (wine-draft-expiry hourly :23, drink-window daily 06:00 UTC, value-snapshot weekly Sun 01:00 UTC, community-price weekly Sun 02:00 UTC, search-reconcile daily 02:37, user-deletion daily 03:00 UTC, cellar-retention daily 04:00 UTC, recommendation-email-scrub daily 04:30 UTC, label-scan-retention daily 04:45 UTC, security-spike every 15 min, climate-offline every 15 min, ai-cap-alert every 15 min offset, demo-sweep every 15 min offset, registry-health weekly Mon 05:00 UTC, embed-sweep weekly Mon 05:30 UTC, bridge-refresh weekly Mon 06:30 UTC)');
+  console.log('[scheduler] Cron jobs registered (wine-draft-expiry hourly :23, drink-window daily 06:00 UTC, new-member-emails daily 17:00 UTC (off until turned on), value-snapshot weekly Sun 01:00 UTC, community-price weekly Sun 02:00 UTC, search-reconcile daily 02:37, user-deletion daily 03:00 UTC, cellar-retention daily 04:00 UTC, recommendation-email-scrub daily 04:30 UTC, label-scan-retention daily 04:45 UTC, security-spike every 15 min, climate-offline every 15 min, ai-cap-alert every 15 min offset, demo-sweep every 15 min offset, registry-health weekly Mon 05:00 UTC, embed-sweep weekly Mon 05:30 UTC, bridge-refresh weekly Mon 06:30 UTC)');
 }
 
 /**
