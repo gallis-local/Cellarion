@@ -1,11 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
+import { StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { makeRemote } from './remote.js';
 
-// A fake remote: every connect() makes a new client; each request takes the
-// next answer from `answers` (an Error is thrown, anything else is returned).
-function fakeRemote(answers) {
+// A fake remote: every connect() makes a new client (the first
+// `failedConnects` attempts throw instead); each request takes the next answer
+// from `answers` (an Error is thrown, anything else is returned).
+function fakeRemote(answers, { failedConnects = 0 } = {}) {
   const clients = [];
   const sent = [];
   const answer = (client, method, params) => {
@@ -15,6 +17,10 @@ function fakeRemote(answers) {
     return next;
   };
   const connect = async () => {
+    if (failedConnects > 0) {
+      failedConnects -= 1;
+      throw new Error('fetch failed');
+    }
     const client = { id: clients.length + 1, closed: false };
     client.close = async () => { client.closed = true; };
     for (const method of ['listTools', 'callTool', 'listResources', 'listResourceTemplates', 'readResource']) {
@@ -149,6 +155,36 @@ test('each full tool list replaces the read-only tools; a later page adds to the
   assert.equal(sent.length, 6);
 });
 
+// What the SDK throws when the server answers the POST with an HTTP error
+// status: a StreamableHTTPError whose `code` is the status.
+const httpError = (status, body) => new StreamableHTTPError(status, `Error POSTing to endpoint: ${body}`);
+// The server's answer to a request on a session that has expired or that it
+// does not know: 404, before it runs anything.
+const sessionGone = () => httpError(404,
+  '{"jsonrpc":"2.0","error":{"code":-32001,"message":"Session not found or expired — re-initialize (POST without Mcp-Session-Id)."},"id":null}');
+
+test('an expired session (404) on a tool call without idempotency_key: reconnects and sends it once more', async () => {
+  const { remote, clients, sent } = fakeRemote([sessionGone(), { content: [] }]);
+  const params = { name: 'add_bottle', arguments: { wine_id: 'w1' } };
+  assert.deepEqual(await remote.callTool(params), { content: [] });
+  assert.equal(clients[0].closed, true);
+  assert.deepEqual(sent.map((s) => [s.client, s.params]), [[1, params], [2, params]]);
+});
+
+test('a second 404, on the fresh session, comes back: no third send', async () => {
+  const { remote, sent } = fakeRemote([sessionGone(), sessionGone(), { content: [] }]);
+  await assert.rejects(remote.callTool({ name: 'add_bottle', arguments: {} }), (err) => err.code === 404);
+  assert.equal(sent.length, 2);
+});
+
+test('a 502, 401 or 429 on a tool call without idempotency_key: the error comes back, nothing is sent twice', async () => {
+  for (const status of [502, 401, 429]) {
+    const { remote, sent } = fakeRemote([httpError(status, 'refused'), { content: [] }]);
+    await assert.rejects(remote.callTool({ name: 'add_bottle', arguments: { wine_id: 'w1' } }), (err) => err.code === status);
+    assert.equal(sent.length, 1, `HTTP ${status}`);
+  }
+});
+
 test('a second failure after the re-send is not retried again', async () => {
   const { remote, sent } = fakeRemote([lostResponse(), lostResponse()]);
   await assert.rejects(remote.listTools({}), /HTTP 502/);
@@ -189,6 +225,30 @@ test('a request timeout is not re-sent and keeps the connection', async () => {
   await remote.callTool({ name: 'list_cellars', arguments: {} });
   assert.equal(clients.length, 1);
   assert.deepEqual(sent.map((s) => s.client), [1, 1]);
+});
+
+test('two calls failing at the same moment share one reconnect', async () => {
+  const { remote, clients, sent } = fakeRemote([lostResponse(), lostResponse(), { ok: 1 }, { ok: 2 }]);
+  await remote.open();
+  assert.deepEqual(
+    await Promise.all([remote.listResources({}), remote.listResources({})]),
+    [{ ok: 1 }, { ok: 2 }],
+  );
+  assert.equal(clients.length, 2, 'connect called once after the failures');
+  assert.deepEqual(sent.map((s) => s.client), [1, 1, 2, 2]);
+});
+
+test('two calls before any connection share one connect', async () => {
+  const { remote, clients } = fakeRemote([{ ok: 1 }, { ok: 2 }]);
+  await Promise.all([remote.listResources({}), remote.listResources({})]);
+  assert.equal(clients.length, 1);
+});
+
+test('a failed connect is not kept: the next call connects again', async () => {
+  const { remote, clients } = fakeRemote([{ ok: 1 }], { failedConnects: 1 });
+  await assert.rejects(remote.listResources({}), /fetch failed/);
+  assert.deepEqual(await remote.listResources({}), { ok: 1 });
+  assert.equal(clients.length, 1);
 });
 
 test('open() connects eagerly and close() drops the connection', async () => {
