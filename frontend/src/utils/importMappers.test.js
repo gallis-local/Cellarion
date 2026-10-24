@@ -1,5 +1,6 @@
 import {
   parseCSV,
+  decodeCharRefs,
   detectFormat,
   detectDelimiter,
   parseJSON,
@@ -13,6 +14,48 @@ import {
   splitClassificationFromName,
   stripAppellationPrefixFromName,
 } from './importMappers';
+
+// ---------------------------------------------------------------------------
+// decodeCharRefs
+// ---------------------------------------------------------------------------
+describe('decodeCharRefs', () => {
+  it('decodes decimal and hex references', () => {
+    expect(decodeCharRefs('Feteasc&#259; Neagr&#x103;')).toBe('Fetească Neagră');
+    expect(decodeCharRefs('Karao&#287;lan &#X1F377;')).toBe('Karaoğlan 🍷');
+  });
+
+  it('decodes the named references a CSV carries', () => {
+    expect(decodeCharRefs('Hart &amp; Hunter')).toBe('Hart & Hunter');
+    expect(decodeCharRefs('&quot;Gassies&quot; l&apos;Est&nbsp;')).toBe('"Gassies" l\'Est ');
+  });
+
+  it('keeps < and > encoded, so the server tag stripper never cuts a note short', () => {
+    expect(decodeCharRefs('Hold until score &lt; 95, then drink')).toBe('Hold until score &lt; 95, then drink');
+    expect(decodeCharRefs('&#60;3 this wine &#x3E;93 pts &gt;')).toBe('&#60;3 this wine &#x3E;93 pts &gt;');
+  });
+
+  it('decodes tab and line breaks but keeps other control characters encoded', () => {
+    expect(decodeCharRefs('a&#9;b&#10;c&#13;d')).toBe('a\tb\nc\rd');
+    expect(decodeCharRefs('a&#1;b&#27;c&#127;')).toBe('a&#1;b&#27;c&#127;');
+  });
+
+  it('decodes in a single pass', () => {
+    expect(decodeCharRefs('&amp;#259;')).toBe('&#259;');
+  });
+
+  it('reads references in 128–159 as Windows-1252, as browsers do', () => {
+    expect(decodeCharRefs('l&#146;Ermite &#128;12')).toBe('l’Ermite €12');
+    expect(decodeCharRefs('&#x9F;&#140;')).toBe('ŸŒ');
+    expect(decodeCharRefs('&#129;')).toBe('&#129;'); // undefined in Windows-1252
+  });
+
+  it('leaves anything that is not a valid reference as written', () => {
+    for (const s of ['R&D', 'Tom & Jerry', '&#0;', '&#55296;', '&#1114112;', '&eacute;', '&#259', '']) {
+      expect(decodeCharRefs(s)).toBe(s);
+    }
+    expect(decodeCharRefs(undefined)).toBeUndefined();
+  });
+});
 
 // ---------------------------------------------------------------------------
 // parseCSV
@@ -38,6 +81,14 @@ describe('parseCSV', () => {
     expect(rows[0].Notes).toBe('Line1\nLine2');
     expect(rows[1].Name).toBe('Wine B');
     expect(rows[1].Notes).toBe('Simple');
+  });
+
+  it('decodes character references per field, after the split', () => {
+    const csv = 'Name,Region\nA&#44;B,Mini&#351;\n"Hart &amp; Hunter",Dealu Mare';
+    const rows = parseCSV(csv);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toEqual({ Name: 'A,B', Region: 'Miniş' }); // an encoded comma never splits a field
+    expect(rows[1].Name).toBe('Hart & Hunter');
   });
 
   it('returns empty array for single line (header only, no data rows)', () => {
@@ -864,6 +915,12 @@ describe('parseOenoExport', () => {
     '5003,null,null,null,null,null,0.75,2014,Red Wine,,Test Wine C,NZ,Test Region,Producer C,null,NZD,2024-10-30,,2024-11-26',
     '5004,10001,500,5502,1004,3,0.75,2019,White Wine,Aged on lees,Test Wine D,NZ,Test Region,Producer D,42,NZD,2024-10-30,,'
   ].join('\n');
+
+  it('decodes character references in the bottle rows', () => {
+    const encoded = fixture.replace('Test Wine D,NZ,Test Region,Producer D', 'Feteasc&#259; Neagr&#259;,RO,Mehedin&#539;i,Crama Opri&#537;or');
+    const wine = parseOenoExport(encoded).items.find((i) => i.wineName === 'Fetească Neagră');
+    expect(wine).toMatchObject({ region: 'Mehedinți', producer: 'Crama Oprișor' });
+  });
 
   it('detects the two-section boundary at the "Bottle ID" header row', () => {
     const lines = fixture.split('\n');
