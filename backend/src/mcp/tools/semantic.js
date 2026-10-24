@@ -14,7 +14,7 @@ const { z } = require('zod');
 const Cellar = require('../../models/Cellar');
 const Bottle = require('../../models/Bottle');
 const WineDefinition = require('../../models/WineDefinition');
-const { CONSUMED_STATUSES } = require('../../config/constants');
+const { NOT_IN_CELLAR_STATUSES } = require('../../config/constants');
 const { registerTool } = require('../registry');
 const { ok, fail, wineSummary } = require('../toolUtil');
 
@@ -123,7 +123,7 @@ registerTool({
       wineIds = cellars.length
         ? await Bottle.distinct('wineDefinition', {
             cellar: { $in: cellars.map((c) => c._id) },
-            status: { $nin: CONSUMED_STATUSES },
+            status: { $nin: NOT_IN_CELLAR_STATUSES },
             wineDefinition: { $ne: null },
           })
         : [];
@@ -150,7 +150,10 @@ registerTool({
       });
     }
 
-    const docs = await WineDefinition.find({ _id: { $in: ranked.map(([id]) => id) }, pendingIdentity: { $ne: true } })
+    // Vectors outlive a quarantine (the flag does not change the embedding
+    // text), so the document load is where a non-wine row stays out of
+    // semantic search, as it does out of keyword search (audit 2026-10-14).
+    const docs = await WineDefinition.find({ _id: { $in: ranked.map(([id]) => id) }, pendingIdentity: { $ne: true }, nonWine: { $ne: true } })
       .select('name producer slug country region appellation classification grapes type colour communityRating')
       .populate(['country', 'region', 'grapes'])
       .lean();

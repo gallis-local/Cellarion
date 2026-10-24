@@ -1,6 +1,8 @@
 const ApiToken = require('../models/ApiToken');
 const User = require('../models/User');
 const { logAudit } = require('../services/audit');
+const { DEPRECATED_RULES, SUNSET } = require('../config/apiDeprecations');
+const { setDeprecationHeaders, recordDeprecatedUse } = require('../services/apiDeprecation');
 
 const { TOKEN_PREFIX } = ApiToken;
 
@@ -29,10 +31,14 @@ const utcDay = (d) => d.toISOString().slice(0, 10);
  * (req.baseUrl + req.path), not req.originalUrl, so query strings and
  * percent-encoding cannot influence matching.
  *
+ * The public, stable contract for these routes is openapi/document.js
+ * (GET /api/openapi.json, cellarion.app/developers); openapi/allowlist.test.js
+ * fails when a rule here and the document disagree.
+ *
  * Scopes (docs/ha-push-events.md §3; climate: docs/climate-monitoring.md):
  *   read    — the GETs the Home Assistant integration uses: stats, cellars,
  *             bottles, notifications, the rack list (summary form only),
- *             the SSE event stream, and /auth/whoami
+ *             the SSE event stream, the inventory, and /auth/whoami
  *             (its own account id, for reauth same-account verification — id
  *             only, no PII, unlike /auth/me). Also POST /api/mcp: the Model
  *             Context Protocol endpoint, whose per-tool authorization is
@@ -43,16 +49,28 @@ const utcDay = (d) => d.toISOString().slice(0, 10);
  */
 const SCOPE_ALLOWLIST = {
   read: [
-    { method: 'GET', pattern: /^\/api\/stats(\/|$)/ },
-    { method: 'GET', pattern: /^\/api\/cellars(\/|$)/ },
-    { method: 'GET', pattern: /^\/api\/bottles(\/|$)/ },
-    { method: 'GET', pattern: /^\/api\/notifications(\/|$)/ },
+    // Exactly the documented reads. The other GETs under these prefixes that
+    // tokens used to reach are deprecated (config/apiDeprecations: still
+    // answered, with Deprecation and Sunset headers, until the sunset date).
+    { method: 'GET', pattern: /^\/api\/stats\/overview$/ },
+    { method: 'GET', pattern: /^\/api\/cellars$/ },
+    { method: 'GET', pattern: /^\/api\/bottles$/ },
+    { method: 'GET', pattern: /^\/api\/bottles\/[a-f0-9]{24}$/ },
+    { method: 'GET', pattern: /^\/api\/notifications$/ },
+    { method: 'GET', pattern: /^\/api\/notifications\/unread-count$/ },
     // The rack LIST only — exact-anchored, so no rack sub-route (edits, slot
     // moves, arrange, the NFC lookup) is reachable. A token gets the light
     // summary form (layout + slot bottle ids); routes/racks.js refuses the
     // populated form to tokens, since an integration may poll it.
     { method: 'GET', pattern: /^\/api\/racks$/ },
     { method: 'GET', pattern: /^\/api\/events\/stream$/ },
+    // The integrations' inventory (routes/inventory, docs/ha-push-events.md
+    // §4) — exact-anchored. It returns the caller's own cellars plus the
+    // cellars shared with them, exactly the offline snapshot's scope: no
+    // collaborator emails, IPs or audit rows; of other people only the
+    // username on a personal-data entry, as the bottle page shows it.
+    // Database reads only — it can never spend AI money.
+    { method: 'GET', pattern: /^\/api\/inventory$/ },
     // Exact match only — the caller's own account id (id, no PII). Anchored so
     // it can never widen to /api/auth/me or any other /api/auth/* route.
     { method: 'GET', pattern: /^\/api\/auth\/whoami$/ },
@@ -119,8 +137,19 @@ function isApiTokenCredential(credential) {
  * could then never stream from or terminate. Exported for direct unit testing.
  */
 function isMcpEndpoint(method, path) {
+  return (method === 'POST' || method === 'GET' || method === 'DELETE') && /^\/api\/mcp$/.test(normalizePath(path));
+}
+
+/**
+ * The path as Express routes it: case-insensitively (the app keeps Express's
+ * default; "case sensitive routing" is off), and with a trailing slash the
+ * same route. Every rule here is written in lower case, so a path must be
+ * compared in lower case too — otherwise /api/cellars/:id/Members reaches the
+ * members route while the exclusion for /members never matches.
+ */
+function normalizePath(path) {
   const p = path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
-  return (method === 'POST' || method === 'GET' || method === 'DELETE') && /^\/api\/mcp$/.test(p);
+  return p.toLowerCase();
 }
 
 /**
@@ -134,17 +163,27 @@ const SELF_REVOKE = { method: 'DELETE', pattern: /^\/api\/tokens\/self$/ };
 
 /** Default-deny scope check. Exported for direct unit testing. */
 function isRequestAllowed(scopes, method, path) {
-  // Normalize: Express treats HEAD as GET, and a trailing slash as the same route.
+  return classifyRequest(scopes, method, path) !== 'denied';
+}
+
+/**
+ * 'allowed' (the allowlist), 'deprecated' (only a deprecated rule admits it:
+ * answered with Deprecation and Sunset headers, config/apiDeprecations) or
+ * 'denied'. Exported for direct unit testing.
+ */
+function classifyRequest(scopes, method, path, now = Date.now()) {
+  // Express treats HEAD as GET; normalizePath matches its path rules.
   const m = method === 'HEAD' ? 'GET' : method;
-  const p = path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
-  if (m === SELF_REVOKE.method && SELF_REVOKE.pattern.test(p)) return true;
-  if (TOKEN_EXCLUSIONS.some(rule => rule.test(p))) return false;
-  for (const scope of scopes || []) {
-    for (const rule of SCOPE_ALLOWLIST[scope] || []) {
-      if (rule.method === m && rule.pattern.test(p)) return true;
-    }
-  }
-  return false;
+  const p = normalizePath(path);
+  if (m === SELF_REVOKE.method && SELF_REVOKE.pattern.test(p)) return 'allowed';
+  if (TOKEN_EXCLUSIONS.some(rule => rule.test(p))) return 'denied';
+  const matches = (rules) => (scopes || []).some((scope) =>
+    (rules[scope] || []).some((rule) => rule.method === m && rule.pattern.test(p)));
+  if (matches(SCOPE_ALLOWLIST)) return 'allowed';
+  // From the sunset on, a deprecated route is just another route outside the
+  // allowlist — what /developers and the Sunset header promised.
+  if (now < SUNSET.getTime() && matches(DEPRECATED_RULES)) return 'deprecated';
+  return 'denied';
 }
 
 /**
@@ -191,8 +230,15 @@ async function authenticateApiToken(req, res, next, rawToken) {
       return res.status(403).json({ error: 'This token is only valid for the MCP endpoint' });
     }
 
-    if (!isRequestAllowed(token.scopes, req.method, path)) {
+    const verdict = classifyRequest(token.scopes, req.method, path);
+    if (verdict === 'denied') {
       return res.status(403).json({ error: 'API token scope insufficient for this request' });
+    }
+    if (verdict === 'deprecated') {
+      setDeprecationHeaders(res);
+      // Counted once answered, under the route Express matched — never the
+      // raw path, which the caller writes (a made-up path would be a new row).
+      res.on('finish', () => recordDeprecatedUse(req, res));
     }
 
     // Same effective-plan downgrade as the JWT path in requireAuth.
@@ -231,6 +277,7 @@ module.exports = {
   isApiTokenCredential,
   authenticateApiToken,
   isRequestAllowed,
+  classifyRequest,
   isMcpEndpoint,
   SCOPE_ALLOWLIST,
   TOKEN_EXCLUSIONS,

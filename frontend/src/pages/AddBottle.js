@@ -2,12 +2,15 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
-import { searchWines, resolveWine, identifyWineByText } from '../api/wines';
+import { searchWines, resolveWine, identifyWineByText, lookupBarcode, getWine } from '../api/wines';
 import { adoptRegistryWine } from '../api/bridge';
 import { getRacks } from '../api/racks';
 import { track } from '../utils/track';
 import DialogBox from '../components/DialogBox';
 import useLabelScanner from '../hooks/useLabelScanner';
+import useTapToFocus from '../hooks/useTapToFocus';
+import CameraFocusRing from '../components/CameraFocusRing';
+import useBarcodeWatch from '../hooks/useBarcodeWatch';
 import { CURRENCIES } from '../config/currencies';
 import { BOTTLE_SIZES, bottleSizeLabel } from '../config/bottleSizes';
 import { validatePriceSanity } from '../utils/priceValidation';
@@ -21,6 +24,23 @@ import AddBottleCustomFields, { buildPersonalDataPayload } from '../components/b
 import { WINE_TYPES } from '../config/wineTypes';
 import { swatchType, wineTypeLabel, isStyleType, colourLabel, WINE_COLOURS } from '../utils/wineColour';
 import './AddBottle.css';
+import { backLabel } from '../utils/backLabel';
+import { useBackToClose } from '../utils/useBackToClose';
+import { bottleNoticeName } from '../components/BottleUndoNotice';
+import { handOverBack } from '../hooks/useHandedOverState';
+import { afterPopupEntryGone, isOnPopupEntry } from '../utils/useBackToClose';
+
+// How this device last started adding a bottle: 'camera' (the label photo, the
+// default) or 'search' (typing the name). Per device on purpose — the same
+// person scans on the phone and types at the desk. Storage may be blocked or
+// absent; the camera card is then simply the start, as before.
+const ADD_MODE_KEY = 'cellarion.addBottleMode';
+function readAddMode() {
+  try { return localStorage.getItem(ADD_MODE_KEY); } catch { return null; }
+}
+function rememberAddMode(mode) {
+  try { localStorage.setItem(ADD_MODE_KEY, mode); } catch { /* not remembered */ }
+}
 
 function AddBottle() {
   const { t } = useTranslation();
@@ -35,9 +55,42 @@ function AddBottle() {
   const [registryWines, setRegistryWines] = useState([]);
   const [adoptingId, setAdoptingId] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+  const [error, setErrorText] = useState(null);
+  // Bumped with every error shown, so the scroll-into-view below runs again
+  // when the SAME message is shown twice (a second tap on Confirm).
+  const [errorTick, setErrorTick] = useState(0);
+  const setError = useCallback((message) => {
+    setErrorText(message);
+    if (message) setErrorTick((n) => n + 1);
+  }, []);
   const [search, setSearch] = useState('');
-  const [showTextSearch, setShowTextSearch] = useState(false);
+  // Opens the way this device last added a bottle: someone who types names
+  // should not have to step past the camera card every time.
+  const [showTextSearch, setShowTextSearchState] = useState(() => readAddMode() === 'search');
+  const setShowTextSearch = useCallback((on) => {
+    setShowTextSearchState(on);
+    rememberAddMode(on ? 'search' : 'camera');
+  }, []);
+  // The query whose library search has finished — the no-results message and
+  // "Enter it yourself" speak about a search that ran, not about typing.
+  const [searchedFor, setSearchedFor] = useState('');
+  const [searchFailed, setSearchFailed] = useState(false);
+  // A library search for exactly what is in the box has finished.
+  const searchDone = !loading && !!searchedFor && searchedFor === search.trim();
+  // Every error renders in the one alert at the top of the page, while the
+  // button that caused it is usually at the bottom of a long form on a phone.
+  // Bring it into view whenever one appears — before, only a refused save
+  // scrolled up, and a missing name/country or drink-window problem looked
+  // like "the button did nothing".
+  const errorRef = useRef(null);
+  useEffect(() => {
+    if (!errorTick || !errorRef.current) return;
+    try { errorRef.current.scrollIntoView({ block: 'center' }); } catch { /* old browser */ }
+    errorRef.current.focus({ preventScroll: true });
+  }, [errorTick]);
+  // Only the latest search's answer is shown: an older one arriving last must
+  // not put its results (or its failure) under the newer query.
+  const searchSeq = useRef(0);
   const [aiSearching, setAiSearching] = useState(false);
   const [aiSearchError, setAiSearchError] = useState(null);
   // identify-text is read-only: it reports what the AI recognised and what the
@@ -79,7 +132,14 @@ function AddBottle() {
     ratingScale: user?.preferences?.ratingScale || '5',
     dateAdded: ''
   });
-  const [addToHistory, setAddToHistory] = useState(false);
+  // "Add another bottle" after an add on order or to the history opens the
+  // next one the same way (components/BottleAddedNotice → addMode).
+  const startMode = useRef(window.history.state?.usr?.addMode || null).current;
+  const [addToHistory, setAddToHistory] = useState(startMode === 'history');
+  // "Not delivered yet": the bottles are added ON ORDER (status 'ordered'),
+  // with an optional expected month ('YYYY-MM').
+  const [onOrder, setOnOrder] = useState(startMode === 'onOrder');
+  const [expectedArrival, setExpectedArrival] = useState('');
   const [historyData, setHistoryData] = useState({
     consumedAt: '',
     consumedReason: 'drank',
@@ -108,7 +168,8 @@ function AddBottle() {
   // response could overwrite the current wine's count with a stale one. Keying
   // makes both unrepresentable. Absent key = not fetched yet.
   const [wineImageCounts, setWineImageCounts] = useState({});
-  const [showDetails, setShowDetails] = useState(false);
+  // Open when the mode was carried over, so its ticked box is in sight.
+  const [showDetails, setShowDetails] = useState(startMode === 'onOrder' || startMode === 'history');
 
   // Whether the user has worked the toggle themselves. Auto-expanding is a
   // suggestion, not a policy — once someone closes the panel deliberately,
@@ -144,6 +205,17 @@ function AddBottle() {
   // Id of the stored ORIGINAL scan frame (never rendered — it rides the commit
   // so the minted wine keeps the label a curator may need to read).
   const [scanImageId, setScanImageId] = useState(null);
+  // ── Barcode ──
+  // The retail barcode the camera read while it was open (useBarcodeWatch).
+  // It rides every bottle this add creates — that is how the next member who
+  // scans the same code is offered this wine. barcodeWineId: the wine a known
+  // code resolved to, so step 2 can say how it was found.
+  const [barcode, setBarcode] = useState(null);
+  const [barcodeNoted, setBarcodeNoted] = useState(false);
+  const [barcodeWineId, setBarcodeWineId] = useState(null);
+  // Barcode-only camera, opened from step 2's "help the community" line: no
+  // shutter (nothing is photographed), it just reads the code and closes.
+  const [barcodeMode, setBarcodeMode] = useState(false);
   // ── Back-label rescue ──
   // Offered ONLY when the front pass came back incomplete (`extracted.partial`)
   // or unreadable (a 422, which still hands back a scanImageId). Optional and
@@ -242,6 +314,9 @@ function AddBottle() {
    */
   const handleBackScanSuccess = useCallback((data) => {
     const merged = data.merged || {};
+    // Read now: the form updater below runs at render time, after this
+    // handler has already replaced the ref with the merge's verdict.
+    const suspectValue = suspectProducerValueRef.current;
     setBackScanImageId(data.backScanImageId || null);
     setScanConflicts(Array.isArray(data.conflicts) ? data.conflicts : []);
     setBackOffer(false);
@@ -276,8 +351,8 @@ function AddBottle() {
       // REPLACE (audit M-1: fill-blanks-only left the flagged string in the
       // box and made the rescue inert) — but only while the box still holds
       // the exact prefilled string; any edit by the user outranks both labels.
-      if (suspectProducerValueRef.current
-          && next.producer === suspectProducerValueRef.current
+      if (suspectValue
+          && next.producer === suspectValue
           && fromMerged.producer
           && fromMerged.producer !== next.producer) {
         next.producer = fromMerged.producer;
@@ -300,6 +375,8 @@ function AddBottle() {
     onScanError: handleScanError,
     onBackScanSuccess: handleBackScanSuccess,
   });
+  // Tap the preview to focus there, as in a camera app.
+  const tapFocus = useTapToFocus(labelVideoRef);
 
   const startBackScan = useCallback(() => {
     startBackLabelCamera({
@@ -341,6 +418,87 @@ function AddBottle() {
     clearAi();
     setStep(2);
   }, [clearAi]);
+
+  // "Add to cellar" from a wishlist item or a wine's page (components/
+  // AddToCellarButton): ?wine=<id> — and the wishlist's ?vintage — arrive
+  // already chosen, straight to the bottle's details. A wine that cannot be
+  // read (gone, not visible) leaves the search as usual. Read from the address
+  // itself, as startMode is read from the history entry. A late answer never
+  // replaces what the member did meanwhile: it lands only while nothing is
+  // chosen yet — step 1, no wine, no scan (camera open, scanning, or its
+  // result), no AI lookup, no hand-typed wine (read through a ref: the answer
+  // arrives after renders this effect did not see).
+  const nothingChosenRef = useRef(true);
+  nothingChosenRef.current = step === 1 && !selectedWine && !pendingNewWine && !scanResult
+    && !labelCam.open && !labelScanning && !aiSearching && !aiIdentified && !showManualForm;
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const wineId = params.get('wine');
+    // Only a well-formed id goes into the API path (as AddToWishlist's ?wine).
+    if (!/^[a-f0-9]{24}$/i.test(wineId || '')) return undefined;
+    const vintage = (params.get('vintage') || '').trim().slice(0, 20);
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await getWine(apiFetch, wineId);
+        if (cancelled || !res.ok) return;
+        const data = await res.json();
+        if (!cancelled && data?.wine?._id && nothingChosenRef.current) applyResolvedWine(data.wine, vintage);
+      } catch { /* the search is there as usual */ }
+    })();
+    return () => { cancelled = true; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A barcode read in the viewfinder. A code members have already added a
+  // bottle of goes straight to that wine — no label photo, no AI call. An
+  // unknown one is kept for this add (so it teaches the next scan) and the
+  // viewfinder asks for the label photo as usual.
+  const handleBarcodeDetected = useCallback(async (code) => {
+    setBarcode(code);
+    // Scanned from step 2 for a wine already chosen: just keep the code for
+    // this bottle — the wine is the user's choice, and their bottle is the vote.
+    if (barcodeMode) {
+      track('barcode-scan', { result: 'contributed' });
+      setBarcodeMode(false);
+      stopLabelCamera();
+      return;
+    }
+    let data = null;
+    try {
+      const res = await lookupBarcode(apiFetch, code);
+      data = res.ok ? await res.json() : null;
+    } catch { /* offline or failed: treat as unknown */ }
+    if (data?.wine) {
+      track('barcode-scan', { result: 'known' });
+      stopLabelCamera();
+      setBarcodeNoted(false);
+      setBarcodeWineId(data.wine._id);
+      applyResolvedWine(data.wine, data.vintage || '');
+      return;
+    }
+    track('barcode-scan', { result: 'new' });
+    setBarcodeNoted(true);
+  }, [apiFetch, stopLabelCamera, applyResolvedWine, barcodeMode]);
+
+  useBarcodeWatch(labelVideoRef, {
+    active: labelCam.open && !labelCam.error && !labelScanning,
+    onDetect: handleBarcodeDetected,
+  });
+
+  const startBarcodeScan = useCallback(() => {
+    setBarcodeMode(true);
+    startLabelCamera();
+  }, [startLabelCamera]);
+
+  // Closing the viewfinder by hand also leaves barcode-only mode, so the next
+  // opening is an ordinary label scan again.
+  const closeCamera = useCallback(() => {
+    setBarcodeMode(false);
+    stopLabelCamera();
+  }, [stopLabelCamera]);
+  // The phone's Back closes the camera, not the add screen (with whatever was
+  // typed in it).
+  useBackToClose(closeCamera, labelCam.open);
 
   // Advance to step 2 WITHOUT any registry write: the confirmed wine fields
   // ride along and are minted by POST /api/bottles when the user commits the
@@ -530,17 +688,46 @@ function AddBottle() {
     const query = search.trim();
     setLoading(true);
     setAiSearchError(null);
+    setSearchFailed(false);
+    setSearchedFor('');
     clearAi();
 
-    searchWines(apiFetch, `search=${encodeURIComponent(query)}&limit=10`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.wines) setWines(data.wines);
+    // ownHidden=1: the member's own drinks that are not wine (hidden from
+    // the shared registry) come back too, so they can add another bottle.
+    const seq = ++searchSeq.current;
+    searchWines(apiFetch, `search=${encodeURIComponent(query)}&limit=10&ownHidden=1`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`search ${res.status}`);
+        const data = await res.json();
+        if (seq !== searchSeq.current) return;
+        setWines(Array.isArray(data.wines) ? data.wines : []);
         setRegistryWines(Array.isArray(data.registryWines) ? data.registryWines : []);
+        setSearchedFor(query);
       })
-      .catch(err => console.error('Search failed:', err))
-      .finally(() => setLoading(false));
+      // Said, not just logged: a search that silently returns nothing reads
+      // as "this wine doesn't exist". The previous list goes too — it is not
+      // the answer to this search.
+      .catch(() => {
+        if (seq !== searchSeq.current) return;
+        setWines([]);
+        setRegistryWines([]);
+        setSearchFailed(true);
+      })
+      .finally(() => { if (seq === searchSeq.current) setLoading(false); });
   }, [search, apiFetch, clearAi]);
+
+  // The wine isn't in the library (or the AI couldn't place it): type it in,
+  // in the same form a misread label opens. Before, the only way out here was
+  // a wine request, which leaves the page without adding the bottle.
+  const enterWineByHand = () => {
+    setPendingWineData({
+      name: search.trim(), producer: '', country: '', region: '', appellation: '',
+      classification: '', type: '', grapes: '',
+    });
+    setAiSearchError(null);
+    setError(null);
+    setShowManualForm(true);
+  };
 
   const handleSearchKeyDown = (e) => {
     if (e.key === 'Enter') handleSearch();
@@ -554,7 +741,14 @@ function AddBottle() {
     try {
       const res = await identifyWineByText(apiFetch, search.trim());
       const data = await res.json();
-      if (!res.ok) { setAiSearchError(data.error || t('addBottle.identifyFailed')); return; }
+      if (!res.ok) {
+        // The demo's AI 403 is a fixed English server string; show the
+        // translated sign-up line for the one case we can recognise.
+        setAiSearchError(data.code === 'demo_ai_disabled'
+          ? t('addBottle.demoAiBlocked')
+          : (data.error || t('addBottle.identifyFailed')));
+        return;
+      }
       // Branch on `identified`, never on a wine: "the model recognised it but
       // the registry doesn't have it" is a SUCCESS, and is the common case.
       if (!data.identified) { setAiSearchError(t('addBottle.aiCouldNotIdentify')); return; }
@@ -689,7 +883,12 @@ function AddBottle() {
         <div className="wine-meta">
           <span>{wine.country?.name}</span>
           {wine.region && <span>• {wine.region.name}</span>}
-          <span className={`wine-type-pill ${swatchType(wine, '')}`}>{wineTypeLabel(wine, t)}</span>
+          {/* A drink that is not wine has no wine type worth showing ("Sparkling" on a lager). */}
+          {wine.nonWine ? (
+            <span className="own-hidden-pill" title={t('wineSearchPicker.onlyInYourCellarTitle')}>{t('wineSearchPicker.onlyInYourCellar')}</span>
+          ) : (
+            <span className={`wine-type-pill ${swatchType(wine, '')}`}>{wineTypeLabel(wine, t)}</span>
+          )}
         </div>
         {wine.grapes?.length > 0 && (
           <p className="wine-grapes">{wine.grapes.map(g => g.displayName || g.name).join(', ')}</p>
@@ -719,6 +918,70 @@ function AddBottle() {
     });
   };
 
+  // The wine on screen came from a scanned barcode (not just a barcode kept
+  // for a wine picked by hand).
+  const foundByBarcode = !!barcodeWineId && selectedWine?._id === barcodeWineId;
+
+  // What the page that lists the new bottles says — "“X 2019” added" with
+  // "Add another bottle" (components/BottleAddedNotice). A newcomer adding a
+  // few wines in a row had to find the add button again after every save
+  // (newcomer walkthrough 2026-10-15). The name is the wine the server filed
+  // the bottles under (a "did you mean?" pick at commit can differ from what
+  // was typed).
+  const addedNotice = () => {
+    const created = createdBottlesRef.current.filter(Boolean);
+    const first = created[0] || {};
+    const name = bottleNoticeName({
+      wineDefinition: { name: first.wineDefinition?.name || selectedWine?.name },
+      pendingWineRequest: first.pendingWineRequest,
+      vintage: first.vintage || bottleData.vintage,
+    });
+    return { name, count: created.length, history: !!addToHistory, onOrder: !!onOrder && !addToHistory };
+  };
+  // Where the bottles now are, said there. Opened from that very list (its
+  // add buttons pass `cameFrom`), the page goes BACK to it — the list keeps
+  // its place and Back from it leaves it, where a second copy of the list
+  // made the first Back dead (release audit 2026-10-16) — and the notice is
+  // handed over through sessionStorage. Otherwise the add page is replaced,
+  // so Back never lands on an emptied form.
+  // From a closing pop-up ("Place them now?", "did you mean?", the custom-
+  // field notice) it first waits until that pop-up's own Back entry is gone;
+  // still on it after the wait, going back would only close that entry, so
+  // it replaces instead.
+  const cameFromHere = (path) => {
+    const entry = window.history.state || {};
+    return entry.usr?.cameFrom === path && Number.isInteger(entry.idx) && entry.idx > 0 && !isOnPopupEntry();
+  };
+  const leaveTo = (path) => afterPopupEntryGone(() => {
+    const notice = addedNotice();
+    if (cameFromHere(path)) {
+      handOverBack('addedNotice', path, notice);
+      navigate(-1);
+    } else {
+      navigate(path, { replace: true, state: { addedNotice: notice } });
+    }
+  });
+  const listPath = () => (onOrder && !addToHistory ? `/cellars/${cellarId}/on-order` : `/cellars/${cellarId}`);
+  const goToCellarAdded = () => leaveTo(`/cellars/${cellarId}`);
+  const leavePlacePrompt = () => { setPlacePrompt(null); goToCellarAdded(); };
+  // Leaving without saving (Cancel, the back link): back to the list it came
+  // from too — a pushed copy of it made the first Back land on the emptied
+  // form. Bottles already saved (a save that stopped part-way) are said there.
+  const leaveUnsaved = (e) => {
+    if (createdBottlesRef.current.some(Boolean)) {
+      e?.preventDefault?.();
+      leaveTo(listPath());
+      return;
+    }
+    const from = window.history.state?.usr?.cameFrom;
+    if (from && cameFromHere(from)) {
+      e?.preventDefault?.();
+      navigate(-1);
+      return;
+    }
+    if (!e) navigate(`/cellars/${cellarId}`);
+  };
+
   // What happens once every bottle exists: link the photos, then either offer
   // to place them or go to the cellar. Extracted so the custom-field notice
   // can hold it back for one dialog and then resume exactly the same flow.
@@ -729,7 +992,13 @@ function AddBottle() {
     const newIds = createdBottlesRef.current.map(b => b?._id).filter(Boolean);
     let hasRacks = false;
     // Bottles added straight into the drinking history are consumed — a
-    // consumed bottle has no place in a rack (audit 2026-09-14 M).
+    // consumed bottle has no place in a rack (audit 2026-09-14 M). Nor does
+    // one on order: it is placed once it arrives, and its list is where the
+    // user goes next.
+    if (onOrder && !addToHistory) {
+      leaveTo(`/cellars/${cellarId}/on-order`);
+      return;
+    }
     if (newIds.length > 0 && !addToHistory) {
       try {
         const rr = await getRacks(apiFetch, cellarId, { summary: true });
@@ -741,7 +1010,7 @@ function AddBottle() {
       setPlacePrompt({ ids: newIds, count: newIds.length });
       return;
     }
-    navigate(`/cellars/${cellarId}`);
+    goToCellarAdded();
   };
 
   // Create the bottle records that are still missing. wineRef is EITHER
@@ -784,7 +1053,12 @@ function AddBottle() {
         rating: bottleData.rating ? parseFloat(bottleData.rating) : undefined,
         ratingScale: bottleData.ratingScale || '5',
         dateAdded: bottleData.dateAdded || undefined,
+        // The barcode the camera read: stored on each bottle, so the next
+        // member who scans this code is offered the same wine.
+        barcode: barcode || undefined,
         addToHistory: addToHistory || undefined,
+        // Bought, not delivered yet: kept out of the cellar until it arrives.
+        ...(onOrder && !addToHistory ? { onOrder: true, expectedArrival: expectedArrival || undefined } : {}),
         ...(addToHistory ? {
           consumedAt: historyData.consumedAt || undefined,
           consumedReason: historyData.consumedReason,
@@ -959,15 +1233,16 @@ function AddBottle() {
       {/* Label-scan camera modal */}
       {labelCam.open && (
         <div className="camera-modal">
-          <div className="camera-container">
+          <div className="camera-container" onPointerDown={tapFocus.onPointerDown}>
             {labelCam.error ? (
               <div className="camera-error-overlay">
                 <p>{labelCam.error}</p>
-                <button type="button" className="btn btn-secondary" onClick={stopLabelCamera}>Close</button>
+                <button type="button" className="btn btn-secondary" onClick={closeCamera}>Close</button>
               </div>
             ) : (
               <>
                 <video ref={labelVideoRef} autoPlay playsInline muted className="camera-video" />
+                <CameraFocusRing ring={tapFocus.ring} />
                 {labelScanning ? (
                   <div className="label-scan-overlay">
                     <div className="label-scan-spinner" />
@@ -977,13 +1252,22 @@ function AddBottle() {
                   <>
                     <div className="camera-overlay">
                       <div className="label-guide-frame" />
-                      <p className="overlay-hint">{t('addBottle.scanHint')}</p>
+                      <p className="overlay-hint">
+                        {barcodeMode
+                          ? t('addBottle.barcodeOnlyHint', 'Point the camera at the barcode — it is read automatically.')
+                          : barcodeNoted
+                            ? t('addBottle.barcodeNoted', 'New barcode — thank you! Now photograph the front label, and the barcode will be saved for the next person.')
+                            : t('addBottle.scanHint')}
+                      </p>
                     </div>
                     <div className="camera-controls">
-                      <button type="button" className="camera-btn camera-btn-close" onClick={stopLabelCamera} aria-label="Close camera">✕</button>
-                      <button type="button" className="camera-btn camera-btn-capture" onClick={captureLabelPhoto} aria-label="Scan label">
-                        <span className="capture-ring" aria-hidden="true"></span>
-                      </button>
+                      <button type="button" className="camera-btn camera-btn-close" onClick={closeCamera} aria-label="Close camera">✕</button>
+                      {/* No shutter in barcode-only mode: nothing is photographed. */}
+                      {!barcodeMode && (
+                        <button type="button" className="camera-btn camera-btn-capture" onClick={captureLabelPhoto} aria-label="Scan label">
+                          <span className="capture-ring" aria-hidden="true"></span>
+                        </button>
+                      )}
                       <button type="button" className="camera-btn camera-btn-switch" onClick={() => setLabelFacing(f => f === 'environment' ? 'user' : 'environment')} aria-label="Switch camera">⟲</button>
                     </div>
                   </>
@@ -996,9 +1280,9 @@ function AddBottle() {
       )}
 
       <div className="add-bottle-header">
-        <Link to={`/cellars/${cellarId}`} className="back-link">
+        <Link to={`/cellars/${cellarId}`} className="back-link" onClick={leaveUnsaved}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
-          {t('addBottle.backToCellar')}
+          {backLabel(t('addBottle.backToCellar'))}
         </Link>
         <h1>{t('addBottle.title')}</h1>
       </div>
@@ -1015,7 +1299,7 @@ function AddBottle() {
         </div>
       </div>
 
-      {error && <div className="alert alert-error">{error}</div>}
+      {error && <div className="alert alert-error" role="alert" ref={errorRef} tabIndex={-1}>{error}</div>}
 
       {step === 1 && (
         <div className="card">
@@ -1256,8 +1540,13 @@ function AddBottle() {
                 </button>
               </div>
               <button type="button" className="wine-select-manual-link" onClick={() => setShowTextSearch(true)}>
-                {t('addBottle.searchManuallyInstead', 'No camera? Search manually instead →')}
+                {t('addBottle.searchManuallyInstead', 'Type the name instead →')}
               </button>
+              {/* Several bottles from one purchase: the import page reads the
+                  whole receipt at once (Import → Scan a receipt). */}
+              <Link to={`/cellars/${cellarId}/import`} className="wine-select-manual-link">
+                {t('addBottle.scanReceiptInstead', 'Bought several? Scan the receipt instead (beta) →')}
+              </Link>
             </div>
           )}
 
@@ -1266,7 +1555,7 @@ function AddBottle() {
             <>
               <div className="wine-select-manual-header">
                 <h2>{t('addBottle.searchForWine')}</h2>
-                <button type="button" className="btn-link-muted" onClick={() => { setShowTextSearch(false); setSearch(''); setWines([]); setAiSearchError(null); }}>
+                <button type="button" className="btn-link-muted" onClick={() => { searchSeq.current += 1; setLoading(false); setShowTextSearch(false); setSearch(''); setWines([]); setSearchedFor(''); setSearchFailed(false); setAiSearchError(null); }}>
                   ← {t('addBottle.useCameraInstead', 'Use camera instead')}
                 </button>
               </div>
@@ -1279,9 +1568,10 @@ function AddBottle() {
                     type="text"
                     placeholder={t('addBottle.searchPlaceholder')}
                     value={search}
-                    onChange={(e) => { setSearch(e.target.value); setWines([]); setAiSearchError(null); setError(null); clearAi(); }}
+                    onChange={(e) => { searchSeq.current += 1; setLoading(false); setSearch(e.target.value); setWines([]); setSearchedFor(''); setSearchFailed(false); setAiSearchError(null); setError(null); clearAi(); }}
                     onKeyDown={handleSearchKeyDown}
                     className="search-input-large"
+                    enterKeyHint="search"
                     autoFocus
                   />
                   <button type="button" className="btn btn-secondary search-submit-btn" onClick={handleSearch} disabled={loading}>
@@ -1291,6 +1581,22 @@ function AddBottle() {
               </div>
 
               {loading && <p>{t('addBottle.searching')}</p>}
+
+              {searchFailed && !loading && (
+                <p className="error-text" role="alert">
+                  {t('addBottle.searchFailed', 'The search didn’t go through. Check your connection and try again.')}
+                </p>
+              )}
+
+              {/* A finished search with nothing in it used to render nothing at
+                  all — say so, so the AI row and "Enter it yourself" below read
+                  as the next step rather than as noise. */}
+              {searchDone && wines.length === 0 && registryWines.length === 0
+                && !aiSearching && !aiIdentified && !aiMatch && (
+                <p className="wine-search-no-results" role="status">
+                  {t('addBottle.noLibraryMatch', 'No wines in the library match “{{query}}”.', { query: searchedFor })}
+                </p>
+              )}
 
               {/* ── AI result card. Shape-aware: `card` is EITHER a saved
                    registry wine (populated country/region/grape refs) OR the
@@ -1411,14 +1717,28 @@ function AddBottle() {
                 </div>
               )}
 
-              {/* ── AI error with request fallback ── */}
+              {/* ── AI error: type the wine in (the bottle still gets added),
+                   or ask for it to be added to the library ── */}
               {aiSearchError && !aiSearching && (
                 <div className="ai-error-state">
                   <p className="error-text">{aiSearchError}</p>
-                  <Link to="/wine-requests" className="btn btn-secondary btn-small">
-                    {t('addBottle.submitWineRequest')}
-                  </Link>
+                  <div className="ai-error-actions">
+                    <button type="button" className="btn btn-primary btn-small" onClick={enterWineByHand}>
+                      {t('addBottle.enterByHand', 'Enter it yourself')}
+                    </button>
+                    <Link to="/wine-requests" className="btn btn-secondary btn-small">
+                      {t('addBottle.submitWineRequest')}
+                    </Link>
+                  </div>
                 </div>
+              )}
+
+              {/* ── After any finished search: the way out when none of the
+                   results is the wine, without going through the AI ── */}
+              {searchDone && !aiSearching && !aiSearchError && (
+                <button type="button" className="wine-select-manual-link" onClick={enterWineByHand}>
+                  {t('addBottle.notListedEnterByHand', 'Not listed? Enter the wine yourself →')}
+                </button>
               )}
             </>
           )}
@@ -1446,6 +1766,12 @@ function AddBottle() {
               {t('addBottle.changeWine')}
             </button>
           </div>
+          {/* Which wine this is: said right under it. */}
+          {foundByBarcode && (
+            <p className="selected-wine-barcode-note">
+              {t('addBottle.barcodeFound', 'Found by its barcode. Not this wine? Use Change wine.')}
+            </p>
+          )}
 
           {/* A wine the registry does not know yet will be MINTED with this
               bottle. Offer to keep it private first: a draft is editable by
@@ -1490,6 +1816,7 @@ function AddBottle() {
                 <label>{t('addBottle.numberOfBottles')}</label>
                 <input
                   type="number"
+                  inputMode="numeric"
                   value={numBottles}
                   onChange={(e) => setNumBottles(Math.max(1, parseInt(e.target.value) || 1))}
                   onFocus={(e) => e.target.select()}
@@ -1527,11 +1854,16 @@ function AddBottle() {
 
               <div className="form-group">
                 <label>{t('common.currency')}</label>
+                {/* Each option carries its code as value, and the list is
+                    never translated: browser page translation rewrote the
+                    option TEXT "EUR" as "EURO", and an option without a value
+                    sends its text (2026-10-13). */}
                 <select
+                  translate="no"
                   value={bottleData.currency}
                   onChange={(e) => setBottleData({ ...bottleData, currency: e.target.value })}
                 >
-                  {CURRENCIES.map(c => <option key={c}>{c}</option>)}
+                  {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
 
@@ -1599,6 +1931,28 @@ function AddBottle() {
               <p className="photo-section-notice">{t('addBottle.photosNotice')}</p>
             </div>
 
+            {/* The registry learns barcodes only from bottles added with one, so
+                ask — once, quietly, at the one step every add path reaches. Below
+                the fields and the photo, next to the other way to help: a
+                newcomer's first job here is the vintage (newcomer walkthrough
+                2026-10-15). The thanks lands where the scan was asked for. */}
+            {!foundByBarcode && (
+              <div className="barcode-ask">
+                {barcode ? (
+                  <p className="selected-wine-barcode-note">
+                    {t('addBottle.barcodeThanks', 'Thank you — the barcode is saved with this bottle, so the next member who scans it finds this wine straight away.')}
+                  </p>
+                ) : (
+                  <div className="barcode-help">
+                    <p>{t('addBottle.barcodeHelp', "Help the community: we're building Cellarion's barcode list together, and it's still small. Scan the barcode on this bottle, and the next member who scans it will find this wine straight away.")}</p>
+                    <button type="button" className="btn btn-ghost btn-small" onClick={startBarcodeScan}>
+                      {t('addBottle.barcodeHelpBtn', 'Scan barcode')}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* ── More details toggle ── */}
             <button
               type="button"
@@ -1664,6 +2018,36 @@ function AddBottle() {
                   </div>
                 </div>
 
+                {/* ── Not delivered yet (on order) ── optional, off by default */}
+                <div className="add-on-order-section">
+                  <label className="toggle-label">
+                    <input
+                      type="checkbox"
+                      checked={onOrder}
+                      onChange={(e) => {
+                        setOnOrder(e.target.checked);
+                        if (e.target.checked) setAddToHistory(false);
+                      }}
+                    />
+                    <span>{t('addBottle.onOrder')}</span>
+                  </label>
+                  <p className="help-text">{t('addBottle.onOrderHint')}</p>
+                  {onOrder && (
+                    <div className="form-group">
+                      <label htmlFor="add-expected-arrival">{t('addBottle.expectedArrival')}</label>
+                      <input
+                        id="add-expected-arrival"
+                        type="month"
+                        placeholder="YYYY-MM"
+                        pattern="\d{4}-\d{2}"
+                        value={expectedArrival}
+                        onChange={(e) => setExpectedArrival(e.target.value)}
+                      />
+                      <p className="help-text">{t('addBottle.expectedArrivalHint')}</p>
+                    </div>
+                  )}
+                </div>
+
                 <div className="form-group">
                   <label>{t('common.notes')}</label>
                   <textarea
@@ -1694,6 +2078,7 @@ function AddBottle() {
                       <label>{t('addBottle.drinkFrom')}</label>
                       <input
                         type="number"
+                        inputMode="numeric"
                         value={bottleData.drinkFrom}
                         onChange={(e) => setBottleData({ ...bottleData, drinkFrom: e.target.value })}
                         placeholder={t('addBottle.drinkFromPlaceholder')}
@@ -1706,6 +2091,7 @@ function AddBottle() {
                       <label>{t('addBottle.drinkTo')}</label>
                       <input
                         type="number"
+                        inputMode="numeric"
                         value={bottleData.drinkTo}
                         onChange={(e) => setBottleData({ ...bottleData, drinkTo: e.target.value })}
                         placeholder={t('addBottle.drinkToPlaceholder')}
@@ -1725,6 +2111,7 @@ function AddBottle() {
                         <label>{t('addBottle.peakFrom')}</label>
                         <input
                           type="number"
+                          inputMode="numeric"
                           value={bottleData.peakFrom}
                           onChange={(e) => setBottleData({ ...bottleData, peakFrom: e.target.value })}
                           placeholder={t('addBottle.peakFromPlaceholder')}
@@ -1737,6 +2124,7 @@ function AddBottle() {
                         <label>{t('addBottle.peakUntil')}</label>
                         <input
                           type="number"
+                          inputMode="numeric"
                           value={bottleData.peakUntil}
                           onChange={(e) => setBottleData({ ...bottleData, peakUntil: e.target.value })}
                           placeholder={t('addBottle.peakUntilPlaceholder')}
@@ -1775,7 +2163,10 @@ function AddBottle() {
                     <input
                       type="checkbox"
                       checked={addToHistory}
-                      onChange={(e) => setAddToHistory(e.target.checked)}
+                      onChange={(e) => {
+                        setAddToHistory(e.target.checked);
+                        if (e.target.checked) setOnOrder(false);
+                      }}
                     />
                     <span>{t('addBottle.addToHistory')}</span>
                   </label>
@@ -1835,11 +2226,13 @@ function AddBottle() {
 
             <div className="form-actions">
               <button type="submit" className="btn btn-success" disabled={saving}>
-                {saving ? t('common.saving', 'Saving…') : addToHistory ? t('addBottle.addToHistoryBtn') : t('addBottle.addBottleBtn')}
+                {saving ? t('common.saving', 'Saving…') : addToHistory ? t('addBottle.addToHistoryBtn') : onOrder ? t('addBottle.addOnOrderBtn') : t('addBottle.addBottleBtn')}
               </button>
+              {/* Cancel after a save that stopped part-way still says what was
+                  added: those bottles exist. */}
               <button
                 type="button"
-                onClick={() => navigate(`/cellars/${cellarId}`)}
+                onClick={() => leaveUnsaved()}
                 className="btn btn-secondary"
               >
                 {t('common.cancel')}
@@ -1897,7 +2290,7 @@ function AddBottle() {
         <div className="modal-overlay">
           <DialogBox
             className="modal-box"
-            onClose={() => { setCustomFieldNotice(null); finishAdd(); }}
+            onClose={() => { setCustomFieldNotice(null); afterPopupEntryGone(finishAdd); }}
             label={t('addBottle.customFieldsNotSaved', 'Some custom fields were not saved')}
           >
             <h2>{t('addBottle.customFieldsNotSaved', 'Some custom fields were not saved')}</h2>
@@ -1909,7 +2302,7 @@ function AddBottle() {
               <button
                 type="button"
                 className="btn btn-primary"
-                onClick={() => { setCustomFieldNotice(null); finishAdd(); }}
+                onClick={() => { setCustomFieldNotice(null); afterPopupEntryGone(finishAdd); }}
               >
                 {t('common.close')}
               </button>
@@ -1920,17 +2313,17 @@ function AddBottle() {
 
       {/* Post-add placing offer (issue #1055) — skippable, never blocking */}
       {placePrompt && (
-        <div className="modal-overlay" onClick={() => navigate(`/cellars/${cellarId}`)}>
+        <div className="modal-overlay" onClick={leavePlacePrompt}>
           <DialogBox
             className="modal-box"
             onClick={e => e.stopPropagation()}
-            onClose={() => navigate(`/cellars/${cellarId}`)}
+            onClose={leavePlacePrompt}
             label={t('addBottle.placePrompt.title', { count: placePrompt.count })}
           >
             <h2>{t('addBottle.placePrompt.title', { count: placePrompt.count })}</h2>
             <p>{t('addBottle.placePrompt.body')}</p>
             <div className="modal-actions">
-              <button type="button" className="btn btn-secondary" onClick={() => navigate(`/cellars/${cellarId}`)}>
+              <button type="button" className="btn btn-secondary" onClick={leavePlacePrompt}>
                 {t('addBottle.placePrompt.notNow')}
               </button>
               <button

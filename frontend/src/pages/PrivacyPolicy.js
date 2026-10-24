@@ -21,7 +21,7 @@ function PrivacyPolicy() {
       </Helmet>
       <div className="privacy-container">
         <h1>Privacy Policy</h1>
-        <p className="privacy-updated">Last updated: 3 October 2026 — Version 2026-10-03</p>
+        <p className="privacy-updated">Last updated: 23 October 2026 — Version 2026-10-23.2</p>
 
         <p>
           Cellarion ("we", "us", or "our") operates the Cellarion wine cellar management
@@ -42,8 +42,8 @@ function PrivacyPolicy() {
         <h2>2. Legal basis for processing</h2>
         <ul>
           <li><strong>Contract performance (Art. 6(1)(b) GDPR):</strong> processing your account data, cellar data, and preferences is necessary to provide the Cellarion service you signed up for.</li>
-          <li><strong>Consent (Art. 6(1)(a) GDPR):</strong> we process your data for optional features (email notifications, label scanning via AI, connecting an external AI assistant) only with your explicit consent, which you can withdraw at any time.</li>
-          <li><strong>Legitimate interest (Art. 6(1)(f) GDPR):</strong> we maintain activity logs and security measures to protect the service and its users.</li>
+          <li><strong>Consent (Art. 6(1)(a) GDPR):</strong> we process your data for optional features (email notifications you turn on yourself, such as forum replies and mentions, label and receipt scanning via AI, connecting an external AI assistant) only with your explicit consent, which you can withdraw at any time.</li>
+          <li><strong>Legitimate interest (Art. 6(1)(f) GDPR):</strong> we maintain activity logs and security measures to protect the service and its users; we email members who own a wine a curator's question about it, so the shared wine registry stays accurate; and we email you about your own cellar (drink-window alerts, and one note two days after you join), so the cellar you set up stays useful to you (see section 4; you can object at any time, see section 8).</li>
         </ul>
 
         <h2>3. Data we collect</h2>
@@ -61,9 +61,13 @@ function PrivacyPolicy() {
         <h2>4. How we use your data</h2>
         <ul>
           <li>To provide and operate the Cellarion service, including authentication and cellar management.</li>
-          <li>To send you notifications you have opted into (drink-window alerts, email digests, push notifications).</li>
+          <li>To tell you when bottles in your cellar reach their best (drink-window alerts). They appear in the app, and by push and email when those are on: for accounts created since this version of the policy both start on, and older accounts keep the settings they had. You get at most one drink-window email a week. Other notifications are sent only if you turn them on.</li>
+          <li>To check in once after you join. Two days after you create an account, if you have not been back since your first day, we send one email: what is in your cellar and which bottles are ready to drink, or, if it is still empty, how to add a first bottle, with a link to delete your account if Cellarion is not for you. It is sent once, never if you unsubscribed from all email, and when it was sent is part of your data export.</li>
           <li>To process bottle label images for wine identification (when you use the label scanning feature).</li>
+          <li>To recognise wines by their barcode. When the camera reads a bottle's barcode while you add it, the barcode is saved on that bottle (it is part of your data export and is deleted with the bottle). Barcodes on members' bottles are used to suggest the same wine when another member scans that barcode; only the wine is shown, never whose bottle it came from. The barcode is read on your device; no camera image is sent for it.</li>
+          <li>To read the wines on a receipt, order confirmation or invoice you choose to scan when importing bottles. The wines, prices, shop and date you then import are kept as part of those bottles; names, addresses, member numbers and card details on the document are never copied to them. While receipt scanning is in beta, we also keep the scanned receipt (photos with their location data removed, or the PDF) and what was read from it for 5 days, so we can fix reading mistakes. Only Cellarion's administrators can see it. While it is kept, what was read from it is part of your data export. It is deleted automatically after 5 days, and at once if you delete your account.</li>
           <li>To answer support requests you send us, in the app and by email. Each emailed answer has a link that stops these emails, and you can also turn them off in Settings.</li>
+          <li>To ask you about a wine you own. When our curators check the shared record of a wine and need something only its label can tell them, they can ask the members who have (or had) a bottle of it. The question reaches you in the app and by email — at most one such email a day, and never if you unsubscribed from all email. Answering is up to you, and an answer only helps correct the shared wine record: your own bottle, notes and ratings do not change. The question, your answer and when it was emailed to you are part of your data export and are deleted with your account. Each of these emails has a link that stops them, and you can also turn them off in Settings.</li>
           <li>To maintain security, prevent abuse, and investigate incidents via activity logs.</li>
           <li>To operate AI-assistant connections you set up yourself (see section 5), including the action trail that lets you review and undo changes a connected assistant made.</li>
         </ul>
@@ -88,13 +92,13 @@ function PrivacyPolicy() {
             <tr>
               <td>Mailgun</td>
               <td>Transactional email delivery</td>
-              <td>Email address, username, bottle names (in digest emails)</td>
+              <td>Email address, username, bottle names (in digest emails), and the wine and the curator's question (in emails asking about a wine you own)</td>
               <td>US/EU</td>
             </tr>
             <tr>
               <td>Anthropic (Claude API)</td>
-              <td>Wine label scanning and AI cellar chat</td>
-              <td>Bottle label images, wine metadata, chat messages</td>
+              <td>Wine label and receipt scanning, and AI cellar chat</td>
+              <td>Bottle label images, images or PDFs of receipts you scan, wine metadata, chat messages</td>
               <td>US</td>
             </tr>
             <tr>
@@ -201,7 +205,7 @@ function PrivacyPolicy() {
           <li><strong>Right to erasure (Art. 17):</strong> you can delete your account and all associated personal data from Settings. Deletion takes effect after a 7-day cooling-off period, and removes your data from the live service at once; encrypted backup copies then age out within six months (see Data retention). Forum posts are anonymised rather than hard-deleted (your authorship is severed) so other users' conversations stay intact; contact support if you need specific posts fully removed.</li>
           <li><strong>Right to data portability (Art. 20):</strong> you can export all your data as JSON from Settings at any time.</li>
           <li><strong>Right to restrict processing (Art. 18):</strong> you can disable all notifications and set your profile to private to restrict how your data is used.</li>
-          <li><strong>Right to object (Art. 21):</strong> you can opt out of all email and push notifications in Settings, or use the one-click unsubscribe link in any email. Emailed answers to your support requests also carry a link that stops only those emails.</li>
+          <li><strong>Right to object (Art. 21):</strong> you can opt out of all email and push notifications in Settings, or use the one-click unsubscribe link in any email. Emailed answers to your support requests, emailed questions about a wine you own, and drink-window emails also carry a link that stops only those emails.</li>
           <li><strong>Right to withdraw consent (Art. 7):</strong> you can withdraw consent for optional data processing at any time by disabling the relevant features, revoking a connected AI assistant in Settings, or deleting your account.</li>
         </ul>
         <p>

@@ -18,6 +18,7 @@ const WineRequest = require('../models/WineRequest');
 const { originFrom } = require('../utils/contributionOrigin');
 const { stripHtml } = require('../utils/sanitize');
 const { SUPPORTED_CURRENCIES } = require('../config/currencies');
+const featureFlags = require('../config/featureFlags');
 
 // Allow-lists — the single source of truth the REST routes previously kept
 // inline. Kept here so the MCP tools validate byte-for-byte identically.
@@ -38,7 +39,7 @@ const ALLOWED_RATING_SCALES = ['5', '20', '100'];
 const ALLOWED_RACK_NAV = ['auto', 'room', 'rack'];
 const ALLOWED_RESTOCK_SCOPE = ['all', 'cellar'];
 const ALLOWED_VISIBILITY = ['public', 'private'];
-const { SUPPORT_CATEGORIES, CELLAR_SORTS } = require('../config/constants');
+const { SUPPORT_CATEGORIES, CELLAR_SORTS, COLLAPSIBLE_BLOCKS } = require('../config/constants');
 const ALLOWED_CELLAR_SORTS = CELLAR_SORTS;
 
 const err = (status, message) => ({ status, message });
@@ -51,7 +52,7 @@ const err = (status, message) => ({ status, message });
  * the user. Returns { update } or { error }.
  */
 async function buildPreferencesUpdate(userId, body = {}) {
-  const { currency, language, ratingScale, rackNavigation, restockScope, cellarSort, defaultCellarId, notifications } = body;
+  const { currency, language, ratingScale, rackNavigation, restockScope, cellarSort, defaultCellarId, notifications, earlyAccess, collapsedBlocks } = body;
   const update = {};
 
   // Notifications: per-category × per-channel booleans, explicitly allow-listed
@@ -81,6 +82,10 @@ async function buildPreferencesUpdate(userId, body = {}) {
     const sr = notifications.supportReply;
     if (sr && typeof sr === 'object') {
       if (sr.email !== undefined) setLeaf('supportReply.email', sr.email);
+    }
+    const oi = notifications.ownerInquiry;
+    if (oi && typeof oi === 'object') {
+      if (oi.email !== undefined) setLeaf('ownerInquiry.email', oi.email);
     }
     // Turning any email back on withdraws the blanket objection the one-click
     // unsubscribe recorded (User.emailOptOutAt): from here on the per-category
@@ -133,6 +138,25 @@ async function buildPreferencesUpdate(userId, body = {}) {
     update['preferences.cellarSort'] = cellarSort;
   }
 
+  // The wine and vintage page's folded blocks: the whole list each time
+  // (unfolding everything sends []), known block names only, no repeats.
+  if (collapsedBlocks !== undefined) {
+    if (!Array.isArray(collapsedBlocks) || collapsedBlocks.length > COLLAPSIBLE_BLOCKS.length
+      || collapsedBlocks.some((b) => !COLLAPSIBLE_BLOCKS.includes(b))) {
+      return { error: err(400, `collapsedBlocks must list blocks from: ${COLLAPSIBLE_BLOCKS.join(', ')}`) };
+    }
+    update['preferences.collapsedBlocks'] = [...new Set(collapsedBlocks)];
+  }
+
+  // "Try new features early": a real boolean, not coerced — a stray string
+  // must not switch a user into the beta screens.
+  if (earlyAccess !== undefined) {
+    if (typeof earlyAccess !== 'boolean') {
+      return { error: err(400, 'earlyAccess must be true or false') };
+    }
+    update['preferences.earlyAccess'] = earlyAccess;
+  }
+
   if (defaultCellarId !== undefined) {
     if (defaultCellarId === null) {
       update['preferences.defaultCellarId'] = null;
@@ -160,7 +184,15 @@ async function buildPreferencesUpdate(userId, body = {}) {
 async function updatePreferences(userId, body) {
   const { update, error } = await buildPreferencesUpdate(userId, body);
   if (error) return { error };
-  const user = await User.findByIdAndUpdate(userId, { $set: update }, { new: true });
+  // A language or currency the user picks is a choice: the first-sign-in guess
+  // (POST /api/users/me/locale-defaults, User.localeDefaultsPending) must never
+  // overwrite it later, so choosing either ends that pending guess.
+  const choosesLocale = 'preferences.language' in update || 'preferences.currency' in update;
+  const user = await User.findByIdAndUpdate(
+    userId,
+    { $set: update, ...(choosesLocale ? { $unset: { localeDefaultsPending: 1 } } : {}) },
+    { new: true },
+  );
   if (!user) return { error: err(404, 'User not found') };
   return { user, changed: Object.keys(update) };
 }
@@ -212,11 +244,28 @@ async function updateProfile(userId, body) {
 
 // ── Support ticket ───────────────────────────────────────────────────────────
 
-/** Validate + create a support ticket. Returns { ticket } or { error }. */
-async function createSupportTicket(userId, { category, subject, message } = {}) {
+/**
+ * Validate + create a support ticket. Returns { ticket } or { error }.
+ *
+ * Category 'beta' is feedback on a feature in early access (config/
+ * featureFlags), sent from the feature's own "Give feedback" button: it names
+ * the feature by key, and when it brings no subject the subject is the
+ * feature's English title, so the admin queue reads the same whatever
+ * language the feedback came in.
+ */
+async function createSupportTicket(userId, { category, subject, message, feature } = {}) {
   if (!SUPPORT_CATEGORIES.includes(category)) {
     return { error: err(400, 'Invalid category') };
   }
+  let featureKey = null;
+  if (feature !== undefined && feature !== null && feature !== '') {
+    if (category !== 'beta') return { error: err(400, 'feature is only for beta feedback') };
+    const known = featureFlags.get(String(feature));
+    if (!known) return { error: err(400, 'Unknown feature') };
+    featureKey = known.key;
+    if (!subject || !String(subject).trim()) subject = `Beta feedback: ${known.title}`;
+  }
+  if (category === 'beta' && (!subject || !String(subject).trim())) subject = 'Beta feedback';
   if (!subject || !String(subject).trim()) return { error: err(400, 'Subject is required') };
   if (!message || !String(message).trim()) return { error: err(400, 'Message is required') };
   if (String(subject).trim().length > 200) {
@@ -230,6 +279,7 @@ async function createSupportTicket(userId, { category, subject, message } = {}) 
     category,
     subject: stripHtml(subject),
     message: stripHtml(message),
+    ...(featureKey ? { feature: featureKey } : {}),
   });
   return { ticket };
 }
@@ -264,6 +314,27 @@ async function replyToTicket(userId, ticketId, message) {
   ticket.status = 'open';
   await ticket.save();
   return { ticket };
+}
+
+/**
+ * The USER closes their own ticket — their question is answered or the issue
+ * is gone, so it can leave the admin queue without an admin closing it. The
+ * web "Mark as resolved" button (POST /api/support/:id/close) and the MCP
+ * close_ticket tool share this. Final for the user: a closed ticket refuses
+ * replies (replyToTicket), and the path back is a fresh ticket. Closing one
+ * that is already closed changes nothing and says so (alreadyClosed), so a
+ * retry is harmless.
+ */
+async function closeTicket(userId, ticketId) {
+  if (!mongoose.Types.ObjectId.isValid(String(ticketId))) {
+    return { error: err(404, 'Ticket not found') };
+  }
+  const ticket = await SupportTicket.findOne({ _id: ticketId, user: userId });
+  if (!ticket) return { error: err(404, 'Ticket not found') };
+  if (ticket.status === 'closed') return { ticket, alreadyClosed: true };
+  ticket.status = 'closed';
+  await ticket.save();
+  return { ticket, alreadyClosed: false };
 }
 
 // ── Wine-addition request (the resolve-dead-end fallback) ─────────────────────
@@ -355,30 +426,67 @@ function validateImageRef(image, { allowInline = true } = {}) {
 }
 
 /**
+ * The links of a request (#1460): sourceUrl and sourceUrls merged in that
+ * order, trimmed, without repeats, at most MAX_SOURCE_URLS, each a public
+ * http(s) URL. The first is required — it is what sourceUrl holds for every
+ * reader and older install that knows one link. Returns { links } or { error }.
+ */
+const MAX_SOURCE_URLS = 3;
+function collectSourceUrls(sourceUrl, sourceUrls) {
+  if (sourceUrls != null && !Array.isArray(sourceUrls)) return { error: 'sourceUrls must be a list of links' };
+  // Refuse the length BEFORE the loop: the route accepts megabytes of JSON,
+  // and the repeat check below is quadratic in the list (release audit
+  // 2026-10-09, H2 — a 5 MB list of one-character strings pinned the event
+  // loop for minutes). The form sends sourceUrl inside sourceUrls too, so the
+  // list itself is capped at the maximum, repeats included.
+  if (sourceUrls && sourceUrls.length > MAX_SOURCE_URLS) return { error: `At most ${MAX_SOURCE_URLS} source links` };
+  const links = [];
+  for (const raw of [sourceUrl, ...(sourceUrls || [])]) {
+    if (raw == null || raw === '') continue;
+    if (typeof raw !== 'string') return { error: 'Please provide a valid URL' };
+    const link = raw.trim();
+    if (!link || links.includes(link)) continue;
+    links.push(link);
+  }
+  if (links.length === 0) return { error: validateSourceUrl(sourceUrl) };
+  if (links.length > MAX_SOURCE_URLS) return { error: `At most ${MAX_SOURCE_URLS} source links` };
+  for (const link of links) {
+    const urlErr = validateSourceUrl(link);
+    if (urlErr) return { error: urlErr };
+  }
+  return { links };
+}
+
+/**
  * Validate + create a `new_wine` WineRequest (the fallback when resolve_wine
  * dead-ends and the user can't confirm enough to mint a registry entry). Returns
  * { wineRequest } or { error }. The grape_suggestion request type is deliberately
  * NOT handled here — it stays inline in the REST route (niche, needs a linked
  * wine) and is not exposed over MCP.
  */
-async function createWineRequest(userId, { wineName, sourceUrl, image } = {}, { via, req } = {}) {
+async function createWineRequest(userId, { wineName, sourceUrl, sourceUrls, image, backImage } = {}, { via, req } = {}) {
   if (!wineName) return { error: err(400, 'Wine name and source URL are required') };
-  const urlErr = validateSourceUrl(sourceUrl);
-  if (urlErr) return { error: err(400, urlErr) };
+  const collected = collectSourceUrls(sourceUrl, sourceUrls);
+  if (collected.error) return { error: err(400, collected.error) };
 
   const trimmedName = String(wineName).trim();
   const trimmedImage = image ? String(image).trim() : '';
+  const trimmedBack = backImage ? String(backImage).trim() : '';
   if (trimmedName.length > 300) {
     return { error: err(400, 'Wine name must be 300 characters or fewer') };
   }
   const imageErr = validateImageRef(trimmedImage);
   if (imageErr) return { error: err(400, imageErr) };
+  const backErr = validateImageRef(trimmedBack);
+  if (backErr) return { error: err(400, `Back label: ${backErr}`) };
 
   const wineRequest = new WineRequest({
     requestType: 'new_wine',
     wineName: trimmedName,
-    sourceUrl: sourceUrl.trim(),
+    sourceUrl: collected.links[0],
+    sourceUrls: collected.links,
     image: trimmedImage || null,
+    backImage: trimmedBack || null,
     user: userId,
     status: 'pending',
     // Which surface and, over the bridge, which install — kept on the record
@@ -396,10 +504,12 @@ module.exports = {
   updateProfile,
   createSupportTicket,
   replyToTicket,
+  closeTicket,
   TICKET_REPLY_CAP,
   createWineRequest,
   validateSourceUrl,
   validateImageRef,
+  MAX_SOURCE_URLS,
   // Exposed so the MCP tool descriptions/schemas can enumerate the same options.
   ALLOWED_CURRENCIES,
   LANGUAGE_TAG,

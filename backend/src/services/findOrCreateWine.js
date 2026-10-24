@@ -19,7 +19,7 @@ const Region = require('../models/Region');
 const Grape = require('../models/Grape');
 const Appellation = require('../models/Appellation');
 const searchService = require('./search');
-const { generateWineKey, pendingProducerKey, pendingWineKey, draftWineKey, normalizeString, normalizeAppellation, normalizeAppellationKey, stripTrailingVintage, resolveGrapeName, resolveCountryName, isRecognizedCountry, isUnknownName, isIdentitySentinel, isImplausibleIdentity, isJunkGrapeName, sanitizeTaxonomyName } = require('../utils/normalize');
+const { generateWineKey, pendingProducerKey, pendingWineKey, draftWineKey, normalizeString, normalizeWineName, normalizeAppellation, normalizeAppellationKey, stripTrailingVintage, resolveGrapeName, resolveCountryName, isRecognizedCountry, isUnknownName, isIdentitySentinel, isImplausibleIdentity, isJunkGrapeName, sanitizeTaxonomyName } = require('../utils/normalize');
 
 // A private draft's untouched clock (models/WineDefinition.draftExpiresAt):
 // reset by every edit and bottle add, swept hourly by services/wineDraftExpiryJob.
@@ -313,6 +313,11 @@ async function findOrCreateGrapes(rawNames, userId) {
  *   services/cellarImport. NEVER passed by the deliberate shared-registry curation
  *   surfaces (routes/admin/wines.js, routes/admin/wineRequests.js, MCP
  *   admin_add_registry_wine): a curator typing "Bordeaux" as producer SHOULD be told.
+ * @param {boolean} [opts.nonWine=false] - A row this call MINTS is born with the
+ *   non-wine flag (WineDefinition.nonWine), so the one index call below removes it
+ *   instead of adding it. A match is returned untouched. Passed by routes/import.js
+ *   /confirm for a row the file marked as a spirit; flagging after the mint would race
+ *   that fire-and-forget index call and could leave the row publicly searchable.
  */
 // ── Estate-name pollution guard (ticket 6a83f014) ───────────────────────────
 //
@@ -387,7 +392,7 @@ async function unpolluteEstateName({ name, producer, appellation, classification
 // re-runs them at publish), and the row keys into the per-creator 'draft~'
 // namespace. `excludeId`: the publish-time re-check passes the draft's own id
 // so no stage can match the draft against itself.
-async function findOrCreateWine({ name, producer, country, region, appellation, type, colour, grapes, classification }, userId, { confirmCreate = false, skipSiblingMatch = false, matchOnly = false, createdVia = null, allowPending = false, provenance = null, draft = false, excludeId = null } = {}) {
+async function findOrCreateWine({ name, producer, country, region, appellation, type, colour, grapes, classification }, userId, { confirmCreate = false, skipSiblingMatch = false, matchOnly = false, createdVia = null, allowPending = false, provenance = null, draft = false, excludeId = null, nonWine = false } = {}) {
   // Internal whitespace collapses too, not just the ends: a double space is
   // invisible in every UI and every normalized key, so "Wrights  Estate" and
   // "Wrights Estate" would otherwise coexist as two display spellings forever
@@ -612,9 +617,12 @@ async function findOrCreateWine({ name, producer, country, region, appellation, 
       return { wine: canonicalSiblings[0], created: false };
     }
     if (canonicalSiblings.length === 0) {
+      // The name part is keyed like every stored key (normalizeWineName):
+      // normalizeString drops a star grade, so "Auslese***" would probe the
+      // plain "Auslese" row's prefix and land on it.
       const siblingPrefix = producerMissing
-        ? `${pendingProducerKey(userId)}:${normalizeString(trimmedName)}:`
-        : `${normalizeString(trimmedProducer)}:${normalizeString(trimmedName)}:`;
+        ? `${pendingProducerKey(userId)}:${normalizeWineName(trimmedName)}:`
+        : `${normalizeString(trimmedProducer)}:${normalizeWineName(trimmedName)}:`;
       const siblings = (await WineDefinition.find({ normalizedKey: new RegExp(`^${escapeRegex(siblingPrefix)}`), ...isolation })
         .limit(2)
         .populate(POPULATE)).filter((c) => !pendingBlocked(c));
@@ -639,10 +647,12 @@ async function findOrCreateWine({ name, producer, country, region, appellation, 
     }
   }
 
-  // MongoDB text-search fallback
+  // MongoDB text-search fallback. A quarantined non-wine is out of the index
+  // and must not come back through here either (audit 2026-10-14): the
+  // exact-key stage above is the one place its owner's add still reaches it.
   if (candidates.length === 0) {
     try {
-      candidates = await WineDefinition.find({ $text: { $search: searchQuery } })
+      candidates = await WineDefinition.find({ $text: { $search: searchQuery }, nonWine: { $ne: true } })
         .populate(POPULATE)
         .limit(20);
     } catch {
@@ -944,12 +954,25 @@ async function findOrCreateWine({ name, producer, country, region, appellation, 
   // that could not contain the wine they were duplicating.
   if (!producerMissing) {
     try {
-      const siblings = (await WineDefinition.find({ producer: producerToStore })
+      const siblings = (await WineDefinition.find({ producer: producerToStore, nonWine: { $ne: true } })
         .limit(60).populate(POPULATE)).filter((c) => !pendingBlocked(c));
       if (siblings.length > 0) {
         const grapeDocs = await Grape.find({}).select('name normalizedName normalizedSynonyms').lean();
         const gTokens = grapeTokenSet(buildSurfaceForms(grapeDocs));
-        const query = { name: trimmedName, appellation: trimmedAppellation, grapes };
+        // isLabelVariant compares grape IDS (the candidate is populated); the
+        // caller sends grape NAMES. Resolve them the way findOrCreateGrapes
+        // does, without minting: a name the taxonomy doesn't know is dropped,
+        // so it counts as silence rather than as a disagreement.
+        const grapeIdByKey = new Map();
+        for (const g of grapeDocs) {
+          grapeIdByKey.set(g.normalizedName, String(g._id));
+          for (const s of g.normalizedSynonyms || []) grapeIdByKey.set(s, String(g._id));
+        }
+        const queryGrapeIds = [...new Set((Array.isArray(grapes) ? grapes : [])
+          .map(sanitizeTaxonomyName).filter(Boolean)
+          .map((n) => grapeIdByKey.get(normalizeString(resolveGrapeName(n))))
+          .filter(Boolean))];
+        const query = { name: trimmedName, appellation: trimmedAppellation, grapes: queryGrapeIds };
         for (const cand of siblings) {
           if (conflictsCountry(cand)) continue;
           const verdict = isLabelVariant(query, cand, gTokens);
@@ -1028,6 +1051,8 @@ async function findOrCreateWine({ name, producer, country, region, appellation, 
     // carries its 7-day untouched clock (services/wineDraftExpiryJob).
     draft,
     draftExpiresAt: draft ? new Date(Date.now() + DRAFT_TTL_MS) : null,
+    // Only when the caller asked: every other create stays exactly as it was.
+    ...(nonWine === true ? { nonWine: true } : {}),
   });
 
   try {

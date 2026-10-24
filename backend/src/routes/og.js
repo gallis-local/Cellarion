@@ -2,7 +2,8 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const WineDefinition = require('../models/WineDefinition');
 const { recordRead, readerFor } = require('../services/registryReadTracker');
-const WineVintageProfile = require('../models/WineVintageProfile');
+const { publicProfileSummary } = require('../services/registryTiering');
+const { buildWinePageContext } = require('../services/winePageContext');
 const BlogPost = require('../models/BlogPost');
 const Country = require('../models/Country');
 const Region = require('../models/Region');
@@ -18,7 +19,11 @@ const { rateLimitKey } = require('../utils/clientIp');
 const { CRAWLER_LANGUAGES } = require('../config/languages');
 
 const WINE_TYPES = ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'];
-const MIN_WINES = 3;
+const { MIN_WINES } = require('../config/taxonomyPages');
+// The crawler taxonomy pages list what the API's first pages list: never a
+// canary (they sit only in the API's deep pages, routes/taxonomy.js), so the
+// two cannot be compared to pick the canaries out.
+const TAXONOMY_LISTED = { nonWine: { $ne: true }, pendingIdentity: { $ne: true }, canary: { $ne: true } };
 
 /**
  * Serialize a JSON-LD object for safe embedding inside a <script
@@ -227,8 +232,8 @@ ${hreflangLinks(pageUrl)}
 });
 
 // GET /og/help — Server-rendered help & guide page for crawlers. Built from
-// backend/src/data/helpContent.js (the single source of truth shared with the
-// help AI), so it stays in sync without duplicating copy. Nginx routes the
+// backend/src/data/helpContent.js, the server's copy of the Help page's text
+// (kept section for section with the page; see that file). Nginx routes the
 // "/help" SPA route for crawler user-agents here.
 router.get('/help', ogLimiter, (req, res) => {
   try {
@@ -313,6 +318,22 @@ router.get('/help', ogLimiter, (req, res) => {
 // copy is deliberately duplicated from the frontend's `connectAi` locale block
 // (short, stable, and the backend has no access to frontend locales) — keep the
 // two in sync when either changes.
+// GET /og/developers — the /developers page for crawlers: the guide and the
+// API reference, both rendered from the OpenAPI document (openapi/crawlerPage).
+router.get('/developers', ogLimiter, (req, res) => {
+  try {
+    const { developersPageHtml } = require('../openapi/crawlerPage');
+    const { siteBaseUrl } = require('../utils/siteUrl');
+    const { version } = require('../../package.json');
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(developersPageHtml({ siteUrl: siteBaseUrl(), version }));
+  } catch (err) {
+    console.error('[og] developers page error:', err.message);
+    res.status(500).send('Error generating page');
+  }
+});
+
 router.get('/connect-ai', ogLimiter, (req, res) => {
   try {
     const pageUrl = `${SITE_URL}/connect-ai`;
@@ -324,7 +345,7 @@ router.get('/connect-ai', ogLimiter, (req, res) => {
     const steps = [
       {
         title: 'Claude (web, desktop and mobile)',
-        text: `Settings, then Connectors, then Add custom connector, and paste ${personalEndpoint}. Sign in with your Cellarion account and choose an access level.`,
+        text: `Customize, then Connectors, then + Add, then Add custom connector, and paste ${personalEndpoint}. Sign in with your Cellarion account and choose an access level.`,
       },
       {
         title: 'ChatGPT',
@@ -348,7 +369,7 @@ router.get('/connect-ai', ogLimiter, (req, res) => {
       },
       {
         title: 'No account needed',
-        text: `A public endpoint at ${publicEndpoint} serves the shared wine registry, grape and region profiles, sommelier drink windows and published guides to any AI, with no sign-up and no personal data.`,
+        text: `A public endpoint at ${publicEndpoint} serves the shared wine registry (each wine with its grapes and region), similar wines and published guides to any AI, with no sign-up and no personal data.`,
       },
     ];
 
@@ -400,6 +421,7 @@ router.get('/connect-ai', ogLimiter, (req, res) => {
   <header>
     <h1>${esc(title)}</h1>
     <p>${esc(metaDescription)}</p>
+    <p><a href="${esc(SITE_URL)}/connect-ai/claude">New to AI assistants? Start with the step-by-step guide for Claude</a></p>
   </header>
   <main>
     <section>
@@ -427,6 +449,108 @@ router.get('/connect-ai', ogLimiter, (req, res) => {
   }
 });
 
+// GET /og/connect-ai/claude — server-rendered twin of the beginner's guide to
+// connecting Claude (frontend/src/pages/ConnectClaude.js), for crawlers and
+// link previews. Same deliberate duplication as /connect-ai above: the copy
+// mirrors the frontend's `connectClaude` locale block — keep them in step.
+router.get('/connect-ai/claude', ogLimiter, (req, res) => {
+  try {
+    const pageUrl = `${SITE_URL}/connect-ai/claude`;
+    const title = 'Ask Claude about your wine cellar';
+    const metaDescription = 'Connect your Cellarion wine cellar to Claude in about five minutes, with a free Claude account. A step-by-step guide for beginners.';
+    const intro = 'Cellar Chat is made for quick questions. Connect Cellarion to Claude and your whole cellar joins a full conversation: Claude can look through every bottle, count and compare, and, if you allow it, log what you drink and add new bottles for you.';
+    const personalEndpoint = `${SITE_URL}/api/mcp`;
+
+    const steps = [
+      { title: 'Get a Claude account', text: 'Go to claude.ai and sign up for free, or sign in if you already have an account. The free plan lets you add one connector of your own, and Cellarion is the only one you need.' },
+      { title: 'Add Cellarion to Claude', text: `In Claude, open Customize, then Connectors, click + Add and choose Add custom connector. Name it Cellarion, paste ${personalEndpoint} and click Add.` },
+      { title: 'Sign in and choose what Claude may do', text: 'Claude takes you to a Cellarion page. Sign in, pick an access level (Read only, Read + log drinking, or Full access) and click Approve.' },
+      { title: 'Start chatting', text: 'Open a new chat in Claude and ask about your cellar. A connector added on the web or desktop works in the Claude phone app too.' },
+    ];
+    const faq = [
+      { q: 'Does it cost anything?', a: 'Not from Cellarion: the connector is free. Claude\'s free plan is enough.' },
+      { q: 'What does Claude see?', a: 'Your own Cellarion data: your cellars, bottles, ratings, notes and racks, and also things like your wishlist, journal, profile, settings, notifications and support tickets. Never other members\' private data.' },
+      { q: 'What if Claude gets something wrong?', a: 'Changes Claude makes to your bottles, racks and cellars are listed in Cellarion under Settings, AI & connections, Recent AI activity, where you can undo recent ones.' },
+      { q: 'How do I disconnect?', a: 'In Cellarion, open Settings, AI & connections, API tokens and click Revoke next to Claude (AI).' },
+    ];
+
+    const jsonLd = {
+      '@context': 'https://schema.org',
+      '@graph': [
+        {
+          '@type': 'HowTo',
+          name: title,
+          description: intro,
+          url: pageUrl,
+          step: steps.map((s, i) => ({ '@type': 'HowToStep', position: i + 1, name: s.title, text: s.text })),
+        },
+        {
+          '@type': 'FAQPage',
+          mainEntity: faq.map((f) => ({ '@type': 'Question', name: f.q, acceptedAnswer: { '@type': 'Answer', text: f.a } })),
+        },
+        {
+          '@type': 'BreadcrumbList',
+          itemListElement: [
+            { '@type': 'ListItem', position: 1, name: 'Cellarion', item: SITE_URL },
+            { '@type': 'ListItem', position: 2, name: 'Connect your AI to your wine cellar', item: `${SITE_URL}/connect-ai` },
+            { '@type': 'ListItem', position: 3, name: title, item: pageUrl },
+          ],
+        },
+      ],
+    };
+
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>${esc(title)} — Cellarion</title>
+  <meta name="description" content="${esc(metaDescription)}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="${esc(title)} — Cellarion" />
+  <meta property="og:description" content="${esc(metaDescription)}" />
+  <meta property="og:image" content="${esc(SITE_URL)}/cellarion-logo.jpg" />
+  <meta property="og:url" content="${esc(pageUrl)}" />
+  <meta property="og:site_name" content="Cellarion" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${esc(title)} — Cellarion" />
+  <meta name="twitter:description" content="${esc(metaDescription)}" />
+  <link rel="canonical" href="${esc(pageUrl)}" />
+  <script type="application/ld+json">${serializeJsonLd(jsonLd)}</script>
+</head>
+<body>
+  <nav><a href="${esc(SITE_URL)}">Cellarion</a> / <a href="${esc(SITE_URL)}/connect-ai">Connect your AI</a> / ${esc(title)}</nav>
+  <header>
+    <h1>${esc(title)}</h1>
+    <p>${esc(intro)}</p>
+  </header>
+  <main>
+    <section>
+      <h2>Set it up in four steps</h2>
+      <ol>
+        ${steps.map(s => `<li><strong>${esc(s.title)}</strong> — ${esc(s.text)}</li>`).join('\n        ')}
+      </ol>
+    </section>
+    <section>
+      <h2>Good to know</h2>
+      ${faq.map(f => `<h3>${esc(f.q)}</h3><p>${esc(f.a)}</p>`).join('\n      ')}
+    </section>
+    <p><a href="${esc(SITE_URL)}/connect-ai">Set-up for other AI apps, and the technical details</a></p>
+  </main>
+  <footer>
+    <p><a href="${esc(SITE_URL)}">Cellarion</a> — track your wine collection, get drink-window alerts, and share cellars with friends. Open source, AGPL-3.0.</p>
+  </footer>
+</body>
+</html>`;
+
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(html);
+  } catch (err) {
+    console.error('[og] connect-ai/claude page error:', err.message);
+    res.status(500).send('Error generating page');
+  }
+});
+
 // GET /og/wines/:idOrSlug — Full server-rendered HTML for search engine crawlers.
 // Nginx routes crawler user-agents here; real users get the SPA.
 // Accepts both ObjectId and slug. When given an ObjectId for a wine that has a slug,
@@ -450,7 +574,7 @@ router.get('/wines/:idOrSlug', ogLimiter, async (req, res) => {
 
     const wine = await WineDefinition.findOne(filter)
       .populate(['country', 'region', 'grapes'])
-      .select('name producer slug country region appellation classification grapes type image communityRating canary')
+      .select('name producer slug country region appellation classification grapes type image communityRating canary aiProfile')
       .lean();
 
     if (!wine) {
@@ -495,9 +619,21 @@ router.get('/wines/:idOrSlug', ogLimiter, async (req, res) => {
       wine.region?.name,
       wine.country?.name
     ].filter(Boolean).join(' · ');
-    // Keep meta description under 160 chars
-    const fullDesc = `${fullTitle}. ${details}. Discover, track, and manage your wine cellar with Cellarion.`;
-    const description = fullDesc.length > 160 ? fullDesc.slice(0, 157) + '...' : fullDesc;
+    // The prose tasting profile a signed-out visitor sees on this wine's page
+    // (registryTiering: the description and a style sentence, never the
+    // structured arrays), so search engines read the page people read.
+    const tasting = publicProfileSummary(wine.aiProfile);
+    // Meta description under 160 chars, cut on a word. With tasting prose it
+    // is this wine's own text instead of the line every wine page shares.
+    const fullDesc = tasting
+      ? `${fullTitle}. ${tasting.description}`
+      : `${fullTitle}. ${details}. Discover, track, and manage your wine cellar with Cellarion.`;
+    let description = fullDesc;
+    if (fullDesc.length > 160) {
+      const cut = fullDesc.slice(0, 157);
+      const lastSpace = cut.lastIndexOf(' ');
+      description = (lastSpace > 100 ? cut.slice(0, lastSpace) : cut).replace(/[\s,.;:]+$/, '') + '…';
+    }
     const pageUrl = `${SITE_URL}/wines/${slugOrId}`;
     // wine.image may be a bare filename, an /api/ path, or (legacy admin data)
     // an already-absolute URL — the last must not get API_URL prepended.
@@ -517,29 +653,20 @@ router.get('/wines/:idOrSlug', ogLimiter, async (req, res) => {
     // schema.org AggregateRating into search-engine structured data.
     const hasAggregate = wine.communityRating?.reviewCount >= 2;
 
-    // Pull the most authoritative vintage profile so we can include real drink-window
-    // dates in the prose and FAQ. Prefer reviewed profiles, then most recent vintage.
-    // Relative (NV) profiles are excluded outright: they store year-OFFSETS from each
-    // bottle's purchase, and this page has no bottle to anchor them to — quoting them
-    // would print "peak maturity from 2 to 5" as if those were dates. The byte-wise
-    // vintage sort makes it worse ('NV' > every year string), so without the filter a
-    // reviewed NV profile would WIN the pick whenever one exists (audit 2026-08-10).
-    let profile = null;
+    // The page around the wine, the same as the page people see
+    // (services/winePageContext): links, region and grape notes, related
+    // wines, and how many vintages have a reviewed drink window. Never the
+    // window years: those are for members.
+    let context = null;
     try {
-      profile = await WineVintageProfile.findOne({
-        wineDefinition: wine._id,
-        status: 'reviewed',
-        relative: { $ne: true }
-      }).sort({ vintage: -1 }).select('vintage peakFrom peakUntil earlyFrom earlyUntil lateFrom lateUntil').lean();
+      context = await buildWinePageContext(wine, { full: false });
     } catch (e) {
-      // Profile is optional — failure here shouldn't break the page render.
+      // Optional — failure here shouldn't break the page render.
     }
-    const peakFrom = profile?.peakFrom;
-    const peakUntil = profile?.peakUntil;
-    const peakKnown = peakFrom && peakUntil;
+    const reviewedVintages = context?.reviewedVintages || 0;
 
     // Generate a prose paragraph (template, not LLM) — AI engines extract from prose,
-    // not from key-value lists. ~80–150 words including drink-window text when known.
+    // not from key-value lists.
     const typeWord = wine.type ? wine.type.toLowerCase() : 'wine';
     const placeWords = [wine.appellation, wine.region?.name, wine.country?.name].filter(Boolean).join(', ');
     const grapesPhrase = grapeNames.length === 0
@@ -550,10 +677,10 @@ router.get('/wines/:idOrSlug', ogLimiter, async (req, res) => {
     const classificationPhrase = wine.classification
       ? ` Classified as ${wine.classification}.`
       : '';
-    const drinkPhrase = peakKnown
-      ? (profile.vintage
-          ? ` The ${profile.vintage} vintage is at peak maturity from ${peakFrom} to ${peakUntil}.`
-          : ` Peak maturity is from ${peakFrom} to ${peakUntil}.`)
+    const vintagesWord = reviewedVintages === 1 ? 'vintage' : 'vintages';
+    const whenReady = reviewedVintages === 1 ? 'when it is ready' : 'when each one is ready';
+    const drinkPhrase = reviewedVintages > 0
+      ? ` Cellarion's sommeliers have reviewed the drink window of ${reviewedVintages} ${vintagesWord}; members see ${whenReady}.`
       : '';
     const ratingPhrase = hasRating
       ? ` Cellarion users rate it ${fromNormalized(wine.communityRating.averageNormalized, '5').toFixed(1)} out of 5 across ${wine.communityRating.reviewCount} ${wine.communityRating.reviewCount === 1 ? 'review' : 'reviews'}.`
@@ -563,12 +690,6 @@ router.get('/wines/:idOrSlug', ogLimiter, async (req, res) => {
     // Per-wine FAQ — only emit a question when the underlying data exists. AI engines
     // love quoting Q&A pairs verbatim; this is what shows up in chat answers.
     const faqs = [];
-    if (peakKnown) {
-      faqs.push({
-        q: `When should I drink ${wine.name}?`,
-        a: `${wine.name}${profile.vintage ? ` ${profile.vintage}` : ''} reaches peak maturity between ${peakFrom} and ${peakUntil}. Outside that window, expect either underdeveloped tannins (too early) or fading fruit (too late).`
-      });
-    }
     if (placeWords) {
       faqs.push({
         q: `Where is ${wine.name} from?`,
@@ -633,6 +754,27 @@ router.get('/wines/:idOrSlug', ogLimiter, async (req, res) => {
     }
     const jsonLd = { '@context': 'https://schema.org', '@graph': graph };
 
+    // Links and sections from the page context; a place or grape whose page
+    // does not exist stays plain text.
+    const linkTo = (entry, name) => (entry?.path
+      ? `<a href="${esc(SITE_URL + entry.path)}">${esc(entry.name)}</a>`
+      : esc(name));
+    const grapeEntries = new Map((context?.grapes || []).map((g) => [g.name, g]));
+    const regionNote = context?.region?.excerpt
+      ? `<h3>${linkTo(context.region, context.region.name)}${wine.country?.name ? `, ${esc(wine.country.name)}` : ''}</h3><p>${esc(context.region.excerpt)}</p>`
+      : '';
+    const grapeNotes = (context?.grapes || []).filter((g) => g.excerpt)
+      .map((g) => `<h3>${linkTo(g, g.name)}</h3><p>${esc(g.excerpt)}</p>`).join('');
+    const whereFromHtml = regionNote || grapeNotes
+      ? `<section><h2>Where it comes from</h2>${regionNote}${grapeNotes}</section>`
+      : '';
+    const wineItems = (list) => list.map((w) => `<li><a href="${esc(SITE_URL + w.path)}">${esc(w.name)}</a> — ${esc(w.producer)}${w.place ? `, ${esc(w.place)}` : ''}</li>`).join('');
+    const sameProducer = context?.sameProducer || [];
+    const similar = context?.similar || [];
+    const moreWinesHtml = sameProducer.length || similar.length
+      ? `<section><h2>More wines</h2>${sameProducer.length ? `<h3>From ${esc(wine.producer)}</h3><ul>${wineItems(sameProducer)}</ul>` : ''}${similar.length ? `<h3>More ${esc(typeWord)} wines from ${esc(wine.region?.name || '')}</h3><ul>${wineItems(similar)}</ul>` : ''}</section>`
+      : '';
+
     const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -663,12 +805,15 @@ router.get('/wines/:idOrSlug', ogLimiter, async (req, res) => {
     ${wine.type ? `<p><strong>Type:</strong> ${esc(wine.type.charAt(0).toUpperCase() + wine.type.slice(1))}</p>` : ''}
     ${wine.appellation ? `<p><strong>Appellation:</strong> ${esc(wine.appellation)}</p>` : ''}
     ${wine.classification ? `<p><strong>Classification:</strong> ${esc(wine.classification)}</p>` : ''}
-    ${wine.region?.name ? `<p><strong>Region:</strong> ${esc(wine.region.name)}</p>` : ''}
-    ${wine.country?.name ? `<p><strong>Country:</strong> ${esc(wine.country.name)}</p>` : ''}
-    ${grapeNames.length > 0 ? `<p><strong>Grapes:</strong> ${esc(grapeNames.join(', '))}</p>` : ''}
-    ${peakKnown ? `<p><strong>Drink window:</strong> ${peakFrom}–${peakUntil}${profile.vintage ? ` (${esc(profile.vintage)} vintage)` : ''}</p>` : ''}
+    ${wine.region?.name ? `<p><strong>Region:</strong> ${linkTo(context?.region, wine.region.name)}</p>` : ''}
+    ${wine.country?.name ? `<p><strong>Country:</strong> ${linkTo(context?.country, wine.country.name)}</p>` : ''}
+    ${grapeNames.length > 0 ? `<p><strong>Grapes:</strong> ${grapeNames.map((n) => linkTo(grapeEntries.get(n), n)).join(', ')}</p>` : ''}
     ${hasRating && ratingOn5 != null ? `<p><strong>Community rating:</strong> ${ratingOn5.toFixed(1)}/5 from ${wine.communityRating.reviewCount} ${wine.communityRating.reviewCount === 1 ? 'review' : 'reviews'}</p>` : ''}
     ${wine.image ? `<img src="${esc(imageUrl)}" alt="${esc(wine.name)}" width="300" />` : ''}
+    ${tasting ? `<section><h2>Tasting profile${tasting.source === 'ai' ? ' (AI-generated)' : ''}</h2>${tasting.style ? `<p><strong>Structure:</strong> ${esc(tasting.style)}</p>` : ''}<p>${esc(tasting.description)}</p></section>` : ''}
+    ${reviewedVintages > 0 ? `<section><h2>When to drink</h2><p>Cellarion's sommeliers have reviewed the drink window of ${reviewedVintages} ${vintagesWord} of ${esc(wine.name)}. <a href="${esc(SITE_URL)}/login?mode=register">Sign up free</a> to see ${whenReady}.</p></section>` : ''}
+    ${whereFromHtml}
+    ${moreWinesHtml}
     ${faqs.length > 0 ? `<section><h2>Frequently asked questions</h2>${faqs.map(({ q, a }) => `<h3>${esc(q)}</h3><p>${esc(a)}</p>`).join('')}</section>` : ''}
   </main>
   <footer>
@@ -1014,7 +1159,7 @@ router.get('/regions/:slug', ogLimiter, async (req, res) => {
       .lean();
     if (!region) return res.status(404).send('Not found');
 
-    const wines = await WineDefinition.find({ region: region._id, nonWine: { $ne: true }, pendingIdentity: { $ne: true } })
+    const wines = await WineDefinition.find({ region: region._id, ...TAXONOMY_LISTED })
       .select('name producer slug _id')
       .sort({ name: 1 })
       .limit(20)
@@ -1075,7 +1220,7 @@ router.get('/countries/:slug', ogLimiter, async (req, res) => {
       .lean();
     if (!country) return res.status(404).send('Not found');
 
-    const wines = await WineDefinition.find({ country: country._id, nonWine: { $ne: true }, pendingIdentity: { $ne: true } })
+    const wines = await WineDefinition.find({ country: country._id, ...TAXONOMY_LISTED })
       .select('name producer slug _id')
       .sort({ name: 1 })
       .limit(20)
@@ -1125,7 +1270,7 @@ router.get('/grapes/:slug', ogLimiter, async (req, res) => {
       .lean();
     if (!grape) return res.status(404).send('Not found');
 
-    const wines = await WineDefinition.find({ grapes: grape._id, nonWine: { $ne: true }, pendingIdentity: { $ne: true } })
+    const wines = await WineDefinition.find({ grapes: grape._id, ...TAXONOMY_LISTED })
       .select('name producer slug _id')
       .sort({ name: 1 })
       .limit(20)
@@ -1188,7 +1333,7 @@ router.get('/wine-types/:type', ogLimiter, async (req, res) => {
     const type = String(req.params.type).toLowerCase();
     if (!WINE_TYPES.includes(type)) return res.status(404).send('Not found');
 
-    const wines = await WineDefinition.find({ type, nonWine: { $ne: true }, pendingIdentity: { $ne: true } })
+    const wines = await WineDefinition.find({ type, ...TAXONOMY_LISTED })
       .select('name producer slug _id')
       .sort({ name: 1 })
       .limit(20)

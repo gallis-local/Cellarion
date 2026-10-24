@@ -16,6 +16,7 @@ const User = require('../../models/User');
 const { registerTool } = require('../registry');
 const { ok, fail, pageParams } = require('../toolUtil');
 const { logAudit } = require('../../services/audit');
+const featureFlags = require('../../config/featureFlags');
 // The human-queue writes (ticket, reply, wine request) cannot be unsent, so a
 // retry after an ambiguous transport failure must be safe: idempotency_key
 // claims/replays through the ledger (support ticket 2026-09-12).
@@ -28,7 +29,7 @@ const RETRY_NOTE = (readBack) =>
   `Cannot be unsent. Pass an idempotency_key (any unique string) so a retry after a transport error replays the ` +
   `original result instead of filing twice; on a transport error WITHOUT a key, read back with ${readBack} before retrying.`;
 const {
-  updatePreferences, updateProfile, createSupportTicket, replyToTicket, createWineRequest,
+  updatePreferences, updateProfile, createSupportTicket, replyToTicket, closeTicket, createWineRequest,
   ALLOWED_CURRENCIES, LANGUAGE_TAG, LANGUAGE_TAG_MAX, ALLOWED_RATING_SCALES,
   ALLOWED_RACK_NAV, ALLOWED_RESTOCK_SCOPE, ALLOWED_CELLAR_SORTS, ALLOWED_VISIBILITY, SUPPORT_CATEGORIES,
   TICKET_REPLY_CAP,
@@ -52,6 +53,7 @@ function prefsView(user) {
       community_mention: { email: !!n.communityMention?.email, push: n.communityMention?.push ?? true },
       community_follow: { push: n.communityFollow?.push ?? true },
       support_reply: { email: n.supportReply?.email ?? true },
+      owner_inquiry: { email: n.ownerInquiry?.email ?? true },
     },
   };
 }
@@ -83,6 +85,7 @@ const NOTIFICATION_SHAPE = z.object({
   communityMention: z.object({ email: z.boolean().optional(), push: z.boolean().optional() }).optional(),
   communityFollow: z.object({ push: z.boolean().optional() }).optional(),
   supportReply: z.object({ email: z.boolean().optional() }).optional(),
+  ownerInquiry: z.object({ email: z.boolean().optional() }).optional(),
 }).optional();
 
 registerTool({
@@ -189,12 +192,19 @@ registerTool({
   },
 });
 
+// The early-access features the user can send beta feedback on — named in
+// the tool description so the assistant can pick the key from what the user
+// says ("the new vintage page").
+const BETA_FEATURES_NOTE = featureFlags.FEATURES.length
+  ? ` category beta is feedback on a feature the user tries in early access (Settings → Early access); pass feature: ${featureFlags.FEATURES.map((f) => `${f.key} = ${f.title}`).join('; ')}.`
+  : '';
+
 registerTool({
   name: 'create_support_ticket',
   title: 'Contact Cellarion support',
   description:
     'Files a support ticket to the Cellarion admins (a bug report, a question, a feature request). category is one ' +
-    `of ${SUPPORT_CATEGORIES.join(' / ')}; subject ≤200 chars, message ≤5000. Use only for issues WITH the app itself — ` +
+    `of ${SUPPORT_CATEGORIES.join(' / ')}; subject ≤200 chars, message ≤5000.${BETA_FEATURES_NOTE} Use only for issues WITH the app itself — ` +
     'not for cellar actions you can do with other tools. Confirm the wording with the user first; this reaches a ' +
     'human and cannot be unsent. Track replies with list_my_tickets (or in the web app under Settings → Support). ' +
     RETRY_NOTE('list_my_tickets'),
@@ -204,6 +214,8 @@ registerTool({
     category: z.enum(SUPPORT_CATEGORIES),
     subject: z.string().min(1).max(200),
     message: z.string().min(1).max(5000),
+    feature: (featureFlags.FEATURE_KEYS.length ? z.enum(featureFlags.FEATURE_KEYS) : z.string().max(64)).optional()
+      .describe('Only with category beta: the early-access feature the feedback is about'),
     idempotency_key: IDEMPOTENCY_KEY,
   },
   handler: async (args, ctx) => {
@@ -212,10 +224,12 @@ registerTool({
 
     const { ticket, error } = await createSupportTicket(ctx.user.id, {
       category: args.category, subject: args.subject, message: args.message,
+      ...(args.feature ? { feature: args.feature } : {}),
     });
     if (error) return fail('invalid_input', error.message);
     logAudit(ctx.req, 'support.ticket.created', { type: 'SupportTicket', id: ticket._id }, {
       via: 'mcp', category: ticket.category,
+      ...(ticket.feature ? { feature: ticket.feature } : {}),
     });
     const envelope = envelopeOf(`Support ticket submitted (${ticket.category})`, {
       ticket_id: ticket._id,
@@ -238,7 +252,8 @@ registerTool({
   description:
     'The user\'s own support tickets with the full conversation (admin responses + follow-ups), newest first — ' +
     'the read side of create_support_ticket. Call when the user asks whether support has replied, what the answer ' +
-    'was, or what they have filed. Continue an open conversation with reply_to_ticket. Optional status filter: ' +
+    'was, or what they have filed. Continue an open conversation with reply_to_ticket, or close_ticket once the ' +
+    'user says it is resolved. Optional status filter: ' +
     'open / in_progress / closed.',
   scope: 'read',
   annotations: { readOnlyHint: true, openWorldHint: false },
@@ -329,6 +344,38 @@ registerTool({
   },
 });
 
+// Ledger-less like the settings tools: closing is idempotent (a second close
+// changes nothing and says so), so a retry after a transport error is safe
+// without an idempotency_key.
+registerTool({
+  name: 'close_ticket',
+  title: 'Close a support ticket',
+  description:
+    'Marks one of the user\'s own support tickets as resolved and closes it, so it leaves the support team\'s queue ' +
+    '— for when the answer arrived or the problem went away (get the ticket_id from list_my_tickets). Confirm with ' +
+    'the user first, naming the ticket: a closed ticket takes no more replies, and further help means a new ticket ' +
+    'with create_support_ticket. Closing an already closed ticket changes nothing.',
+  scope: 'write',
+  // Destructive for the user: nothing reopens a ticket from their side, so
+  // clients should ask before running it (like consume_bottle).
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  inputSchema: {
+    ticket_id: z.string().regex(/^[a-f0-9]{24}$/i).describe('From list_my_tickets'),
+  },
+  handler: async (args, ctx) => {
+    const { ticket, alreadyClosed, error } = await closeTicket(ctx.user.id, args.ticket_id);
+    if (error) return fail(error.status === 404 ? 'not_found' : 'invalid_input', error.message);
+    if (!alreadyClosed) {
+      logAudit(ctx.req, 'support.ticket.closed_by_user', { type: 'SupportTicket', id: ticket._id }, { via: 'mcp' });
+    }
+    return ok(alreadyClosed ? `"${ticket.subject}" was already closed` : `Closed "${ticket.subject}"`, {
+      ticket_id: ticket._id,
+      status: ticket.status,
+      already_closed: alreadyClosed,
+    });
+  },
+});
+
 registerTool({
   name: 'request_wine_addition',
   title: 'Request a wine be added to the registry',
@@ -337,13 +384,17 @@ registerTool({
     'match AND you can\'t confirm enough detail (producer, country, type) to add it yourself with add_bottle/new_wine. ' +
     'Requires a source_url (a Systembolaget / Vivino / winery page an admin can verify) and the wine_name as printed. ' +
     'This is a request to a human queue, not an instant add — tell the user it may take a while and that add_bottle ' +
-    'with new_wine is the immediate route when the details are known. ' + RETRY_NOTE('list_history'),
+    'with new_wine is the immediate route when the details are known. Cannot be unsent, and no tool lists your ' +
+    'requests, so ALWAYS pass an idempotency_key (any unique string): a retry with the same key replays the ' +
+    'original result instead of filing twice.',
   scope: 'write',
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   inputSchema: {
     wine_name: z.string().min(1).max(300).describe('The wine name as printed on the label / source'),
     source_url: z.string().min(1).max(2048).describe('An http(s) link to a page describing the wine (required)'),
+    source_urls: z.array(z.string().min(1).max(2048)).max(2).optional().describe('Up to two FURTHER http(s) links beyond source_url — a winery page and a review each help the reviewer (three links in all)'),
     image_url: z.string().max(500000).optional().describe('Optional picture of the wine: an http(s) link or an inline data:image. An admin reviews it; on approval it may become the picture of the wine in the shared registry, visible to all Cellarion users'),
+    back_image_url: z.string().max(500000).optional().describe('Optional photo of the BACK label (an http(s) link or an inline data:image): often the producer, appellation and importer the front leaves out. An admin reviews it; on approval it may be published among the wine\'s public photos in the shared registry, visible to all Cellarion users — never as the wine\'s main picture. Tell the user that before sending one'),
     idempotency_key: IDEMPOTENCY_KEY,
   },
   handler: async (args, ctx) => {
@@ -351,7 +402,8 @@ registerTool({
     if (replayed) return replayed;
 
     const { wineRequest, error } = await createWineRequest(ctx.user.id, {
-      wineName: args.wine_name, sourceUrl: args.source_url, image: args.image_url,
+      wineName: args.wine_name, sourceUrl: args.source_url, sourceUrls: args.source_urls,
+      image: args.image_url, backImage: args.back_image_url,
     }, { via: 'mcp', req: ctx.req });
     if (error) return fail('invalid_input', error.message);
     logAudit(ctx.req, 'wineRequest.create', { type: 'wineRequest', id: wineRequest._id }, { via: 'mcp' });

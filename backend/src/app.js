@@ -42,9 +42,12 @@ const adminAiBudgetRequestsRoute = require('./routes/admin/aiBudgetRequests');
 const supportRoute = require('./routes/support');
 const wineReportsRoute = require('./routes/wineReports');
 const importRoute = require('./routes/import');
+const importReceiptRoute = require('./routes/importReceipt');
 const cellarImportRoute = require('./routes/cellarImport');
 const racksRoute = require('./routes/racks');
 const offlineRoute = require('./routes/offline');
+const openapiRoute = require('./routes/openapi');
+const inventoryRoute = require('./routes/inventory');
 const cellarLayoutRoute = require('./routes/cellarLayout');
 const imagesRoute = require('./routes/images');
 const sommMaturityRoute = require('./routes/somm/maturity');
@@ -74,6 +77,7 @@ const journalRoute = require('./routes/journal');
 const restockAlertsRoute = require('./routes/restockAlerts');
 const helpRoute = require('./routes/help');
 const wineListsRoute = require('./routes/wineLists');
+const pickListsRoute = require('./routes/pickLists');
 const wineListPublicRoute = require('./routes/wineListPublic');
 const sitemapRoute = require('./routes/sitemap');
 const ogRoute = require('./routes/og');
@@ -90,8 +94,6 @@ const mcpRoute = require('./routes/mcp');
 const mcpOAuthRoute = require('./routes/mcpOAuth');
 const wellKnownOAuthRoute = require('./routes/wellKnownOAuth');
 const rateLimitsConfig = require('./config/rateLimits');
-const aiConfig = require('./config/aiConfig');
-const announcementConfig = require('./config/announcement');
 const { logAudit, logger } = require('./services/audit');
 const { drainingConnectionClose } = require('./services/shutdown');
 
@@ -164,6 +166,9 @@ app.use('/api/bottles/import', express.json({ limit: '8mb' }));
 app.use('/api/bottles', express.json({ limit: '64kb' }));
 app.use('/api/blog/admin/posts', express.json({ limit: '2mb' }));
 app.use('/api/wine-lists', express.json({ limit: '1mb' }));
+// Pick lists: up to 500 bottle ids per request (~14 kB of JSON) — past the
+// 10 kb default (release audit 2026-10-13: 379+ ids answered 413).
+app.use('/api/pick-lists', express.json({ limit: '32kb' }));
 // MCP: the anonymous public surface stays tiny (no image tool) — registered
 // BEFORE the personal /api/mcp rule so /api/mcp/public matches it first (the
 // first express.json to parse wins). The personal endpoint allows a larger
@@ -180,6 +185,17 @@ app.use('/api/mcp', express.json({ limit: '2mb' }));
 // of JSON); everything else on the router is small. Registered above the
 // 10 kb default rule below (first express.json to parse wins).
 app.use('/api/bridge/v1/wines/changes', express.json({ limit: '256kb' }));
+// A forwarded wine request may carry the requester's label photos inline —
+// front and, since #1460, back — each up to the same 500,000-character cap a
+// request has here (services/accountOps).
+app.use('/api/bridge/v1/requests', express.json({ limit: '1200kb' }));
+// A climate post may carry 100 readings (routes/climate INGEST_MAX_READINGS):
+// with timestamps and long channel names that passes 10 kB.
+app.use('/api/climate/ingest', express.json({ limit: '32kb' }));
+// SuperAdmin → AI: a prompt save posts the whole prompt, and the longest cap
+// (config/constants PROMPT_MAX_LENGTHS, in characters) passes 10 kB once
+// accents and dashes take two or three bytes each.
+app.use('/api/superadmin/ai', express.json({ limit: '64kb' }));
 app.use(express.json({ limit: '10kb' }));
 const corsOrigin = process.env.FRONTEND_URL || (process.env.NODE_ENV === 'production' ? false : 'http://localhost:3000');
 if (process.env.NODE_ENV === 'production' && !process.env.FRONTEND_URL) {
@@ -315,6 +331,8 @@ app.use('/api/uploads', uploadsGuard, express.static('/app/uploads', { setHeader
 
 // Routes
 app.use('/api/health', healthRoute);
+// The public API contract (openapi/document.js), for /developers and tools.
+app.use('/api/openapi.json', openapiRoute);
 app.use('/api/site', siteRoute);
 app.use('/api/auth', authRoute);
 // SSO / OAuth endpoints (Google) live under the same /api/auth prefix. Mounted
@@ -354,10 +372,15 @@ app.use('/api/ai-budget', aiBudgetRoute);
 app.use('/api/admin/ai-budget-requests', adminAiBudgetRequestsRoute);
 app.use('/api/support', supportRoute);
 app.use('/api/wine-reports', wineReportsRoute);
+// Receipt scan first: its own multipart upload, auth and AI budget (routes/importReceipt).
+app.use('/api/bottles/import/receipt', importReceiptRoute);
 app.use('/api/bottles/import', importRoute);
 app.use('/api/cellar-import', cellarImportRoute);
 app.use('/api/racks', racksRoute);
 app.use('/api/offline', offlineRoute);
+// The integrations' inventory (Home Assistant): read-only, token-reachable
+// with the read scope, database reads only (docs/ha-push-events.md §4).
+app.use('/api/inventory', inventoryRoute);
 app.use('/api/cellar-layout', cellarLayoutRoute);
 app.use('/api/images', imagesRoute);
 app.use('/api/somm/maturity', sommMaturityRoute);
@@ -391,6 +414,7 @@ app.use('/api/journal', journalRoute);
 app.use('/api/restock-alerts', restockAlertsRoute);
 app.use('/api/help', helpRoute);
 app.use('/api/wine-lists', wineListsRoute);
+app.use('/api/pick-lists', pickListsRoute);
 app.use('/api/stripe', stripeRoute);
 app.use('/api/tokens', tokensRoute);
 app.use('/api/bridge/keys', bridgeKeysRoute);
@@ -434,20 +458,5 @@ app.use((err, req, res, next) => {
     : (err.message || 'Internal server error');
   res.status(status).json({ error: message });
 });
-
-// Load rate limit configuration from DB on startup (non-blocking; falls back to defaults)
-rateLimitsConfig.load().catch(err =>
-  console.warn('[rateLimits] Startup load failed, using defaults:', err.message)
-);
-
-// Load AI feature-flag configuration from DB on startup
-aiConfig.load().catch(err =>
-  console.warn('[aiConfig] Startup load failed, using defaults:', err.message)
-);
-
-// Load the site announcement banner from DB on startup
-announcementConfig.load().catch(err =>
-  console.warn('[announcement] Startup load failed, using defaults:', err.message)
-);
 
 module.exports = app;

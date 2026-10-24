@@ -123,6 +123,7 @@ function mapBottlesForExport(bottles, racks, imagesByBottle = new Map(), reviews
     if (b.purchaseDate) item.purchaseDate = b.purchaseDate.toISOString().slice(0, 10);
     if (b.purchaseLocation) item.purchaseLocation = b.purchaseLocation;
     if (b.purchaseUrl) item.purchaseUrl = b.purchaseUrl;
+    if (b.barcode) item.barcode = b.barcode;
     if (b.location) item.location = b.location;
     if (b.notes) item.notes = b.notes;
 
@@ -165,8 +166,14 @@ function mapBottlesForExport(bottles, racks, imagesByBottle = new Map(), reviews
       }
     }
 
-    // Consumed / history bottles
-    if (b.status && b.status !== 'active') {
+    // Bottles on order (bought, not delivered yet) — the importer re-creates
+    // them on order, with the expected month.
+    if (b.arrivedAt) item.arrivedAt = b.arrivedAt.toISOString().slice(0, 10);
+    if (b.status === 'ordered') {
+      item.onOrder = true;
+      if (b.expectedArrival) item.expectedArrival = b.expectedArrival.toISOString().slice(0, 7);
+    } else if (b.status && b.status !== 'active') {
+      // Consumed / history bottles
       item.addToHistory = true;
       item.consumedReason = b.consumedReason || b.status;
       if (b.consumedAt) item.consumedAt = b.consumedAt.toISOString().slice(0, 10);

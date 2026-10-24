@@ -145,3 +145,39 @@ describe('BottleFilterModal — rating range in the user scale', () => {
     expect(onApply).toHaveBeenCalledWith(expect.objectContaining({ minRating: '', maxRating: '', maturity: [] }));
   });
 });
+
+// Support report 2026-10-16: with Red chosen, picking France showed France's
+// whole-cellar count again, as if Red were off. A chosen field shows the
+// server's counts (every OTHER filter applied); the whole cellar only lists
+// the pills, so another country can still be added.
+describe('BottleFilterModal — counts of a field with a choice made', () => {
+  const pill = (label) => screen.getByRole('button', { name: new RegExp(`^${label}`) });
+
+  test('a chosen country keeps counting under the other filters, and every country stays listed', () => {
+    renderModal({ type: ['red'], country: ['fr'] }, {
+      facets: { type: { red: 32, white: 9 }, countryName: { France: 32, Italy: 5 } },
+      baseFacets: { type: { red: 70, white: 30 }, countryName: { France: 92, Italy: 40, Spain: 12 } },
+      facetMeta: { countries: { France: 'fr', Italy: 'it', Spain: 'es' } },
+    });
+    expect(pill('France')).toHaveTextContent('France32');
+    expect(pill('Italy')).toHaveTextContent('Italy5');
+    // Listed from the whole cellar, with no red bottles: dimmed, no count.
+    expect(pill('Spain')).toHaveClass('filter-pill--dimmed');
+    expect(pill('Spain')).not.toHaveTextContent('12');
+    // The type row counts under the country choice, not the whole cellar.
+    expect(pill('Red')).toHaveTextContent('Red32');
+  });
+});
+
+// A rack / storage filter: the server sends no counts. No numbers then, and
+// nothing dimmed — never the previous request's counts.
+test('without counts (null) the pills show no numbers and none is dimmed', () => {
+  renderModal({ country: ['fr'] }, {
+    facets: null,
+    baseFacets: { countryName: { France: 92, Italy: 40 } },
+    facetMeta: { countries: { France: 'fr', Italy: 'it' } },
+  });
+  const italy = screen.getByRole('button', { name: /^Italy/ });
+  expect(italy).toHaveTextContent(/^Italy$/);
+  expect(italy).not.toHaveClass('filter-pill--dimmed');
+});

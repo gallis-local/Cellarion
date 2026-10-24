@@ -1,0 +1,187 @@
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useAuth } from '../contexts/AuthContext';
+import { updateBottle, bulkUpdateBottles } from '../api/bottles';
+import useBarcodeWatch from '../hooks/useBarcodeWatch';
+import { normalizeBarcode, sharedBarcode } from '../utils/barcode';
+import { openCamera, isSuperseded } from '../utils/camera';
+import useTapToFocus from '../hooks/useTapToFocus';
+import CameraFocusRing from './CameraFocusRing';
+import Modal from './Modal';
+import './BarcodeScanModal.css';
+
+/**
+ * "Add barcode" for a bottle already in the cellar (the bottle page's ⋮).
+ * Until now a barcode could only be read while adding a bottle. The camera
+ * reads it with the same reader Add Bottle uses (useBarcodeWatch: the
+ * browser's BarcodeDetector, else the ZXing fallback, the same code in two
+ * frames); the numbers can also be typed. A code read by the camera is saved
+ * at once; a typed one when the user presses Save. A bottle that has a
+ * barcode can have it removed here.
+ *
+ * Saving goes through the ordinary bottle update (PUT /api/bottles/:id),
+ * which stores the canonical form and refuses an invalid code. On the
+ * vintage page the code goes on several bottles at once (`bottles`, chosen
+ * by vintageBarcodeTargets) in one bulk request; `otherCount` says how many
+ * bottles of the vintage it leaves alone. onSaved(code, { done, total }) —
+ * done < total when some bottles could not be changed.
+ */
+export default function BarcodeScanModal({ bottle, bottles, otherCount = 0, onClose, onSaved }) {
+  const { t } = useTranslation();
+  const { apiFetch } = useAuth();
+  const inputId = useId();
+  const videoRef = useRef(null);
+  const tapFocus = useTapToFocus(videoRef);
+  const streamRef = useRef(null);
+  const openRef = useRef(true);
+  const [cameraError, setCameraError] = useState(null);
+  const [cameraOn, setCameraOn] = useState(false);
+  const [typed, setTyped] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  // The bottles the code goes on: one (the bottle page) or the bottles of a
+  // vintage (the vintage page). 'current' is the code they share, if any.
+  const targets = useMemo(() => (bottles && bottles.length ? bottles : [bottle]), [bottles, bottle]);
+  const current = sharedBarcode(targets);
+
+  const stopCamera = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    setCameraOn(false);
+  }, []);
+
+  // The camera opens with the window and closes with it — once per opening,
+  // whatever re-renders in between (the texts are read through a ref).
+  const tRef = useRef(t);
+  tRef.current = t;
+  useEffect(() => {
+    const t = (...args) => tRef.current(...args);
+    openRef.current = true;
+    (async () => {
+      try {
+        // In focus where the phone allows it (utils/camera): a blurred
+        // preview reads no barcode. No camera API at all is a NotFoundError
+        // there, for every camera view.
+        const stream = await openCamera({ facingMode: 'environment', width: 1920, height: 1080 });
+        // Closed while the permission prompt was up: never leave it running.
+        if (!openRef.current) { stream.getTracks().forEach((track) => track.stop()); return; }
+        streamRef.current = stream;
+        if (videoRef.current) videoRef.current.srcObject = stream;
+        setCameraOn(true);
+      } catch (err) {
+        // A newer open (a quick camera switch) took over: nothing to show.
+        if (isSuperseded(err)) return;
+        if (err?.name === 'NotAllowedError') setCameraError(t('camera.accessDenied'));
+        else if (err?.name === 'NotFoundError') setCameraError(t('camera.notFound'));
+        else setCameraError(t('camera.accessError'));
+      }
+    })();
+    return () => { openRef.current = false; stopCamera(); };
+  }, [stopCamera]);
+
+  const save = useCallback(async (code) => {
+    setSaving(true);
+    setError(null);
+    try {
+      // One bottle: its own update. Every bottle of a vintage (the vintage
+      // page): one bulk request — they are the same product.
+      const res = targets.length === 1
+        ? await updateBottle(apiFetch, targets[0]._id, { barcode: code })
+        : await bulkUpdateBottles(apiFetch, targets.map((b) => b._id), { barcode: code });
+      const data = await res.json().catch(() => ({}));
+      // The bulk request answers 200 with the bottles it could not change
+      // listed as skipped: none done is a failure, some done is said so.
+      const done = targets.length === 1 ? 1 : Number(data.done) || 0;
+      if (!res.ok || done === 0) {
+        setError(data.error || t('barcodeScan.failed', 'Could not save the barcode. Please try again.'));
+        setSaving(false);
+        return;
+      }
+      stopCamera();
+      onSaved(
+        targets.length === 1 ? (data.bottle?.barcode ?? (code || null)) : (code || null),
+        { done, total: targets.length },
+      );
+    } catch {
+      setError(t('barcodeScan.failed', 'Could not save the barcode. Please try again.'));
+      setSaving(false);
+    }
+  }, [apiFetch, targets, onSaved, stopCamera, t]);
+
+  useBarcodeWatch(videoRef, { active: cameraOn && !saving, onDetect: save });
+
+  const submitTyped = (e) => {
+    e.preventDefault();
+    const code = normalizeBarcode(typed);
+    if (!code) {
+      setError(t('barcodeScan.invalid', 'That is not a valid barcode. Check the numbers under the stripes (8, 12 or 13 digits).'));
+      return;
+    }
+    save(code);
+  };
+
+  return (
+    <Modal title={current ? t('barcodeScan.titleChange', 'Change barcode') : t('barcodeScan.title', 'Add barcode')} onClose={onClose} showClose trapFocus>
+      {current && (
+        <p className="barcode-scan-current">
+          {t('barcodeScan.current', 'Saved now: {{code}}', { code: current })}
+        </p>
+      )}
+      {(targets.length > 1 || otherCount > 0) && (
+        <p className="barcode-scan-scope">
+          {otherCount > 0
+            ? t('barcodeScan.someBottles', { count: targets.length })
+            : t('barcodeScan.allBottles', { count: targets.length })}
+          {otherCount > 0 && <> {t('barcodeScan.othersKeep', { count: otherCount })}</>}
+        </p>
+      )}
+      {cameraError ? (
+        <p className="barcode-scan-camera-error" role="status">{cameraError}</p>
+      ) : (
+        <div className="barcode-scan-viewfinder">
+          <div className="barcode-scan-frame" onPointerDown={tapFocus.onPointerDown}>
+            <video ref={videoRef} autoPlay playsInline muted className="barcode-scan-video" />
+            <CameraFocusRing ring={tapFocus.ring} />
+          </div>
+          <p className="barcode-scan-hint">
+            {saving ? t('barcodeScan.saving', 'Saving…') : t('barcodeScan.hint', 'Point the camera at the barcode on the bottle.')}
+          </p>
+        </div>
+      )}
+
+      <form onSubmit={submitTyped} className="barcode-scan-form">
+        <label htmlFor={inputId}>{t('barcodeScan.typeLabel', 'Or type the numbers under the stripes')}</label>
+        <div className="barcode-scan-row">
+          <input
+            id={inputId}
+            type="text"
+            inputMode="numeric"
+            autoComplete="off"
+            maxLength={20}
+            value={typed}
+            onChange={(e) => { setTyped(e.target.value); setError(null); }}
+            disabled={saving}
+          />
+          <button type="submit" className="btn btn-primary" disabled={saving || !typed.trim()}>
+            {t('barcodeScan.save', 'Save')}
+          </button>
+        </div>
+      </form>
+
+      {error && <p className="error-message" role="alert">{error}</p>}
+
+      <div className="modal-actions">
+        {current && (
+          <button type="button" className="btn btn-secondary barcode-scan-remove" onClick={() => save('')} disabled={saving}>
+            {t('barcodeScan.remove', 'Remove barcode')}
+          </button>
+        )}
+        <button type="button" className="btn btn-secondary" onClick={onClose} disabled={saving}>
+          {t('common.cancel')}
+        </button>
+      </div>
+    </Modal>
+  );
+}

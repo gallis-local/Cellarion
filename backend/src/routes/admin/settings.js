@@ -34,7 +34,7 @@ router.get('/rate-limits', async (req, res) => {
 // accountLockout.threshold to 9999 effectively turns lockout off).
 router.patch('/rate-limits', async (req, res) => {
   try {
-    const { api, write, auth, accountLockout, chatBurst, chatConcurrentStreams, aiDailyBudget, aiImportPerRequestCap, aiGlobalDailyCap, imageUploadBurst, demo, mcp, registryRead, bridge } = req.body;
+    const { api, write, auth, accountLockout, chatBurst, aiDailyBudget, aiImportPerRequestCap, aiGlobalDailyCap, imageUploadBurst, demo, mcp, registryRead, bridge } = req.body;
 
     const previous = { ...rateLimitsConfig.get() };
 
@@ -68,11 +68,6 @@ router.patch('/rate-limits', async (req, res) => {
     if (chatBurst !== undefined) {
       requireIntInRange('chatBurst.max',      chatBurst.max,      1,      1000);
       requireIntInRange('chatBurst.windowMs', chatBurst.windowMs, 10_000, 60 * 60 * 1000);
-    }
-
-    // Concurrent SSE streams cap per user
-    if (chatConcurrentStreams !== undefined) {
-      requireIntInRange('chatConcurrentStreams.max', chatConcurrentStreams.max, 1, 50);
     }
 
     // Shared per-user daily Anthropic-call budget (0 = unlimited)
@@ -187,9 +182,6 @@ router.patch('/rate-limits', async (req, res) => {
         max:      chatBurst?.max      ?? previous.chatBurst.max,
         windowMs: chatBurst?.windowMs ?? previous.chatBurst.windowMs,
       },
-      chatConcurrentStreams: {
-        max: chatConcurrentStreams?.max ?? previous.chatConcurrentStreams.max,
-      },
       aiDailyBudget: {
         max: aiDailyBudget?.max ?? previous.aiDailyBudget?.max ?? rateLimitsConfig.defaults.aiDailyBudget.max,
       },
@@ -273,6 +265,43 @@ router.patch('/contact-email', async (req, res) => {
   } catch (err) {
     console.error('Admin update contact-email error:', err);
     res.status(500).json({ error: 'Failed to update contact email setting' });
+  }
+});
+
+// GET /api/admin/settings/new-member-emails — the switch for the one email a
+// new member gets two days after joining (services/newMemberEmails), and how
+// many went out in the last 30 days.
+router.get('/new-member-emails', async (req, res) => {
+  try {
+    const { getSettings } = require('../../services/newMemberEmails');
+    const { EMAIL_VERIFICATION_ENABLED } = require('../../services/mailgun');
+    const User = require('../../models/User');
+    const settings = await getSettings();
+    const since30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const [cellar, empty] = await Promise.all(['cellar', 'empty'].map((kind) =>
+      User.countDocuments({ newMemberEmailSentAt: { $gte: since30 }, newMemberEmailKind: kind })));
+    res.json({ ...settings, mailConfigured: EMAIL_VERIFICATION_ENABLED, sentLast30Days: { cellar, empty } });
+  } catch (err) {
+    console.error('Admin get new-member-emails error:', err);
+    res.status(500).json({ error: 'Failed to load the new-member email setting' });
+  }
+});
+
+// PATCH /api/admin/settings/new-member-emails — body { enabled }. Turning it
+// on starts from now: accounts created before that never get one.
+router.patch('/new-member-emails', async (req, res) => {
+  try {
+    const { enabled } = req.body || {};
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be true or false' });
+    }
+    const { setEnabled } = require('../../services/newMemberEmails');
+    const settings = await setEnabled(enabled, req.user.id);
+    logAudit(req, 'admin.settings.new_member_emails.update', {}, { enabled });
+    res.json(settings);
+  } catch (err) {
+    console.error('Admin update new-member-emails error:', err);
+    res.status(500).json({ error: 'Failed to update the new-member email setting' });
   }
 });
 

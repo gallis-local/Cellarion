@@ -18,15 +18,15 @@ jest.mock('../../models/WineDefinition', () => {
   ctor.updateMany = jest.fn();
   return ctor;
 });
-jest.mock('../../models/Bottle', () => ({ aggregate: jest.fn(), countDocuments: jest.fn() }));
+jest.mock('../../models/Bottle', () => ({ aggregate: jest.fn(), countDocuments: jest.fn(), distinct: jest.fn() }));
 jest.mock('../../models/BottleImage', () => ({}));
-jest.mock('../../models/WineVintageProfile', () => ({}));
+jest.mock('../../models/WineVintageProfile', () => ({ deleteMany: jest.fn().mockResolvedValue({ deletedCount: 0 }) }));
 jest.mock('../../models/WineVintagePrice', () => ({}));
 jest.mock('../../models/WineReport', () => ({}));
 jest.mock('../../models/Review', () => ({}));
 jest.mock('../../models/Discussion', () => ({}));
 jest.mock('../../models/DiscussionReply', () => ({}));
-jest.mock('../../models/WineEmbedding', () => ({}));
+jest.mock('../../models/WineEmbedding', () => ({ deleteMany: jest.fn().mockResolvedValue({ deletedCount: 0 }) }));
 jest.mock('../../models/WineNotDuplicate', () => ({ find: jest.fn() }));
 jest.mock('../../models/WineList', () => ({}));
 jest.mock('../../models/WishlistItem', () => ({}));
@@ -40,11 +40,12 @@ jest.mock('../../models/WineRequest', () => ({}));
 jest.mock('../../models/Country', () => ({ findById: jest.fn() }));
 jest.mock('../../services/vectorStore', () => ({}));
 jest.mock('../../services/imageProcessor', () => ({ unlinkImageFiles: jest.fn() }));
-jest.mock('../../services/embeddingJob', () => ({ embedSinglePair: jest.fn() }));
+jest.mock('../../services/embeddingJob', () => ({ embedSinglePair: jest.fn(), reembedActiveVintages: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../../services/search', () => ({ indexWine: jest.fn(), removeWine: jest.fn() }));
 jest.mock('../../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../../services/indexNow', () => ({ submitUrls: jest.fn() }));
 jest.mock('../../services/findOrCreateWine', () => ({ findOrCreateWine: jest.fn() }));
+jest.mock('../../utils/vintageProfile', () => ({ ensurePendingVintageProfile: jest.fn() }));
 
 const express = require('express');
 const http = require('http');
@@ -53,6 +54,7 @@ const WineDefinition = require('../../models/WineDefinition');
 const Bottle = require('../../models/Bottle');
 const searchService = require('../../services/search');
 const { logAudit } = require('../../services/audit');
+const { ensurePendingVintageProfile } = require('../../utils/vintageProfile');
 const adminWinesRouter = require('./wines');
 
 const ADMIN_ID = '64b000000000000000000001';
@@ -101,16 +103,84 @@ test('quarantines a row: sets the flag, saves, self-heals the index, audits', as
     { type: 'wine', id: WINE_ID },
     expect.objectContaining({ value: true, name: 'Blue Label' })
   );
+  // A quarantine seeds nothing — the queue rows are what it takes away.
+  expect(ensurePendingVintageProfile).not.toHaveBeenCalled();
+  // Its vectors go too (audit 2026-10-14): semantic search and the
+  // similar-wines graph must not keep a row keyword search dropped.
+  expect(require('../../models/WineEmbedding').deleteMany).toHaveBeenCalledWith({ wineDefinition: WINE_ID });
+  expect(require('../../services/embeddingJob').reembedActiveVintages).not.toHaveBeenCalled();
 });
 
-test('restores a row with value: false', async () => {
+test('restores a row with value: false and re-seeds the maturity queue from its bottles in cellars', async () => {
   const doc = { ...wineDoc(), nonWine: true };
   doc.save = jest.fn().mockResolvedValue(doc);
   WineDefinition.findById.mockResolvedValue(doc);
+  Bottle.distinct.mockResolvedValue(['2019', 'NV']);
 
   const res = await toggle(WINE_ID, { value: false });
   expect(res.status).toBe(200);
   expect(doc.nonWine).toBe(false);
+  expect(Bottle.distinct).toHaveBeenCalledWith('vintage', { wineDefinition: WINE_ID, status: 'active' });
+  expect(ensurePendingVintageProfile.mock.calls).toEqual([[WINE_ID, '2019'], [WINE_ID, 'NV']]);
+  // A restore re-embeds (the quarantine purged the vectors) and purges nothing.
+  expect(require('../../services/embeddingJob').reembedActiveVintages).toHaveBeenCalledWith(WINE_ID);
+  expect(require('../../models/WineEmbedding').deleteMany).not.toHaveBeenCalled();
+});
+
+test('a restore still answers 200 when the re-seed fails', async () => {
+  const doc = { ...wineDoc(), nonWine: true };
+  doc.save = jest.fn().mockResolvedValue(doc);
+  WineDefinition.findById.mockResolvedValue(doc);
+  Bottle.distinct.mockRejectedValue(new Error('db down'));
+  const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+  const res = await toggle(WINE_ID, { value: false });
+  expect(res.status).toBe(200);
+  expect(doc.nonWine).toBe(false);
+  warn.mockRestore();
+});
+
+test('setting false on a row that was never quarantined re-seeds nothing', async () => {
+  WineDefinition.findById.mockResolvedValue(wineDoc());
+  const res = await toggle(WINE_ID, { value: false });
+  expect(res.status).toBe(200);
+  expect(Bottle.distinct).not.toHaveBeenCalled();
+  expect(require('../../services/embeddingJob').reembedActiveVintages).not.toHaveBeenCalled();
+});
+
+// The maturity queue: quarantine from Admin → Wines drops the PENDING rows,
+// the same rule as a quarantine through a correction proposal (before, only
+// the proposal path did, so a non-wine kept its stubs in the somm queue while
+// the restore below already assumed they were gone). Reviewed windows stay.
+describe('the maturity queue on a quarantine', () => {
+  const WineVintageProfile = require('../../models/WineVintageProfile');
+
+  test('quarantine deletes the pending rows only and audits how many', async () => {
+    WineDefinition.findById.mockResolvedValue(wineDoc());
+    WineVintageProfile.deleteMany.mockResolvedValueOnce({ deletedCount: 3 });
+
+    const res = await toggle(WINE_ID, { value: true });
+    expect(res.status).toBe(200);
+    expect(WineVintageProfile.deleteMany).toHaveBeenCalledWith({ wineDefinition: WINE_ID, status: 'pending' });
+    expect(logAudit).toHaveBeenCalledWith(expect.anything(), 'admin.wine.nonWine', { type: 'wine', id: WINE_ID },
+      expect.objectContaining({ value: true, pendingRemoved: 3 }));
+  });
+
+  test('quarantining an already quarantined row deletes nothing', async () => {
+    WineDefinition.findById.mockResolvedValue({ ...wineDoc(), nonWine: true, save: jest.fn() });
+    const res = await toggle(WINE_ID, { value: true });
+    expect(res.status).toBe(200);
+    expect(WineVintageProfile.deleteMany).not.toHaveBeenCalled();
+  });
+
+  test('a restore deletes nothing (it re-seeds instead)', async () => {
+    WineDefinition.findById.mockResolvedValue({ ...wineDoc(), nonWine: true, save: jest.fn() });
+    Bottle.distinct.mockResolvedValue(['2019']);
+    const res = await toggle(WINE_ID, { value: false });
+    expect(res.status).toBe(200);
+    expect(WineVintageProfile.deleteMany).not.toHaveBeenCalled();
+    expect(ensurePendingVintageProfile).toHaveBeenCalledWith(WINE_ID, '2019');
+  });
 });
 
 test.each([

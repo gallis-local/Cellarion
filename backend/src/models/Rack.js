@@ -46,6 +46,11 @@ const rackModuleSchema = new mongoose.Schema({
     // shelf). Drawing only — every level still holds `cols` bottles and the
     // position contract is unchanged, so turning it on never moves a bottle.
     stagger: { type: Boolean },
+    // Cabinet racks only, single deep (twoDeep off): bottles in a row lie
+    // head to tail, every other one neck forward, so a row fits more. Drawing
+    // only — capacity and the position contract are unchanged, so it can be
+    // switched on and off with bottles in place (validateCabinetConfig).
+    headToTail: { type: Boolean },
     // Cabinet racks only: rows alternate in width like a honeycomb — the
     // first level's front row holds `cols`, its back row (in the gaps between
     // those bottles) one fewer, the level above nests in its grooves so its
@@ -64,6 +69,9 @@ const rackModuleSchema = new mongoose.Schema({
     // own cols / alternate. Shape, like shelfRows: creation-only in the UI.
     shelfCols: { type: [Number], default: undefined },
     shelfAlternate: { type: [Boolean], default: undefined },
+    // (No shelfSideways here: a module is never a cabinet, and nothing
+    // validates a module's typeConfig — declared, any strings were stored;
+    // left out, Mongoose drops the key. Release audit 2026-10-13.)
     // Hex racks only: mirror the row sequence top-to-bottom. Pure reversal —
     // never changes total slot count (see rackSchema.typeConfig.hexFlip below).
     hexFlip: { type: Boolean, default: false },
@@ -112,6 +120,11 @@ const rackSchema = new mongoose.Schema({
     // shelf). Drawing only — every level still holds `cols` bottles and the
     // position contract is unchanged, so turning it on never moves a bottle.
     stagger: { type: Boolean },
+    // Cabinet racks only, single deep (twoDeep off): bottles in a row lie
+    // head to tail, every other one neck forward, so a row fits more. Drawing
+    // only — capacity and the position contract are unchanged, so it can be
+    // switched on and off with bottles in place (validateCabinetConfig).
+    headToTail: { type: Boolean },
     // Cabinet racks only: rows alternate in width like a honeycomb — the
     // first level's front row holds `cols`, its back row (in the gaps between
     // those bottles) one fewer, the level above nests in its grooves so its
@@ -130,6 +143,19 @@ const rackSchema = new mongoose.Schema({
     // own cols / alternate. Shape, like shelfRows: creation-only in the UI.
     shelfCols: { type: [Number], default: undefined },
     shelfAlternate: { type: [Boolean], default: undefined },
+    // Cabinet racks only, per shelf (top first, length === rows when set): how
+    // the bottles of a shelf lie. '' = front to back (the default), 'front' =
+    // the first bottle of the shelf's bottom row lies ACROSS the front, in
+    // front of the others (a slim fridge's shelf: 5 front to back + 1 across),
+    // 'all' = every bottle of the shelf lies across, piled (a bottom bin).
+    // Drawing only, with one exception: on a STACKED shelf of a one-deep
+    // cabinet, 'front' leaves one bottle fewer on each level above the
+    // first (they rest on the bottles behind the one across: 1 + 4 with 3 on
+    // top), which changes capacity and numbering (utils/rackGeometry
+    // .cabinetRowWidth). So the update route refuses that one change on a
+    // loaded cabinet; every other switch keeps the bottles in place
+    // (support forum 2026-10-13, 2026-10-14).
+    shelfSideways: { type: [{ type: String, enum: ['', 'front', 'all'] }], default: undefined },
     // Grid racks only: 1-indexed row numbers with headroom for a top layer
     // of bottles resting in the gaps (cols across + cols-1 on top).
     // POSITION NUMBERING CONTRACT (double-height rows): the base grid keeps

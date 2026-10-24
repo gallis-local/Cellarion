@@ -131,6 +131,10 @@ async function changes(ids, since) {
     const chunk = ids.slice(i, i + 5000);
     const r = await request('/wines/changes', { method: 'POST', body: { ids: chunk, since: since ? new Date(since).toISOString() : undefined } });
     if (!r || !r.ok) { out.failed = true; break; }
+    // The registry's own clock for the next watermark — the first chunk's,
+    // the earliest. Without it the install's clock was used, and a clock
+    // running ahead skipped every registry change made in that gap.
+    if (i === 0 && r.body.checkedAt) out.checkedAt = r.body.checkedAt;
     out.changed.push(...(r.body.changed || []));
     out.removed.push(...(r.body.removed || []));
     out.checked += r.body.checked || chunk.length;
@@ -144,6 +148,18 @@ async function me() {
 }
 
 const forwardRequest = (payload) => request('/requests', { method: 'POST', body: payload });
+
+/**
+ * What became of requests this install forwarded: [{ id, status, notes, wine }]
+ * for the ones the registry knows as ours; null when off or unreachable.
+ */
+async function requestStatuses(ids) {
+  const clean = (ids || []).filter((id) => /^[a-f0-9]{24}$/i.test(String(id))).slice(0, 50);
+  if (!clean.length) return [];
+  const r = await request(`/requests?ids=${clean.join(',')}`);
+  if (!r || !r.ok) return null;
+  return Array.isArray(r.body.requests) ? r.body.requests : [];
+}
 const forwardCorrection = (payload) => request('/corrections', { method: 'POST', body: payload });
 const forwardValue = (payload) => request('/values', { method: 'POST', body: payload });
 
@@ -152,6 +168,6 @@ function _reset() { searchCache.clear(); blockedUntil = 0; blockedReason = null;
 
 module.exports = {
   config, isEnabled, transportState, request, search, fetchWine, changes, me,
-  forwardRequest, forwardCorrection, forwardValue, _reset,
+  forwardRequest, requestStatuses, forwardCorrection, forwardValue, _reset,
   DEFAULT_URL, TIMEOUT_MS, SEARCH_CACHE_TTL_MS,
 };

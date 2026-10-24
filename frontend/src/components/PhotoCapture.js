@@ -1,5 +1,8 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
+import { openCamera, isSuperseded } from '../utils/camera';
+import useTapToFocus from '../hooks/useTapToFocus';
+import CameraFocusRing from './CameraFocusRing';
 import './ImageUpload.css'; // reuse camera + button styles
 
 /**
@@ -16,6 +19,7 @@ function PhotoCapture({ onCapture, onRemove, processedUrl, processing }) {
   const [cameraError, setCameraError] = useState(null);
   const [facingMode, setFacingMode] = useState('environment');
   const videoRef = useRef(null);
+  const tapFocus = useTapToFocus(videoRef);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -55,10 +59,8 @@ function PhotoCapture({ onCapture, onRemove, processedUrl, processing }) {
     setCameraOpen(true);
     cameraOpenRef.current = true;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode, width: { ideal: 1920 }, height: { ideal: 1080 } },
-        audio: false
-      });
+      // In focus where the phone allows it (utils/camera).
+      const stream = await openCamera({ facingMode, width: 1920, height: 1080 });
       // The viewfinder may have been closed while the permission prompt was
       // up — stop the just-acquired stream or the camera stays on forever.
       if (!cameraOpenRef.current) {
@@ -72,6 +74,8 @@ function PhotoCapture({ onCapture, onRemove, processedUrl, processing }) {
         if (videoRef.current) videoRef.current.srcObject = stream;
       });
     } catch (err) {
+      // A newer open (a quick camera switch) took over: nothing to show.
+      if (isSuperseded(err)) return;
       if (err.name === 'NotAllowedError') setCameraError(t('camera.accessDenied'));
       else if (err.name === 'NotFoundError') setCameraError(t('camera.notFound'));
       else setCameraError(t('camera.accessError'));
@@ -131,7 +135,7 @@ function PhotoCapture({ onCapture, onRemove, processedUrl, processing }) {
     <>
       {cameraOpen && (
         <div className="camera-modal">
-          <div className="camera-container">
+          <div className="camera-container" onPointerDown={tapFocus.onPointerDown}>
             {cameraError ? (
               <div className="camera-error-overlay">
                 <p>{cameraError}</p>
@@ -140,6 +144,7 @@ function PhotoCapture({ onCapture, onRemove, processedUrl, processing }) {
             ) : (
               <>
                 <video ref={videoRef} autoPlay playsInline muted className="camera-video" />
+                <CameraFocusRing ring={tapFocus.ring} />
                 <div className="camera-overlay">
                   <img src="/bottle-overlay.png" alt="" className="bottle-guide" aria-hidden="true" />
                   <p className="overlay-hint">{t('camera.placeBottle')}</p>

@@ -39,10 +39,22 @@ jobs:
   backend:
     name: Backend tests (Node 24)
     runs-on: ubuntu-latest
+    services:
+      # A real MongoDB for the public API contract test
+      # (backend/src/openapi/contract.test.js) and the cleanup-unused-wines
+      # run (backend/src/scripts/cleanup-unused-wines.db.test.js), the same
+      # major as production. Each test uses its own database.
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 5s --health-timeout 5s --health-retries 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           # Must track backend/Dockerfile's FROM. Testing on a different major
           # than we ship would defeat the point of the gate.
@@ -56,6 +68,9 @@ jobs:
 
       - name: Test
         working-directory: backend
+        env:
+          CONTRACT_MONGO_URI: mongodb://localhost:27017/cellarion_contract_ci
+          CLEANUP_MONGO_URI: mongodb://localhost:27017/cellarion_cleanup_ci
         run: npm test
 
   frontend:
@@ -64,7 +79,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
           cache: npm
@@ -78,6 +93,28 @@ jobs:
 
       - name: Test
         working-directory: frontend
+        run: npm test
+
+  mcp-bridge:
+    # cellarion-mcp is published to npm on its own tag
+    # (cellarion-mcp-publish.yml); its tests gate every PR like the app's.
+    name: cellarion-mcp tests (Node 24)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: cellarion-mcp/package-lock.json
+
+      - name: Install
+        working-directory: cellarion-mcp
+        run: npm ci
+
+      - name: Test
+        working-directory: cellarion-mcp
         run: npm test
 
   images:

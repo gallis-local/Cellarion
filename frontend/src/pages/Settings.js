@@ -11,17 +11,20 @@ import { PLANS } from '../config/plans';
 import { SCALE_META, VALID_SCALES } from '../utils/ratingUtils';
 import { isPushSupported, getPushPermissionState, subscribeToPush, unsubscribeFromPush, getCurrentEndpoint, getDeviceStatus, sendTestPush } from '../utils/pushSubscription';
 import { downloadBlobObject } from '../utils/downloadBlob';
+import { friendlyError, httpError } from '../utils/friendlyError';
 import ApiTokensSection from '../components/ApiTokensSection';
 import LanguagePicker from '../components/LanguagePicker';
 import AiConnectSection from '../components/AiConnectSection';
 import SelfHostedBridgeSection from '../components/SelfHostedBridgeSection';
 import RegistryConnectionSection from '../components/RegistryConnectionSection';
 import { isHostedOrigin } from '../utils/mcpConnect';
+import { PASSWORD_POLICY } from '../utils/accountRules';
 import SetPasswordNotice from '../components/SetPasswordNotice';
 import McpActivitySection from '../components/McpActivitySection';
 import ClimateDevicesSection from '../components/ClimateDevicesSection';
 import { journalPromptOptedOut, setJournalPromptOptOut } from '../components/JournalPrompt';
 import OfflineSettings from '../components/OfflineSettings';
+import EarlyAccessSettings from '../components/EarlyAccessSettings';
 import SettingsGroup from '../components/SettingsGroup';
 import './Settings.css';
 
@@ -75,6 +78,7 @@ function Settings() {
   const cmInit = notifPrefs.communityMention || {};
   const cfInit = notifPrefs.communityFollow || {};
   const srInit = notifPrefs.supportReply || {};
+  const oiInit = notifPrefs.ownerInquiry || {};
   const [drinkWindowEnabled, setDrinkWindowEnabled] = useState(dwInit.enabled !== false);
   const [drinkWindowEmail, setDrinkWindowEmail] = useState(dwInit.email === true);
   const [drinkWindowPush,  setDrinkWindowPush]  = useState(dwInit.push  === true);
@@ -85,6 +89,8 @@ function Settings() {
   const [communityFollowPush,   setCommunityFollowPush]   = useState(cfInit.push  !== false);
   // Support answers are a service email, on unless turned off (User schema).
   const [supportReplyEmail,     setSupportReplyEmail]     = useState(srInit.email !== false);
+  // Curators' questions about your wines: on unless turned off (User schema).
+  const [ownerInquiryEmail,     setOwnerInquiryEmail]     = useState(oiInit.email !== false);
   // Combined "any push enabled?" flag — drives the device-registration UX
   // below. If the user turns off all push categories there's no reason to
   // keep a registered device.
@@ -186,7 +192,8 @@ function Settings() {
         communityReply:   { email: communityReplyEmail,   push: communityReplyPush },
         communityMention: { email: communityMentionEmail, push: communityMentionPush },
         communityFollow:  { push: communityFollowPush },
-        supportReply:     { email: supportReplyEmail }
+        supportReply:     { email: supportReplyEmail },
+        ownerInquiry:     { email: ownerInquiryEmail }
       }
     });
     setNotifSaving(false);
@@ -238,7 +245,6 @@ function Settings() {
   // min 12 chars with an uppercase letter, lowercase letter, number and
   // special character. Checked client-side for instant feedback; the
   // backend re-validates and returns 400 if it disagrees.
-  const PASSWORD_POLICY = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^a-zA-Z\d]).{12,}$/;
 
   const handleChangePassword = async (e) => {
     e.preventDefault();
@@ -324,13 +330,13 @@ function Settings() {
     try {
       const res = await apiFetch('/api/users/me/export');
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || 'Export failed');
+        const data = await res.json().catch(() => null);
+        throw httpError(res, data, 'Export failed');
       }
       const blob = await res.blob();
       downloadBlobObject(blob, `cellarion-data-export-${user?.username || 'user'}.json`);
     } catch (err) {
-      setExportError(err.message);
+      setExportError(friendlyError(err, t));
     } finally {
       setExporting(false);
     }
@@ -626,6 +632,14 @@ function Settings() {
               </td>
               <td className="settings-notif-grid__na">—</td>
             </tr>
+            <tr>
+              <td>{t('settings.notifications.ownerInquiry')}</td>
+              <td>
+                <input type="checkbox" aria-label={`${t('settings.notifications.ownerInquiry')} — ${t('settings.notifications.email')}`}
+                  checked={ownerInquiryEmail} onChange={e => setOwnerInquiryEmail(e.target.checked)} />
+              </td>
+              <td className="settings-notif-grid__na">—</td>
+            </tr>
           </tbody>
         </table>
 
@@ -709,6 +723,7 @@ function Settings() {
             </p>
             <select
               id="currency-select"
+              translate="no"
               className="input settings-select"
               value={currency}
               onChange={e => setCurrency(e.target.value)}
@@ -810,6 +825,16 @@ function Settings() {
       {/* ── Offline mode (#1355) ── */}
       <OfflineSettings />
 
+      </SettingsGroup>
+
+      {/* ── Early access: one switch for every feature in beta, the list of
+          them, and the way to send feedback (backend config/featureFlags) ── */}
+      <SettingsGroup
+        id="early-access"
+        title={t('settings.groups.earlyAccess.title', 'Early access')}
+        summary={t('settings.groups.earlyAccess.summary', 'Try new features before everyone else, and tell us what you think')}
+      >
+        <EarlyAccessSettings />
       </SettingsGroup>
 
       {/* ── AI & connections (none of it for demo — tokens are blocked there) ── */}

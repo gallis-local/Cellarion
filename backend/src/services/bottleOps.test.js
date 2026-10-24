@@ -62,11 +62,21 @@ describe('consumeBottle', () => {
     expect(checkRestockGap).not.toHaveBeenCalled();
 
     await consumeBottle(freshBottle(), { reason: 'drank' }, REQ);
-    expect(checkRestockGap).toHaveBeenCalledWith('u1', 'b1', 'c1');
+    expect(checkRestockGap).toHaveBeenCalledWith('u1', 'b1', 'c1', { storedVectorOnly: false });
 
     checkRestockGap.mockClear();
     await consumeBottle(freshBottle(), { reason: 'drank' }, { user: { id: 'd1', isDemo: true }, headers: {} });
     expect(checkRestockGap).not.toHaveBeenCalled();
+  });
+
+  // Nothing a token can reach may spend AI money (Johan, 2026-10-21): a
+  // consume from Home Assistant or a connected AI (an API or OAuth token —
+  // req.apiToken) compares stored vectors only and never embeds. A session
+  // consume from the web app keeps the full check.
+  test('a token consume asks the restock check for stored vectors only', async () => {
+    const TOKEN_REQ = { ...REQ, apiToken: { id: 't1', scopes: ['consume'] } };
+    await consumeBottle(freshBottle(), { reason: 'drank' }, TOKEN_REQ);
+    expect(checkRestockGap).toHaveBeenCalledWith('u1', 'b1', 'c1', { storedVectorOnly: true });
   });
 });
 
@@ -127,14 +137,16 @@ jest.mock('./enrichmentJob', () => ({ enrichWineById: jest.fn().mockResolvedValu
 jest.mock('../utils/exchangeRates', () => ({ getOrCreateDailySnapshot: jest.fn().mockResolvedValue({}) }));
 jest.mock('../utils/vintageProfile', () => ({ ensurePendingVintageProfile: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('./imageProcessor', () => ({ unlinkImageFiles: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../models/WineDefinition', () => ({ findById: jest.fn(() => ({ select: () => ({ lean: async () => ({ producer: 'Old Estate', name: 'Old Wine' }) }) })) }));
 
 const BottleModel = require('../models/Bottle');
 const BottleImage = require('../models/BottleImage');
 const WineRequest = require('../models/WineRequest');
 const { embedSinglePair } = require('./embeddingJob');
+const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
 const { enrichWineById } = require('./enrichmentJob');
 const { getOrCreateDailySnapshot } = require('../utils/exchangeRates');
-const { addBottle, updateBottleFields, removeBottleCascade } = require('./bottleOps');
+const { addBottle, updateBottleFields, removeBottleCascade, validateBottleCommitFields } = require('./bottleOps');
 
 const CELLAR = { _id: 'c1', user: 'owner1', name: 'Main Cellar' };
 const WINE = { _id: 'w1', name: 'Barolo' };
@@ -189,6 +201,26 @@ describe('addBottle (real execution)', () => {
 
     await addBottle(CELLAR, WINE, { price: 25, currency: 'EUR' }, REQ);
     expect(getOrCreateDailySnapshot).toHaveBeenCalledTimes(1); // awaited pre-save, REST parity
+  });
+
+  // 2026-10-13: Chrome's page translation made the add form send "EURO".
+  test('currency: an alias is stored as its code, an unsupported code is refused', async () => {
+    expect((await addBottle(CELLAR, WINE, { currency: 'EURO' }, REQ)).bottle.currency).toBe('EUR');
+    expect((await addBottle(CELLAR, WINE, { currency: 'eur' }, REQ)).bottle.currency).toBe('EUR');
+    expect((await addBottle(CELLAR, WINE, {}, REQ)).bottle.currency).toBe('USD');
+    expect((await addBottle(CELLAR, WINE, { currency: 'XYZ' }, REQ)).error.status).toBe(400);
+    expect((await addBottle(CELLAR, WINE, { currency: 42 }, REQ)).error.status).toBe(400);
+    // The route's pre-check (before a new wine is minted) applies the same rule.
+    expect(validateBottleCommitFields({ currency: 'XYZ' }).error.status).toBe(400);
+    expect(validateBottleCommitFields({ currency: 'EURO' }).error).toBeUndefined();
+  });
+
+  test('a scanned barcode is stored in its canonical form; a bad one never refuses the add', async () => {
+    expect((await addBottle(CELLAR, WINE, { barcode: '036000291452' }, REQ)).bottle.barcode).toBe('0036000291452'); // UPC-A → EAN-13
+    const misread = await addBottle(CELLAR, WINE, { barcode: '4006381333932' }, REQ); // wrong check digit
+    expect(misread.error).toBeUndefined();
+    expect(misread.bottle.barcode).toBeUndefined();
+    expect((await addBottle(CELLAR, WINE, {}, REQ)).bottle.barcode).toBeUndefined();
   });
 
   test('location is stored HTML-stripped and capped with the REST message', async () => {
@@ -259,6 +291,59 @@ describe('updateBottleFields (real execution)', () => {
     expect(b.drinkWindowNotifiedStatus).toBeNull();
   });
 
+  test('currency: an alias is stored as its code; only a CHANGE to an unsupported code is refused', async () => {
+    // Stored as "EURO" before writes normalised it: the form sends it back.
+    let b = liveBottle({ currency: 'EURO' });
+    let res = await updateBottleFields(b, { currency: 'EURO', price: 25 }, REQ);
+    expect(res.error).toBeUndefined();
+    expect(b.currency).toBe('EUR');
+    // An older import's code outside the list: the bottle keeps it on any save.
+    b = liveBottle({ currency: 'ILS' });
+    res = await updateBottleFields(b, { currency: 'ILS', notes: 'kept' }, REQ);
+    expect(res.error).toBeUndefined();
+    expect(b.currency).toBe('ILS');
+    expect(b.notes).toBe('kept');
+    // A change to an unsupported code, or a non-string, is refused.
+    expect((await updateBottleFields(liveBottle(), { currency: 'XYZ' }, REQ)).error.status).toBe(400);
+    expect((await updateBottleFields(liveBottle(), { currency: 7 }, REQ)).error.status).toBe(400);
+  });
+
+  // Release audit 2026-10-13: undoing a change away from an old import's code was refused.
+  test('currency: an undo (restoringPrev) puts back a previous code that is not supported', async () => {
+    const b = liveBottle({ currency: 'SEK' });
+    const res = await updateBottleFields(b, { currency: 'ILS' }, REQ, { restoringPrev: true });
+    expect(res.error).toBeUndefined();
+    expect(b.currency).toBe('ILS');
+    // Without the flag the same change is refused.
+    expect((await updateBottleFields(liveBottle({ currency: 'SEK' }), { currency: 'ILS' }, REQ)).error.status).toBe(400);
+  });
+
+  test('a barcode added to a bottle already in the cellar is stored in canonical form; a bad one is refused', async () => {
+    // The bottle page's "Add barcode": UPC-A becomes its EAN-13 form, as on add.
+    const b = liveBottle();
+    let res = await updateBottleFields(b, { barcode: '0 12345 67890 5' }, REQ);
+    expect(res.error).toBeUndefined();
+    expect(b.barcode).toBe('0012345678905');
+    expect(res.changes).toEqual({ barcode: '0012345678905' });
+
+    // Unlike on add, the user asked for exactly this — a typo is an error.
+    res = await updateBottleFields(liveBottle(), { barcode: '7310070000001' }, REQ); // wrong check digit
+    expect(res.error.status).toBe(400);
+    res = await updateBottleFields(liveBottle(), { barcode: '2001234567893' }, REQ); // shop-internal prefix
+    expect(res.error.status).toBe(400);
+  });
+
+  test('an empty barcode clears it; a demo account cannot add one (each code is a vote in the shared lookup)', async () => {
+    const b = liveBottle({ barcode: '7310070000002' });
+    const res = await updateBottleFields(b, { barcode: '' }, REQ);
+    expect(res.error).toBeUndefined();
+    expect(b.barcode).toBeNull();
+    expect(res.changes).toEqual({ barcode: null });
+
+    const demo = await updateBottleFields(liveBottle(), { barcode: '7310070000002' }, { ...REQ, user: { ...REQ.user, isDemo: true } });
+    expect(demo.error.status).toBe(403);
+  });
+
   test('audit log uses the { field: { from, to } } shape CellarAudit renders (grand-audit H2)', async () => {
     const b = liveBottle({ rating: 92, ratingScale: '100' });
     await updateBottleFields(b, { rating: null, ratingScale: '5' }, REQ);
@@ -308,11 +393,44 @@ describe('updateBottleFields (real execution)', () => {
     expect((await updateBottleFields(liveBottle(), { vintage: '20x9' }, REQ)).error.status).toBe(400);
   });
 
+  test('a changed vintage enters the sommelier maturity queue, like adding a bottle of it', async () => {
+    const b = liveBottle({ wineDefinition: 'w9' });
+    await updateBottleFields(b, { vintage: 'NV' }, REQ);
+    expect(ensurePendingVintageProfile).toHaveBeenCalledWith('w9', 'NV');
+  });
+
+  test('…but not for a bottle on order (queued when it arrives), nor when the vintage did not change', async () => {
+    await updateBottleFields(liveBottle({ wineDefinition: 'w9', status: 'ordered' }), { vintage: 2021 }, REQ);
+    await updateBottleFields(liveBottle({ wineDefinition: 'w9' }), { vintage: '2019', price: 30 }, REQ);
+    expect(ensurePendingVintageProfile).not.toHaveBeenCalled();
+  });
+
+  test('a queue failure never fails the edit', async () => {
+    ensurePendingVintageProfile.mockRejectedValueOnce(new Error('db down'));
+    const b = liveBottle({ wineDefinition: 'w9' });
+    const res = await updateBottleFields(b, { vintage: 2020 }, REQ);
+    expect(res.error).toBeUndefined();
+    expect(b.vintage).toBe('2020');
+  });
+
   test('vintage re-embed is skipped for demo users (zero AI spend guarantee)', async () => {
     const b = liveBottle({ wineDefinition: 'w9' });
     await updateBottleFields(b, { vintage: 2022 }, { user: { id: 'd1', isDemo: true }, headers: {} });
     expect(b.vintage).toBe('2022');
     expect(embedSinglePair).not.toHaveBeenCalled();
+  });
+
+  test('a changed vintage moves the bottle\'s photos to that vintage; an unchanged one leaves them alone (ticket 2026-10-09)', async () => {
+    const b = liveBottle({ wineDefinition: 'w9' });
+    await updateBottleFields(b, { vintage: 2021 }, REQ);
+    expect(BottleImage.updateMany).toHaveBeenCalledWith({ bottle: b._id }, { $set: { vintage: '2021', assignedToVintage: false } });
+    BottleImage.updateMany.mockClear();
+    await updateBottleFields(liveBottle({ wineDefinition: 'w9' }), { vintage: '2019', price: 30 }, REQ);
+    expect(BottleImage.updateMany).not.toHaveBeenCalled();
+    // A failed sync never fails the edit.
+    BottleImage.updateMany.mockRejectedValueOnce(new Error('db down'));
+    const res = await updateBottleFields(liveBottle({ wineDefinition: 'w9' }), { vintage: 'NV' }, REQ);
+    expect(res.error).toBeUndefined();
   });
 
   test('bottleSize is canonicalized on the way in', async () => {
@@ -521,9 +639,12 @@ describe('open-bottle ops (openBottle / pourFromBottle / closeBottle)', () => {
 
   test('openBottle sets the open state, re-arms the expiry alert, saves, audits', async () => {
     const bottle = freshBottle({ pours: [{ ml: 999 }], openBottleNotifiedAt: new Date() });
-    const res = await openBottle(bottle, { preservationMethod: 'coravin', openedAt: '2026-07-20' }, REQ);
+    // Relative to today: a fixed day falls outside the 90-day back-date window
+    // as the calendar moves on ('2026-07-20' started failing on 2026-10-20).
+    const openedAt = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+    const res = await openBottle(bottle, { preservationMethod: 'coravin', openedAt }, REQ);
     expect(res.error).toBeUndefined();
-    expect(bottle.openedAt).toEqual(new Date('2026-07-20'));
+    expect(bottle.openedAt).toEqual(new Date(openedAt));
     expect(bottle.preservationMethod).toBe('coravin');
     expect(bottle.pours).toEqual([]); // a fresh opening starts a fresh pour log
     expect(bottle.openBottleNotifiedAt).toBeNull();
@@ -696,5 +817,159 @@ describe('consumedLoggedAt and the restore window (post-ship audit 2026-09-03)',
     expect(checkRestockGap).not.toHaveBeenCalled();
     await consumeBottle(freshBottle(), { reason: 'drank' }, REQ);
     expect(checkRestockGap).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── On order (bought, not delivered yet) ────────────────────────────────────
+describe('bottles on order', () => {
+  const { markArrived, openBottle, pourFromBottle } = require('./bottleOps');
+  const ordered = (over = {}) => freshBottle({ status: 'ordered', addedToCellarAt: new Date('2026-01-01T12:00:00Z'), ...over });
+
+  test('addBottle onOrder creates the bottle ordered, with the expected MONTH, audited as on order', async () => {
+    const res = await addBottle(CELLAR, WINE, { vintage: '2023', onOrder: true, expectedArrival: '2027-03' }, REQ);
+    expect(res.error).toBeUndefined();
+    expect(res.bottle.status).toBe('ordered');
+    expect(res.bottle.expectedArrival.toISOString()).toBe('2027-03-01T12:00:00.000Z');
+    expect(logAudit).toHaveBeenCalledWith(REQ, 'bottle.add', expect.anything(),
+      { wineName: 'Barolo', vintage: '2023', onOrder: true });
+  });
+
+  test('a bottle on order is NOT queued for a sommelier drink window (an en primeur vintage may be unreleased); an ordinary add is', async () => {
+    const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
+    ensurePendingVintageProfile.mockClear();
+    await addBottle(CELLAR, WINE, { vintage: '2024', onOrder: true }, REQ);
+    expect(ensurePendingVintageProfile).not.toHaveBeenCalled();
+    await addBottle(CELLAR, WINE, { vintage: '2024' }, REQ);
+    expect(ensurePendingVintageProfile).toHaveBeenCalledWith('w1', '2024');
+  });
+
+  test('addBottle onOrder without a date is fine; a bad month or a history add is a 400', async () => {
+    const noDate = await addBottle(CELLAR, WINE, { vintage: '2023', onOrder: true }, REQ);
+    expect(noDate.bottle.status).toBe('ordered');
+    expect(noDate.bottle.expectedArrival).toBeUndefined();
+    expect((await addBottle(CELLAR, WINE, { vintage: '2023', onOrder: true, expectedArrival: '2027-13' }, REQ)).error.status).toBe(400);
+    expect((await addBottle(CELLAR, WINE, { vintage: '2023', onOrder: true, expectedArrival: '2207-01' }, REQ)).error.status).toBe(400);
+    expect((await addBottle(CELLAR, WINE, { vintage: '2023', onOrder: true, addToHistory: true }, REQ)).error.status).toBe(400);
+  });
+
+  test('nothing on order can be drunk, opened or poured (409 not_arrived, nothing saved)', async () => {
+    for (const res of [
+      await consumeBottle(ordered(), { reason: 'drank' }, REQ),
+      await openBottle(ordered(), { preservationMethod: 'vacuum' }, REQ),
+      await pourFromBottle(ordered({ openedAt: new Date() }), {}, REQ),
+    ]) {
+      expect(res.error).toMatchObject({ status: 409, code: 'not_arrived' });
+    }
+    expect(Rack.updateMany).not.toHaveBeenCalled();
+  });
+
+  test('markArrived: ordered → active, arrival day becomes addedToCellarAt, marker cleared, audited', async () => {
+    const b = ordered({ expectedArrival: new Date('2026-09-01T12:00:00Z'), arrivalNotifiedAt: new Date() });
+    const res = await markArrived(b, {}, REQ);
+    expect(res.error).toBeUndefined();
+    expect(b.status).toBe('active');
+    expect(b.arrivedAt).toBeInstanceOf(Date);
+    expect(b.addedToCellarAt).toBe(b.arrivedAt);
+    expect(b.arrivalNotifiedAt).toBeUndefined();
+    expect(b.save).toHaveBeenCalled();
+    expect(logAudit).toHaveBeenCalledWith(REQ, 'bottle.arrive', { type: 'bottle', id: 'b1', cellarId: 'c1' },
+      { expectedArrival: new Date('2026-09-01T12:00:00Z') });
+  });
+
+  test('markArrived takes a day (noon UTC), refuses the future and a bottle not on order', async () => {
+    const b = ordered();
+    await markArrived(b, { arrivedAt: '2026-09-18' }, REQ);
+    expect(b.arrivedAt.toISOString()).toBe('2026-09-18T12:00:00.000Z');
+    expect((await markArrived(ordered(), { arrivedAt: new Date(Date.now() + 5 * 86400000).toISOString() }, REQ)).error.status).toBe(400);
+    expect((await markArrived(freshBottle(), {}, REQ)).error).toMatchObject({ status: 409, code: 'not_on_order' });
+  });
+
+  test('markArrived refuses a day before the order; the order day itself is fine', async () => {
+    const placed = () => ordered({ createdAt: new Date('2026-09-10T15:00:00Z') });
+    expect((await markArrived(placed(), { arrivedAt: '2026-09-09' }, REQ)).error).toMatchObject({ status: 400 });
+    expect((await markArrived(placed(), { arrivedAt: '2026-09-10' }, REQ)).error).toBeUndefined();
+  });
+
+  test('markArrived queues the vintage for a drink window and embeds it (not for demo accounts)', async () => {
+    const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
+    await markArrived(ordered({ wineDefinition: 'w9', vintage: '2022' }), {}, REQ);
+    expect(ensurePendingVintageProfile).toHaveBeenCalledWith('w9', '2022');
+    expect(embedSinglePair).toHaveBeenCalledWith('w9', '2022');
+
+    embedSinglePair.mockClear();
+    await markArrived(ordered({ wineDefinition: 'w9', vintage: '2022' }), {}, { user: { id: 'd1', isDemo: true }, headers: {} });
+    expect(embedSinglePair).not.toHaveBeenCalled();
+  });
+
+  test('updateBottleFields: expectedArrival changes (and re-arms the reminder) only on a bottle on order', async () => {
+    const b = new BottleModel({ cellar: 'c1', status: 'ordered', vintage: '2023', ratingScale: '5', arrivalNotifiedAt: new Date() });
+    const res = await updateBottleFields(b, { expectedArrival: '2027-05' }, REQ);
+    expect(res.changes.expectedArrival.toISOString()).toBe('2027-05-01T12:00:00.000Z');
+    expect(b.arrivalNotifiedAt).toBeUndefined();
+
+    const active = new BottleModel({ cellar: 'c1', status: 'active', vintage: '2023', ratingScale: '5' });
+    const res2 = await updateBottleFields(active, { expectedArrival: '2027-05' }, REQ);
+    expect(res2.changes).toEqual({});
+    expect(active.expectedArrival).toBeUndefined();
+
+    expect((await updateBottleFields(new BottleModel({ cellar: 'c1', status: 'ordered', vintage: '2023' }), { expectedArrival: 'soon' }, REQ)).error.status).toBe(400);
+  });
+
+  test('a cancelled order is removed with the same cascade as a mistake', async () => {
+    const b = new BottleModel({ cellar: 'c1', status: 'ordered', pendingWineRequest: null });
+    const res = await removeBottleCascade(b, REQ, 'bottle.undo');
+    expect(res.removed).toBe(true);
+    expect(b.deleteOne).toHaveBeenCalled();
+  });
+});
+
+// ── Change wine (a bottle saved under the wrong registry wine) ──────────────
+describe('changeBottleWine', () => {
+  const { changeBottleWine } = require('./bottleOps');
+  const NEW_WINE = { _id: 'w-red', producer: 'Domaine du Vieux Lazaret', name: 'Châteauneuf-du-Pape' };
+  const saved = (over = {}) => freshBottle({ wineDefinition: 'w-white', vintage: '2021', status: 'active', ...over });
+
+  test('moves the bottle, keeps its own data, moves its own photos (not an official picture), audits from → to', async () => {
+    const b = saved({ price: 30, notes: 'birthday', rating: 4 });
+    const res = await changeBottleWine(b, NEW_WINE, REQ);
+    expect(res.error).toBeUndefined();
+    expect(b.wineDefinition).toBe('w-red');
+    expect(b).toMatchObject({ price: 30, notes: 'birthday', rating: 4, vintage: '2021', status: 'active' });
+    expect(b.save).toHaveBeenCalled();
+    expect(BottleImage.updateMany).toHaveBeenCalledWith(
+      { bottle: 'b1', assignedToWine: { $ne: true } }, { $set: { wineDefinition: 'w-red' } });
+    expect(logAudit).toHaveBeenCalledWith(REQ, 'bottle.change_wine', { type: 'bottle', id: 'b1', cellarId: 'c1' },
+      expect.objectContaining({ fromWineId: 'w-white', fromWine: 'Old Estate — Old Wine', toWineId: 'w-red', toWine: 'Domaine du Vieux Lazaret — Châteauneuf-du-Pape', vintage: '2021' }));
+    expect(Rack.updateMany).not.toHaveBeenCalled(); // the rack slot stays
+  });
+
+  test('queues the new vintage for a drink window and embeds it — but not the queue for a bottle on order', async () => {
+    const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
+    ensurePendingVintageProfile.mockClear(); embedSinglePair.mockClear();
+    await changeBottleWine(saved(), NEW_WINE, REQ);
+    expect(ensurePendingVintageProfile).toHaveBeenCalledWith('w-red', '2021');
+    expect(embedSinglePair).toHaveBeenCalledWith('w-red', '2021');
+
+    ensurePendingVintageProfile.mockClear();
+    await changeBottleWine(saved({ status: 'ordered' }), NEW_WINE, REQ);
+    expect(ensurePendingVintageProfile).not.toHaveBeenCalled();
+  });
+
+  test('refuses the wine it already is', async () => {
+    const b = saved({ wineDefinition: 'w-red' });
+    expect((await changeBottleWine(b, NEW_WINE, REQ)).error).toMatchObject({ status: 400, code: 'same_wine' });
+    expect(b.save).not.toHaveBeenCalled();
+  });
+
+  test('a bottle waiting on an import request leaves it; the request goes only when nobody else waits on it', async () => {
+    BottleModel.countDocuments.mockResolvedValueOnce(2);
+    const b1 = saved({ wineDefinition: null, pendingWineRequest: 'req1' });
+    await changeBottleWine(b1, NEW_WINE, REQ);
+    expect(b1.pendingWineRequest).toBeUndefined();
+    expect(WineRequest.deleteOne).not.toHaveBeenCalled();
+
+    BottleModel.countDocuments.mockResolvedValueOnce(0);
+    await changeBottleWine(saved({ wineDefinition: null, pendingWineRequest: 'req1' }), NEW_WINE, REQ);
+    expect(WineRequest.deleteOne).toHaveBeenCalledWith({ _id: 'req1', status: 'pending' });
   });
 });

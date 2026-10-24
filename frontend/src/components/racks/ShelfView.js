@@ -4,7 +4,7 @@ import useSlotDrag from '../../hooks/useSlotDrag';
 import { isReserved } from '../../utils/reservation';
 import { swatchType } from '../../utils/wineColour';
 import { ReservedRibbon } from './RackRenderer';
-import { cabinetBays, cabinetBayUnits, cabinetRowWidth } from '../../utils/rackLayouts';
+import { cabinetBays, cabinetBayUnits, cabinetRowWidth, cabinetBayOpts, cabinetRowOffset, cabinetHeadToTail, cabinetNeckForward, cabinetSlotSideways, cabinetNeckIndex } from '../../utils/rackLayouts';
 import './ShelfView.css';
 
 const WINE_COLORS = {
@@ -19,6 +19,10 @@ const WINE_COLORS = {
 const BOTTLE_RX = 16; // horizontal radius (oval — top-down silhouette)
 const BOTTLE_RY = 22; // vertical radius (longer axis = bottle length)
 const BOTTLE_GAP = 8;  // gap between bottles in a row
+// A bottle lying across the shelf (typeConfig.shelfSideways): the oval turned,
+// as wide as one bottle pitch so it never touches its neighbours.
+const SIDE_RX = (BOTTLE_RX * 2 + BOTTLE_GAP) / 2;
+const SIDE_RY = 13;
 const SHELF_PAD_Y = 12;
 const SHELF_LABEL_W = 64;
 
@@ -55,6 +59,7 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
   const rows = rack?.rows || 0;
   const twoDeep = rack?.typeConfig?.twoDeep !== false;
   const stagger = rack?.typeConfig?.stagger !== false;
+  const headToTail = isCabinet && cabinetHeadToTail(rack?.typeConfig);
   const hasBack = isCabinet ? twoDeep : backCols > 0;
   // Ovals per row on the active layer (drives the "no cells" message + width).
   const layerCols = isCabinet ? cols : (layerMode === 'front' ? cols : backCols);
@@ -87,11 +92,10 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
         const rowCount = bay.rows;
         const levels = twoDeep ? Math.ceil(rowCount / 2) : rowCount;
         const height = SHELF_PAD_Y * 2 + levels * rowPitch - BOTTLE_GAP;
-        const nest = bay.alternate || stagger;
-        const x0 = ((units - cabinetBayUnits(bay, drawOpts)) / 2) * colPitch;
+        const x0 =((units - cabinetBayUnits(bay, drawOpts)) / 2) * colPitch;
         const slots = [];
         for (let r = 1; r <= rowCount; r++) {
-          const width = cabinetRowWidth(r, bay.cols, { twoDeep, alternate: bay.alternate });
+          const width = cabinetRowWidth(r, bay.cols, cabinetBayOpts(bay, twoDeep));
           const start = pos;
           pos += width;
           const isBackRow = twoDeep && r % 2 === 0;
@@ -99,12 +103,18 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
           const level = twoDeep ? Math.ceil(r / 2) : r;
           const cy = height - SHELF_PAD_Y - BOTTLE_RY - (level - 1) * rowPitch;
           // Nested levels alternate half a bottle left and right; on an
-          // alternating bay it is the narrow rows that sit offset.
-          const nudge = bay.alternate
-            ? (width < bay.cols ? colPitch / 2 : 0)
-            : (nest && bay.cols > 1 && level % 2 === 0 ? colPitch / 2 : 0);
+          // alternating bay it is the narrow rows that sit offset; a level
+          // resting behind a bottle across the front also skips that
+          // bottle's cell (rackLayouts.cabinetRowOffset).
+          const nudge = cabinetRowOffset(bay, r, { twoDeep, stagger }) * colPitch;
           for (let c = 0; c < width; c++) {
-            slots.push({ position: start + c + 1, cx: x0 + slotX(c) + nudge, cy });
+            // Head to tail: every other bottle lies neck forward (drawn flipped).
+            // A bottle lying across the shelf is drawn turned, in its cell.
+            const sideways = cabinetSlotSideways(bay, r, c);
+            slots.push({
+              position: start + c + 1, cx: x0 + slotX(c) + nudge, cy, sideways,
+              neck: headToTail && !sideways && cabinetNeckForward(cabinetNeckIndex(bay, r, c)),
+            });
           }
         }
         shelves.push({ number: bays.length - i, y, height, slots });
@@ -131,8 +141,8 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
     const width = SHELF_LABEL_W + BOTTLE_GAP + perRow * (BOTTLE_RX * 2 + BOTTLE_GAP);
     return { shelves, width, height: y };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isCabinet, rows, cols, backCols, bpc, twoDeep, stagger, layerMode, rack?.typeConfig?.shelfRows,
-    rack?.typeConfig?.shelfCols, rack?.typeConfig?.shelfAlternate, rack?.typeConfig?.alternate, rowPitch, colPitch]);
+  }, [isCabinet, rows, cols, backCols, bpc, twoDeep, stagger, headToTail, layerMode, rack?.typeConfig?.shelfRows,
+    rack?.typeConfig?.shelfCols, rack?.typeConfig?.shelfAlternate, rack?.typeConfig?.shelfSideways, rack?.typeConfig?.alternate, rowPitch, colPitch]);
 
   // Absolute svg coords of every visible oval on the active layer — the
   // drag hit map (mirrors the geometry in the render loop below).
@@ -250,6 +260,8 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
                     key={s.position}
                     cx={cx}
                     cy={cy}
+                    neck={!!s.neck}
+                    sideways={!!s.sideways}
                     slot={s.slot}
                     position={s.position}
                     disabled={disabledSet.has(s.position)}
@@ -293,7 +305,7 @@ export default function ShelfView({ rack, activePosition, highlightPos, onSlotCl
   );
 }
 
-function BottleOval({ cx, cy, slot, position, disabled, isActive, isHighlight, onClick, getSlotStyle, onDragStart, isDragOrigin, isDragTarget, zoneColor }) {
+function BottleOval({ cx, cy, neck = false, sideways = false, slot, position, disabled, isActive, isHighlight, onClick, getSlotStyle, onDragStart, isDragOrigin, isDragTarget, zoneColor }) {
   const { t } = useTranslation();
   const bottle = slot?.bottle;
   const wine = bottle?.wineDefinition;
@@ -307,12 +319,15 @@ function BottleOval({ cx, cy, slot, position, disabled, isActive, isHighlight, o
   // as coming from that slot.
   const dimStyle = isDragOrigin ? { opacity: 0.3 } : custom?.dim ? { opacity: 0.22 } : null;
   const draggable = !!(filled && onDragStart);
+  // A bottle lying across the shelf: the oval turns, its long axis across.
+  const rx = sideways ? SIDE_RX : BOTTLE_RX;
+  const ry = sideways ? SIDE_RY : BOTTLE_RY;
 
   // Disabled (unusable) position: greyed oval with a subtle diagonal cross.
   // Still clickable so editors can re-enable it from the slot popup.
   if (disabled) {
-    const dx = BOTTLE_RX * 0.5;
-    const dy = BOTTLE_RY * 0.5;
+    const dx = rx * 0.5;
+    const dy = ry * 0.5;
     return (
       <g
         onClick={onClick}
@@ -326,8 +341,8 @@ function BottleOval({ cx, cy, slot, position, disabled, isActive, isHighlight, o
         <ellipse
           cx={cx}
           cy={cy}
-          rx={BOTTLE_RX}
-          ry={BOTTLE_RY}
+          rx={rx}
+          ry={ry}
           fill="rgba(90, 74, 56, 0.12)"
           stroke="#A89880"
           strokeWidth={1.5}
@@ -343,6 +358,9 @@ function BottleOval({ cx, cy, slot, position, disabled, isActive, isHighlight, o
   const fillColor = filled ? (custom?.fill || colors.fill) : 'transparent';
   const strokeColor = filled ? (custom?.stroke || colors.stroke) : '#B09060';
   const textColor = custom?.text || colors?.text;
+  // A neck-forward bottle (head-to-tail cabinet) is drawn upside down: its
+  // neck mark at the other end of the oval.
+  const flip = neck ? -1 : 1;
 
   return (
     <g
@@ -353,16 +371,16 @@ function BottleOval({ cx, cy, slot, position, disabled, isActive, isHighlight, o
       tabIndex={0}
       className={`shelf-view-bottle ${filled ? 'filled' : 'empty'} ${isActive ? 'active' : ''} ${isHighlight ? 'highlight' : ''}`}
       aria-label={filled
-        ? `${wine?.name || 'Wine'} ${bottle?.vintage || ''}${isReserved(bottle) ? ` — ${t('rackView.reservedAria', 'reserved')}` : ''}`
-        : `Empty slot ${position}`}
+        ? `${wine?.name || 'Wine'} ${bottle?.vintage || ''}${neck ? `, ${t('rackView.neckForwardAria', 'neck forward')}` : ''}${sideways ? `, ${t('rackView.sidewaysAria', 'lying across')}` : ''}${isReserved(bottle) ? ` — ${t('rackView.reservedAria', 'reserved')}` : ''}`
+        : `Empty slot ${position}${sideways ? `, ${t('rackView.sidewaysAria', 'lying across')}` : ''}`}
       style={{ ...(draggable ? { cursor: 'grab' } : null), ...dimStyle }}
     >
       {zoneColor && (
         <ellipse
           cx={cx}
           cy={cy}
-          rx={BOTTLE_RX + 4}
-          ry={BOTTLE_RY + 4}
+          rx={rx + 4}
+          ry={ry + 4}
           fill={zoneColor}
           opacity={0.3}
           pointerEvents="none"
@@ -371,36 +389,46 @@ function BottleOval({ cx, cy, slot, position, disabled, isActive, isHighlight, o
       <ellipse
         cx={cx + 0.5}
         cy={cy + 1}
-        rx={BOTTLE_RX}
-        ry={BOTTLE_RY}
+        rx={rx}
+        ry={ry}
         fill="rgba(0,0,0,0.10)"
         pointerEvents="none"
       />
       <ellipse
         cx={cx}
         cy={cy}
-        rx={BOTTLE_RX}
-        ry={BOTTLE_RY}
+        rx={rx}
+        ry={ry}
         fill={fillColor}
         stroke={strokeColor}
         strokeWidth={isActive || isHighlight ? 2.5 : 1.5}
         strokeDasharray={filled ? null : '3 2'}
       />
-      {filled && (
+      {filled && (sideways ? (
+        // Lying across: the neck mark at the right-hand end.
+        <ellipse
+          cx={cx + rx * 0.55}
+          cy={cy}
+          rx={BOTTLE_RX * 0.35}
+          ry={BOTTLE_RX * 0.42}
+          fill="rgba(0,0,0,0.35)"
+          pointerEvents="none"
+        />
+      ) : (
         <ellipse
           cx={cx}
-          cy={cy - BOTTLE_RY * 0.45}
+          cy={cy - flip * BOTTLE_RY * 0.45}
           rx={BOTTLE_RX * 0.42}
           ry={BOTTLE_RX * 0.35}
           fill="rgba(0,0,0,0.35)"
           pointerEvents="none"
         />
-      )}
+      ))}
       {filled && isReserved(bottle) && <ReservedRibbon cx={cx} cy={cy} r={BOTTLE_RY * 0.9} />}
       {filled && bottle?.vintage && bottle.vintage !== 'NV' && (
         <text
-          x={cx}
-          y={cy + BOTTLE_RY * 0.15}
+          x={sideways ? cx - rx * 0.15 : cx}
+          y={sideways ? cy : cy + flip * BOTTLE_RY * 0.15}
           textAnchor="middle"
           dominantBaseline="central"
           className="shelf-view-vintage"
@@ -423,7 +451,7 @@ function BottleOval({ cx, cy, slot, position, disabled, isActive, isHighlight, o
       {isDragTarget && (
         <ellipse
           cx={cx} cy={cy}
-          rx={BOTTLE_RX + 3} ry={BOTTLE_RY + 3}
+          rx={rx + 3} ry={ry + 3}
           fill="none"
           stroke="#7A1E2D"
           strokeWidth={2.5}

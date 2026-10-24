@@ -100,20 +100,103 @@ describe('AddBottle — "Place your bottles now?" (issue #1055)', () => {
     expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1/racks', { state: { placeQueue: ['b1', 'b2'] } });
   });
 
-  test('"Not now" goes to the cellar page exactly as before', async () => {
+  // The cellar page then says what was added, with "Add another bottle"
+  // (newcomer walkthrough 2026-10-15).
+  // Not opened from the list here (no `cameFrom`): the add page is replaced,
+  // so Back never lands on an emptied form — from the place dialog too, once
+  // its own Back entry is gone (release audit 2026-10-16).
+  const NOTICE = { addedNotice: { name: 'Kaefferkopf 2019', count: 2, history: false, onOrder: false } };
+  const ADDED = { replace: true, state: NOTICE };
+
+  test('"Not now" goes to the cellar page, which says what was added', async () => {
     routeApi({ racks: [{ _id: 'r1' }] });
     await submitTwoBottles();
     await waitFor(() => expect(screen.getByText('addBottle.placePrompt.title')).toBeInTheDocument());
 
     fireEvent.click(screen.getByText('addBottle.placePrompt.notNow'));
-    expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1');
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1', ADDED));
   });
 
   test('a cellar WITHOUT racks never sees the offer', async () => {
     routeApi({ racks: [] });
     await submitTwoBottles();
 
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1'));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1', ADDED));
     expect(screen.queryByText('addBottle.placePrompt.title')).not.toBeInTheDocument();
+  });
+
+  test('Cancel leaves without a notice: nothing was added', async () => {
+    routeApi({ racks: [] });
+    render(<AddBottle />);
+    fireEvent.click(screen.getByText('addBottle.searchManuallyInstead'));
+    fireEvent.change(screen.getByPlaceholderText('addBottle.searchPlaceholder'), { target: { value: 'kaefferkopf kaysersberg' } });
+    await act(async () => { fireEvent.click(screen.getByText('addBottle.searchBtn')); });
+    await act(async () => { fireEvent.click(screen.getByText('addBottle.cantFindAiTitle')); });
+    await act(async () => { fireEvent.click(screen.getByText('addBottle.aiAddAndUse')); });
+    await waitFor(() => expect(screen.getByText('common.cancel')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('common.cancel'));
+    expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1');
+  });
+});
+
+// The name is the wine the server filed the bottles under, not what was typed:
+// a "did you mean?" pick at commit, or a resolve to an existing wine.
+test('the notice names the wine the bottles were saved under', async () => {
+  apiFetchMock.mockImplementation(async (url) => {
+    if (url.startsWith('/api/racks?cellar=')) return jsonRes({ racks: [] });
+    apiFetchMock.__n = (apiFetchMock.__n || 0) + 1;
+    return jsonRes({ bottle: { _id: `s${apiFetchMock.__n}`, wineDefinition: { _id: 'w-x', name: 'Kaefferkopf Grand Cru' }, vintage: '2019' }, priceWarnings: [] }, true, 201);
+  });
+  await submitTwoBottles();
+  await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1', {
+    replace: true, state: { addedNotice: { name: 'Kaefferkopf Grand Cru 2019', count: 2, history: false, onOrder: false } },
+  }));
+});
+
+// Release audit 2026-10-16: opened from the cellar list, a save goes BACK to
+// it (a second copy of the list made the first Back dead), and the notice
+// waits for it in sessionStorage — router state cannot ride a pop.
+describe('back to the list it came from', () => {
+  const store = () => {
+    const m = new Map();
+    return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k), clear: () => m.clear() };
+  };
+  beforeEach(() => vi.stubGlobal('sessionStorage', store()));
+  afterEach(() => { vi.unstubAllGlobals(); window.history.replaceState(null, ''); });
+
+  test('a save goes back to the cellar list and leaves the notice there', async () => {
+    window.history.replaceState({ usr: { cameFrom: '/cellars/cellar1' }, key: 'add', idx: 3 }, '');
+    routeApi({ racks: [] });
+    await submitTwoBottles();
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith(-1));
+    expect(JSON.parse(sessionStorage.getItem('cellarion.handOver'))).toMatchObject({
+      key: 'addedNotice', path: '/cellars/cellar1', value: { name: 'Kaefferkopf 2019', count: 2, history: false, onOrder: false },
+    });
+  });
+
+  test('Cancel with nothing saved goes back to the list it came from (no second copy of it)', async () => {
+    window.history.replaceState({ usr: { cameFrom: '/cellars/cellar1' }, key: 'add', idx: 3 }, '');
+    routeApi({ racks: [] });
+    render(<AddBottle />);
+    fireEvent.click(screen.getByText('addBottle.searchManuallyInstead'));
+    fireEvent.change(screen.getByPlaceholderText('addBottle.searchPlaceholder'), { target: { value: 'kaefferkopf kaysersberg' } });
+    await act(async () => { fireEvent.click(screen.getByText('addBottle.searchBtn')); });
+    await act(async () => { fireEvent.click(screen.getByText('addBottle.cantFindAiTitle')); });
+    await act(async () => { fireEvent.click(screen.getByText('addBottle.aiAddAndUse')); });
+    fireEvent.click(await screen.findByText('common.cancel'));
+    expect(navigateMock).toHaveBeenCalledWith(-1);
+    expect(sessionStorage.getItem('cellarion.handOver')).toBeNull();
+  });
+
+  test('"Add another" after an add on order starts on order', async () => {
+    window.history.replaceState({ usr: { cameFrom: '/cellars/cellar1/on-order', addMode: 'onOrder' }, key: 'add', idx: 3 }, '');
+    routeApi({ racks: [] });
+    render(<AddBottle />);
+    fireEvent.click(screen.getByText('addBottle.searchManuallyInstead'));
+    fireEvent.change(screen.getByPlaceholderText('addBottle.searchPlaceholder'), { target: { value: 'kaefferkopf kaysersberg' } });
+    await act(async () => { fireEvent.click(screen.getByText('addBottle.searchBtn')); });
+    await act(async () => { fireEvent.click(screen.getByText('addBottle.cantFindAiTitle')); });
+    await act(async () => { fireEvent.click(screen.getByText('addBottle.aiAddAndUse')); });
+    expect(await screen.findByText('addBottle.addOnOrderBtn')).toBeInTheDocument();
   });
 });

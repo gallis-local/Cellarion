@@ -1,6 +1,6 @@
-import { Suspense } from 'react';
+import { Suspense, useEffect } from 'react';
 import { lazy } from './utils/lazyWithReload';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useParams } from 'react-router-dom';
 import { HelmetProvider } from 'react-helmet-async';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import OfflineSync from './components/OfflineSync';
@@ -10,6 +10,7 @@ import Layout from './components/Layout';
 import ProtectedRoute from './components/ProtectedRoute';
 import ReconsentModal from './components/ReconsentModal';
 import Analytics from './components/Analytics';
+import { loadFeatureFlags } from './utils/featureFlags';
 import './styles/common.css';
 
 // Lazy-load all pages so each route gets its own chunk.
@@ -32,6 +33,8 @@ const CellarRacks     = lazy(() => import('./pages/CellarRacks'));
 const CellarBook      = lazy(() => import('./pages/CellarBook'));
 const BottleDetail    = lazy(() => import('./pages/BottleDetail'));
 const CellarHistory   = lazy(() => import('./pages/CellarHistory'));
+const CellarOnOrder   = lazy(() => import('./pages/CellarOnOrder'));
+const CellarVintage = lazy(() => import('./pages/CellarVintage'));
 const CellarAudit     = lazy(() => import('./pages/CellarAudit'));
 const WineRequests    = lazy(() => import('./pages/WineRequests'));
 const WineDrafts      = lazy(() => import('./pages/WineDrafts'));
@@ -71,7 +74,11 @@ const AdminBlogEditor      = lazy(() => import('./pages/AdminBlogEditor'));
 const NfcRedirect          = lazy(() => import('./pages/NfcRedirect'));
 const Wishlist             = lazy(() => import('./pages/Wishlist'));
 const AddToWishlist        = lazy(() => import('./pages/AddToWishlist'));
+const PickLists            = lazy(() => import('./pages/PickLists'));
+const PickList             = lazy(() => import('./pages/PickList'));
+const CuratorQuestion      = lazy(() => import('./pages/CuratorQuestion'));
 const Unsubscribed         = lazy(() => import('./pages/Unsubscribed'));
+const DeleteAccountLink    = lazy(() => import('./pages/DeleteAccountLink'));
 const Recommendations      = lazy(() => import('./pages/Recommendations'));
 const Journal              = lazy(() => import('./pages/Journal'));
 const Restock              = lazy(() => import('./pages/Restock'));
@@ -82,9 +89,28 @@ const GrapeDetail          = lazy(() => import('./pages/GrapeDetail'));
 const WineTypeDetail       = lazy(() => import('./pages/WineTypeDetail'));
 const Help                 = lazy(() => import('./pages/Help'));
 const ConnectAi            = lazy(() => import('./pages/ConnectAi'));
+const ConnectClaude        = lazy(() => import('./pages/ConnectClaude'));
+const Developers           = lazy(() => import('./pages/Developers'));
 const WineLists            = lazy(() => import('./pages/WineLists'));
 const WineListEditor       = lazy(() => import('./pages/WineListEditor'));
 const PublicWineList       = lazy(() => import('./pages/PublicWineList'));
+
+// The page of one wine and vintage (the early-access layout, out for
+// everyone since 2026-10-13 — the classic page and its flag are gone).
+// Keyed by the address: one vintage page links to another (its "Other
+// vintages"), and the next one must start fresh — no notice, open window or
+// folded list carried over from the last.
+function VintagePage() {
+  const { id, wineId, vintage } = useParams();
+  return <CellarVintage key={`${id}/${wineId}/${vintage}`} />;
+}
+
+// A public wine page links to other wines ("More wines"); keyed by the
+// address so the next one starts fresh — no earlier wine, error or scroll.
+function WinePage() {
+  const { idOrSlug } = useParams();
+  return <WineDetail key={idOrSlug} />;
+}
 
 function AppRoutes() {
   const { user, loading } = useAuth();
@@ -115,6 +141,7 @@ function AppRoutes() {
         <Route path="/privacy" element={<PrivacyPolicy />} />
         <Route path="/terms" element={<RegistryTerms />} />
         <Route path="/unsubscribed" element={<Unsubscribed />} />
+        <Route path="/delete-account" element={<DeleteAccountLink />} />
 
         {/* Protected routes wrapped in Layout */}
         <Route path="/" element={<LandingPage />} />
@@ -224,6 +251,22 @@ function AppRoutes() {
           }
         />
         <Route
+          path="/cellars/:id/on-order"
+          element={
+            <ProtectedRoute>
+              <Layout><CellarOnOrder /></Layout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/cellars/:id/vintages/:wineId/:vintage"
+          element={
+            <ProtectedRoute>
+              <Layout><VintagePage /></Layout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
           path="/cellars/:id/audit"
           element={
             <ProtectedRoute>
@@ -244,6 +287,35 @@ function AppRoutes() {
           element={
             <ProtectedRoute>
               <Layout><WineDrafts /></Layout>
+            </ProtectedRoute>
+          }
+        />
+        {/* Pick lists (early access, flag pickLists). The list page sits outside
+            Layout, like Cellar Book, so Print gives a clean sheet. */}
+        <Route
+          path="/pick-lists"
+          element={
+            <ProtectedRoute>
+              <Layout><PickLists /></Layout>
+            </ProtectedRoute>
+          }
+        />
+        {/* A curator question from a notification: goes on to a bottle of the
+            wine the member can open now, or shows the question on its own
+            (support ticket 2026-10-14). */}
+        <Route
+          path="/questions/:id"
+          element={
+            <ProtectedRoute>
+              <Layout><CuratorQuestion /></Layout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/pick-lists/:id"
+          element={
+            <ProtectedRoute>
+              <PickList />
             </ProtectedRoute>
           }
         />
@@ -398,7 +470,7 @@ function AppRoutes() {
 
         {/* Public content — no auth required */}
         <Route path="/menu/:token" element={<PublicWineList />} />
-        <Route path="/wines/:idOrSlug" element={<WineDetail />} />
+        <Route path="/wines/:idOrSlug" element={<WinePage />} />
         <Route path="/wines/type/:type" element={<WineTypeDetail />} />
         <Route path="/regions/:slug" element={<RegionDetail />} />
         <Route path="/countries/:slug" element={<CountryDetail />} />
@@ -409,6 +481,10 @@ function AppRoutes() {
         {/* Public set-up docs for the MCP connector. Distinct from
             /connect-ai/authorize above, which is the OAuth consent screen. */}
         <Route path="/connect-ai" element={<Layout><ConnectAi /></Layout>} />
+        {/* The beginner's guide to connecting Claude — Cellar Chat points here. */}
+        <Route path="/connect-ai/claude" element={<Layout><ConnectClaude /></Layout>} />
+        {/* The API guide and reference — public, English only. */}
+        <Route path="/developers" element={<Layout><Developers /></Layout>} />
 
         {/* Admin routes */}
         <Route
@@ -571,6 +647,9 @@ function AppRoutes() {
 }
 
 function App() {
+  // Ask for the feature flags as the app starts, so the cellar list already
+  // knows which screens to show (utils/featureFlags; cached between visits).
+  useEffect(() => { loadFeatureFlags(); }, []);
   return (
     <HelmetProvider>
       <ThemeProvider>

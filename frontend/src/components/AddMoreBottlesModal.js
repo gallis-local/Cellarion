@@ -3,11 +3,12 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { createBottle } from '../api/bottles';
 import Modal from './Modal';
+import { bottleCopyPayload, MAX_COPIES } from '../utils/bottleCopy';
 
 // Cap per batch — this flow tops up a bottle you already registered (a case or
 // two), it is not the bulk importer. Matches the sequential-POST budget the
 // Add Bottle page tolerates.
-const MAX_MORE = 24;
+const MAX_MORE = MAX_COPIES;
 
 /**
  * Add more bottles of a wine directly from a bottle you already registered —
@@ -24,14 +25,16 @@ const MAX_MORE = 24;
  *
  * Props: bottle (the populated bottle being viewed — must have a
  * wineDefinition), onClose(), onAdded(count) — fired only when the whole
- * batch succeeded.
+ * batch succeeded. copyDetailsDefault: whether "Copy this bottle's details"
+ * starts ticked — off for "Add again" of a bottle already drunk, a new
+ * purchase whose date, price, shop, notes and occasion are not the old one's.
  */
-function AddMoreBottlesModal({ bottle, onClose, onAdded }) {
+function AddMoreBottlesModal({ bottle, onClose, onAdded, copyDetailsDefault = true }) {
   const { t } = useTranslation();
   const { apiFetch } = useAuth();
   const countId = useId();
   const [count, setCount] = useState(1);
-  const [copyDetails, setCopyDetails] = useState(true);
+  const [copyDetails, setCopyDetails] = useState(copyDetailsDefault);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
   // Bottles already created by earlier attempts of THIS batch — a retry after
@@ -47,35 +50,9 @@ function AddMoreBottlesModal({ bottle, onClose, onAdded }) {
   // would silently mix differently-shaped bottles into one batch.
   const locked = saving || createdSoFar > 0;
 
-  // What a copy is made of — only fields POST /api/bottles accepts (see
-  // backend bottleOps.addBottle):
-  // - wine / cellar / vintage / bottleSize / currency always travel: "more of
-  //   this bottle" means the same wine, same vintage, same format, same
-  //   cellar — and the same currency even when details are unticked, because
-  //   the backend otherwise defaults a blank copy to USD (bottleOps).
-  // - The details checkbox carries provenance: price, purchase info, notes,
-  //   occasion.
-  // - Never copied: rating and the personal drink window (judgements about
-  //   that specific bottle, not the purchase), rack position (new bottles
-  //   arrive unplaced) and the migration helpers (dateAdded / addToHistory).
-  const buildPayload = () => {
-    const payload = {
-      cellar: bottle.cellar?._id || bottle.cellar,
-      wineDefinition: bottle.wineDefinition?._id || bottle.wineDefinition,
-      vintage: bottle.vintage,
-      bottleSize: bottle.bottleSize || undefined,
-    };
-    if (bottle.currency) payload.currency = bottle.currency;
-    if (copyDetails) {
-      if (bottle.price != null) payload.price = bottle.price;
-      if (bottle.purchaseDate) payload.purchaseDate = bottle.purchaseDate;
-      if (bottle.purchaseLocation) payload.purchaseLocation = bottle.purchaseLocation;
-      if (bottle.purchaseUrl) payload.purchaseUrl = bottle.purchaseUrl;
-      if (bottle.notes) payload.notes = bottle.notes;
-      if (bottle.occasion) payload.occasion = bottle.occasion;
-    }
-    return payload;
-  };
+  // The copy rule (which fields travel) is shared with an order's "Change
+  // quantity": utils/bottleCopy.
+  const buildPayload = () => bottleCopyPayload(bottle, { copyDetails });
 
   const handleSubmit = async () => {
     // In-flight guard (belt to the disabled buttons): a second submit during
@@ -130,6 +107,7 @@ function AddMoreBottlesModal({ bottle, onClose, onAdded }) {
         <input
           id={countId}
           type="number"
+          inputMode="numeric"
           min="1"
           max={MAX_MORE}
           value={count}

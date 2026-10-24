@@ -1,8 +1,22 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import PhotoCapture from '../components/PhotoCapture';
+import { requestImageFor } from '../utils/requestImage';
+import safeUrl from '../utils/safeUrl';
 import './WineRequests.css';
+
+// Links a request may carry (#1460): the required source plus two more — a
+// winery page and a review give the reviewer different evidence. The same
+// bound as the server's (services/accountOps MAX_SOURCE_URLS).
+const MAX_LINKS = 3;
+
+// Every link of a request, oldest requests only knowing one.
+const linksOf = (request) => (Array.isArray(request.sourceUrls) && request.sourceUrls.length
+  ? request.sourceUrls
+  : [request.sourceUrl]).filter(Boolean);
+
+const EMPTY_FORM = { wineName: '', sourceUrl: '', image: '' };
 
 function WineRequests() {
   const { t } = useTranslation();
@@ -10,10 +24,19 @@ function WineRequests() {
   const [requests, setRequests] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
-  const [formData, setFormData] = useState({ wineName: '', sourceUrl: '', image: '' });
+  const [formData, setFormData] = useState(EMPTY_FORM);
+  const [extraUrls, setExtraUrls] = useState([]);
   const [imageFile, setImageFile] = useState(null);
   const [imageBgRemoved, setImageBgRemoved] = useState(null);
   const [processingBg, setProcessingBg] = useState(false);
+  // The back label (#1460): a photo or a link, like the front. Never the
+  // wine's picture and no background removal here; after review the admin
+  // may publish it among the wine's gallery photos (the notice says so).
+  const [backImageFile, setBackImageFile] = useState(null);
+  // One submission at a time: the photo encodes take a moment, and a second
+  // tap used to file the same request twice.
+  const [submitting, setSubmitting] = useState(false);
+  const [backImageUrl, setBackImageUrl] = useState('');
 
   useEffect(() => {
     fetchRequests();
@@ -31,10 +54,23 @@ function WineRequests() {
     }
   };
 
+  // The background-removed preview belongs to the photo it was made from: a
+  // retake or a removal while one is running drops its late result.
+  const bgSeq = useRef(0);
+
   const clearImage = () => {
+    bgSeq.current++;
     setImageFile(null);
     setImageBgRemoved(null);
     setProcessingBg(false);
+  };
+
+  const resetForm = () => {
+    clearImage();
+    setBackImageFile(null);
+    setBackImageUrl('');
+    setExtraUrls([]);
+    setFormData(EMPTY_FORM);
   };
 
   const compressImage = (file) => {
@@ -61,6 +97,7 @@ function WineRequests() {
   };
 
   const removeBgPreview = async (file) => {
+    const seq = ++bgSeq.current;
     setProcessingBg(true);
     setImageBgRemoved(null);
     try {
@@ -72,56 +109,85 @@ function WineRequests() {
       });
       if (res.ok) {
         const data = await res.json();
-        setImageBgRemoved(data.processedImage);
+        if (seq === bgSeq.current) setImageBgRemoved(data.processedImage);
       }
     } catch (err) {
       console.error('BG removal preview failed:', err);
     } finally {
-      setProcessingBg(false);
+      if (seq === bgSeq.current) setProcessingBg(false);
     }
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (submitting || processingBg) return;
+    setSubmitting(true);
     try {
       let imageValue = formData.image || null;
       if (imageFile) {
-        imageValue = imageBgRemoved || await compressImage(imageFile);
+        // The background-removed preview (or the photo itself), re-encoded to
+        // fit the server's cap — a raw PNG preview often did not (utils/requestImage).
+        imageValue = await requestImageFor({ preview: imageBgRemoved, file: imageFile });
+        if (!imageValue) {
+          alert(t('wineRequests.photoTooLarge'));
+          return;
+        }
       }
+      let backImageValue = backImageUrl.trim() || null;
+      if (backImageFile) {
+        backImageValue = await requestImageFor({ file: backImageFile });
+        if (!backImageValue) {
+          alert(t('wineRequests.backPhotoTooLarge', 'The back label photo could not be made small enough to send. Try another photo, or send the request without it.'));
+          return;
+        }
+      }
+      // sourceUrl stays the first link for the server and for older installs
+      // that forward it; sourceUrls carries every link in the user's order.
+      const sourceUrls = [formData.sourceUrl, ...extraUrls].map((u) => u.trim()).filter(Boolean);
       const res = await apiFetch('/api/wine-requests', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...formData, image: imageValue })
+        body: JSON.stringify({ ...formData, sourceUrls, image: imageValue, backImage: backImageValue })
       });
       if (res.ok) {
-        setFormData({ wineName: '', sourceUrl: '', image: '' });
-        clearImage();
+        resetForm();
         setShowForm(false);
         fetchRequests();
       } else {
-        alert('Failed to submit request');
+        // Say WHY: the server names the problem (a URL it refuses, a photo
+        // it cannot read); a bare "failed" left the user nothing to fix.
+        const data = await res.json().catch(() => ({}));
+        alert(data.error ? t('wineRequests.submitFailedReason', { reason: data.error }) : t('wineRequests.submitFailed'));
       }
     } catch (err) {
-      alert('Failed to submit request');
+      alert(t('wineRequests.submitFailed'));
+    } finally {
+      setSubmitting(false);
     }
   };
 
   const handleCancel = () => {
-    clearImage();
-    setFormData({ wineName: '', sourceUrl: '', image: '' });
+    resetForm();
     setShowForm(false);
   };
+  // Closing the form forgets its photos and links: a photo taken for one wine
+  // used to ride along into the next request after the form was reopened
+  // (release audit 2026-10-09, F2).
+  const toggleForm = () => (showForm ? handleCancel() : setShowForm(true));
+
+  const setExtraUrl = (index, value) => setExtraUrls(extraUrls.map((u, i) => (i === index ? value : u)));
+  const removeExtraUrl = (index) => setExtraUrls(extraUrls.filter((_, i) => i !== index));
 
   return (
     <div className="wine-requests-page">
       <div className="winerequest-header">
         <h1>{t('wineRequests.title')}</h1>
-        <button onClick={() => setShowForm(!showForm)} className="btn btn-primary winerequest-desktop-create">
+        <button onClick={toggleForm} className="btn btn-primary winerequest-desktop-create">
           {showForm ? t('common.cancel') : `+ ${t('wineRequests.newRequest')}`}
         </button>
       </div>
 
-      <button className="fab winerequest-fab" onClick={() => setShowForm(!showForm)} aria-label="New Request">
+      <button className="fab winerequest-fab" onClick={toggleForm} aria-label="New Request">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
       </button>
 
@@ -148,6 +214,31 @@ function WineRequests() {
                 required
                 placeholder="https://..."
               />
+            </div>
+
+            {/* More links (#1460): a winery page AND a review, each worth having */}
+            <div className="form-group">
+              <label>{t('wineRequests.moreLinksLabel', 'More links')} <span className="label-optional">({t('common.optional', 'optional')})</span></label>
+              <p className="field-hint">{t('wineRequests.linksHint', 'A winery page and a review each give the reviewer something different.')}</p>
+              {extraUrls.map((url, index) => (
+                <div className="extra-link-row" key={index}>
+                  <input
+                    type="url"
+                    value={url}
+                    onChange={(e) => setExtraUrl(index, e.target.value)}
+                    placeholder="https://..."
+                    aria-label={`${t('wineRequests.moreLinksLabel', 'More links')} ${index + 2}`}
+                  />
+                  <button type="button" className="btn btn-secondary btn-small" onClick={() => removeExtraUrl(index)}>
+                    {t('wineRequests.removeLink', 'Remove')}
+                  </button>
+                </div>
+              ))}
+              {extraUrls.length < MAX_LINKS - 1 && (
+                <button type="button" className="btn btn-secondary btn-small" onClick={() => setExtraUrls([...extraUrls, ''])}>
+                  + {t('wineRequests.addLink', 'Add another link')}
+                </button>
+              )}
             </div>
 
             {/* Image field */}
@@ -185,8 +276,42 @@ function WineRequests() {
               </p>
             </div>
 
+            {/* Back label (#1460): never the wine's picture, but after review it may
+                join the wine's public photos — said here, like the notice above. */}
+            <div className="form-group">
+              <label>{t('wineRequests.backImageLabel', 'Back label')} <span className="label-optional">({t('common.optional', 'optional')})</span></label>
+              <p className="field-hint">{t('wineRequests.backImageHint', 'The back label often names the producer, the appellation and the importer.')}</p>
+              <p className="image-public-notice">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0, marginTop: '1px' }}>
+                  <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+                {t('wineRequests.backImageNotice', 'After review, the back label may be shown among the wine\'s photos in the shared registry, visible to all Cellarion users.')}
+              </p>
+              <PhotoCapture
+                onCapture={(file) => {
+                  setBackImageFile(file);
+                  setBackImageUrl('');
+                }}
+                onRemove={() => setBackImageFile(null)}
+                processedUrl={null}
+                processing={false}
+              />
+              {!backImageFile && (
+                <div className="image-input-row" style={{ marginTop: '0.5rem' }}>
+                  <span className="image-or">{t('common.or', 'or')}</span>
+                  <input
+                    type="url"
+                    value={backImageUrl}
+                    onChange={(e) => setBackImageUrl(e.target.value)}
+                    placeholder={t('wineRequests.imageUrlPlaceholder', 'Paste image URL…')}
+                    className="image-url-input"
+                  />
+                </div>
+              )}
+            </div>
+
             <div className="form-actions">
-              <button type="submit" className="btn btn-success">{t('wineRequests.submitRequest')}</button>
+              <button type="submit" className="btn btn-success" disabled={submitting || processingBg}>{t('wineRequests.submitRequest')}</button>
               <button type="button" onClick={handleCancel} className="btn btn-secondary">
                 {t('common.cancel')}
               </button>
@@ -224,9 +349,14 @@ function WineRequests() {
                   </p>
                 )
               ) : (
-                <p><strong>{t('common.source')}:</strong> <a href={request.sourceUrl} target="_blank" rel="noopener noreferrer">
-                  {request.sourceUrl}
-                </a></p>
+                <p className="request-links"><strong>{t('common.source')}:</strong>{' '}
+                  {linksOf(request).map((url, index) => (
+                    <span key={url}>
+                      {index > 0 && ' · '}
+                      <a href={safeUrl(url) || undefined} target="_blank" rel="noopener noreferrer">{url}</a>
+                    </span>
+                  ))}
+                </p>
               )}
               {request.status === 'resolved' && request.linkedWineDefinition && (
                 <div className="resolution">

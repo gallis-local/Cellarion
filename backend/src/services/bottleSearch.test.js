@@ -116,7 +116,8 @@ describe('scope — never unscoped (security audit 2026-09-02, D10-5)', () => {
   });
 
   test.each([
-    ['active', { status: { $nin: ['drank', 'gifted', 'sold', 'other'] } }],
+    ['active', { status: { $nin: ['drank', 'gifted', 'sold', 'other', 'ordered'] } }],
+    ['ordered', { status: 'ordered' }],
     ['consumed', { status: { $in: ['drank', 'gifted', 'sold', 'other'] } }],
   ])('statusFilter %s', async (statusFilter, expected) => {
     await search('x', { statusFilter });
@@ -286,6 +287,59 @@ describe('results, pages and facets', () => {
     expect(res.baseFacetDistribution.grapeIds[MERLOT._id]).toBe(3);
   });
 
+  // Support report 2026-10-16: with Red chosen, picking France sent France
+  // back to the whole cellar's count. A narrowed field counts with every
+  // OTHER filter and the search text, never with none.
+  test('a narrowed field counts with every other filter, not its own and not none', async () => {
+    const both = await search('', { type: 'red', countryId: String(FRANCE._id) });
+    const redOnly = await search('', { type: 'red' });
+    const franceOnly = await search('', { countryId: String(FRANCE._id) });
+    // Countries: the red bottles per country (France's own filter left out).
+    expect(both.facetDistribution.countryName).toEqual(redOnly.facetDistribution.countryName);
+    expect(both.facetDistribution.countryId).toEqual(redOnly.facetDistribution.countryId);
+    // Types: the French bottles per type (the type filter left out).
+    expect(both.facetDistribution.type).toEqual(franceOnly.facetDistribution.type);
+    // Not the whole cellar's counts.
+    expect(both.facetDistribution.countryName).not.toEqual(both.baseFacetDistribution.countryName);
+    // A field nobody narrowed still counts the hits: each vintage's count is
+    // what adding that vintage to both filters would find.
+    const expected = {};
+    for (const label of Object.keys(both.baseFacetDistribution.vintage)) {
+      const n = (await search('', { type: 'red', countryId: String(FRANCE._id), vintage: label })).total;
+      if (n > 0) expected[label] = n;
+    }
+    expect(both.facetDistribution.vintage).toEqual(expected);
+    // The chosen value's own count is the hits.
+    expect(both.facetDistribution.countryName.France).toBe(both.total);
+  });
+
+  test('the search text narrows the own counts of a field too', async () => {
+    // Italy has no red "chateau": the countries still say where the red
+    // chateaux are (the text counts), not every red bottle and not nothing.
+    const both = await search('chateau', { type: 'red', countryId: String(ITALY._id) });
+    expect(both.total).toBe(0);
+    const redText = await search('chateau', { type: 'red' });
+    const redAll = await search('', { type: 'red' });
+    expect(both.facetDistribution.countryName).toEqual(redText.facetDistribution.countryName);
+    expect(both.facetDistribution.countryName).not.toEqual(redAll.facetDistribution.countryName);
+    expect(Object.keys(both.facetDistribution.countryName).length).toBeGreaterThan(0);
+  });
+
+  test('counts are keyed by the spelling the whole scope lists (a subset may favour another)', () => {
+    const { underBaseLabels } = _internal;
+    expect(underBaseLabels({ vintage: { Nv: 2 }, appellation: { margaux: 1 } }, { vintage: { NV: 5 }, appellation: { Margaux: 3 } }))
+      .toEqual({ vintage: { NV: 2 }, appellation: { Margaux: 1 } });
+  });
+
+  test('withFacets: false counts nothing but finds the same bottles (MCP never reads them)', async () => {
+    const full = await search('chateau', { type: 'red', countryId: String(FRANCE._id) });
+    const bare = await search('chateau', { type: 'red', countryId: String(FRANCE._id), withFacets: false });
+    expect(bare.ids).toEqual(full.ids);
+    expect(bare.total).toBe(full.total);
+    expect(bare.facetDistribution.countryName).toEqual({});
+    expect(bare.baseFacetDistribution.type).toEqual({});
+  });
+
   test('empty values are not counted; NV and Nv are one value under the common spelling', async () => {
     const { baseFacetDistribution: f } = await search('');
     expect(f.type).not.toHaveProperty('');
@@ -328,7 +382,7 @@ describe('bottleFacets — the plain cellar page', () => {
     const res = await bottleFacets({ cellarId: CELLAR });
     const [pipeline] = Bottle.aggregate.mock.calls[0];
     expect(String(pipeline[0].$match.cellar.$in[0])).toBe(CELLAR);
-    expect(pipeline[0].$match.status).toEqual({ $nin: ['drank', 'gifted', 'sold', 'other'] });
+    expect(pipeline[0].$match.status).toEqual({ $nin: ['drank', 'gifted', 'sold', 'other', 'ordered'] });
     expect(res.facetDistribution.vintage).toEqual({ 2015: 2, NV: 1, 2020: 4 });
     expect(res.facetDistribution.countryName).toEqual({ France: 2, Portugal: 1 });
     expect(res.baseFacetDistribution).toBe(res.facetDistribution);

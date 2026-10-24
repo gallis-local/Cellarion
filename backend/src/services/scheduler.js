@@ -1,10 +1,13 @@
 const cron = require('node-cron');
 const { runDrinkWindowCheck } = require('./drinkWindowNotifier');
+const { runNewMemberEmails } = require('./newMemberEmails');
 const { runCellarValueSnapshots } = require('./cellarValueSnapshotJob');
 const { runCommunityPriceAggregation } = require('./communityPriceJob');
 const { runUserDeletionJob } = require('./userDeletionJob');
 const { runCellarRetentionPurge } = require('./cellarRetentionJob');
+const { runTrashRetentionPurge } = require('./bottleTrash');
 const { runRecommendationEmailScrub } = require('./recommendationRetentionJob');
+const { runMcpSnapshotScrub } = require('./mcpSnapshotRetentionJob');
 const { runScanImageRetentionSweep } = require('./scanImageRetentionJob');
 const { runWineDraftExpirySweep } = require('./wineDraftExpiryJob');
 const { runSearchIndexReconcile } = require('./searchReconcileJob');
@@ -17,6 +20,7 @@ const DiscussionReply = require('../models/DiscussionReply');
 const { runRegistryReadReport } = require('./registryReadReportJob');
 const embeddingJob = require('./embeddingJob');
 const registryBridge = require('./registryBridge');
+const { runReceiptRetentionSweep } = require('./receiptArchive');
 
 /**
  * Start all scheduled cron jobs.
@@ -30,6 +34,16 @@ function startScheduler() {
       await runDrinkWindowCheck();
     } catch (err) {
       console.error('[scheduler] Drink window check failed:', err);
+    }
+  });
+
+  // New-member emails: daily at 17:00 UTC, early evening in Europe, when most
+  // members use the app. Off until an admin turns them on (newMemberEmails).
+  cron.schedule('0 17 * * *', async () => {
+    try {
+      await runNewMemberEmails();
+    } catch (err) {
+      console.error('[scheduler] New-member emails failed:', err);
     }
   });
 
@@ -73,6 +87,13 @@ function startScheduler() {
     } catch (err) {
       console.error('[scheduler] Cellar retention purge failed:', err);
     }
+    // Bottles in "Recently deleted" past their 30 days go for good, with
+    // their own photos (services/bottleTrash).
+    try {
+      await runTrashRetentionPurge();
+    } catch (err) {
+      console.error('[scheduler] Recently-deleted purge failed:', err);
+    }
     // Audit 2026-09 S3-3: the original text of a soft-deleted forum reply is
     // kept 30 days for moderation and was then kept forever — the purge
     // helper existed but nothing called it.
@@ -92,6 +113,16 @@ function startScheduler() {
       await runRecommendationEmailScrub();
     } catch (err) {
       console.error('[scheduler] Recommendation email scrub failed:', err);
+    }
+  });
+
+  // MCP delete snapshots: hourly at :41. A deleted bottle's snapshot is only
+  // usable inside the undo window; after it, the contents are cleared.
+  cron.schedule('41 * * * *', async () => {
+    try {
+      await runMcpSnapshotScrub();
+    } catch (err) {
+      console.error('[scheduler] MCP snapshot scrub failed:', err);
     }
   });
 
@@ -121,6 +152,17 @@ function startScheduler() {
       await runSearchIndexReconcile();
     } catch (err) {
       console.error('[scheduler] Search-index reconciliation failed:', err);
+    }
+  });
+
+  // Receipt-scan beta archive: hourly at :17. Deletes every kept receipt past
+  // its retention — record AND file — plus orphaned files (services/
+  // receiptArchive). Hourly so "kept for 5 days" is true to within the hour.
+  cron.schedule('17 * * * *', async () => {
+    try {
+      await runReceiptRetentionSweep();
+    } catch (err) {
+      console.error('[scheduler] Receipt retention sweep failed:', err);
     }
   });
 
@@ -233,6 +275,19 @@ function startScheduler() {
     }
   });
 
+  // Registry Bridge request sync (self-hosted installs): hourly at :29, finish
+  // the wine requests this install forwarded once cellarion.app has answered
+  // them — copy the wine and move the waiting bottles, or pass on a decline.
+  // A no-op when REGISTRY_BRIDGE_KEY is not set.
+  cron.schedule('29 * * * *', async () => {
+    if (!registryBridge.isEnabled()) return;
+    try {
+      await registryBridge.syncForwardedRequests();
+    } catch (err) {
+      console.error('[scheduler] Registry bridge request sync failed:', err);
+    }
+  });
+
   // Private-draft expiry: hourly, because the 24-hour warning before an empty
   // draft is deleted cannot be honoured by a daily pass (draft design 2026-09-12).
   cron.schedule('23 * * * *', async () => {
@@ -246,7 +301,7 @@ function startScheduler() {
     }
   });
 
-  console.log('[scheduler] Cron jobs registered (wine-draft-expiry hourly :23, drink-window daily 06:00 UTC, value-snapshot weekly Sun 01:00 UTC, community-price weekly Sun 02:00 UTC, search-reconcile daily 02:37, user-deletion daily 03:00 UTC, cellar-retention daily 04:00 UTC, recommendation-email-scrub daily 04:30 UTC, label-scan-retention daily 04:45 UTC, security-spike every 15 min, climate-offline every 15 min, ai-cap-alert every 15 min offset, demo-sweep every 15 min offset, registry-health weekly Mon 05:00 UTC, embed-sweep weekly Mon 05:30 UTC, bridge-refresh weekly Mon 06:30 UTC)');
+  console.log('[scheduler] Cron jobs registered (wine-draft-expiry hourly :23, drink-window daily 06:00 UTC, new-member-emails daily 17:00 UTC (off until turned on), value-snapshot weekly Sun 01:00 UTC, community-price weekly Sun 02:00 UTC, search-reconcile daily 02:37, user-deletion daily 03:00 UTC, cellar-retention daily 04:00 UTC, recommendation-email-scrub daily 04:30 UTC, label-scan-retention daily 04:45 UTC, security-spike every 15 min, climate-offline every 15 min, ai-cap-alert every 15 min offset, demo-sweep every 15 min offset, registry-health weekly Mon 05:00 UTC, embed-sweep weekly Mon 05:30 UTC, bridge-refresh weekly Mon 06:30 UTC)');
 }
 
 /**

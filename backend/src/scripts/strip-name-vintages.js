@@ -42,6 +42,7 @@ const mongoose = require('mongoose');
 const WineDefinition = require('../models/WineDefinition');
 const Bottle = require('../models/Bottle');
 const searchService = require('../services/search');
+const { initSearch } = require('./lib/scriptSearch');
 const { stripTrailingVintage, generateWineKey } = require('../utils/normalize');
 const { computeCanonicalKey } = require('../utils/wineIdentity');
 
@@ -80,17 +81,28 @@ const UNDATED = {
   ],
 };
 
+// Names ending in a plausible vintage, on rows whose normalizedKey is a
+// generateWineKey key. A pending-identity row keys as `pending~<creator>` and
+// a draft as `draft~<creator>`: re-keyed here they would enter the public key
+// space while still private. A canary keeps the fields it was seeded with.
+const CANDIDATES = {
+  name: { $regex: /(?:19[5-9]\d|20[0-4]\d)\)?$/ },
+  pendingIdentity: { $ne: true },
+  draft: { $ne: true },
+  canary: { $ne: true },
+};
+
 async function run() {
   await mongoose.connect(process.env.MONGO_URI || 'mongodb://mongo:27017/winecellar');
   console.log(`Connected. Mode: ${APPLY ? 'APPLY' : 'DRY RUN (pass --apply to execute)'}\n`);
+  const searchOk = APPLY ? await initSearch({ label: 'strip-name-vintages' }) : false;
 
   const wines = await WineDefinition
-    .find({ name: { $regex: /(?:19[5-9]\d|20[0-4]\d)\)?$/ } })
+    .find(CANDIDATES)
     .select('name producer appellation normalizedKey')
     .lean();
 
   const stats = { candidates: 0, changed: 0, collisions: 0, bottlesDated: 0 };
-  const reindexing = [];
 
   // Backup is flushed after EVERY mutation, not once at the end. Buffering it
   // meant a throw mid-loop (or a Ctrl-C, or the 4GB host OOM-killing us) exited
@@ -151,10 +163,9 @@ async function run() {
         );
         stats.bottlesDated += r.modifiedCount || 0;
       }
-      // Awaited below, before we disconnect — an un-awaited reindex reads Mongo
-      // internally and can lose the connection mid-flight, leaving Meili on the
-      // old name with the error swallowed (code audit 2026-07-27, M4).
-      reindexing.push(searchService.indexWine(w._id));
+      // Awaited: indexWine reads the row back from Mongo, so it has to finish
+      // before we disconnect. It never throws (failures are logged inside).
+      if (searchOk) await searchService.indexWine(w._id);
     }
     stats.changed += 1;
   }
@@ -164,15 +175,13 @@ async function run() {
     console.log('(container /tmp is ephemeral — docker cp it off before recreating the container)');
   }
 
-  if (reindexing.length) {
-    const results = await Promise.allSettled(reindexing);
-    const failed = results.filter(r => r.status === 'rejected').length;
-    if (failed) console.warn(`\n⚠ ${failed}/${reindexing.length} reindex calls failed — re-run a Meili sync.`);
-  }
-
   console.log(`\nCandidates: ${stats.candidates}  changed: ${stats.changed}  collisions(skipped): ${stats.collisions}  bottles dated: ${stats.bottlesDated}`);
   if (APPLY) console.log('Next: start the admin embedding job (incremental) — the name feeds the embed text.');
   await mongoose.disconnect();
 }
 
-run().catch((err) => { console.error('strip-name-vintages failed:', err); process.exit(1); });
+if (require.main === module) {
+  run().catch((err) => { console.error('strip-name-vintages failed:', err); process.exit(1); });
+}
+
+module.exports = { CANDIDATES };

@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useTranslation, Trans } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
-import { validateImport, confirmImport } from '../api/bottles';
+import { validateImport, confirmImport, scanReceipt } from '../api/bottles';
 import { getAiBudgetStatus, requestAiBudgetIncrease } from '../api/aiBudget';
 import { searchWines } from '../api/wines';
 import { getRacks } from '../api/racks';
@@ -11,20 +11,26 @@ import {
   parseAndMap, parseJSON, summariseRacks, getDefaultRackConfig, getDefaultAnchor, decodeImportBuffer,
   parseCSV, detectDelimiter, detectPlocFile, parsePlocFiles,
 } from '../utils/importMappers';
-import { buildImportItem as buildImportItemPayload } from '../utils/importPayload';
+import { buildImportItem as buildImportItemPayload, applyImportOnOrder } from '../utils/importPayload';
 import { prepareImportItems } from '../utils/importPrepare';
 import { describePriceWarning } from '../utils/priceValidation';
 import { summariseImportOutcome, buildImportReportCsv } from '../utils/importReport';
+import { expandReceiptItems, groupSkippedLines, receiptErrorKey } from '../utils/receiptImport';
 import {
   rowsNeedingAiRetry,
   reconcileRetrySelections,
   mergeRetryResults,
   mergeValidateSummaries,
   autoSelectionsFor,
+  preselectableMatch,
   canResumeValidation,
   restoreSessionMeta,
   nextAiBudgetRequestState,
-  isAiBudgetRequestPending
+  isAiBudgetRequestPending,
+  propagationTargets,
+  lookUpTargets,
+  lookUpSiblingResult,
+  undoSelections
 } from '../utils/importReview';
 import { getTotalSlots } from '../utils/rackLayouts';
 import { TYPE_DIMENSIONS } from '../components/racks/RackTypeSelector';
@@ -39,6 +45,7 @@ import {
 } from '../api/importSessions';
 import Modal from '../components/Modal';
 import './ImportBottles.css';
+import { backLabel } from '../utils/backLabel';
 
 const STEPS = ['upload', 'review', 'importing', 'done'];
 
@@ -55,7 +62,8 @@ const FORMAT_LABEL_KEYS = {
   vivino: 'importBottles.formats.vivino',
   cellartracker: 'importBottles.formats.cellartracker',
   'oeno-export': 'importBottles.formats.oenoExport',
-  generic: 'importBottles.formats.generic'
+  generic: 'importBottles.formats.generic',
+  receipt: 'importBottles.formats.receipt'
 };
 
 const STATUS_LABEL_KEYS = {
@@ -134,7 +142,7 @@ function ImportBottles() {
   const [detectedEncoding, setDetectedEncoding] = useState(null);
   // Which CellarTracker table the file is (list/inventory/bottles/…), if CT
   const [ctTable, setCtTable] = useState(null);
-  // Non-blocking parse warnings ({ code: 'ct-truncated' | 'ct-pending-skipped', … })
+  // Non-blocking parse warnings ({ code: 'ct-truncated' | 'ct-pending-on-order', … })
   const [importWarnings, setImportWarnings] = useState([]);
   // CellarTracker Location groups whose bins had no consistent pattern —
   // their bottles keep the location as text: [{ location, count }]
@@ -161,6 +169,11 @@ function ImportBottles() {
   // carry their own note in the file keep it (fill-blank only).
   const [importNotes, setImportNotes] = useState('');
   const [importOccasion, setImportOccasion] = useState('');
+  // "Not delivered yet": every bottle of this import comes in ON ORDER, with
+  // an optional expected month ('YYYY-MM'). Pre-ticked for a prepayment
+  // receipt or a pro-forma invoice.
+  const [importOnOrder, setImportOnOrder] = useState(false);
+  const [importExpectedArrival, setImportExpectedArrival] = useState('');
 
   // Review step
   const [results, setResults] = useState([]);
@@ -175,6 +188,10 @@ function ImportBottles() {
   // deliberate re-Match stays a full fresh validation.
   const [validationResume, setValidationResume] = useState(null);
   const [selections, setSelections] = useState({}); // index -> wineId or 'skip'
+  // The latest selections, for an async handler that must see choices made
+  // while it waited (handleAiSearch).
+  const selectionsRef = useRef(selections);
+  useEffect(() => { selectionsRef.current = selections; }, [selections]);
   const [searchModal, setSearchModal] = useState(null); // { index } or null
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
@@ -203,6 +220,12 @@ function ImportBottles() {
   // in importMappers.
   const [vivinoScanHistory, setVivinoScanHistory] = useState(false);
   const [vivinoImportMode, setVivinoImportMode] = useState('history');
+  // Receipt scan: a photo/PDF read server-side into the same rows a file
+  // produces. receiptInfo = { documentType, store, purchaseDate, currency,
+  // lines, bottles, skipped: [{ reason, count, lines }], warnings } for the
+  // summary under the drop zone; null when the rows did not come from a receipt.
+  const [receiptScanning, setReceiptScanning] = useState(false);
+  const [receiptInfo, setReceiptInfo] = useState(null);
 
   // AI daily budget (rows with aiSkipped fell back to fuzzy matching).
   // Status from GET /api/ai-budget/status: { dailyMax, usedToday, override, pendingRequest }
@@ -274,7 +297,10 @@ function ImportBottles() {
     importWarnings, detectedEncoding, ctTable, ctTextFallback
   };
 
-  // Auto-save whenever selections or manualWines change while in review step
+  // Auto-save whenever a review edit (a selection, a manual wine, a typed
+  // vintage, the rack/currency options) changes while in the review step.
+  // Validation commits results while the step is still 'upload', which the
+  // early return keeps from saving.
   useEffect(() => {
     if (step !== 'review' || results.length === 0) return;
 
@@ -325,7 +351,7 @@ function ImportBottles() {
     }, 1500);
 
     return () => clearTimeout(saveTimerRef.current);
-  }, [step, selections, manualWines, positionAnchor, rackConfigs, importCurrency]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [step, results, selections, manualWines, positionAnchor, rackConfigs, importCurrency]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Recompute summary from a results array (used after resume + refresh)
   const computeSummary = (rs) => ({
@@ -344,6 +370,11 @@ function ImportBottles() {
     try {
       const res = await getImportSession(apiFetch, session._id);
       if (!res.ok) return;
+      // A draft does not remember "Not delivered yet": start it cleared, so a
+      // choice made for an unrelated file or receipt never rides along. The
+      // review step shows the choice to set again.
+      setImportOnOrder(false);
+      setImportExpectedArrival('');
       const { session: s, refreshed } = await res.json();
 
       // Apply refreshed matches (items that were 'request' but now have an exact wine)
@@ -412,10 +443,7 @@ function ImportBottles() {
   const applyParsed = useCallback((parsed, { fileName: sourceName, encoding }) => {
     const { items, format, oenoRackSpecs } = parsed;
     if (items.length === 0) {
-      const pendingWarning = (parsed.warnings || []).find(w => w.code === 'ct-pending-skipped');
-      setError(pendingWarning
-        ? t('importBottles.errors.ctAllPending', { count: pendingWarning.count })
-        : t('importBottles.errors.noValidItems'));
+      setError(t('importBottles.errors.noValidItems'));
       return;
     }
     setParsedItems(items);
@@ -483,6 +511,9 @@ function ImportBottles() {
    */
   const processFiles = useCallback((fileList) => {
     setError(null);
+    setReceiptInfo(null); // a file replaces rows read from a receipt
+    setImportOnOrder(false);
+    setImportExpectedArrival('');
     const files = Array.from(fileList || []).filter(Boolean);
     if (files.length === 0) return;
 
@@ -580,6 +611,58 @@ function ImportBottles() {
     e.preventDefault();
     setDragOver(false);
     processFiles(e.dataTransfer.files);
+  };
+
+  // ── Receipt scan ────────────────────────────────────────────────────────
+  // Photos (or a PDF) of a receipt are read server-side into the same rows a
+  // parsed file produces. From there the import is the usual match → review →
+  // confirm, so every receipt line is checked before a bottle is created.
+  const handleReceiptFiles = async (fileList) => {
+    const files = Array.from(fileList || []).filter(Boolean);
+    if (files.length === 0 || receiptScanning) return;
+    setError(null);
+    setReceiptScanning(true);
+    try {
+      const res = await scanReceipt(apiFetch, files);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        track('receipt-scan', { result: data?.code || `http-${res.status}` });
+        const { key, values } = receiptErrorKey(res.status, data);
+        setError(t(key, values));
+        return;
+      }
+      const items = expandReceiptItems(data.items);
+      track('receipt-scan', { result: items.length > 0 ? 'read' : 'no-wine', lines: data.items?.length || 0 });
+      if (items.length === 0) {
+        setError(t('importBottles.receipt.errors.noWine'));
+        return;
+      }
+      const missingVintage = items.filter(i => i.vintageMissing).length;
+      setSourceText(null);
+      applyParsed(
+        { items, format: 'receipt', warnings: missingVintage > 0 ? [{ code: 'vintage-missing', count: missingVintage }] : [] },
+        { fileName: data.receipt?.store || t('importBottles.receipt.defaultName'), encoding: null }
+      );
+      // Every row already carries the receipt's currency; show the same in the
+      // picker rather than the profile default (it covers rows without one).
+      if (data.receipt?.currency) setImportCurrency(data.receipt.currency);
+      setReceiptInfo({
+        ...data.receipt,
+        lines: data.items.length,
+        bottles: items.length,
+        skipped: groupSkippedLines(data.skipped),
+        warnings: Array.isArray(data.warnings) ? data.warnings : [],
+      });
+      // A prepayment receipt or a pro-forma invoice is an order not handed
+      // over yet: suggest importing it on order (the user can untick it).
+      const docType = data.receipt?.documentType;
+      setImportOnOrder(docType === 'prepayment' || docType === 'proforma');
+      setImportExpectedArrival('');
+    } catch {
+      setError(t('importBottles.receipt.errors.generic'));
+    } finally {
+      setReceiptScanning(false);
+    }
   };
 
   // ── Validation ──────────────────────────────────────────────────────────
@@ -795,6 +878,12 @@ function ImportBottles() {
   const handleAiSearch = async (rowIndex) => {
     const r = results.find(res => res.index === rowIndex);
     if (!r) return;
+    // The same wine's other bottles still in this row's state take the answer
+    // too. Chosen at click time; the answer then lands only on rows the user
+    // has not changed while the look-up ran (a skip or request made in the
+    // meantime stands).
+    const siblings = lookUpTargets(results, selections, rowIndex);
+    const atClick = { ...selections };
     setAiSearchingRow(rowIndex);
     try {
       const res = await validateImport(apiFetch, {
@@ -804,16 +893,35 @@ function ImportBottles() {
       const data = await res.json();
       if (!res.ok || !data.results?.[0]) return;
       const updated = { ...data.results[0], index: rowIndex };
-      setResults(prev => prev.map(x => x.index === rowIndex ? updated : x));
-      if ((updated.status === 'ai_match' || updated.status === 'exact' || updated.status === 'fuzzy') && updated.matches.length > 0) {
-        setSelections(prev => ({ ...prev, [rowIndex]: updated.matches[0].wineId }));
+      const unchanged = (i) => selectionsRef.current[i] === atClick[i];
+      const followers = siblings.filter(unchanged);
+      setResults(prev => prev.map(x => {
+        if (x.index === rowIndex) return updated;
+        // Each sibling keeps its own file row (vintage, price, location) and
+        // the price warnings the server computed from its own price.
+        if (followers.includes(x.index)) return lookUpSiblingResult(updated, x);
+        return x;
+      }));
+      const rowsToSet = [rowIndex, ...followers];
+      const setAll = (value) => setSelections(prev => {
+        const next = { ...prev };
+        for (const i of rowsToSet) {
+          if (prev[i] !== atClick[i]) continue; // changed meanwhile — the user's choice stands
+          if (value === undefined) delete next[i];
+          else next[i] = value;
+        }
+        return next;
+      });
+      const top = preselectableMatch(updated.matches);
+      if ((updated.status === 'ai_match' || updated.status === 'exact' || updated.status === 'fuzzy') && top) {
+        setAll(top.wineId);
       } else if (updated.status === 'ai_new' && updated.aiProposed) {
         // AI identified a wine the registry doesn't have — select the
         // create-on-confirm proposal.
-        setSelections(prev => ({ ...prev, [rowIndex]: 'create' }));
+        setAll('create');
       } else {
         // AI couldn't identify — clear the old fuzzy selection
-        setSelections(prev => { const next = { ...prev }; delete next[rowIndex]; return next; });
+        setAll(undefined);
       }
     } catch {
       // Non-fatal
@@ -828,7 +936,8 @@ function ImportBottles() {
     if (!searchQuery.trim()) return;
     setSearching(true);
     try {
-      const res = await searchWines(apiFetch, `search=${encodeURIComponent(searchQuery)}&limit=10`);
+      // ownHidden=1: the member's own drinks that are not wine match too.
+      const res = await searchWines(apiFetch, `search=${encodeURIComponent(searchQuery)}&limit=10&ownHidden=1`);
       const data = await res.json();
       if (res.ok) {
         setSearchResults(data.wines || []);
@@ -849,18 +958,13 @@ function ImportBottles() {
 
   const selectSearchResult = (wine) => {
     const sourceIndex = searchModal.index;
+    // The same rows the selection spreads to below, so every row that now
+    // imports this wine also remembers it as a hand-picked match.
+    const targets = propagationTargets(results, selections, sourceIndex, wine._id);
     setSelections(withPropagation(sourceIndex, wine._id));
     setManualWines(prev => {
-      const sourceItem = results.find(r => r.index === sourceIndex)?.item;
-      const key = sourceItem ? wineKey(sourceItem) : null;
       const next = { ...prev, [sourceIndex]: wine };
-      if (key) {
-        results.forEach(r => {
-          if (r.index !== sourceIndex && wineKey(r.item) === key && !selections[r.index]) {
-            next[r.index] = wine;
-          }
-        });
-      }
+      for (const i of targets) next[i] = wine;
       return next;
     });
     setSearchModal(null);
@@ -868,22 +972,13 @@ function ImportBottles() {
 
   // ── Selection helpers ────────────────────────────────────────────────────
 
-  // Returns a key for grouping duplicate wines: "wineName|producer" (lowercased)
-  const wineKey = (item) =>
-    `${(item?.wineName || '').toLowerCase()}|${(item?.producer || '').toLowerCase()}`;
-
-  // Returns a selections updater that also propagates selValue to unselected
-  // rows that have the same wine name + producer as the source row.
+  // Returns a selections updater that also carries selValue to the file's
+  // other bottles of the same wine (utils/importReview propagationTargets:
+  // undecided rows, and rows still on the source row's automatic choice).
   const withPropagation = (sourceIndex, selValue) => (prev) => {
-    const sourceItem = results.find(r => r.index === sourceIndex)?.item;
-    const key = sourceItem ? wineKey(sourceItem) : null;
     const next = { ...prev, [sourceIndex]: selValue };
-    if (key) {
-      results.forEach(r => {
-        if (r.index !== sourceIndex && wineKey(r.item) === key && !prev[r.index]) {
-          next[r.index] = selValue;
-        }
-      });
+    for (const i of propagationTargets(results, prev, sourceIndex, selValue)) {
+      next[i] = selValue;
     }
     return next;
   };
@@ -898,12 +993,10 @@ function ImportBottles() {
     setSelections(withPropagation(index, 'skip'));
   };
 
+  // Undo on a skipped / requested row: back to the automatic choice, and an
+  // undone request brings the rest of the line back with it (undoSelections).
   const unskipItem = (index) => {
-    setSelections(prev => {
-      const next = { ...prev };
-      delete next[index];
-      return next;
-    });
+    setSelections(prev => undoSelections(results, prev, index));
   };
 
   const requestWine = (index) => {
@@ -914,9 +1007,10 @@ function ImportBottles() {
   const selectAllExact = () => {
     const sel = { ...selections };
     results.forEach(r => {
-      if ((r.status === 'exact' || r.status === 'fuzzy') && r.matches.length > 0) {
-        sel[r.index] = r.matches[0].wineId;
-      }
+      // A conflicted top match (a range sibling, or the other colour of a
+      // pair) is never bulk-selected — the next clean one is, or none.
+      const top = (r.status === 'exact' || r.status === 'fuzzy') ? preselectableMatch(r.matches) : null;
+      if (top) sel[r.index] = top.wineId;
     });
     setSelections(sel);
   };
@@ -985,7 +1079,9 @@ function ImportBottles() {
     setSubmittedRows(importableRows);
     setUserSkippedRows(skippedAtReview);
     setUnresolvedRows(unresolvedAtReview);
-    const items = importableRows.map(buildImportItem);
+    const items = applyImportOnOrder(importableRows.map(buildImportItem), {
+      onOrder: importOnOrder, expectedArrival: importExpectedArrival,
+    });
 
     // Mirror of the backend cap: /confirm refuses more than MAX_IMPORT_ROWS
     // in one request — fail here with guidance instead of a bare 400 after
@@ -1030,6 +1126,90 @@ function ImportBottles() {
 
   // ── Render helpers ──────────────────────────────────────────────────────
 
+  // Not delivered yet: the whole import comes in ON ORDER. Pre-ticked for a
+  // prepayment receipt or a pro-forma invoice (an order not handed over yet).
+  // Shown on the upload step AND the review step, so a resumed draft (which
+  // does not remember the choice) can still set it before importing.
+  const renderOnOrderChoice = () => (
+    <div className="form-group import-on-order">
+      <label className="toggle-label">
+        <input
+          type="checkbox"
+          checked={importOnOrder}
+          onChange={(e) => setImportOnOrder(e.target.checked)}
+        />
+        <span>{t('importBottles.wholeImport.onOrderLabel')}</span>
+      </label>
+      <p className="rack-options-hint">{t('importBottles.wholeImport.onOrderHint')}</p>
+      {importOnOrder && (
+        <label className="import-on-order-month">
+          <span>{t('addBottle.expectedArrival')}</span>
+          <input
+            type="month"
+            placeholder="YYYY-MM"
+            pattern="\d{4}-\d{2}"
+            value={importExpectedArrival}
+            onChange={(e) => setImportExpectedArrival(e.target.value)}
+          />
+        </label>
+      )}
+    </div>
+  );
+
+  // What the receipt scan read: the shop and date, how many wines, the lines it
+  // left out (beer, deposits, bags…) so nothing disappears unexplained, and the
+  // notices that need a decision before importing.
+  const renderReceiptSummary = () => {
+    const r = receiptInfo;
+    const skippedCount = r.skipped.reduce((sum, g) => sum + g.count, 0);
+    const secondDocument = r.documentType === 'prepayment' || r.documentType === 'proforma';
+    return (
+      <div className="receipt-summary">
+        <p className="receipt-summary-head">
+          <strong>{t('importBottles.receipt.summary', { count: r.bottles, lines: r.lines })}</strong>
+          {(r.store || r.purchaseDate) && (
+            <span className="receipt-summary-meta">{[r.store, r.purchaseDate].filter(Boolean).join(' · ')}</span>
+          )}
+        </p>
+        {secondDocument && (
+          <div className="import-parse-warning-banner" role="note">
+            {importOnOrder
+              ? t(r.documentType === 'prepayment' ? 'importBottles.receipt.prepaymentOnOrderNote' : 'importBottles.receipt.proformaOnOrderNote')
+              : t(r.documentType === 'prepayment' ? 'importBottles.receipt.prepaymentNote' : 'importBottles.receipt.proformaNote')}
+          </div>
+        )}
+        {r.warnings.includes('mixed_case') && (
+          <div className="import-parse-warning-banner" role="note">{t('importBottles.receipt.mixedCaseNote')}</div>
+        )}
+        {r.warnings.includes('wine_discount_spread') && (
+          <div className="import-parse-warning-banner" role="note">{t('importBottles.receipt.discountNote')}</div>
+        )}
+        {r.warnings.includes('vat_added') && (
+          <div className="import-parse-warning-banner" role="note">{t('importBottles.receipt.vatAddedNote')}</div>
+        )}
+        {r.warnings.includes('vat_rate_missing') && (
+          <div className="import-parse-warning-banner" role="note">{t('importBottles.receipt.vatRateMissingNote')}</div>
+        )}
+        {r.warnings.includes('currency_unsupported') && (
+          <div className="import-parse-warning-banner" role="note">{t('importBottles.receipt.currencyNote')}</div>
+        )}
+        {skippedCount > 0 && (
+          <details className="receipt-summary-skipped">
+            <summary>{t('importBottles.receipt.skippedTitle', { count: skippedCount })}</summary>
+            <ul>
+              {r.skipped.map(g => (
+                <li key={g.reason}>
+                  <strong>{t(`importBottles.receipt.skipReason.${g.reason}`, g.reason)}:</strong> {g.lines.join(', ')}
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+        <p className="receipt-summary-hint">{t('importBottles.receipt.reviewHint')}</p>
+      </div>
+    );
+  };
+
   // Non-blocking parse warnings (shown on both upload and review steps).
   // The CT truncation warning gets elevated styling + a bold headline: a
   // 25-row page export silently missing 90% of a cellar is the single worst
@@ -1058,8 +1238,13 @@ function ImportBottles() {
             count: w.count,
             wines: (w.wines || []).join(', ')
           })}
+          {w.code === 'ct-pending-on-order' && t('importBottles.warnings.ctPendingOnOrder', {
+            count: w.count,
+            wines: (w.wines || []).join(', ')
+          })}
           {w.code === 'no-identity-skipped' && t('importBottles.warnings.noIdentitySkipped', { count: w.count })}
           {w.code === 'vintage-missing' && t('importBottles.warnings.vintageMissing', { count: w.count })}
+          {w.code === 'price-not-read' && t('importBottles.warnings.priceNotRead', { column: w.column })}
           {w.code === 'extra-files-ignored' && t('importBottles.warnings.extraFilesIgnored', { count: w.count })}
           {w.code === 'ploc-placed' && t('importBottles.warnings.plocPlaced', { count: w.count, racks: w.racks })}
           {w.code === 'ploc-history' && t('importBottles.warnings.plocHistory', { count: w.count })}
@@ -1242,6 +1427,37 @@ function ImportBottles() {
           </div>
         </div>
       )}
+      {/* Receipt scan: photos or a PDF of a purchase, read by the AI into rows
+          for the same review as a file. The document itself is not stored.
+          First on the page: on a phone, photographing a receipt is the import
+          most people come here for. */}
+      <div className="receipt-scan">
+        <div className="receipt-scan-text">
+          <h3>
+            {t('importBottles.receipt.title')}
+            <span className="receipt-beta-badge">{t('importBottles.receipt.beta', 'Beta')}</span>
+          </h3>
+          <p>{t('importBottles.receipt.desc')}</p>
+          <p className="receipt-scan-privacy">{t('importBottles.receipt.privacy')}</p>
+        </div>
+        <input
+          id="receipt-file-input"
+          type="file"
+          accept="image/*,application/pdf"
+          multiple
+          onChange={(e) => { handleReceiptFiles(e.target.files); e.target.value = ''; }}
+          style={{ display: 'none' }}
+        />
+        <button
+          type="button"
+          className="btn btn-primary receipt-scan-btn"
+          disabled={receiptScanning}
+          onClick={() => document.getElementById('receipt-file-input').click()}
+        >
+          {receiptScanning ? t('importBottles.receipt.reading') : t('importBottles.receipt.choose')}
+        </button>
+      </div>
+
       <div className="import-instructions">
         <h3>{t('importBottles.upload.supportedFormats')}</h3>
         <div className="format-cards">
@@ -1313,6 +1529,7 @@ function ImportBottles() {
         )}
       </div>
 
+      {parsedItems.length > 0 && detectedFormat === 'receipt' && receiptInfo && renderReceiptSummary()}
       {parsedItems.length > 0 && renderImportWarnings()}
       {parsedItems.length > 0 && renderCtDisclosure()}
       {parsedItems.length > 0 && renderVivinoHistoryChoice()}
@@ -1350,6 +1567,7 @@ function ImportBottles() {
               maxLength={500}
             />
           </div>
+          {renderOnOrderChoice()}
         </div>
       )}
 
@@ -1814,8 +2032,11 @@ function ImportBottles() {
           )}
         </div>
 
-        {/* Parse-time warnings (CT truncation / skipped pending bottles) + encoding info */}
+        {/* Parse-time warnings (CT truncation / pending bottles on order) + encoding info */}
         {renderImportWarnings()}
+        <div className="import-rack-options import-on-order-review">
+          {renderOnOrderChoice()}
+        </div>
         {detectedEncoding && (
           <p className="import-encoding-line">
             {t('importBottles.upload.encodingLine', { encoding: ENCODING_LABELS[detectedEncoding] || detectedEncoding })}
@@ -1900,6 +2121,9 @@ function ImportBottles() {
               setSessionId(null);
               setSaveStatus('idle');
               setRefreshedItems({});
+              // The results are gone, so a resume would skip batches that are
+              // no longer in the review: the next Match starts from the top.
+              setValidationResume(null);
             }}
           >
             {t('importBottles.review.backToUpload')}
@@ -2012,6 +2236,14 @@ function ImportBottles() {
                           ) : (r.item.vintage || t('importBottles.preview.nv'))}
                           {r.item.country && ` · ${r.item.country}`}
                         </span>
+                        {/* Receipt rows: the line as printed, to check an
+                            abbreviated name against its match. */}
+                        {r.item.receiptLine && (
+                          <span className="source-receipt-line" title={t('importBottles.receipt.printedLine')}>
+                            {r.item.receiptLine}
+                            {r.item.mixedCase && ` · ${t('importBottles.receipt.mixedCaseBadge')}`}
+                          </span>
+                        )}
                       </div>
                     </td>
                     <td className="col-match">
@@ -2174,6 +2406,11 @@ function ImportBottles() {
                                   <span className="type-dot" style={{ background: TYPE_DOTS[m.type] || '#888' }} />
                                   {m.country || ''}{m.region ? ` · ${m.region}` : ''}
                                 </span>
+                                {/* Never preselected (preselectableMatch) — say why, so a
+                                    hand pick of the other colour is a decision, not a slip. */}
+                                {m.colourConflict && (
+                                  <span className="candidate-conflict">{t('importBottles.review.colourConflict')}</span>
+                                )}
                               </div>
                               <span className="candidate-score">{Math.round(m.score * 100)}%</span>
                             </button>
@@ -2318,6 +2555,14 @@ function ImportBottles() {
             <span className="done-number">{importResult.createdActive ?? importResult.created}</span>
             <span>{t('importBottles.done.activeBottles')}</span>
           </div>
+          {importResult.createdOnOrder > 0 && (
+            <div className="done-stat">
+              <span className="done-number">{importResult.createdOnOrder}</span>
+              <span>
+                <Link to={`/cellars/${cellarId}/on-order`}>{t('importBottles.done.onOrder')}</Link>
+              </span>
+            </div>
+          )}
           {importResult.createdHistory > 0 && (
             <div className="done-stat">
               <span className="done-number">{importResult.createdHistory}</span>
@@ -2472,6 +2717,11 @@ function ImportBottles() {
           onClick={() => {
             setStep('upload');
             setParsedItems([]);
+            setReceiptInfo(null);
+            setImportNotes('');
+            setImportOccasion('');
+            setImportOnOrder(false);
+            setImportExpectedArrival('');
             setResults([]);
             setSummary(null);
             setSelections({});
@@ -2504,7 +2754,7 @@ function ImportBottles() {
       <div className="import-header">
         <Link to={`/cellars/${cellarId}`} className="back-link">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
-          {t('importBottles.backToCellar')}
+          {backLabel(t('importBottles.backToCellar'))}
         </Link>
         <h1>{t('importBottles.title')}</h1>
       </div>
@@ -2585,6 +2835,9 @@ function ImportBottles() {
                       {wine.region?.name ? ` · ${wine.region.name}` : ''}
                       {wine.appellation ? ` · ${wine.appellation}` : ''}
                     </span>
+                    {wine.nonWine && (
+                      <span className="own-hidden-pill" title={t('wineSearchPicker.onlyInYourCellarTitle')}>{t('wineSearchPicker.onlyInYourCellar')}</span>
+                    )}
                   </div>
                 </button>
               ))}

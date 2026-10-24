@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, Suspense } from 'react';
 import { lazy } from '../utils/lazyWithReload';
+import { friendlyError, httpError } from '../utils/friendlyError';
 import { Link, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
@@ -8,7 +9,7 @@ import { TYPE_COLORS, COUNTRY_COLORS, GRAPE_COLORS, fmt, fmtRating, fmtCurrency 
 import DonutChart from '../components/charts/DonutChart';
 import HBarChart from '../components/charts/HBarChart';
 import VintageBarChart from '../components/charts/VintageBarChart';
-import RatingChart from '../components/charts/RatingChart';
+import RatingViewsCard from '../components/charts/RatingViewsCard';
 import MaturityViz from '../components/charts/MaturityViz';
 import HealthScoreCard from '../components/charts/HealthScoreCard';
 import RegretIndexCard from '../components/charts/RegretIndexCard';
@@ -92,10 +93,10 @@ function Statistics() {
     try {
       const res  = await apiFetch('/api/stats/overview');
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to load statistics');
+      if (!res.ok) throw httpError(res, data, 'Failed to load statistics');
       setStats(data.stats);
     } catch (e) {
-      setError(e.message);
+      setError(friendlyError(e, t));
     } finally {
       setLoading(false);
     }
@@ -133,7 +134,7 @@ function Statistics() {
 
   const {
     overview, byType, byCountry, byRegion, byGrape,
-    byVintage, byRating, byBottleSize, byPurchaseYear,
+    byVintage, byRating, ratingViews, byBottleSize, byPurchaseYear,
     maturity, maturityCoverage, topValueBottles,
     consumptionByYear, consumptionByReason, cellarBreakdown,
     maturityForecast, urgencyLadder, holdingTime,
@@ -188,6 +189,7 @@ function Statistics() {
             already there (turbulent3964 2026-08-29). One hint under the
             subtitle beats repeating a note on every clickable card. */}
         <p className="stats-hint">{t('statistics.clickHint')}</p>
+        <p className="stats-hint"><Link to="/dashboard">{t('statistics.dashboardLink', 'Build your own tables and charts in the Dashboard →')}</Link></p>
       </div>
 
       {/* ── Primary KPIs ── */}
@@ -197,7 +199,9 @@ function Statistics() {
         <KPICard icon={'\ud83c\udf0d'} label={t('statistics.kpi.countries')} value={fmt(overview.totalCountries)}
           sub={t('statistics.kpi.grapeVarieties', { count: overview.totalGrapes })} accentColor="#6EC6C6" />
         <KPICard icon={'\u2b50'} label={t('statistics.kpi.avgRating')}
-          value={overview.avgRating != null ? fmtRating(overview.avgRating, targetScale) : '\u2014'}
+          // Every rating, as the rating card's "All": a drunk bottle with the
+          // rating given when drinking (support ticket 2026-10-11).
+          value={(ratingViews?.all?.avg ?? overview.avgRating) != null ? fmtRating(ratingViews?.all?.avg ?? overview.avgRating, targetScale) : '\u2014'}
           accentColor="#D4C87A" />
         <KPICard icon={'\ud83d\udcc5'} label={t('statistics.kpi.avgVintageAge')}
           value={overview.avgVintageAge ? `${overview.avgVintageAge} ${t('statistics.kpi.yrs')}` : '\u2014'}
@@ -433,14 +437,20 @@ function Statistics() {
         {/* Rating Distribution */}
         <div className="stats-card">
           <h2 className="stats-card-title">{t('statistics.sections.ratingDistribution')}</h2>
-          <RatingChart
-            byRating={byRating}
-            avg={overview.avgRating}
+          {/* All / In the cellar / History: a drunk bottle counts with the
+              rating given when drinking. A band opens exactly its bottles
+              (?ratingBand — the server selects with the band rule it counts
+              with): the cellar list, the history, or both. */}
+          <RatingViewsCard
+            views={ratingViews}
+            fallback={{ byRating, avg: overview.avgRating }}
             targetScale={targetScale}
-            onBandClick={(band) => {
+            onBand={(view, band) => {
               // band.key is "0-20" / "21-40" / "41-60" / "61-80" / "81-100"
-              const min = parseInt(String(band.key).split('-')[0], 10);
-              goWithFilter({ minRating: isNaN(min) ? '' : String(min) });
+              const ratingBand = band.key;
+              if (view === 'history') goWithFilter({ status: 'consumed', ratingBand });
+              else if (view === 'all') goWithFilter({ status: 'all', ratingBand });
+              else goWithFilter({ ratingBand });
             }}
           />
         </div>

@@ -155,4 +155,26 @@ describe('buildCaseJourneys for the bottle page', () => {
     const { data } = await run([], { focusWineId: 'w1', focusVintage: '2020' });
     expect(data).toEqual([]);
   });
+
+  test('withCellars: each lot names the cellars to open it in — where bottles are left, else where it was drunk', async () => {
+    // The 2019 was drunk in c1 and has one bottle left in c2: its page is
+    // c2's. The 2018 is all drunk, in c3: its page (the history) is c3's.
+    const left = { ...active('2019'), cellar: 'c2' };
+    const gone = { ...drunk('2018'), cellar: 'c3' };
+    const { data } = await run([drunk('2019'), left, active('2020'), gone], { focusWineId: 'w1', sort: 'vintage', withCellars: true });
+    expect(data.map((l) => [l.vintage, l.cellar_ids])).toEqual([['2020', ['c1']], ['2019', ['c2']], ['2018', ['c3']]]);
+  });
+
+  test('withCellars: the cellar holding the most bottles of a vintage comes first, whatever order the bottles came in', async () => {
+    // 1 left in c-a, 3 left in c-b: the row's "4 in your cellar" opens c-b,
+    // the page with most of them.
+    const bottles = [{ ...active('2021'), cellar: 'c-a' }, ...[1, 2, 3].map(() => ({ ...active('2021'), cellar: 'c-b' }))];
+    const { data } = await run(bottles, { focusWineId: 'w1', withCellars: true });
+    expect(data[0].cellar_ids).toEqual(['c-b', 'c-a']);
+  });
+
+  test('without withCellars the lot has no cellar_ids — the MCP case_journey envelope is unchanged', async () => {
+    const { data } = await run([active('2020'), drunk('2020')], { focusWineId: 'w1' });
+    expect(data[0]).not.toHaveProperty('cellar_ids');
+  });
 });

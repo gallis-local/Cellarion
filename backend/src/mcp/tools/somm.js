@@ -25,9 +25,10 @@ const { registerTool } = require('../registry');
 const { logAudit } = require('../../services/audit');
 const { bumpWineOwners } = require('../../services/dataVersion');
 const { SUPPORTED_CURRENCIES } = require('../../config/currencies');
-const { isValidId } = require('../../utils/validation');
+const { isValidId, parseAndValidateVintage } = require('../../utils/validation');
 const { stripHtml } = require('../../utils/sanitize');
-const { normalizeString, sanitizeTaxonomyName, resolveCountryName } = require('../../utils/normalize');
+const { normalizeString, sanitizeTaxonomyName, resolveCountryName, resolveGrapeName } = require('../../utils/normalize');
+const { claimKey, findGrapeClaim } = require('../../services/grapeClaims');
 const { otherProducerSpellings, displaySpelling } = require('../../services/producerSpelling');
 const { classifyProposal } = require('../../services/proposalDirectApply');
 const { WINE_COLOURS, colourTypeConflict } = require('../../utils/wineColour');
@@ -262,7 +263,7 @@ registerTool({
   description:
     'Lists wine+vintage pairs awaiting drink-window review (every added bottle seeds one). Pending first, newest ' +
     'first. Call when the somm asks "anything in my maturity queue?" or before a review session. Pass wine_id ' +
-    '(and optionally vintage) to fetch ONE wine\'s rows — including curator notes, which the public drink_window_for ' +
+    '(and optionally vintage) to fetch ONE wine\'s rows — including curator notes, which drink_window_for ' +
     'deliberately omits; a wine-scoped call defaults to status "all" so reviewed rows show without paginating the ' +
     'whole queue. Use the returned profile_id with set_vintage_maturity (which also accepts wine_id + vintage directly). ' +
     'THIS QUEUE IS A TWO-OUTPUT PASS: the research you do to set a drink window — the producer, the vintage, the ' +
@@ -346,7 +347,7 @@ registerTool({
       // `source` tells the model whether a human has already vetted this.
       tasting_profile: profileLite(p.wineDefinition?.aiProfile, p.wineDefinition),
       // Somm-gated tool, so the curator's own note comes back with the row.
-      // Kept out of drink_window_for, which is public — see publicContent.js.
+      // Kept out of drink_window_for, which any reader may call — see publicContent.js.
       somm_notes: p.sommNotes || null,
     }));
     return ok(`${pending} pending in the maturity queue (showing ${data.length} of ${total} ${status})`, data, {
@@ -520,9 +521,8 @@ registerTool({
   description:
     'Resets a REVIEWED wine+vintage back to pending: clears every phase and the note, drops the reviewer stamp, and ' +
     'puts the pair back in the queue as if never curated. For a window written in error — the wrong vintage, a ' +
-    'non-vintage cuvée given a year, an en primeur vintage with no bottle to assess. This was the missing verb: ' +
-    'remove_from_maturity_queue refuses reviewed rows and told the caller to reset first, and until now nothing ' +
-    'could (somm ticket 6a944e46). To remove the pair entirely, reset here and then call remove_from_maturity_queue. ' +
+    'non-vintage cuvée given a year, an en primeur vintage with no bottle to assess. remove_from_maturity_queue ' +
+    'refuses reviewed rows, so to remove the pair entirely, reset here and then call remove_from_maturity_queue. ' +
     'Reversible via undo_last, which restores the exact window and note that were withdrawn.',
   scope: 'write',
   requireRole: SOMM_ROLES,
@@ -558,6 +558,9 @@ registerTool({
     profile.setBy = null;
     profile.setAt = null;
     await profile.save();
+    // Same as the REST route: withdrawing the window changes the owners'
+    // maturity statistics — move their data version.
+    bumpWineOwners([profile.wineDefinition?._id || profile.wineDefinition]);
 
     logAudit(ctx.req, 'somm.maturity.reset',
       { type: 'wine', id: profile.wineDefinition?._id || profile.wineDefinition },
@@ -810,13 +813,14 @@ registerTool({
   title: 'Sommelier: add a variety to the grape taxonomy',
   description:
     'Adds a NEW grape variety to the shared taxonomy — the unblock for set_wine_profile/propose_wine_correction ' +
-    'failing with "not in the grape taxonomy". Until 2026-08-22 this needed an admin and a support ticket (Norton, ' +
-    'St. Pepin, Souzão, Vidal and three more were all filed that way in one week); wine data is somm-owned now, and ' +
+    'failing with "not in the grape taxonomy". No admin or support ticket is needed: wine data is somm-owned, and ' +
     'taxonomy is wine data. Match-first: if the name or any synonym already resolves to an existing variety, ' +
     'nothing is created and the tool tells you what it resolves to — so calling it "just in case" is safe. Include ' +
     'the synonyms owners actually write (accents, hyphens, Cynthiana-for-Norton) — they are what the resolver ' +
     'matches label text against. colour follows the registry rule: the colour of the BERRY (Red/White), null only ' +
-    'for genuine edge cases. Adds are audited and attributed to you.',
+    'for genuine edge cases. Adds are audited and attributed to you. ' +
+    'A known alias such as Shiraz counts as its canonical variety (Syrah): it matches that variety, or the new ' +
+    'row is stored under the canonical name and the reply says so.',
   scope: 'write',
   requireRole: SOMM_ROLES,
   annotations: { readOnlyHint: false, openWorldHint: false },
@@ -833,18 +837,21 @@ registerTool({
     if (denied) return denied;
     const Grape = require('../../models/Grape');
 
-    const name = sanitizeTaxonomyName(args.name);
+    const typed = sanitizeTaxonomyName(args.name);
+    // A static alias ("Shiraz") is stored under its canonical variety (Syrah):
+    // resolveGrapeIdsStrict folds every name through the alias map before it
+    // looks a variety up, so a row named after the alias could never be reached.
+    const name = sanitizeTaxonomyName(resolveGrapeName(typed));
     if (!name) return fail('invalid_input', 'name is empty after sanitising');
+    const substitution = normalizeString(typed) !== normalizeString(name) ? `${typed} → ${name}` : null;
     const synonyms = [...new Set((args.synonyms || []).map((s) => sanitizeTaxonomyName(s)).filter(Boolean))]
       .filter((s) => normalizeString(s) !== normalizeString(name));
 
     // Every string this row would claim — canonical name and all synonyms —
-    // must be unclaimed. Two varieties answering to one string would make
-    // resolveGrapeIdsStrict ambiguous for every later profile write.
-    const claims = [name, ...synonyms].map((s) => normalizeString(s));
-    const taken = await Grape.findOne({
-      $or: [{ normalizedName: { $in: claims } }, { normalizedSynonyms: { $in: claims } }],
-    }).select('name synonyms').lean();
+    // must be unclaimed, under the same fold resolveGrapeIdsStrict uses. Two
+    // varieties answering to one string would make it ambiguous for every
+    // later profile write.
+    const taken = await findGrapeClaim([name, ...synonyms]);
     if (taken) {
       return fail('conflict',
         `Already in the taxonomy: "${taken.name}"${taken.synonyms?.length ? ` (synonyms: ${taken.synonyms.join(', ')})` : ''} ` +
@@ -861,17 +868,22 @@ registerTool({
       createdBy: ctx.user.id,
     });
     await grape.save();
+    // The public taxonomy lists are cached; the admin taxonomy routes clear
+    // them after every change, and so does this one.
+    require('../../routes/taxonomy').clearTaxonomyListCache();
 
     logAudit(ctx.req, 'somm.taxonomy.create',
       { type: 'grape', id: grape._id }, { name: grape.name, colour: grape.color, synonyms });
 
     const envelope = {
-      summary: `Added "${grape.name}" (${grape.color || 'no colour'}) to the grape taxonomy${synonyms.length ? ` with ${synonyms.length} synonym(s)` : ''}`,
+      summary: `Added "${grape.name}" (${grape.color || 'no colour'}) to the grape taxonomy${synonyms.length ? ` with ${synonyms.length} synonym(s)` : ''}` +
+        (substitution ? ` — "${typed}" is a known alias, stored under its canonical name ${grape.name}` : ''),
       data: {
         grape_id: String(grape._id),
         name: grape.name,
         colour: grape.color,
         synonyms,
+        ...(substitution ? { substitution } : {}),
         note: 'Resolves immediately — re-run the set_wine_profile or correction that failed on it.',
       },
     };
@@ -894,13 +906,14 @@ registerTool({
     'arrived incomplete — a curator could see the hole and not fill it. ' +
     'COLOUR IS THE ONE THAT MATTERS MOST. A grape with no colour cannot take part in the colour-conflict check ' +
     'at all: wines built on it are not failing that check, they are never evaluated, so the queue reports zero ' +
-    'and reads as clean. Filling seven null colours on 2026-08-23 immediately surfaced a wine typed red whose ' +
-    'only grape was white. If you see a variety with no colour, that is a silent hole in a live validation rule. ' +
+    'and reads as clean. Filling a null colour can immediately surface a wine typed red whose only grape is ' +
+    'white. If you see a variety with no colour, that is a silent hole in a live validation rule. ' +
     'REGIONAL NAMES render the label a drinker in that country would actually see — Gouveio on a Douro wine ' +
     'rather than Godello, Durif in Australia rather than Petite Sirah — while storage keeps ONE canonical ' +
     'variety. Pass region as well as country where a variety has several (Carignan is Mazuelo in Rioja and ' +
     'Carignano in Sardinia), and add the same string as a synonym so label text and imports resolve INBOUND too, ' +
-    'not only render outbound. Synonyms and regional names are additive; nothing is ever removed.',
+    'not only render outbound. One display name per place — a second name for the same country/region is refused. ' +
+    'Synonyms and regional names are additive; nothing is ever removed.',
   scope: 'write',
   requireRole: SOMM_ROLES,
   annotations: { readOnlyHint: false, openWorldHint: false },
@@ -925,12 +938,15 @@ registerTool({
     const Country = require('../../models/Country');
     const Region = require('../../models/Region');
 
-    const key = normalizeString(args.grape);
+    // Looked up under the fold the wine write path uses, so an alias finds the
+    // variety set_wine_profile would store it under ("Shiraz" → Syrah).
+    const key = claimKey(args.grape);
     const grape = await Grape.findOne({ $or: [{ normalizedName: key }, { normalizedSynonyms: key }] });
     if (!grape) return fail('not_found', `No variety resolves from "${args.grape}" — add_grape creates a new one.`);
 
     const before = { color: grape.color, synonyms: [...(grape.synonyms || [])], regionalNames: (grape.regionalNames || []).length };
     const applied = [];
+    let regionalNameAdded = false;
 
     if (args.colour !== undefined) {
       // An established colour is load-bearing: the conflict check and the
@@ -949,12 +965,9 @@ registerTool({
       const claims = args.add_synonyms.map((s) => sanitizeTaxonomyName(s)).filter(Boolean);
       for (const s of claims) {
         const n = normalizeString(s);
-        // A synonym another variety already answers to would make the
-        // resolver ambiguous for every later write.
-        const taken = await Grape.findOne({
-          _id: { $ne: grape._id },
-          $or: [{ normalizedName: n }, { normalizedSynonyms: n }],
-        }).select('name').lean();
+        // A synonym another variety already answers to — directly or through
+        // the alias map — would make the resolver ambiguous for every later write.
+        const taken = await findGrapeClaim([s], { excludeId: grape._id });
         if (taken) return fail('conflict', `"${s}" already resolves to "${taken.name}" — one string cannot mean two varieties.`);
         if (n === normalizeString(grape.name)) continue;
         if (!(grape.synonyms || []).some((x) => normalizeString(x) === n)) {
@@ -974,12 +987,27 @@ registerTool({
         if (!regionDoc) return fail('not_found', `No region "${args.region}" in ${country.name}.`);
       }
       const rn = sanitizeTaxonomyName(args.regional_name);
-      const dup = (grape.regionalNames || []).some((x) =>
+      const existing = (grape.regionalNames || []).map((x) => ({ country: x.country, region: x.region || null, name: x.name }));
+      const dup = existing.some((x) =>
         String(x.country) === String(country._id) &&
         String(x.region || '') === String(regionDoc ? regionDoc._id : '') &&
         normalizeString(x.name) === normalizeString(rn));
       if (!dup) {
-        grape.regionalNames.push({ country: country._id, region: regionDoc ? regionDoc._id : null, name: rn });
+        // The admin grape editor's validator, over the whole list as it will
+        // be saved: one display name per (country, region) — two would make
+        // the rendered label depend on array order — and at most 20.
+        const { validateGrapeRegionalNames } = require('../../services/grapeRegionalNames');
+        const check = await validateGrapeRegionalNames([
+          ...existing,
+          { country: country._id, region: regionDoc ? regionDoc._id : null, name: rn },
+        ]);
+        if (check.error) {
+          return fail('conflict',
+            `Cannot add regional name "${rn}" to "${grape.name}": ${check.error}. This tool only adds — changing or removing a ` +
+            'regional name is an admin edit.');
+        }
+        grape.regionalNames = check.value;
+        regionalNameAdded = true;
         applied.push(`regional name ${rn} (${country.name}${regionDoc ? ' / ' + regionDoc.name : ''})`);
       }
     }
@@ -989,6 +1017,12 @@ registerTool({
 
     if (applied.length === 0) return ok(`Nothing to change on "${grape.name}" — every value given is already set.`, { grape: grape.name });
     await grape.save();
+
+    // The same follow-through as the admin grape editor: the public taxonomy
+    // lists (colour, synonyms) are cached, and regional names feed the
+    // registry search index (regional display recall), so a new one rebuilds it.
+    require('../../routes/taxonomy').clearTaxonomyListCache();
+    if (regionalNameAdded) require('../../services/search').fullSync().catch(() => {});
 
     logAudit(ctx.req, 'somm.taxonomy.update', { type: 'grape', id: grape._id },
       { name: grape.name, applied, from: before });
@@ -1110,30 +1144,42 @@ registerTool({
       return fail('invalid_input', `Unsupported currency ${currency}. Supported: ${SUPPORTED_CURRENCIES.join(', ')}`);
     }
     if (!isValidId(args.wine_id)) return fail('invalid_input', 'wine_id must be a 24-hex id.');
+    // The bottles' canonical vintage ("nv" → "NV", a malformed or impossible
+    // year refused), so the snapshot matches the bottles and the request it
+    // answers. An unknown vintage has no vintage price.
+    // The helper reads a blank value as NV; for a price that is a missing vintage.
+    if (!String(args.vintage).trim()) return fail('invalid_input', 'vintage is required: a year or NV.');
+    const vintage = parseAndValidateVintage(args.vintage);
+    if (!vintage.ok) return fail('invalid_input', vintage.error);
+    if (vintage.value === 'Unknown') return fail('invalid_input', 'A price needs a vintage year or NV.');
     const wine = await WineDefinition.findById(args.wine_id).select('name producer draft');
     if (!wine || wine.draft === true) return fail('not_found', 'No registry wine with that id.');
 
     const entry = new WineVintagePrice({
       wineDefinition: wine._id,
-      vintage: String(args.vintage).trim(),
+      vintage: vintage.value,
       price: args.price,
       currency,
       source: args.source?.trim() || undefined,
       sommNotes: args.somm_notes?.trim() || undefined,
       setBy: ctx.user.id,
     });
+    // Today's rate snapshot before the save, as on REST: the snapshot's setAt
+    // date anchors later currency conversions. Non-fatal.
+    try { await require('../../utils/exchangeRates').getOrCreateDailySnapshot(); } catch { /* as on REST */ }
     await entry.save();
 
-    require('../../utils/exchangeRates').getOrCreateDailySnapshot().catch(() => {});
-    // Notify requesters exactly like REST (best-effort).
+    // Requesters: the same title, body and link as routes/somm/prices.js
+    // (best-effort). The link is the public wine page — requesters are members,
+    // and the somm prices page answers them with Access Denied.
     PriceTrackingRequest.findOne({ wineDefinition: wine._id, vintage: entry.vintage }).lean()
       .then((reqDoc) => {
         if (!reqDoc?.requesters?.length) return;
         const { createNotification } = require('../../services/notifications');
+        const wineLabel = [wine.producer, wine.name].filter(Boolean).join(' — ');
+        const body = `A sommelier just added a market price for ${wineLabel} ${entry.vintage}: ${entry.currency} ${entry.price}.`;
         for (const { user } of reqDoc.requesters) {
-          createNotification(user, 'price_tracked', 'Price added',
-            `${wine.name} ${entry.vintage}: ${entry.price} ${entry.currency}`,
-            '/somm/prices', 'community').catch(() => {}); // link parity with REST
+          createNotification(user, 'price_tracked', 'Market price updated', body, `/wines/${wine._id}`).catch(() => {});
         }
       }).catch(() => {});
 
@@ -1580,12 +1626,13 @@ registerTool({
     'grape list is wrong, and the note does not presume which). A held row stores NO profile content by design — ' +
     'publication withheld means never written, which is why release REGENERATES rather than publishing something ' +
     'stored. include_published_suspects:true ALSO lists the published rows whose producer the model flagged as ' +
-    'suspect (the 08-17 batch) — same judgement work, different state. Owner-count rides on every row and the list ' +
+    'suspect — same judgement work, different state. Owner-count rides on every row and the list ' +
     'is impact-first (owners desc, then confidence asc). Judge each with review_held_profile; rows you have decided ' +
     'disappear from this list. ' +
-    'SINCE 2026-08-22 this is also the INTAKE queue: automatic AI enrichment is off (wine data is somm-owned), so ' +
-    'every new registry wine appears here as state "unprofiled" — no flags, no confidence, just a wine awaiting its ' +
-    'first profile. Write it with set_wine_profile (type/grape fixes ride the same call); identity gaps go through ' +
+    'This is also the INTAKE queue: a registry wine with no profile at all appears here as state "unprofiled" — no ' +
+    'flags, no confidence, just a wine awaiting its first profile. When this server has automatic AI profiles ' +
+    'switched off (wine data is somm-owned), every new registry wine lands here and nothing else writes its ' +
+    'profile. Write it with set_wine_profile (type/grape fixes ride the same call); identity gaps go through ' +
     'propose_wine_correction as usual. state:"unprofiled" lists only these.',
   scope: 'read',
   requireRole: SOMM_ROLES,
@@ -1593,7 +1640,7 @@ registerTool({
   inputSchema: {
     held_reason: z.string().max(40).optional().describe('Filter the HELD set to one reason (e.g. "taxonomy_conflict"); "legacy" = rows with no recorded reason'),
     state: z.enum(['held', 'published_suspect', 'unprofiled']).optional()
-      .describe('One state only. "unprofiled" = wines with NO profile at all — since automatic AI enrichment was turned off (2026-08-22, somm-owned data) every new wine lands here and set_wine_profile is how it leaves. Omit for all states.'),
+      .describe('One state only. "unprofiled" = wines with NO profile at all — with automatic AI profiles switched off every new wine lands here, and set_wine_profile is how it leaves. Omit for all states.'),
     include_published_suspects: z.boolean().optional().describe('Also list PUBLISHED producer-suspect rows awaiting judgement (state "published_suspect")'),
     producer: z.string().max(200).optional().describe('Only rows whose producer contains this text (case-insensitive) — the queue clusters hard by producer, and one producer judgement often decides many rows'),
     group_by: z.enum(['producer']).optional().describe('Return producer CLUSTERS instead of rows: {producer, row_count, reasons, max_owner_count, wine_ids} — the unit of judgement is usually the producer'),
@@ -1849,7 +1896,9 @@ registerTool({
     // semantics (and the stamp rule) cannot fork.
     const decideOne = async (id) => {
       const wine = await WineDefinition.findById(id)
-        .select('name producer aiProfile.heldAt aiProfile.heldReason aiProfile.producerSuspect aiProfile.producerUnknown aiProfile.suspectDowngradedBy aiProfile.description aiProfile.generatedAt aiProfile.source');
+        // producerNote: the confirm below clears it with the flag it explains,
+        // and can only do that if it was loaded.
+        .select('name producer aiProfile.heldAt aiProfile.heldReason aiProfile.producerSuspect aiProfile.producerUnknown aiProfile.suspectDowngradedBy aiProfile.producerNote aiProfile.description aiProfile.generatedAt aiProfile.source');
       if (!wine) return { wine_id: id, error: 'not_found' };
       const ap = wine.aiProfile || {};
       const held = !!ap.heldAt;
@@ -2033,7 +2082,13 @@ registerTool({
         : r.decision === 'confirm'
           ? (r.state === 'held'
             ? `Confirmed the hold on ${r.label} — it stays unpublished (owners see "Not yet assessed") and leaves the queue.`
-            : `Confirmed ${r.label} as published — the suspect flag is CLEARED (a human adjudicated the doubt); producer_note stays for context.`)
+            // Built from what this confirm actually cleared, not one sentence
+            // for every published state.
+            : `Confirmed ${r.label} as published` +
+              (r.suspect_cleared ? ' — the suspect flag is CLEARED (a human adjudicated the doubt)' : '') +
+              (r.unknown_cleared ? ' — producer placed (producerUnknown cleared)' : '') +
+              (r.rule_cleared ? ` — the ${r.rule_cleared} tag is cleared; it leaves list_rule_downgrades` : '') +
+              (r.producer_note_cleared ? '; the producer note went with the flag (kept in the audit row).' : '.'))
           : r.decision === 'uphold'
             ? `Upheld the flag on ${r.label} — stays published WITH the caveat, review stamped; the row is now honest residue, not queue.`
             : aiConfig.get().enrichmentOnAdd === 'off'
@@ -2112,22 +2167,25 @@ registerTool({
   description:
     'Files a correction on a registry wine. A correction that only FILLS BLANK appellation, region or classification '
     + 'fields, and does not contradict the wine\'s own name, APPLIES IMMEDIATELY — the reply says "Applied" and gives '
-    + 'the applied_note. Everything else is filed for an admin and the reply says "awaiting admin review" with '
+    + 'the applied_note. A non-wine flag applies immediately too, unless more than three members hold bottles of the '
+    + 'row. Everything else is filed for an admin and the reply says "awaiting admin review" with '
     + 'why_reviewed: producer and name (they drive the dedup key and the public URL), country, any OVERWRITE of a '
-    + 'field that already has a value, merges, non-wine flags, and any appellation that disagrees with an appellation '
+    + 'field that already has a value, merges, and any appellation that disagrees with an appellation '
     + 'stated in the wine\'s name. That last one is a ROUTING rule, not a verdict — an Australian "Prosecco" really is '
     + 'a King Valley wine and not the Italian DOC, so file it with your evidence and an admin will read it. ' +
     'THIS is the path for the identity fields set_wine_profile deliberately does not cover: producer, name, ' +
     'appellation, region, country and classification (kind "field_correction", region/country as plain names — ' +
     'resolved against the taxonomy when it applies, never minted). Also: kind "merge" when this wine duplicates another ' +
     'registry wine (merge_target_id = the wine that should SURVIVE), and kind "non_wine" when the row is not wine at ' +
-    'all (spirits/cider/sake) and should be quarantined out of search and the maturity queue. Always give the reason ' +
+    'all (beer/spirits/cider/sake/soft drinks), or nothing on the record or in research shows that it is wine, and ' +
+    'should be quarantined out of search and the maturity queue — owners keep their bottles, and an admin can ' +
+    'restore it. Always give the reason ' +
     'the somm established, and cite an evidence_url (producer site, appellation register) — evidence is what makes a ' +
     'one-click approval possible. One pending proposal per wine and kind — list_pending_corrections shows what is ' +
     'already filed. MERGE proposals are decided in Admin → Wines on the web, DELIBERATELY not over MCP: a wine ' +
     'merge moves bottles and rewrites references (same stance as taxonomy merge), and the merge DELETES the absorbed '
     + 'record — there is no unmerge. undo_last withdraws a proposal that is still pending; one that already applied is '
-    + 'changed by filing a further correction. A producer spelled unlike the rest of that producer in the registry '
+    + 'changed by filing a further correction (an applied non-wine flag is lifted by an admin). A producer spelled unlike the rest of that producer in the registry '
     + 'comes back with registry_spellings: use the registry\'s spelling unless it is the wrong one, and say which in '
     + 'the reason.',
   scope: 'write',
@@ -2146,7 +2204,7 @@ registerTool({
       type: z.enum(WINE_TYPES).optional(),
       colour: z.enum(WINE_COLOURS).optional(),
       grapes: z.array(z.string().min(1).max(GRAPE_NAME_MAX)).min(1).max(GRAPES_MAX).optional(),
-    }).optional().describe('kind "field_correction" only: the corrected value per field (omit fields that are right). Region/country as plain names. `type` is the wine colour/style; `colour` is the colour of a sparkling, dessert or fortified wine (a sparkling rosé is type "sparkling", colour "rosé"); `grapes` REPLACES the whole variety list (send every variety the wine has, not just the added one) and each name must already exist in the taxonomy — synonyms resolve, unknown names are refused so an approval can never mint a variety. A BRAND THAT CHANGED HANDS (somm ticket 6a8698d5): registry wines are vintage-neutral, so a producer that was acquired has no single true value. The convention is CURRENT OWNER WINS — put today\'s owner in `producer` and record the predecessor in the reason, e.g. "ZAREA acquired the brand from Domeniile Tohani in 2019". Do not uphold a suspect flag on a wine whose producer is knowable just because ownership moved: that leaves a permanent cannot-identify caveat on an identifiable wine and inflates the residue count the scaling review reads.'),
+    }).optional().describe('kind "field_correction" only: the corrected value per field (omit fields that are right). Region/country as plain names. `type` is the wine colour/style; `colour` is the colour of a sparkling, dessert or fortified wine (a sparkling rosé is type "sparkling", colour "rosé"); `grapes` REPLACES the whole variety list (send every variety the wine has, not just the added one) and each name must already exist in the taxonomy — synonyms resolve, unknown names are refused so an approval can never mint a variety. A BRAND THAT CHANGED HANDS: registry wines are vintage-neutral, so a producer that was acquired has no single true value. The convention is CURRENT OWNER WINS — put today\'s owner in `producer` and record the predecessor in the reason, e.g. "ZAREA acquired the brand from Domeniile Tohani in 2019". Do not uphold a suspect flag on a wine whose producer is knowable just because ownership moved: that leaves a permanent cannot-identify caveat on an identifiable wine and inflates the residue count the scaling review reads.'),
     merge_target_id: objectId.optional().describe('kind "merge" only: the duplicate\'s SURVIVING wine — must differ from wine_id'),
     evidence_url: z.string().max(PROPOSAL_URL_MAX).optional()
       .describe('http(s) URL backing the claim — cite one whenever the somm has it; it is what makes approval fast'),
@@ -2192,7 +2250,7 @@ registerTool({
       const src = args.proposed_fields || {};
       for (const f of PROPOSAL_FIELDS) {
         if (src[f] === undefined || src[f] === null) continue;
-        const v = String(src[f]).trim();
+        const v = stripHtml(String(src[f])).trim();
         if (!v) continue;
         if (v.length > PROPOSAL_FIELD_MAX) {
           return fail('invalid_input', `proposed_fields.${f} must be at most ${PROPOSAL_FIELD_MAX} characters.`);
@@ -2230,7 +2288,8 @@ registerTool({
         if (!args.merge_target_id) {
           return fail('invalid_input', 'kind "merge" needs merge_target_id — the registry wine this duplicate should be merged INTO.');
         }
-        if (String(args.merge_target_id) === String(args.wine_id)) {
+        // Canonical forms: an id in another letter case is the same wine.
+        if (String(args.merge_target_id).toLowerCase() === String(args.wine_id).toLowerCase()) {
           return fail('invalid_input', 'merge_target_id must be a DIFFERENT wine — a wine cannot merge into itself.');
         }
       } else if (args.merge_target_id) {
@@ -2317,9 +2376,13 @@ registerTool({
     // (rather than a second write path) is what keeps canonicalization, the
     // dedup key, the search/embed/IndexNow follow-through and the re-enrich
     // identical between the two doors.
+    //
+    // A non-wine flag takes the same door (2026-10-13): the quarantine is one
+    // reversible flag, and classifyProposal keeps the gate only for a row
+    // several members hold.
     let applied = null;
     let reviewReason = null;
-    if (args.kind === 'field_correction') {
+    if (args.kind === 'field_correction' || args.kind === 'non_wine') {
       // Required lazily: wineProposals pulls in the whole admin route tree
       // (which requires the MCP registry back), so a top-level require here
       // would close a cycle.
@@ -2382,9 +2445,16 @@ registerTool({
         ...(proposedFields ? { proposed_fields: proposedFields } : {}),
         evidence_url: evidenceUrl || null,
         applied_note: applied,
-        note: 'Live on the wine now. Blank identity fields that agree with the name apply on filing; '
-          + 'the proposal is kept with your reason so an admin can review it afterwards.',
-        undo: 'This is already applied — file a further correction to change it again.',
+        ...(args.kind === 'non_wine' ? {
+          note: 'Quarantined now: the row is gone from registry search and the maturity queue. Owners keep their '
+            + 'bottles, and a member who adds the same drink again lands on this hidden row. The proposal is kept '
+            + 'with your reason so an admin can review it afterwards.',
+          undo: 'This is already applied — an admin restores it as wine in Admin → Wines → Proposals (Decided).',
+        } : {
+          note: 'Live on the wine now. Blank identity fields that agree with the name apply on filing; '
+            + 'the proposal is kept with your reason so an admin can review it afterwards.',
+          undo: 'This is already applied — file a further correction to change it again.',
+        }),
       },
     } : {
       summary: `Proposal filed: ${kindLabel} for ${wine.producer} — ${wine.name} (awaiting admin review)`,
@@ -2429,7 +2499,8 @@ registerTool({
   name: 'ask_bottle_owner',
   title: 'Sommelier: ask a wine\'s bottle owners about their record',
   description:
-    'Sends a question about a registry wine to the users who OWN bottles of it (in-app notification; owners answer ' +
+    'Sends a question about a registry wine to the users who OWN bottles of it (in-app notification, and an email ' +
+    'unless the owner turned it off; owners answer ' +
     'from their bottle page, answers land in the owner-inquiry queue). THE tool for record facts research cannot ' +
     'settle — "what does the label say the producer is?", "is this the DOCG or the DOC bottling?". Owners with ' +
     'ACTIVE bottles are asked; when none exist, owners who consumed one are asked instead. Capped at 20 owners. One ' +
@@ -2470,7 +2541,7 @@ registerTool({
 
     const label = [result.wine.producer, result.wine.name].filter(Boolean).join(' — ');
     return ok(
-      `Inquiry sent to ${result.recipientCount} bottle owner(s) of ${label}${result.fallbackUsed ? ' (no active bottles — owners of consumed bottles were asked)' : ''}`,
+      `Inquiry sent to ${result.recipientCount} bottle owner(s) of ${label}${result.fallbackUsed ? ' (no bottles still in a cellar — owners of consumed bottles were asked)' : ''}`,
       {
         inquiry_id: result.inquiry._id,
         wine_id: result.wine._id,
@@ -2478,7 +2549,7 @@ registerTool({
         recipients_notified: result.recipientCount,
         asked_consumed_owners: result.fallbackUsed,
         expires_at: result.inquiry.expiresAt,
-        note: 'Owners answer in-app; answers appear in list_owner_inquiries. The inquiry expires after 60 days. Not undoable — the notifications are already out.',
+        note: 'Owners are told in-app and, where their settings allow, by email; they answer in the app, and answers appear in list_owner_inquiries. The inquiry expires after 60 days. Not undoable — the notifications are already out.',
       }
     );
   },
@@ -3447,7 +3518,7 @@ registerTool({
     'when the note reports only that the model could not place the name ("not a producer I can verify") and makes ' +
     'no claim about what the field is instead — producer_suspect asserts a positive suspicion, and an epistemic ' +
     'note contains no such assertion. Both leave the row as producerUnknown: a real winery we cannot place, ' +
-    'published without an owner-visible caveat. `note_doubts_cuvee_not_producer` (somm 6a872291) fires when the ' +
+    'published without an owner-visible caveat. `note_doubts_cuvee_not_producer` fires when the ' +
     'doubt is scoped to the WINE NAME or a quoted other entity while the producer is named affirmatively — "La ' +
     'Libertad appears to be a label or line from Bodega Benegas" doubts the cuvée, not the estate; it declines ' +
     'whenever any clause doubts the producer itself, and lands clean, or on producerUnknown when the note also ' +
@@ -3456,7 +3527,7 @@ registerTool({
     'propose_wine_correction or set_wine_profile still work on it normally; and when the row is RIGHT — a ' +
     'documented estate the rule happened to move — review_held_profile with decision confirm records the placement ' +
     'and takes it off this list. A row a HUMAN judged carries ' +
-    'suspectDecision instead and never appears here. One documented semantic (audit 6a86dad6): the tag records ' +
+    'suspectDecision instead and never appears here. One documented semantic: the tag records ' +
     'which rule FIRED under strongest-claim-first precedence, not which shape the note best fits — a note that ' +
     'textually asserts a producer can carry the epistemic tag when the assertion regex did not match it; the ' +
     'outcome is identical either way. A fourth tag, `appellation_has_geography`, is record-based rather than ' +
@@ -3532,8 +3603,8 @@ registerTool({
   description:
     'Registry wines whose PUBLISHED AI description names a place or variety on a record that has NO region and NO ' +
     'appellation — so every such claim in the prose is ungrounded by construction. Each ungrounded claim is ' +
-    'labelled kind: place | variety (varieties were in the original 6a82bfb7 test; the label keeps the two ' +
-    'readable at a glance). The producer\'s own name and the record\'s country are subtracted from claim spans ' +
+    'labelled kind: place | variety, so the two read apart at a glance. ' +
+    'The producer\'s own name and the record\'s country are subtracted from claim spans ' +
     'rather than grounding them wholesale — "Chile\'s Maipo Valley" on a Chile record reports Maipo Valley, and a ' +
     'mention of the producer is never a claim. Graded, never just ' +
     'counted: `assertion` = an ungrounded place stated as fact for the wine ("a red blend from the Hunter Valley" ' +
@@ -3544,7 +3615,7 @@ registerTool({
     'correctly knows — several rows are exactly this) or rewriting the prose (set_wine_profile, or a re-enrich ' +
     'via review). Never fix one by just deleting the geography sentence — silence about region always passes, and ' +
     'training enrichment toward blank confidence is the failure mode this grading exists to avoid. Curator-written ' +
-    'descriptions are out of scope by construction (the 6a86dad6 exclusion, one layer up). Records that HAVE a ' +
+    'descriptions are out of scope by construction. Records that HAVE a ' +
     'region or appellation are also out of scope: prose legitimately goes finer than the record (a La Morra ' +
     'mention on a Barolo row), and judging that needs a gazetteer, not a substring.',
   scope: 'read',

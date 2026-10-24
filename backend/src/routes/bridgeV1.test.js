@@ -10,8 +10,12 @@
  * the hosted site uses, attributed to the key; every route spends its quota.
  */
 jest.mock('../models/WineDefinition', () => ({ find: jest.fn() }));
-jest.mock('../models/WineVintageProfile', () => ({ find: jest.fn() }));
+jest.mock('../models/WineVintageProfile', () => ({ find: jest.fn(), aggregate: jest.fn().mockResolvedValue([]) }));
+jest.mock('../models/RegistryDataValue', () => ({ aggregate: jest.fn().mockResolvedValue([]) }));
 jest.mock('../models/User', () => ({ find: jest.fn() }));
+jest.mock('../models/WineRequest', () => ({
+  find: jest.fn(), updateOne: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({}),
+}));
 jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn() }));
 jest.mock('../services/wineVisibility', () => ({ findVisibleWine: jest.fn() }));
 jest.mock('../services/photoState', () => ({ absoluteImageUrl: (p) => (p ? `https://api.test${p}` : null) }));
@@ -59,6 +63,7 @@ const express = require('express');
 const http = require('http');
 const WineDefinition = require('../models/WineDefinition');
 const WineVintageProfile = require('../models/WineVintageProfile');
+const RegistryDataValue = require('../models/RegistryDataValue');
 const User = require('../models/User');
 const searchService = require('../services/search');
 const { findVisibleWine } = require('../services/wineVisibility');
@@ -82,9 +87,13 @@ beforeAll((done) => {
   server.listen(0, () => { baseUrl = `http://127.0.0.1:${server.address().port}`; done(); });
 });
 afterAll((done) => { server.closeAllConnections(); server.close(done); });
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => {
+  jest.clearAllMocks();
+  WineVintageProfile.aggregate.mockResolvedValue([]);
+  RegistryDataValue.aggregate.mockResolvedValue([]);
+});
 
-const call = (method, path, body, key = 'good') => fetch(`${baseUrl}${path}`, {
+const call =(method, path, body, key = 'good') => fetch(`${baseUrl}${path}`, {
   method, headers: { 'x-test-key': key, 'Content-Type': 'application/json' },
   body: body && method !== 'GET' ? JSON.stringify(body) : undefined,
 });
@@ -225,6 +234,82 @@ describe('POST /wines/changes', () => {
     expect(body.checked).toBe(3);
   });
 
+  // A sommelier reviewing a window, or a value being published, does not touch
+  // the wine record, so the check also asks when those last changed. Without
+  // it an install kept "awaiting staff review" for a window the registry had.
+  test('a window reviewed or a value published after since marks the wine changed, at that time', async () => {
+    const ID3 = 'c'.repeat(24);
+    const ID4 = 'd'.repeat(24);
+    WineDefinition.find.mockReturnValue(chain([
+      { _id: ID, updatedAt: new Date('2026-08-01'), nonWine: false },
+      { _id: ID2, updatedAt: new Date('2026-08-01'), nonWine: false },
+      { _id: ID3, updatedAt: new Date('2026-08-01'), nonWine: false },
+      { _id: ID4, updatedAt: new Date('2026-08-01'), nonWine: true },
+    ]));
+    WineVintageProfile.aggregate.mockResolvedValue([
+      { _id: ID, at: new Date('2026-10-22T21:14:00Z') },
+      { _id: ID3, at: new Date('2026-10-15') }, // before since: not a change
+    ]);
+    RegistryDataValue.aggregate.mockResolvedValue([{ _id: ID2, at: new Date('2026-10-24') }]);
+
+    // A watermark past the cutover: windows and values compare to since.
+    const body = await (await call('POST', '/api/bridge/v1/wines/changes', { ids: [ID, ID2, ID3, ID4], since: '2026-10-19T06:30:00Z' })).json();
+
+    // The latest of the three is what the install compares its sync stamp to.
+    expect(body.changed).toEqual([
+      { id: ID, updatedAt: '2026-10-22T21:14:00.000Z' },
+      { id: ID2, updatedAt: '2026-10-24T00:00:00.000Z' },
+    ]);
+    expect(body.removed).toEqual([ID4]);
+    // Only wines present and still wine are asked about, and only reviewed
+    // windows and published values count: what a fetch carries.
+    const [winStages] = WineVintageProfile.aggregate.mock.calls[0];
+    expect(winStages[0].$match).toEqual({ wineDefinition: { $in: [ID, ID2, ID3] }, status: 'reviewed' });
+    expect(winStages[1].$group.at).toEqual({ $max: { $max: ['$updatedAt', '$setAt'] } });
+    const [valStages] = RegistryDataValue.aggregate.mock.calls[0];
+    expect(valStages[0].$match).toEqual({ wineDefinition: { $in: [ID, ID2, ID3] }, status: 'published' });
+    expect(valStages[1].$group.at).toEqual({ $max: { $max: ['$updatedAt', '$decidedAt'] } });
+  });
+
+  // The backlog: a window reviewed between an install's copy and its last
+  // check before windows counted was never reported, and is older than that
+  // watermark. A since before the cutover reports every window/value change,
+  // so the install's own sync-stamp skip fetches only the copies behind.
+  test('a watermark from before windows counted is told about every window and value change', async () => {
+    const ID3 = 'c'.repeat(24);
+    WineDefinition.find.mockReturnValue(chain([
+      { _id: ID, updatedAt: new Date('2026-09-01'), nonWine: false },
+      { _id: ID2, updatedAt: new Date('2026-09-01'), nonWine: false },
+      { _id: ID3, updatedAt: new Date('2026-09-01'), nonWine: false },
+    ]));
+    WineVintageProfile.aggregate.mockResolvedValue([{ _id: ID, at: new Date('2026-09-20') }]);
+    RegistryDataValue.aggregate.mockResolvedValue([{ _id: ID2, at: new Date('2026-08-23') }]);
+
+    const body = await (await call('POST', '/api/bridge/v1/wines/changes', { ids: [ID, ID2, ID3], since: '2026-10-12T06:30:00Z' })).json();
+
+    expect(body.changed).toEqual([
+      { id: ID, updatedAt: '2026-09-20T00:00:00.000Z' },
+      // Reported for its value; the time is still the latest of the two.
+      { id: ID2, updatedAt: '2026-09-01T00:00:00.000Z' },
+    ]);
+    // A wine with nothing attached still compares its record to since.
+  });
+
+  test("a wine record changed later than its window reports the wine's own time", async () => {
+    WineDefinition.find.mockReturnValue(chain([{ _id: ID, updatedAt: new Date('2026-09-20'), nonWine: false }]));
+    WineVintageProfile.aggregate.mockResolvedValue([{ _id: ID, at: new Date('2026-09-10') }]);
+    const body = await (await call('POST', '/api/bridge/v1/wines/changes', { ids: [ID], since: '2026-09-01T00:00:00Z' })).json();
+    expect(body.changed).toEqual([{ id: ID, updatedAt: '2026-09-20T00:00:00.000Z' }]);
+  });
+
+  test('no wine left to ask about → no window or value lookup', async () => {
+    WineDefinition.find.mockReturnValue(chain([]));
+    const body = await (await call('POST', '/api/bridge/v1/wines/changes', { ids: [ID], since: '2026-09-01T00:00:00Z' })).json();
+    expect(body.removed).toEqual([ID]);
+    expect(WineVintageProfile.aggregate).not.toHaveBeenCalled();
+    expect(RegistryDataValue.aggregate).not.toHaveBeenCalled();
+  });
+
   test('rejects an empty list, more than 5,000 ids, a bad id, or a bad date', async () => {
     expect((await call('POST', '/api/bridge/v1/wines/changes', { ids: [] })).status).toBe(400);
     expect((await call('POST', '/api/bridge/v1/wines/changes', { ids: Array(5001).fill(ID) })).status).toBe(400);
@@ -249,6 +334,17 @@ describe('contributions', () => {
     expect(logAudit).toHaveBeenCalledWith(expect.anything(), 'bridge.request.forwarded', { type: 'wineRequest', id: 'r1' }, expect.objectContaining({ key: 'k1', instanceHost: 'cellar.example.org' }));
     createWineRequest.mockResolvedValue({ error: { status: 400, message: 'Wine name and source URL are required' } });
     expect((await call('POST', '/api/bridge/v1/requests', {})).status).toBe(400);
+  });
+
+  test('an install that says it follows the request (follow: true) has it marked at once; one that says nothing does not', async () => {
+    const WineRequest = require('../models/WineRequest');
+    createWineRequest.mockResolvedValue({ wineRequest: { _id: 'r3', status: 'pending', wineName: 'Salmos 2019' } });
+    await call('POST', '/api/bridge/v1/requests', { wineName: 'Salmos 2019', sourceUrl: 'https://torres.es/salmos' });
+    expect(WineRequest.updateOne).not.toHaveBeenCalled();
+    expect((await call('POST', '/api/bridge/v1/requests', { wineName: 'Salmos 2019', sourceUrl: 'https://torres.es/salmos', follow: true })).status).toBe(201);
+    expect(WineRequest.updateOne).toHaveBeenCalledWith({ _id: 'r3' }, { $set: { installFollowsAt: expect.any(Date) } });
+    // follow is a flag for the route, never a field the intake sees.
+    expect(createWineRequest.mock.calls[1][1]).not.toHaveProperty('follow');
   });
 
   test('a correction is filed via the shared service with via "bridge"; service codes map to statuses', async () => {
@@ -342,4 +438,64 @@ describe('audit 2026-09-08 — counting and the kill switch', () => {
     expect((await call('POST', '/api/bridge/v1/wines/changes', { ids: [ID] })).status).toBe(200);
     expect(global.__bridgeQuotaSpends).toEqual(['changeChecks']);
   });
+});
+
+describe('GET /requests — what became of the requests this install filed', () => {
+  const WineRequest = require('../models/WineRequest');
+  const RQ1 = 'c'.repeat(24); const RQ2 = 'd'.repeat(24);
+
+  test('only the key owner\'s own bridge requests answer; a resolved one carries its visible wine', async () => {
+    WineRequest.find.mockReturnValue(chain([
+      { _id: RQ1, status: 'resolved', linkedWineDefinition: ID, adminNotes: 'Added', resolvedAt: new Date('2026-10-01T10:00:00Z') },
+      { _id: RQ2, status: 'rejected', adminNotes: 'Not a wine', resolvedAt: new Date('2026-10-02T10:00:00Z') },
+    ]));
+    WineDefinition.find.mockReturnValue(chain([wine()]));
+    const res = await call('GET', `/api/bridge/v1/requests?ids=${RQ1},${RQ2},not-an-id`);
+    expect(res.status).toBe(200);
+    expect(WineRequest.find).toHaveBeenCalledWith({ _id: { $in: [RQ1, RQ2] }, user: 'u1', via: 'bridge' });
+    // A wine still pending identity or flagged non-wine never travels.
+    expect(WineDefinition.find.mock.calls[0][0]).toMatchObject({ nonWine: { $ne: true }, pendingIdentity: { $ne: true } });
+    const body = await res.json();
+    expect(body.requests[0]).toMatchObject({ id: RQ1, status: 'resolved', notes: 'Added', wine: { id: ID, name: 'Salmos', producer: 'Torres' } });
+    expect(body.requests[1]).toMatchObject({ id: RQ2, status: 'rejected', notes: 'Not a wine', wine: null });
+  });
+
+  test('asking about a pending request marks it followed by the install (once); decided ones are left alone', async () => {
+    const RQ3 = 'e'.repeat(24);
+    WineRequest.find.mockReturnValue(chain([
+      { _id: RQ1, status: 'pending' },
+      { _id: RQ2, status: 'resolved', linkedWineDefinition: ID },
+      { _id: RQ3, status: 'pending', installFollowsAt: new Date('2026-10-01T10:00:00Z') },
+    ]));
+    WineDefinition.find.mockReturnValue(chain([]));
+    expect((await call('GET', `/api/bridge/v1/requests?ids=${RQ1},${RQ2},${RQ3}`)).status).toBe(200);
+    expect(WineRequest.updateMany).toHaveBeenCalledTimes(1);
+    expect(WineRequest.updateMany).toHaveBeenCalledWith(
+      { _id: { $in: [RQ1] }, installFollowsAt: null },
+      { $set: { installFollowsAt: expect.any(Date) } }
+    );
+  });
+
+  test('no usable id is a 400; more than 50 are capped', async () => {
+    expect((await call('GET', '/api/bridge/v1/requests?ids=x,y')).status).toBe(400);
+    WineRequest.find.mockReturnValue(chain([]));
+    const many = Array.from({ length: 60 }, (_, i) => i.toString(16).padStart(24, '0')).join(',');
+    expect((await call('GET', `/api/bridge/v1/requests?ids=${many}`)).status).toBe(200);
+    expect(WineRequest.find.mock.calls[0][0]._id.$in).toHaveLength(50);
+  });
+});
+
+// #1460: the extra links and the back label an install forwards reach the
+// shared service the way the first link and the front photo do.
+test('the extra links and the back label reach the shared service', async () => {
+  createWineRequest.mockResolvedValue({ wineRequest: { _id: 'r2', status: 'pending', wineName: 'X' } });
+  const res = await call('POST', '/api/bridge/v1/requests', {
+    wineName: 'X', sourceUrl: 'https://a.example', sourceUrls: ['https://a.example', 'https://b.example'], backImage: 'https://a.example/back.jpg',
+  });
+  expect(res.status).toBe(201);
+  expect(createWineRequest).toHaveBeenCalledWith(
+    'u1',
+    { wineName: 'X', sourceUrl: 'https://a.example', sourceUrls: ['https://a.example', 'https://b.example'], image: undefined, backImage: 'https://a.example/back.jpg' },
+    expect.objectContaining({ via: 'bridge' })
+  );
 });

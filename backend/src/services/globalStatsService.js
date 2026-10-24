@@ -5,6 +5,7 @@ const BridgeKey = require('../models/BridgeKey');
 const WineDefinition = require('../models/WineDefinition');
 const AuditLog = require('../models/AuditLog');
 const { PLAN_NAMES } = require('../config/plans');
+const { CONSUMED_STATUSES } = require('../config/constants');
 const { classifySignupSource } = require('../utils/signupSource');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -415,7 +416,9 @@ async function _computeGlobalStatsUncached({ excludeAdmins = true } = {}) {
     Cellar.countDocuments(cellarMatch),
     Bottle.countDocuments(bottleMatch),
     Bottle.countDocuments({ ...bottleMatch, status: 'active' }),
-    Bottle.countDocuments({ ...bottleMatch, status: { $ne: 'active' } }),
+    // Consumed = the four consumed statuses (not "anything but active": a
+    // bottle on order is neither).
+    Bottle.countDocuments({ ...bottleMatch, status: { $in: CONSUMED_STATUSES } }),
     Bottle.countDocuments({ ...bottleMatch, status: 'drank' }),
     Bottle.countDocuments({ ...bottleMatch, status: 'gifted' }),
     Bottle.countDocuments({ ...bottleMatch, status: 'sold' }),
@@ -696,20 +699,30 @@ async function _computeGlobalStatsUncached({ excludeAdmins = true } = {}) {
   // instance-wide roll-up. See statsService.js for the personal-window-aware path.
   const maturityRaw = await safeAggregate(Bottle, [
     { $match: { ...bottleMatch, status: 'active', vintage: { $nin: ['NV', null, ''] } } },
+    // One join per (wine, vintage), not per bottle: bottles of the same wine
+    // and vintage share a profile, so they are counted together (n) and the
+    // final $group sums n. With a plain localField/foreignField join through
+    // the wineDefinition index and the vintage picked in $filter, this is
+    // 3.3 s → 1.0 s on prod data (19,851 bottles, 9,896 pairs, the same
+    // profile on every pair). The per-bottle let/$expr sub-pipeline was the
+    // slowest query in the Mongo profiler (2026-10-14), and it grew with
+    // every bottle; this grows with distinct wine + vintage pairs instead.
+    { $group: { _id: { wd: '$wineDefinition', v: '$vintage' }, n: { $sum: 1 } } },
     { $lookup: {
       from: 'winevintageprofiles',
-      let: { wdId: '$wineDefinition', v: '$vintage' },
-      pipeline: [
-        { $match: { $expr: { $and: [
-          { $eq: ['$wineDefinition', '$$wdId'] },
-          { $eq: ['$vintage', '$$v'] },
-          { $eq: ['$status', 'reviewed'] },
-        ]}}},
-        { $limit: 1 },
-      ],
-      as: 'profile',
+      localField: '_id.wd',
+      foreignField: 'wineDefinition',
+      as: 'profiles',
     }},
-    { $unwind: { path: '$profile', preserveNullAndEmptyArrays: true } },
+    { $addFields: {
+      // The reviewed profile of this vintage (unique on wine + vintage), or
+      // missing, which the classification below reads as noProfile.
+      profile: { $first: { $filter: {
+        input: '$profiles',
+        cond: { $and: [{ $eq: ['$$this.vintage', '$_id.v'] }, { $eq: ['$$this.status', 'reviewed'] }] },
+      } } },
+    }},
+    { $project: { profiles: 0 } },
     { $addFields: {
       maturity: {
         // Mirror utils/maturityUtils.js#classifyMaturity's PROFILE branch (the
@@ -723,71 +736,94 @@ async function _computeGlobalStatsUncached({ excludeAdmins = true } = {}) {
         //     WineVintageProfile is optional, so partial profiles are real)
         //   - Fall-through default is 'early' (matches the JS function's
         //     final `return 'early'`)
-        $cond: {
-          if: {
-            $or: [
-              { $eq: [{ $ifNull: ['$profile', null] }, null] },
-              { $and: [
-                { $eq: [{ $ifNull: ['$profile.earlyFrom', null] }, null] },
-                { $eq: [{ $ifNull: ['$profile.peakFrom',  null] }, null] },
-                { $eq: [{ $ifNull: ['$profile.peakUntil', null] }, null] },
-              ]},
-            ],
+        //   - Every boundary is read through $ifNull. The sommelier writers
+        //     $unset a cleared phase, so an unset boundary is a MISSING field,
+        //     and aggregation sorts missing below null: `$ne: [<missing>, null]`
+        //     is true and `$gt: [year, <missing>]` is true. Read raw, an absent
+        //     boundary passes every "is set" guard.
+        $let: {
+          vars: {
+            earlyFrom:  { $ifNull: ['$profile.earlyFrom',  null] },
+            earlyUntil: { $ifNull: ['$profile.earlyUntil', null] },
+            peakFrom:   { $ifNull: ['$profile.peakFrom',   null] },
+            peakUntil:  { $ifNull: ['$profile.peakUntil',  null] },
+            lateFrom:   { $ifNull: ['$profile.lateFrom',   null] },
+            lateUntil:  { $ifNull: ['$profile.lateUntil',  null] },
           },
-          then: 'noProfile',
-          else: {
-            $switch: {
-              branches: [
-                { case: { $and: [
-                  { $ne: ['$profile.earlyFrom', null] },
-                  { $lt: [currentYear, '$profile.earlyFrom'] },
-                ]}, then: 'notReady' },
-                { case: { $and: [
-                  { $eq: ['$profile.earlyFrom', null] },
-                  { $ne: ['$profile.peakFrom', null] },
-                  { $lt: [currentYear, '$profile.peakFrom'] },
-                ]}, then: 'notReady' },
-                { case: { $and: [
-                  { $ne: ['$profile.earlyUntil', null] },
-                  { $lte: [currentYear, '$profile.earlyUntil'] },
-                ]}, then: 'early' },
-                { case: { $and: [
-                  { $ne: ['$profile.peakFrom', null] },
-                  { $lt: [currentYear, '$profile.peakFrom'] },
-                ]}, then: 'early' },
-                { case: { $and: [
-                  { $ne: ['$profile.peakUntil', null] },
-                  { $lte: [currentYear, '$profile.peakUntil'] },
-                ]}, then: 'peak' },
-                { case: { $and: [
-                  { $ne: ['$profile.lateFrom', null] },
-                  { $lt: [currentYear, '$profile.lateFrom'] },
-                ]}, then: 'peak' },
-                { case: { $and: [
-                  { $ne: ['$profile.lateUntil', null] },
-                  { $lte: [currentYear, '$profile.lateUntil'] },
-                ]}, then: 'late' },
-                { case: { $and: [
-                  { $ne: ['$profile.lateUntil', null] },
-                  { $gt: [currentYear, '$profile.lateUntil'] },
-                ]}, then: 'declining' },
-                { case: { $and: [
-                  { $ne: ['$profile.peakUntil', null] },
-                  { $gt: [currentYear, '$profile.peakUntil'] },
-                  { $eq: ['$profile.lateFrom', null] },
-                ]}, then: 'declining' },
-                { case: { $and: [
-                  { $ne: ['$profile.peakFrom', null] },
-                  { $gte: [currentYear, '$profile.peakFrom'] },
-                ]}, then: 'peak' },
-              ],
-              default: 'early',
+          in: {
+            $cond: {
+              if: {
+                $or: [
+                  { $eq: [{ $ifNull: ['$profile', null] }, null] },
+                  { $and: [
+                    { $eq: ['$$earlyFrom', null] },
+                    { $eq: ['$$peakFrom',  null] },
+                    { $eq: ['$$peakUntil', null] },
+                  ]},
+                ],
+              },
+              then: 'noProfile',
+              else: {
+                $switch: {
+                  branches: [
+                    { case: { $and: [
+                      { $ne: ['$$earlyFrom', null] },
+                      { $lt: [currentYear, '$$earlyFrom'] },
+                    ]}, then: 'notReady' },
+                    { case: { $and: [
+                      { $eq: ['$$earlyFrom', null] },
+                      { $ne: ['$$peakFrom', null] },
+                      { $lt: [currentYear, '$$peakFrom'] },
+                    ]}, then: 'notReady' },
+                    { case: { $and: [
+                      { $ne: ['$$earlyUntil', null] },
+                      { $lte: [currentYear, '$$earlyUntil'] },
+                    ]}, then: 'early' },
+                    { case: { $and: [
+                      { $ne: ['$$peakFrom', null] },
+                      { $lt: [currentYear, '$$peakFrom'] },
+                    ]}, then: 'early' },
+                    { case: { $and: [
+                      { $ne: ['$$peakUntil', null] },
+                      { $lte: [currentYear, '$$peakUntil'] },
+                    ]}, then: 'peak' },
+                    { case: { $and: [
+                      { $ne: ['$$lateFrom', null] },
+                      { $lt: [currentYear, '$$lateFrom'] },
+                    ]}, then: 'peak' },
+                    { case: { $and: [
+                      { $ne: ['$$lateUntil', null] },
+                      { $lte: [currentYear, '$$lateUntil'] },
+                    ]}, then: 'late' },
+                    // A late phase with no end stays late once it has begun.
+                    { case: { $and: [
+                      { $ne: ['$$lateFrom', null] },
+                      { $eq: ['$$lateUntil', null] },
+                      { $gte: [currentYear, '$$lateFrom'] },
+                    ]}, then: 'late' },
+                    { case: { $and: [
+                      { $ne: ['$$lateUntil', null] },
+                      { $gt: [currentYear, '$$lateUntil'] },
+                    ]}, then: 'declining' },
+                    { case: { $and: [
+                      { $ne: ['$$peakUntil', null] },
+                      { $gt: [currentYear, '$$peakUntil'] },
+                      { $eq: ['$$lateFrom', null] },
+                    ]}, then: 'declining' },
+                    { case: { $and: [
+                      { $ne: ['$$peakFrom', null] },
+                      { $gte: [currentYear, '$$peakFrom'] },
+                    ]}, then: 'peak' },
+                  ],
+                  default: 'early',
+                },
+              },
             },
           },
         },
       },
     }},
-    { $group: { _id: '$maturity', count: { $sum: 1 } } },
+    { $group: { _id: '$maturity', count: { $sum: '$n' } } },
   ]);
   const maturity = { peak: 0, early: 0, late: 0, declining: 0, notReady: 0, noProfile: 0 };
   for (const m of maturityRaw) {
@@ -823,7 +859,7 @@ async function _computeGlobalStatsUncached({ excludeAdmins = true } = {}) {
 
   const [trendBottlesAdded, trendBottlesConsumed, trendNewUsers, trendNewCellars] = await Promise.all([
     buildMonthlySeries(Bottle, 'createdAt',  bottleMatch),
-    buildMonthlySeries(Bottle, 'consumedAt', bottleMatch, { status: { $ne: 'active' } }),
+    buildMonthlySeries(Bottle, 'consumedAt', bottleMatch, { status: { $in: CONSUMED_STATUSES } }),
     buildMonthlySeries(User,   'createdAt',  userMatch),
     buildMonthlySeries(Cellar, 'createdAt',  cellarMatch),
   ]);

@@ -63,6 +63,7 @@ const fs = require('fs');
 const mongoose = require('mongoose');
 const app = require('./src/app');
 const connectDB = require('./src/config/db');
+const { loadRuntimeConfig } = require('./src/config/runtime');
 const searchService = require('./src/services/search');
 const eventBus = require('./src/services/eventBus');
 const mcpSessions = require('./src/mcp/sessions');
@@ -79,6 +80,12 @@ const PORT = process.env.PORT || 5000;
 
 // Connect to MongoDB, initialize search, then start server
 connectDB().then(async () => {
+  // The settings admins change at run time (rate limits, AI settings, the
+  // announcement, feature flags) are read from the database now that it is
+  // connected, before the migrations, the scheduler or a request use them.
+  // A config that cannot be read keeps its code defaults; the boot goes on.
+  await loadRuntimeConfig();
+
   // Migration: drop old non-partial cellar name index so Mongoose can create the
   // updated partial one (user_1_name_1 with partialFilterExpression: {deletedAt: null}).
   // Only drop when the existing index actually lacks the partial filter — the new
@@ -108,6 +115,68 @@ connectDB().then(async () => {
     }
   } catch {
     // Collection doesn't exist yet — nothing to do
+  }
+
+  // Migration: photos learn their bottle's vintage (support ticket 2026-10-09).
+  // Rows written before the field carry no `vintage` key; after this, every
+  // row does, so a later boot finds nothing to do.
+  try {
+    const { backfillImageVintages } = require('./src/services/imageVintageBackfill');
+    const n = await backfillImageVintages();
+    if (n > 0) console.log(`[migration] Set vintage on ${n} photo(s) from their bottles`);
+  } catch (err) {
+    console.error('[migration] Photo vintage backfill failed (will retry next boot):', err.message);
+  }
+
+  // Migration: accounts that unsubscribed from all email before owner-question
+  // emails existed get that category stored off, so Settings shows it off and
+  // a later save cannot withdraw their unsubscribe. Idempotent.
+  try {
+    const { storeOptedOutOwnerQuestions } = require('./src/services/ownerInquiryEmail');
+    const n = await storeOptedOutOwnerQuestions();
+    if (n > 0) console.log(`[migration] Owner-question emails stored off for ${n} unsubscribed account(s)`);
+  } catch (err) {
+    console.error('[migration] Owner-question opt-out backfill failed (will retry next boot):', err.message);
+  }
+
+  // Migration: new accounts get drink-window email and push on by default.
+  // Older accounts with nothing stored for them get it stored off, so the new
+  // default never switches anyone on. Idempotent.
+  try {
+    const { storeDrinkWindowDefaultsOff } = require('./src/services/drinkWindowNotifier');
+    const n = await storeDrinkWindowDefaultsOff();
+    if (n > 0) console.log(`[migration] Drink-window email/push stored off on ${n} older value(s)`);
+  } catch (err) {
+    console.error('[migration] Drink-window default backfill failed (will retry next boot):', err.message);
+  }
+
+  // Migration: a wine name's star grade is part of its keys ("Auslese**" and
+  // "Auslese***" are two wines). Re-keys the few names that carry stars. The
+  // scan is an unanchored regex over the whole registry, so it runs ONCE: a
+  // SiteConfig marker records a complete run (names created since get their
+  // keys at creation), and a run with failures leaves no marker and retries
+  // next boot (audit 2026-10-14). A restore from backup brings the marker
+  // back with the data it describes.
+  try {
+    const SiteConfig = require('./src/models/SiteConfig');
+    const MARKER = 'migration.starGradeRekey';
+    if (!(await SiteConfig.exists({ key: MARKER }))) {
+      const { run: rekeyStarGradeWines } = require('./src/scripts/rekey-star-grade-wines');
+      const r = await rekeyStarGradeWines({ apply: true });
+      if (r.rekeyed.length || r.canonical.length) {
+        console.log(`[migration] Star-grade keys: ${r.rekeyed.length} dedup key(s), ${r.canonical.length} canonical key(s) updated`);
+      }
+      for (const line of [...r.skipped, ...r.failed]) console.warn('[migration] Star-grade keys:', line);
+      if (!r.failed.length) {
+        await SiteConfig.updateOne(
+          { key: MARKER },
+          { $set: { value: { at: new Date(), rekeyed: r.rekeyed.length, canonical: r.canonical.length, skipped: r.skipped.length }, updatedAt: new Date() } },
+          { upsert: true },
+        );
+      }
+    }
+  } catch (err) {
+    console.error('[migration] Star-grade re-key failed (will retry next boot):', err.message);
   }
 
   try {

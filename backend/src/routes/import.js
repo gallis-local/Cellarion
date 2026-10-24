@@ -12,7 +12,7 @@ const { getCellarRole } = require('../utils/cellarAccess');
 const { logAudit } = require('../services/audit');
 const { getOrCreateDailySnapshot } = require('../utils/exchangeRates');
 const { resolveRating } = require('../utils/ratingUtils');
-const { normalizeString, resolveCountryName, isRecognizedCountry, isUnknownName, isIdentitySentinel
+const { normalizeString, normalizeWineName, resolveCountryName, isRecognizedCountry, isUnknownName, isIdentitySentinel
 } = require('../utils/normalize');
 const { normalizeBottleSize, DEFAULT_SIZE } = require('../config/bottleSizes');
 const searchService = require('../services/search');
@@ -21,6 +21,7 @@ const aiProvider = require('../services/aiProvider');
 const { findOrCreateWine } = require('../services/findOrCreateWine');
 const { scoreWineMatchVariants, stripProducerPrefix, stripAppellationPrefix, stripProducerBrackets, importQueryVariants } = require('../services/wineMatching');
 const { conflictingStyleTerms, pradikatOnlyValue, pradikatContradictsName } = require('../utils/styleTerms');
+const { statedColourConflict } = require('../utils/wineColour');
 const { wineVisibilityFilter, findVisibleWine } = require('../services/wineVisibility');
 // Audit 2026-09 D13-12: parse-time warnings are bounded before they are stored.
 const { sanitizeImportWarnings } = require('../utils/importWarnings');
@@ -29,6 +30,7 @@ const rateLimitsConfig = require('../config/rateLimits');
 const { generateWineKey } = require('../utils/normalize');
 const {
   CONSUMED_STATUSES,
+  ORDERED_STATUS,
   IMPORT_EXACT_THRESHOLD,
   IMPORT_FUZZY_THRESHOLD,
   MAX_IMPORT_SIZE,
@@ -39,17 +41,33 @@ const { WINE_TYPES } = require('../services/wineProfileOps');
 const { parseAndValidateVintage, parseDrinkYear } = require('../utils/validation');
 const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
 const { extractAiExplanation } = require('../utils/jsonExtract');
-const { getMaxPosition, cabinetShelfRows, cabinetShelfCols, cabinetShelfAlternate } = require('../utils/rackGeometry');
+const { getMaxPosition, cabinetShelfRows, cabinetShelfCols, cabinetShelfAlternate, cabinetShelfSideways, fitCabinetTypeConfig } = require('../utils/rackGeometry');
 const { planRackCreations, placeBottlesInRack, VALID_ANCHORS, DEFAULT_ANCHOR } = require('../utils/rackImport');
 const { RACK_TYPES } = require('../models/Rack');
 const { validatePriceSanity } = require('../utils/priceValidation');
 const { computeUserMediansByCurrency } = require('../services/priceWarnings');
+const { parseCurrency, currencyOrFallback, isSupportedCurrency } = require('../config/currencies');
 const { runConcurrent } = require('../utils/concurrency');
 const WineRequest = require('../models/WineRequest');
 const { findOrCreatePendingRequest, pickImportHints } = require('../services/wineRequestIntake');
 const WishlistItem = require('../models/WishlistItem');
 const ImportSession = require('../models/ImportSession');
 const ImportArchive = require('../models/ImportArchive');
+const { parseExpectedArrival } = require('../utils/onOrder');
+
+/**
+ * A row flagged `onOrder` (a CellarTracker pending purchase, or a receipt the
+ * review marked "not delivered yet") becomes a bottle ON ORDER, with its
+ * expected month when the row has a usable one. Forgiving like the rest of
+ * the import: an unreadable date imports the bottle without one rather than
+ * failing the row. Never applied to a row going straight into history.
+ */
+function applyOnOrder(bottle, item) {
+  if (item.onOrder !== true) return;
+  bottle.status = ORDERED_STATUS;
+  const ea = parseExpectedArrival(item.expectedArrival);
+  if (ea.ok && ea.value) bottle.expectedArrival = ea.value;
+}
 
 const router = express.Router();
 // requireNonDemo: the CT/CSV importer spends AI on identify and creates registry
@@ -300,8 +318,12 @@ const IMPORT_ARCHIVE_DAYS = 30;
 /**
  * Project one import row down to its identity columns plus its outcome.
  * `outcome` is what the row's SELECTION resolved to — matched an existing
- * wine, minted a new one, filed a request, or was skipped — because "what
- * the file said" and "what we did with it" are only diagnostic together.
+ * wine, minted a new one, or filed a request ('other' when it had none). A
+ * confirmed AI proposal records what /confirm resolved it to: 'created' only
+ * when this row minted the wine, 'matched' when it found one, 'unresolved'
+ * when it found none. Any other row that errored keeps its selection's
+ * outcome. "What the file said" and "what we did with it" are only diagnostic
+ * together.
  */
 function archiveRow(item, outcome) {
   const row = { outcome };
@@ -438,6 +460,23 @@ function scoreCandidate(candidate, item) {
     // appellation (registry backlog 2026-09-06).
     region: item.region
   });
+}
+
+/**
+ * The colour gate: why this import row cannot be registry wine `wine`, or null.
+ *
+ * Neither the normalizedKey (`producer:name:appellation`) nor the scorer reads
+ * colour, so a producer whose red and white share a name ("Châteauneuf-du-Pape"
+ * for both) scores 1.0 either way, and the cascade filed a file's RED rows
+ * under the registry's WHITE with status 'exact' — the one status users are
+ * told needs no review. Where the row and the wine both state a colour and
+ * the two differ, it is the other bottle of the pair. Same contract as
+ * styleConflict: never auto-link it, carry the reason on the match, let the
+ * user choose. Fails open — an untyped row, a style-typed row (no colour of
+ * its own) or a wine of unknown colour is never a conflict.
+ */
+function rowColourConflict(item, wine) {
+  return statedColourConflict(String((item && item.type) || '').trim().toLowerCase(), wine);
 }
 
 /**
@@ -607,7 +646,7 @@ async function findWineMatches(item, viewer = {}) {
   // Strategy 3: Direct normalized name/producer lookup
   if (candidates.size < 3 && item.producer && item.wineName) {
     const normalizedProducer = normalizeString(item.producer);
-    const normalizedName = normalizeString(item.wineName);
+    const normalizedName = normalizeWineName(item.wineName);
     const bareProducer = stripProducerBrackets(item.producer);
     const bareName = stripAppellationPrefix(item.wineName, item.appellation) || stripAppellationPrefix(item.wineName, item.region);
 
@@ -648,10 +687,15 @@ async function findWineMatches(item, viewer = {}) {
   // from one vineyard measures 0.9543 through this scorer. Annotated here,
   // at the single place all three consumers get their matches, so the
   // >= EXACT_THRESHOLD gates and the client's preselection read one verdict.
+  // colourConflict rides alongside for the same consumers (rowColourConflict).
   const sorted = [...candidates.values()]
     .sort((a, b) => b.score - a.score)
     .slice(0, 5)
-    .map((m) => ({ ...m, styleConflict: conflictingStyleTerms(item.wineName, m.wine.name) }));
+    .map((m) => ({
+      ...m,
+      styleConflict: conflictingStyleTerms(item.wineName, m.wine.name),
+      colourConflict: rowColourConflict(item, m.wine),
+    }));
 
   return sorted;
 }
@@ -689,8 +733,13 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     if (!cellar || cellar.deletedAt) {
       return res.status(404).json({ error: 'Cellar not found' });
     }
+    // No role answers like a missing cellar (no existence oracle), as
+    // middleware/cellarAccess does; a viewer sees the cellar but cannot import.
     const role = getCellarRole(cellar, req.user.id);
-    if (!role || role === 'viewer') {
+    if (!role) {
+      return res.status(404).json({ error: 'Cellar not found' });
+    }
+    if (role === 'viewer') {
       return res.status(403).json({ error: 'Not authorized to import bottles to this cellar' });
     }
 
@@ -752,7 +801,7 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       if (pr.errorMsg || !pr.item.wineName) continue;
       if (pr.item.producer && !isIdentitySentinel(pr.item.producer)) continue;
       if (pr.item.producer) pr.item.producer = ''; // sentinel → genuinely producer-less
-      const nameKey = normalizeString(pr.item.wineName);
+      const nameKey = normalizeWineName(pr.item.wineName);
       if (!splitByName.has(nameKey)) splitByName.set(nameKey, await splitKnownProducerPrefix(pr.item.wineName));
       const split = splitByName.get(nameKey);
       if (split) {
@@ -769,7 +818,7 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     // Build unique wine keys — one cascade/AI attempt per unique wine, not per bottle
     const aiKeyMap = new Map(); // normalizedKey -> preResult (representative)
     for (const pr of identifyEligible) {
-      const key = `${normalizeString(pr.item.wineName)}:${normalizeString(pr.item.producer)}`;
+      const key = `${normalizeWineName(pr.item.wineName)}:${normalizeString(pr.item.producer)}`;
       if (!aiKeyMap.has(key)) aiKeyMap.set(key, pr);
       if (pr.forceAi) aiKeyMap.get(key).forceAi = true; // any row's Look-up button forces the key
     }
@@ -814,8 +863,11 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       // forceAi bypasses the cascade only when there is an AI to reach; with
       // no key configured the shared cascade is the best available outcome.
       if (pr.forceAi && aiConfigured) continue;
+      // An exact KEY is not an exact WINE when the colours differ: the key
+      // carries no colour (rowColourConflict). Such a hit falls through to
+      // (b), which offers the same wine with the conflict on the match.
       const exactWine = await findExactRegistryWine(pr.item);
-      if (exactWine) {
+      if (exactWine && !rowColourConflict(pr.item, exactWine)) {
         pr.registryWine = { wine: exactWine, score: 1 };
         continue;
       }
@@ -826,7 +878,8 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       // "outcome-identical" claim is false and the import files a Trocken
       // under its Halbtrocken sibling with status 'exact'. A conflicted top
       // match falls through to the AI/fuzzy path, where the user chooses.
-      if (matches.length > 0 && matches[0].score >= EXACT_THRESHOLD && !matches[0].styleConflict) {
+      // colourConflict is gated the same way, for the same reason.
+      if (matches.length > 0 && matches[0].score >= EXACT_THRESHOLD && !matches[0].styleConflict && !matches[0].colourConflict) {
         pr.registryWine = { wine: matches[0].wine, score: matches[0].score };
         continue;
       }
@@ -907,16 +960,23 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     // Build a key -> AI result lookup (only wines that actually went to AI)
     const aiByKey = new Map();
     for (let j = 0; j < aiRun.length; j++) {
-      const key = `${normalizeString(aiRun[j].item.wineName)}:${normalizeString(aiRun[j].item.producer)}`;
+      const key = `${normalizeWineName(aiRun[j].item.wineName)}:${normalizeString(aiRun[j].item.producer)}`;
       aiByKey.set(key, aiSettled[j]);
     }
 
     // Attach the shared cascade/AI result to every eligible preResult with
     // that key (duplicates share the representative's outcome, as before).
     for (const pr of identifyEligible) {
-      const key = `${normalizeString(pr.item.wineName)}:${normalizeString(pr.item.producer)}`;
+      const key = `${normalizeWineName(pr.item.wineName)}:${normalizeString(pr.item.producer)}`;
       const rep = aiKeyMap.get(key);
-      if (rep.registryWine) { pr.registryWine = rep.registryWine; continue; }
+      // The representative is chosen by name + producer, not colour: a file
+      // listing a red and a white under one name shares one representative,
+      // so its registry hit is re-checked against THIS row's colour. A row it
+      // does not fit leaves here unresolved and is matched on its own below.
+      if (rep.registryWine) {
+        if (!rowColourConflict(pr.item, rep.registryWine.wine)) pr.registryWine = rep.registryWine;
+        continue;
+      }
       if (rep.preMatches && !pr.preMatches) pr.preMatches = rep.preMatches;
       if (rep.aiSkipped) { pr.aiSkipped = true; continue; }
       // A representative identified by the FILE (Pass 1a's complete-row
@@ -1049,7 +1109,7 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     const matchedWineCache = new Map(); // normalizedKey -> { wine } | { proposed } | { error }
     for (const pr of preResults) {
       if (pr.registryWine || !pr.aiIdentified) continue;
-      const key = `${normalizeString(pr.aiIdentified.name)}:${normalizeString(pr.aiIdentified.producer)}`;
+      const key = `${normalizeWineName(pr.aiIdentified.name)}:${normalizeString(pr.aiIdentified.producer)}`;
       if (matchedWineCache.has(key)) {
         const cached = matchedWineCache.get(key);
         if (cached.wine) pr.aiWine = cached.wine;
@@ -1146,6 +1206,7 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       } else if (pr.aiWine) {
         // AI identified the wine and the registry already knows it
         status = 'ai_match';
+        const aiColourConflict = rowColourConflict(pr.item, pr.aiWine);
         resultMatches = [{
           wineId: pr.aiWine._id,
           name: pr.aiWine.name,
@@ -1156,7 +1217,12 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
           type: pr.aiWine.type,
           image: pr.aiWine.image || null,
           score: pr.aiIdentified.confidence ?? 1,
-          aiIdentified: true
+          aiIdentified: true,
+          // findOrCreateWine resolves by key, and the key carries no colour, so
+          // the model's red can resolve to the registry's white of that name.
+          // Only present when set: an ordinary ai_match keeps its exact shape
+          // (pinned by import.validate.aiBudget.test.js).
+          ...(aiColourConflict ? { colourConflict: aiColourConflict } : {})
         }];
       } else if (pr.aiProposed) {
         // AI identified the wine but the registry doesn't know it yet. NOTHING
@@ -1175,15 +1241,18 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
           type: m.wine.type,
           image: m.wine.image || null,
           score: Math.round(m.score * 100) / 100,
-          styleConflict: m.styleConflict || null
+          styleConflict: m.styleConflict || null,
+          colourConflict: rowColourConflict(pr.item, m.wine)
         }));
       } else if (pr.matches.length > 0) {
         // AI failed or unavailable, but fuzzy matching found candidates.
-        // A style-conflicting top match never earns 'exact' — that status
-        // tells the user no review is needed, which is precisely wrong for
-        // a range sibling (see the findWineMatches annotation).
+        // A style- or colour-conflicting top match never earns 'exact' — that
+        // status tells the user no review is needed, which is precisely wrong
+        // for a range sibling or the other colour of a pair (see the
+        // findWineMatches annotation). The colour is re-read against THIS row:
+        // its matches may be a shared representative's.
         const { matches } = pr;
-        if (matches[0].score >= EXACT_THRESHOLD && !matches[0].styleConflict) {
+        if (matches[0].score >= EXACT_THRESHOLD && !matches[0].styleConflict && !rowColourConflict(pr.item, matches[0].wine)) {
           status = 'exact';
         } else {
           status = 'fuzzy';
@@ -1198,7 +1267,8 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
           type: m.wine.type,
           image: m.wine.image || null,
           score: Math.round(m.score * 100) / 100,
-          styleConflict: m.styleConflict || null
+          styleConflict: m.styleConflict || null,
+          colourConflict: rowColourConflict(pr.item, m.wine)
         }));
       } else {
         // No match from either AI or fuzzy
@@ -1240,7 +1310,10 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     for (const r of results) {
       const price = Number(r.item?.price);
       if (!isFinite(price) || price <= 0) continue;
-      const currency = (r.item?.currency || 'USD').toUpperCase();
+      // A currency the app does not know ("kr", "€ EUR") is told here and
+      // replaced by the import's default on confirm (audit 2026-10-14).
+      const rawCurrency = typeof r.item?.currency === 'string' ? r.item.currency.trim() : '';
+      const currency = currencyOrFallback(rawCurrency, 'USD');
       const m = userMedians[currency];
       r.priceWarnings = validatePriceSanity({
         price,
@@ -1248,6 +1321,9 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
         userMedianPrice:  m?.median ?? null,
         userMedianSample: m?.sample ?? 0,
       });
+      if (rawCurrency && !isSupportedCurrency(rawCurrency)) {
+        r.priceWarnings.push({ code: 'unknownCurrency', severity: 'warning', context: { currency: rawCurrency.slice(0, 20) } });
+      }
     }
 
     res.json({
@@ -1293,6 +1369,9 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
  *                     instead of a Bottle (requires a matched registry wine;
  *                     request-wine rows are reported as per-row errors).
  *                     Duplicates — in-batch or already-wanted — are skipped.
+ *   nonWineHint     — true when the file's Type/Category named a spirit; a
+ *                     wine this row mints (aiWine) is created non-wine
+ *                     flagged. A matched registry wine is never touched.
  * Response: { created, skipped, errors[], wishlistCreated, ... }
  */
 router.post('/confirm', async (req, res) => {
@@ -1314,13 +1393,16 @@ router.post('/confirm', async (req, res) => {
 
     const positionAnchor = VALID_ANCHORS.includes(rawAnchor) ? rawAnchor : DEFAULT_ANCHOR;
 
-    // Currency to apply when an import item has no Currency column of its own.
-    // We accept any 3-letter ISO code here so the user's profile preference
-    // (or a future addition to the frontend CURRENCIES list) flows through
-    // without backend changes. Falls back to USD when no preference is set.
-    const defaultCurrency = (typeof rawDefaultCurrency === 'string' && /^[A-Z]{3}$/i.test(rawDefaultCurrency))
-      ? rawDefaultCurrency.toUpperCase()
-      : 'USD';
+    // Currency to apply when an import item has no Currency column of its
+    // own, or one the app does not know. The user's choice on the confirm
+    // screen (their profile currency by default): a supported code or an
+    // alias of one, as every other write path demands — this used to accept
+    // any three letters (audit 2026-10-14). Falls back to USD when unset.
+    const defaultCurrencyCheck = parseCurrency(rawDefaultCurrency);
+    if (!defaultCurrencyCheck.ok) {
+      return res.status(400).json({ error: defaultCurrencyCheck.error });
+    }
+    const defaultCurrency = defaultCurrencyCheck.value || 'USD';
 
     // Whole-import comment/occasion (support ticket 2026-07-30): typed once on
     // the confirm screen, they land on every BOTTLE this import creates.
@@ -1394,6 +1476,7 @@ router.post('/confirm', async (req, res) => {
               : fitted;
             tc.twoDeep = cfg.typeConfig.twoDeep !== false;
             tc.stagger = cfg.typeConfig.stagger !== false;
+            tc.headToTail = !tc.twoDeep && cfg.typeConfig.headToTail === true;
             tc.alternate = cfg.typeConfig.alternate === true;
             // Per-shelf width / pattern, when the file has them (a Cellarion
             // export); fitted to the shelf count the same way as shelfRows.
@@ -1407,6 +1490,7 @@ router.post('/confirm', async (req, res) => {
             };
             if (Array.isArray(cfg.typeConfig.shelfCols)) tc.shelfCols = cabinetShelfCols(rows, cols, { shelfCols: grown(cfg.typeConfig.shelfCols) });
             if (Array.isArray(cfg.typeConfig.shelfAlternate)) tc.shelfAlternate = cabinetShelfAlternate(rows, { alternate: tc.alternate, shelfAlternate: grown(cfg.typeConfig.shelfAlternate) });
+            if (Array.isArray(cfg.typeConfig.shelfSideways)) tc.shelfSideways = cabinetShelfSideways(rows, { shelfSideways: grown(cfg.typeConfig.shelfSideways) });
           }
           if (Object.keys(tc).length > 0) entry.typeConfig = tc;
         }
@@ -1429,8 +1513,13 @@ router.post('/confirm', async (req, res) => {
     if (!cellar || cellar.deletedAt) {
       return res.status(404).json({ error: 'Cellar not found' });
     }
+    // No role answers like a missing cellar (no existence oracle), as
+    // middleware/cellarAccess does; a viewer sees the cellar but cannot import.
     const role = getCellarRole(cellar, req.user.id);
-    if (!role || role === 'viewer') {
+    if (!role) {
+      return res.status(404).json({ error: 'Cellar not found' });
+    }
+    if (role === 'viewer') {
       return res.status(403).json({ error: 'Not authorized to import bottles to this cellar' });
     }
 
@@ -1478,15 +1567,7 @@ router.post('/confirm', async (req, res) => {
           // (the update route's shape gate would otherwise reject every later
           // rename/group/zone edit — audit 2026-09-15).
           if (safeType === 'cabinet') {
-            rackData.typeConfig = {
-              ...(rackData.typeConfig || {}),
-              shelfRows: cabinetShelfRows(rows, rackData.typeConfig),
-              twoDeep: rackData.typeConfig?.twoDeep !== false,
-              stagger: rackData.typeConfig?.stagger !== false,
-              alternate: rackData.typeConfig?.alternate === true,
-              ...(Array.isArray(rackData.typeConfig?.shelfCols) ? { shelfCols: cabinetShelfCols(rows, cols, rackData.typeConfig) } : {}),
-              ...(Array.isArray(rackData.typeConfig?.shelfAlternate) ? { shelfAlternate: cabinetShelfAlternate(rows, rackData.typeConfig) } : {}),
-            };
+            rackData.typeConfig = fitCabinetTypeConfig(rows, cols, rackData.typeConfig);
           }
           const rack = new Rack(rackData);
           // Disabled positions beyond the created geometry address cells that
@@ -1512,6 +1593,9 @@ router.post('/confirm', async (req, res) => {
     // Oeno-export rows with a Consumed On date.
     let createdActive = 0;
     let createdHistory = 0;
+    // Rows imported as bottles ON ORDER (bought, not delivered yet — a
+    // CellarTracker pending purchase, a pro-forma or prepayment receipt).
+    let createdOnOrder = 0;
     // Rows flagged addToWishlist (e.g. a Vivino scan-history import sent to
     // the wishlist) become WishlistItems for the IMPORTING user — wishlists
     // are personal, unlike bottles which belong to the cellar owner.
@@ -1528,6 +1612,11 @@ router.post('/confirm', async (req, res) => {
     // routinely repeats the same wine, and each unique one must resolve to ONE
     // registry row per batch. normalizedKey-style key, same as /validate.
     const aiWineCache = new Map();
+    // What each confirmed AI proposal resolved to, by row index, for the
+    // import archive below: 'created' when findOrCreateWine minted the wine
+    // for this row, 'matched' when it found an existing one or the row repeats
+    // a wine this batch already resolved.
+    const aiOutcomes = new Map();
     // Wines this batch minted with an incomplete identity (no usable producer,
     // or a geography in the producer column — the classic one-column-off
     // mapping). Their BOTTLES imported normally; only the registry entry waits
@@ -1581,8 +1670,9 @@ router.post('/confirm', async (req, res) => {
             errors.push({ index: i, reason: 'AI wine data is missing its name' });
             continue;
           }
-          const aiKey = `${normalizeString(ai.name)}:${normalizeString(ai.producer || '')}`;
+          const aiKey = `${normalizeWineName(ai.name)}:${normalizeString(ai.producer || '')}`;
           let wine = aiWineCache.get(aiKey);
+          let outcome = 'matched';
           if (!wine) {
             const { wine: resolved, created, producerRejected } = await findOrCreateWine({
               name: ai.name,
@@ -1596,6 +1686,9 @@ router.post('/confirm', async (req, res) => {
             }, req.user.id, {
               createdVia: 'import', allowPending: true,
               provenance: computeIdentityProvenance(item, ai),
+              // The file's Type/Category named a spirit: a wine this row
+              // mints is born non-wine flagged (see below).
+              ...(item.nonWineHint === true ? { nonWine: true } : {}),
             });
             // findOrCreateWine can return { wine: null, candidates } — the soft
             // zone. Unguarded, `wine._id` two lines down threw and took the
@@ -1608,6 +1701,7 @@ router.post('/confirm', async (req, res) => {
             wine = resolved;
             aiWineCache.set(aiKey, wine);
             if (created) {
+              outcome = 'created';
               if (wine.pendingIdentity) pendingIdentityCount++;
               // Same action name as the MCP/admin/find-or-create surfaces so
               // registry writes read as one audit stream (2026-08-03 M-1).
@@ -1619,8 +1713,24 @@ router.post('/confirm', async (req, res) => {
                   ...(producerRejected
                     ? { rejectedProducer: producerRejected.producer, rejectedByCheck: producerRejected.check }
                     : {}) });
+              // The file's Type/Category named a spirit, whisky, gin, …
+              // (frontend utils/importMappers looksNonWine). The row this
+              // import just minted carries the flag that
+              // POST /admin/wines/:id/non-wine sets: the bottle lands and its
+              // owner keeps the wine (services/ownHiddenWines), but it stays
+              // out of public search, the maturity queue and embeddings.
+              // findOrCreateWine created it flagged, so the one index call the
+              // mint makes removes it and nothing is seeded that would need
+              // removing; flagging it here instead would race that
+              // fire-and-forget call. A hinted row that MATCHED an existing
+              // wine is left to a curator: the file's category can be wrong.
+              if (item.nonWineHint === true) {
+                logAudit(req, 'wine.nonWine', { type: 'wine', id: wine._id },
+                  { via: 'import', value: true, name: wine.name, producer: wine.producer || null });
+              }
             }
           }
+          aiOutcomes.set(i, outcome);
           // Hand the resolved doc straight to the bottle-creation flow below —
           // item.wineDefinition keeps the wishlist branch working, wineDoc
           // skips the redundant findById re-fetch.
@@ -1757,7 +1867,7 @@ router.post('/confirm', async (req, res) => {
             pendingWineRequest: wineRequest._id,
             vintage: canonicalVintage,
             price: item.price || undefined,
-            currency: item.currency || defaultCurrency,
+            currency: currencyOrFallback(item.currency, defaultCurrency),
             priceSetAt,
             bottleSize: normalizeBottleSize(item.bottleSize) || DEFAULT_SIZE,
             purchaseDate: item.purchaseDate || undefined,
@@ -1789,12 +1899,16 @@ router.post('/confirm', async (req, res) => {
               bottle.consumedRating = resolvedConsumedRating;
               bottle.consumedRatingScale = resolvedConsumedScale;
             }
+          } else {
+            applyOnOrder(bottle, item);
           }
 
           await bottle.save();
           created++;
           if (item.addToHistory) {
             createdHistory++;
+          } else if (bottle.status === ORDERED_STATUS) {
+            createdOnOrder++;
           } else {
             createdActive++;
           }
@@ -1851,7 +1965,7 @@ router.post('/confirm', async (req, res) => {
           wineDefinition: item.wineDefinition,
           vintage: canonicalVintage,
           price: item.price || undefined,
-          currency: item.currency || defaultCurrency,
+          currency: currencyOrFallback(item.currency, defaultCurrency),
           priceSetAt,
           bottleSize: normalizeBottleSize(item.bottleSize) || DEFAULT_SIZE,
           purchaseDate: item.purchaseDate || undefined,
@@ -1884,12 +1998,16 @@ router.post('/confirm', async (req, res) => {
             bottle.consumedRating = resolvedConsumedRating;
             bottle.consumedRatingScale = resolvedConsumedScale;
           }
+        } else {
+          applyOnOrder(bottle, item);
         }
 
         await bottle.save();
         created++;
         if (item.addToHistory) {
           createdHistory++;
+        } else if (bottle.status === ORDERED_STATUS) {
+          createdOnOrder++;
         } else {
           createdActive++;
         }
@@ -1904,7 +2022,9 @@ router.post('/confirm', async (req, res) => {
 
         // Seed the sommelier maturity queue for this wine+vintage (no-op for
         // "Unknown"). Fire-and-forget — best-effort relative to the import.
-        ensurePendingVintageProfile(wineDoc._id, canonicalVintage);
+        // Not for a bottle on order: it is queued when it arrives (an en
+        // primeur vintage may not be released yet).
+        if (bottle.status !== ORDERED_STATUS) ensurePendingVintageProfile(wineDoc._id, canonicalVintage);
       } catch (err) {
         errors.push({ index: i, reason: err.message });
       }
@@ -1990,6 +2110,7 @@ router.post('/confirm', async (req, res) => {
     logAudit(req, 'bottle.import', { type: 'cellar', id: cellarId, cellarId: cellar._id }, {
       created,
       createdActive,
+      ...(createdOnOrder ? { createdOnOrder } : {}),
       createdHistory,
       wishlistCreated,
       skipped: skipped.length,
@@ -2031,11 +2152,16 @@ router.post('/confirm', async (req, res) => {
     // the same stall a real connection hiccup would cause in production.)
     // The rows are projected, not stored raw — see IDENTITY_FIELDS.
     try {
-      const rows = items.slice(0, ARCHIVE_ROW_CAP).map((item) => archiveRow(
+      const rows = items.slice(0, ARCHIVE_ROW_CAP).map((item, i) => archiveRow(
         item,
         item.requestWine ? 'request'
-          : (item.newWine ? 'created'
-            : (item.wineDefinition ? 'matched' : 'other'))
+          // The import client sends a confirmed AI proposal as `aiWine`
+          // (utils/importPayload); the loop above recorded what it resolved
+          // to. One it never resolved (the near-match zone, a missing name, a
+          // bad vintage) has no wineDefinition: the loop fills that in only
+          // on a row it resolved.
+          : (aiOutcomes.get(i)
+            || (item.wineDefinition ? 'matched' : (item.aiWine ? 'unresolved' : 'other')))
       ));
       ImportArchive.create({
         user: req.user.id,
@@ -2049,6 +2175,7 @@ router.post('/confirm', async (req, res) => {
         rowsTruncated: items.length > ARCHIVE_ROW_CAP,
         summary: {
           created, createdActive, createdHistory, wishlistCreated,
+          ...(createdOnOrder ? { createdOnOrder } : {}),
           skipped: skipped.length, errors: errors.length,
           ...(errors.length ? { errorReasons: summariseReasons(errors) } : {}),
           pendingIdentity: pendingIdentityCount,
@@ -2065,6 +2192,8 @@ router.post('/confirm', async (req, res) => {
     res.json({
       created,
       createdActive,
+      // Only when some rows came in on order — the response shape is otherwise unchanged.
+      ...(createdOnOrder ? { createdOnOrder } : {}),
       createdHistory,
       wishlistCreated,
       skipped,
@@ -2112,9 +2241,14 @@ router.post('/sessions', async (req, res) => {
     if (!cellar || cellar.deletedAt) {
       return res.status(404).json({ error: 'Cellar not found' });
     }
+    // No role answers like a missing cellar (no existence oracle), as
+    // middleware/cellarAccess does; a viewer sees the cellar but cannot import.
     const role = getCellarRole(cellar, req.user.id);
-    if (!role || role === 'viewer') {
-      return res.status(403).json({ error: 'Not authorized' });
+    if (!role) {
+      return res.status(404).json({ error: 'Cellar not found' });
+    }
+    if (role === 'viewer') {
+      return res.status(403).json({ error: 'Not authorized to import bottles to this cellar' });
     }
 
     // Replace any existing draft for this user+cellar
@@ -2161,8 +2295,10 @@ router.get('/sessions', async (req, res) => {
     if (!cellar || cellar.deletedAt) {
       return res.status(404).json({ error: 'Cellar not found' });
     }
+    // No role answers like a missing cellar (no existence oracle), as
+    // middleware/cellarAccess does. A viewer may list their own drafts.
     if (!getCellarRole(cellar, req.user.id)) {
-      return res.status(403).json({ error: 'Not authorized' });
+      return res.status(404).json({ error: 'Cellar not found' });
     }
 
     const sessions = await ImportSession.find({
@@ -2214,9 +2350,10 @@ router.get('/sessions/:id', async (req, res) => {
       if (!result?.item) continue;
       try {
         const matches = await findWineMatches(result.item, { userId: req.user.id, roles: req.user.roles });
-        // Same styleConflict gate as Pass 1a: this path silently re-points a
-        // row the user marked 'request', so a range sibling must never pass.
-        if (matches.length > 0 && matches[0].score >= EXACT_THRESHOLD && !matches[0].styleConflict) {
+        // Same styleConflict + colourConflict gates as Pass 1a: this path
+        // silently re-points a row the user marked 'request', so a range
+        // sibling or the other colour of a pair must never pass.
+        if (matches.length > 0 && matches[0].score >= EXACT_THRESHOLD && !matches[0].styleConflict && !matches[0].colourConflict) {
           const m = matches[0];
           refreshed[idx] = {
             wineId: m.wine._id,

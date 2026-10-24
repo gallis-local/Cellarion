@@ -399,8 +399,25 @@ function shelfLayout(rows, cols, typeConfig) {
 //   position = cols × Σ_{k<i} shelfRows[k] + (row − 1) × cols + slot
 // rows counted from the plank up, slots left to right; in general (an
 // alternating cabinet) position = Σ widths of every earlier row + slot.
-// twoDeep never changes the numbering, only where a row is drawn.
+// twoDeep changes the numbering only where it changes a width (an
+// alternating bay, or a stacked bay with a bottle across the front:
+// cabinetRowWidth); otherwise only where a row is drawn.
 export const CABINET_MAX_ROWS_PER_SHELF = 12;
+
+/**
+ * Head to tail: on a one-deep cabinet (twoDeep off) the bottles of a row lie
+ * base forward and neck forward in turn. Drawing only — the numbering
+ * contract below never changes. Never on a two-deep cabinet, whose rows lie
+ * neck to neck (the backend refuses the pair).
+ */
+export function cabinetHeadToTail(typeConfig) {
+  return typeConfig?.twoDeep === false && typeConfig?.headToTail === true;
+}
+
+/** Under head to tail, the 2nd, 4th, … bottle from the left of a row (0-based `c`) lies neck forward. */
+export function cabinetNeckForward(c) {
+  return c % 2 === 1;
+}
 
 /** Per-shelf row list fitted to `rows` (missing → 1, clamped 1..12). */
 export function cabinetShelfRows(rows, typeConfig) {
@@ -423,23 +440,62 @@ export function cabinetOptions(typeConfig) {
  * Bottles in row `row` (1-based, from the plank) of a cabinet bay: `cols`,
  * unless the cabinet alternates — then the first level's front row holds
  * cols, its back row one fewer, the level above one fewer in front of cols,
- * and so on; single-deep levels alternate cols, cols−1, cols, … Mirrors
- * backend rackGeometry.cabinetRowWidth. Never 0 wide.
+ * and so on; single-deep levels alternate cols, cols−1, cols, … On a
+ * stacked one-deep shelf with a bottle across the front (sideways 'front')
+ * the levels above the first rest on the bottles behind that one, so they
+ * are counted from cols−1 (cabinetRestsBehindAcross). Mirrors backend
+ * rackGeometry.cabinetRowWidth. Never 0 wide.
  */
-export function cabinetRowWidth(row, cols, { twoDeep = true, alternate = false } = {}) {
-  if (!alternate) return cols;
+export function cabinetRowWidth(row, cols, { twoDeep = true, alternate = false, sideways = '' } = {}) {
+  const base = sideways === 'front' && !twoDeep && row > 1 ? Math.max(1, cols - 1) : cols;
+  if (!alternate) return base;
   const level = twoDeep ? Math.ceil(row / 2) : row;
   const isBack = twoDeep && row % 2 === 0;
   const wide = (level % 2 === 1) !== isBack;
-  return wide ? cols : Math.max(1, cols - 1);
+  return wide ? base : Math.max(1, base - 1);
 }
 
-/** Bottles a bay of `rowCount` rows holds (mirrors backend cabinetBayCapacity). */
+/** Bottles a bay of `rowCount` rows holds: the sum of its rows (mirrors backend cabinetBayCapacity). */
 export function cabinetBayCapacity(rowCount, cols, opts) {
-  if (!opts?.alternate) return cols * rowCount;
   let n = 0;
   for (let r = 1; r <= rowCount; r++) n += cabinetRowWidth(r, cols, opts);
   return n;
+}
+
+/** The options cabinetRowWidth needs for one bay (mirrors backend cabinetBayOpts). */
+export function cabinetBayOpts(bay, twoDeep) {
+  return { twoDeep, alternate: bay.alternate, sideways: bay.sideways };
+}
+
+/**
+ * Does row `row` of `bay` rest on the bottles BEHIND a bottle lying across
+ * the front? Only on a stacked one-deep shelf ('front', twoDeep off), for the
+ * levels above the first: they hold one bottle fewer (cabinetRowWidth) and
+ * are drawn over the first row's cells 1…, not 0….
+ */
+export function cabinetRestsBehindAcross(bay, row, twoDeep) {
+  // A one-bottle-wide shelf has nothing behind the bottle across to rest on:
+  // its levels stay where they were drawn (the count is 1 either way).
+  return bay?.sideways === 'front' && !twoDeep && row > 1 && bay.cols > 1;
+}
+
+/**
+ * Where a row's first cell is drawn, in bottle widths from the bay's left
+ * edge: the half-bottle nudge of a nested level or a narrow (alternating)
+ * row, plus the cell the bottle across the front takes under a level that
+ * rests behind it. The 2D map and the shelf view draw with it; the 3D room
+ * uses it for those levels too.
+ */
+export function cabinetRowOffset(bay, row, { twoDeep, stagger }) {
+  const behind = cabinetRestsBehindAcross(bay, row, twoDeep);
+  const inner = behind ? Math.max(1, bay.cols - 1) : bay.cols;
+  const width = cabinetRowWidth(row, bay.cols, cabinetBayOpts(bay, twoDeep));
+  const level = twoDeep ? Math.ceil(row / 2) : row;
+  const nest = bay.alternate || stagger;
+  const nudge = bay.alternate
+    ? (width < inner ? 0.5 : 0)
+    : (nest && inner > 1 && level % 2 === 0 ? 0.5 : 0);
+  return (behind ? 1 : 0) + nudge;
 }
 
 /** Per-shelf widths fitted to `rows` (missing → cols, clamped 1..cols). Mirrors the backend. */
@@ -465,15 +521,53 @@ export function cabinetShelfAlternate(rows, typeConfig) {
   return out;
 }
 
+// How a shelf's bottles lie (typeConfig.shelfSideways, mirrors the backend):
+// '' front to back, 'front' the first bottle of the shelf's bottom row lies
+// ACROSS the front of the others (a slim fridge's shelf: 5 front to back + 1
+// across), 'all' every bottle lies across, piled (a bottom bin). Drawing
+// only, except the levels above a 'front' bottle on a stacked one-deep shelf
+// (cabinetRowWidth).
+export const CABINET_SIDEWAYS = ['', 'front', 'all'];
+
+/** Per-shelf lie list fitted to `rows` (missing or unknown → ''). Mirrors the backend. */
+export function cabinetShelfSideways(rows, typeConfig) {
+  const n = Math.max(0, Math.min(20, parseInt(rows, 10) || 0));
+  const src = Array.isArray(typeConfig?.shelfSideways) ? typeConfig.shelfSideways : [];
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(CABINET_SIDEWAYS.includes(src[i]) ? src[i] : '');
+  return out;
+}
+
 /**
- * Every bay top first with its resolved shape { rows, cols, alternate } —
- * the one place the per-shelf lists are combined (mirrors backend cabinetBays).
+ * Does cell `c` (0-based from the left) of row `row` (1-based, from the
+ * plank) of `bay` hold a bottle lying across? Every renderer asks this one
+ * function, so the 2D map, the shelf view and the 3D room agree.
+ */
+export function cabinetSlotSideways(bay, row, c) {
+  if (bay?.sideways === 'all') return true;
+  return bay?.sideways === 'front' && row === 1 && c === 0;
+}
+
+/**
+ * Head to tail on a row whose first bottle lies across the front: the
+ * bottles behind it alternate from the first of THEM, so the parity runs
+ * from the second cell (the across bottle is neither).
+ */
+export function cabinetNeckIndex(bay, row, c) {
+  return bay?.sideways === 'front' && row === 1 ? c - 1 : c;
+}
+
+/**
+ * Every bay top first with its resolved shape { rows, cols, alternate,
+ * sideways } — the one place the per-shelf lists are combined (mirrors
+ * backend cabinetBays).
  */
 export function cabinetBays(rows, cols, typeConfig) {
   const rowList = cabinetShelfRows(rows, typeConfig);
   const colList = cabinetShelfCols(rows, cols, typeConfig);
   const altList = cabinetShelfAlternate(rows, typeConfig);
-  return rowList.map((r, i) => ({ rows: r, cols: colList[i], alternate: altList[i] }));
+  const sideList = cabinetShelfSideways(rows, typeConfig);
+  return rowList.map((r, i) => ({ rows: r, cols: colList[i], alternate: altList[i], sideways: sideList[i] }));
 }
 
 /**
@@ -503,6 +597,7 @@ function cabinetLayout(rows, cols, typeConfig) {
   const bayShapes = cabinetBays(rows, cols, typeConfig);
   const { twoDeep } = cabinetOptions(typeConfig);
   const stagger = typeConfig?.stagger !== false;
+  const headToTail = cabinetHeadToTail(typeConfig);
   // Every bay alternates → the cabinet does; drawn nesting follows per bay
   // (a narrow row can only lie in the grooves of the wide row below, so an
   // alternating bay always nests, whatever stagger says).
@@ -544,22 +639,28 @@ function cabinetLayout(rows, cols, typeConfig) {
       // Alternating bay: the NARROW rows are the offset ones, centred in
       // the gaps of the wide rows (front and back alike), and the shelf is
       // exactly its width — the classic honeycomb.
-      const width = cabinetRowWidth(r, bay.cols, { twoDeep, alternate: bay.alternate });
-      const nudge = bay.alternate
-        ? (width < bay.cols ? 0.5 : 0)
-        : (nest && bay.cols > 1 && level % 2 === 0 ? 0.5 : 0);
+      const width = cabinetRowWidth(r, bay.cols, cabinetBayOpts(bay, twoDeep));
+      // Plus, under a level resting behind a bottle across the front, the
+      // cell that bottle takes (cabinetRowOffset).
+      const nudge = cabinetRowOffset(bay, r, { twoDeep, stagger });
       for (let c = 0; c < width; c++) {
         const cx = isBack && !bay.alternate
           ? x0 + (c + 0.5 + nudge) * CELL
           : x0 + (c + nudge) * CELL;
+        // A bottle lying across keeps its cell on this map (the numbering is
+        // the map's job); it is drawn lying, and the shelf view and the 3D
+        // room show where it really lies.
+        const sideways = cabinetSlotSideways(bay, r, c);
         slots.push({
           position: pos++, cx, cy: isBack ? backCY : frontCY,
           ...(isBack ? { isBack: true } : {}),
           ...(!isBack && level > 1 ? { isTop: true } : {}),
+          ...(sideways ? { isSideways: true } : {}),
+          ...(headToTail && !sideways && cabinetNeckForward(cabinetNeckIndex(bay, r, c)) ? { isNeck: true } : {}),
         });
       }
     }
-    bays.push({ index: i, top: bayTop, height: bayH, rows: rowCount, levels, cols: bay.cols, alternate: bay.alternate });
+    bays.push({ index: i, top: bayTop, height: bayH, rows: rowCount, levels, cols: bay.cols, alternate: bay.alternate, sideways: bay.sideways });
     y += bayH;
     if (i < bayShapes.length - 1) shelfYs.push(y - SLOT_GAP / 2);
   });
@@ -570,7 +671,7 @@ function cabinetLayout(rows, cols, typeConfig) {
     bottlesPerCell: 1,
     backRadius: twoDeep ? CAB_BACK_R : undefined,
     shelfYs: shelfYs.length ? shelfYs : undefined,
-    cabinet: { shelfRows, twoDeep, stagger: alternate || stagger, alternate, bays },
+    cabinet: { shelfRows, twoDeep, stagger: alternate || stagger, alternate, headToTail, bays },
     viewBox: {
       width: contentRight + PADDING,
       height: y + PADDING - SLOT_GAP,
@@ -605,9 +706,131 @@ export function computeLayout(type, rows, cols, typeConfig) {
 
 /** Slot radius — exported so renderers can use it. */
 export const SLOT_RADIUS = SLOT_R;
+// How far beyond its drawn circle a slot still counts as hit: a dragged
+// bottle's drop (hooks/useSlotDrag) and a finger's tap (RackRenderer) — the
+// same forgiveness for both.
+export const SLOT_HIT_FACTOR = 1.2;
+
+/**
+ * The closest two slot centres of a layout. Sorted by x and swept, so a big
+ * rack costs about n log n rather than every pair.
+ */
+export function minSlotDistance(slots) {
+  const pts = [...(slots || [])].sort((a, b) => a.cx - b.cx);
+  let min = Infinity;
+  for (let i = 0; i < pts.length; i += 1) {
+    for (let j = i + 1; j < pts.length && pts[j].cx - pts[i].cx < min; j += 1) {
+      const d = Math.hypot(pts[j].cx - pts[i].cx, pts[j].cy - pts[i].cy);
+      if (d < min) min = d;
+    }
+  }
+  return min;
+}
 
 /** Centre-to-centre distance — exported for builder grid snapping. */
 export const CELL_SIZE = CELL;
+
+// ── Multi-bottle cells (shelf bottlesPerCell > 1) ───────────────────
+// shelfLayout gives every bottle of a cell the cell's own centre; spreading
+// them is the renderer's job. Every 2D map of a rack (the rack view, the
+// Cellar Book print map, the zone editor) spreads them with the helpers
+// below, so a position sits in the same spot on each.
+
+/** Sub-circle offsets for multi-bottle cells (dx, dy from cell centre) */
+export function getSubOffsets(bpc, R) {
+  const g = R * 0.42;
+  switch (bpc) {
+    case 2: return [{ dx: -g, dy: 0 }, { dx: g, dy: 0 }];
+    case 3: {
+      // Equilateral triangle, slightly tighter so the cluster reads as one unit
+      const t = R * 0.38;
+      return [
+        { dx: 0,             dy: -t * 0.85 },
+        { dx: -t * 0.85,     dy:  t * 0.55 },
+        { dx:  t * 0.85,     dy:  t * 0.55 },
+      ];
+    }
+    case 4: return [{ dx: -g, dy: -g }, { dx: g, dy: -g }, { dx: -g, dy: g }, { dx: g, dy: g }];
+    default: {
+      // General grid arrangement
+      const cols = Math.ceil(Math.sqrt(bpc));
+      const rows = Math.ceil(bpc / cols);
+      const offsets = [];
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          if (offsets.length >= bpc) break;
+          offsets.push({
+            dx: -g + (2 * g * c) / Math.max(cols - 1, 1),
+            dy: -g + (2 * g * r) / Math.max(rows - 1, 1),
+          });
+        }
+      }
+      return offsets;
+    }
+  }
+}
+
+/** Sub-circle radius for multi-bottle cells */
+export function getSubRadius(bpc, R) {
+  if (bpc <= 2) return R * 0.45;
+  if (bpc <= 4) return R * 0.40;
+  return R * 0.3;
+}
+
+const CELL_TRAY_PAD = 3;
+
+/**
+ * The cells of a layout whose cells hold several bottles, or null when each
+ * holds one. Positions sharing a centre form a cell (layout order); each
+ * bottle is fanned out by getSubOffsets at getSubRadius, a back-row cell's
+ * from layout.backRadius. Per cell: { cx, cy, isBack, r (each bottle's
+ * radius), size (side of the tray drawn behind it), pitch (closest two
+ * bottles' centres), bottles: [{ position, cx, cy }] }.
+ */
+export function multiBottleCells(layout, { fit = false } = {}) {
+  const bpc = layout.bottlesPerCell || 1;
+  if (bpc <= 1) return null;
+  const backR = layout.backRadius;
+  const kind = (R, size) => {
+    const offsets = getSubOffsets(bpc, R);
+    const pitch = minSlotDistance(offsets.map(o => ({ cx: o.dx, cy: o.dy })));
+    // `fit`: no bottle wider than the spacing, so each one's number (and
+    // click target) is its own — from 10 per cell the rack view's radius
+    // covers the next bottle's centre. The print map and the zone editor
+    // fit; the rack view keeps its drawing.
+    const r = fit ? Math.min(getSubRadius(bpc, R), pitch / 2) : getSubRadius(bpc, R);
+    return { offsets, r, size, pitch };
+  };
+  const front = kind(SLOT_R, CELL - CELL_TRAY_PAD * 2);
+  const back = backR ? kind(backR, backR * 2 + 4) : front;
+
+  const cellMap = {};
+  layout.slots.forEach(s => {
+    const key = `${s.cx},${s.cy}`;
+    if (!cellMap[key]) cellMap[key] = { cx: s.cx, cy: s.cy, isBack: !!s.isBack, positions: [] };
+    cellMap[key].positions.push(s.position);
+  });
+  return Object.values(cellMap).map(({ positions, ...cell }) => {
+    const { offsets, r, size, pitch } = cell.isBack ? back : front;
+    return {
+      ...cell, r, size, pitch,
+      bottles: positions.map((position, idx) => {
+        const off = offsets[idx] || { dx: 0, dy: 0 };
+        return { position, cx: cell.cx + off.dx, cy: cell.cy + off.dy };
+      }),
+    };
+  });
+}
+
+/**
+ * Font size for the position numbers on a multi-bottle cell's bottles:
+ * `ratio` of the bottle's radius, but never so large that a number of
+ * `digits` digits (about 0.6 em each) reaches the next bottle's — a cell of
+ * ten or more bottles sits tighter than its radius suggests.
+ */
+export function cellNumberSize(cell, ratio, digits) {
+  return Math.min(cell.r * ratio, (cell.pitch * 0.9) / (Math.max(1, digits) * 0.6));
+}
 
 /**
  * Compute layout for a modular rack (multiple modules composed together).
@@ -718,7 +941,7 @@ export function getTotalSlots(type, rows, cols, typeConfig) {
       // sum when it alternates) — mirrors backend rackGeometry.totalSlots.
       const { twoDeep } = cabinetOptions(typeConfig);
       return cabinetBays(rows, cols, typeConfig)
-        .reduce((sum, bay) => sum + cabinetBayCapacity(bay.rows, bay.cols, { twoDeep, alternate: bay.alternate }), 0);
+        .reduce((sum, bay) => sum + cabinetBayCapacity(bay.rows, bay.cols, cabinetBayOpts(bay, twoDeep)), 0);
     }
     case 'grid':
     default: {

@@ -42,6 +42,7 @@ jest.mock('../models/WineRequest', () => ({}));
 jest.mock('../models/Country', () => ({}));
 jest.mock('../models/Region', () => ({}));
 jest.mock('../models/Grape', () => ({}));
+jest.mock('../models/WineVintageProfile', () => ({ find: jest.fn() }));
 
 const express = require('express');
 const http = require('http');
@@ -50,6 +51,7 @@ const mongoose = require('mongoose');
 const Cellar = require('../models/Cellar');
 const Bottle = require('../models/Bottle');
 const WineDefinition = require('../models/WineDefinition');
+const WineVintageProfile = require('../models/WineVintageProfile');
 const { getSnapshotsForDates, getOrCreateDailySnapshot } = require('../utils/exchangeRates');
 const cellarsRouter = require('./cellars');
 
@@ -120,7 +122,7 @@ test('one grouping query over this cellar\'s active bottles, by what the figures
   const { cellar, ...rest } = pipeline[0].$match;
   expect(cellar).toBeInstanceOf(mongoose.Types.ObjectId);
   expect(String(cellar)).toBe(CELLAR_ID);
-  expect(rest).toEqual({ status: { $nin: ['drank', 'gifted', 'sold', 'other'] } });
+  expect(rest).toEqual({ status: { $nin: ['drank', 'gifted', 'sold', 'other', 'ordered'] } });
   expect(Object.keys(pipeline[1].$group._id)).toEqual(['wine', 'vintage', 'rating', 'ratingScale', 'currency', 'priceDay']);
   expect(pipeline[2]).toEqual({ $sort: { first: 1 } });
   expect(body.statistics).toMatchObject({ totalBottles: 0, uniqueWines: 0, totalValue: 0, oldestVintage: null, newestVintage: null });
@@ -179,4 +181,44 @@ test('another user\'s cellar is not found', async () => {
   const { status } = await request(`/api/cellars/${CELLAR_ID}/statistics`);
   expect(status).toBe(404);
   expect(Bottle.aggregate).not.toHaveBeenCalled();
+});
+
+// #1291: the filter's maturity buttons showed no counts — the statistics never
+// carried them. Their own endpoint (the filter asks as it opens) uses the
+// list's maturity classification, so a count is what choosing it shows, and
+// reads only what that needs — not the cellar's other statistics.
+test('maturity counts: bottles per stage from vintage profiles and own windows, one grouping query', async () => {
+  const year = new Date().getFullYear();
+  const oid = (id) => new mongoose.Types.ObjectId(id);
+  let pipe;
+  Bottle.aggregate.mockImplementation((p) => {
+    pipe = p;
+    return { allowDiskUse: async () => [
+      { _id: { wineDefinition: oid(RED), vintage: '2015', anchorYear: 2020 }, count: 2 },                 // profile: at its peak
+      { _id: { wineDefinition: oid(WHITE), vintage: '2020', anchorYear: 2021 }, count: 1 },               // no profile
+      { _id: { wineDefinition: oid(WHITE), vintage: '2021', drinkFrom: year + 2, anchorYear: 2022 }, count: 3 }, // own window: not ready
+      { _id: { drinkFrom: year - 10, drinkTo: year - 1, anchorYear: null }, count: 1 },                 // own window: past it
+    ] };
+  });
+  WineVintageProfile.find.mockReturnValue({ lean: async () => [
+    { wineDefinition: oid(RED), vintage: '2015', status: 'reviewed', earlyFrom: year - 6, earlyUntil: year - 2, peakFrom: year - 1, peakUntil: year + 1, lateFrom: year + 2, lateUntil: year + 4 },
+  ] });
+
+  const { status, body } = await request(`/api/cellars/${CELLAR_ID}/maturity-counts`);
+  expect(status).toBe(200);
+  // Each group is classified once and counts as many bottles as it holds.
+  expect(body).toEqual({ maturity: { declining: 1, late: 0, peak: 2, early: 0, notReady: 3, noProfile: 1 }, total: 7 });
+  // This cellar's active bottles, grouped by what the classification reads.
+  const { cellar, status: st } = pipe[0].$match;
+  expect(String(cellar)).toBe(CELLAR_ID);
+  expect(st).toEqual({ $nin: ['drank', 'gifted', 'sold', 'other', 'ordered'] });
+  expect(Object.keys(pipe[1].$group._id).sort()).toEqual(['anchorYear', 'drinkFrom', 'drinkTo', 'peakFrom', 'peakUntil', 'vintage', 'wineDefinition']);
+  expect(Bottle.find).not.toHaveBeenCalled();
+});
+
+test('maturity counts: a cellar of another user is not found', async () => {
+  Cellar.findById.mockResolvedValue({ _id: new mongoose.Types.ObjectId(CELLAR_ID), user: '64b0000000000000000000ff', members: [], deletedAt: null });
+  const { status } = await request(`/api/cellars/${CELLAR_ID}/maturity-counts`);
+  expect(status).toBe(404);
+  expect(Bottle.find).not.toHaveBeenCalled();
 });

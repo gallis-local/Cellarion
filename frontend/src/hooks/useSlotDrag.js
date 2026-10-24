@@ -1,11 +1,12 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { SLOT_HIT_FACTOR } from '../utils/rackLayouts';
 
 /**
  * Find the slot whose center is nearest to (x, y) within its own hit radius
  * (scaled by `factor` to be a little forgiving). Returns the slot's position
  * or null. Pure — exported for tests.
  */
-export function findNearestSlot(slotCenters, x, y, { exclude = null, factor = 1.2 } = {}) {
+export function findNearestSlot(slotCenters, x, y, { exclude = null, factor = SLOT_HIT_FACTOR } = {}) {
   let best = null;
   let bestD = Infinity;
   for (const s of slotCenters) {
@@ -25,8 +26,9 @@ export function findNearestSlot(slotCenters, x, y, { exclude = null, factor = 1.
 /**
  * Pointer-based drag & drop between the slots of an SVG rack renderer.
  *
- * Mouse/pen only — on touch the tap→popup flow already covers moving a
- * bottle, and capturing touch drags would fight page scrolling.
+ * Mouse/pen only — capturing touch drags would fight page scrolling. On a
+ * touch screen a bottle is moved from its slot popup instead: "Move", then a
+ * tap on the slot it should go to (the move mode in pages/CellarRacks).
  *
  * A drag only begins once the pointer travels past a small threshold, so
  * plain clicks still open the slot popup; after a drop the next click on

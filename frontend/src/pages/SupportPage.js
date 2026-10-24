@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { getMySupportTickets, getMyWineReports, replySupportTicket } from '../api/support';
+import { getMySupportTickets, getMyWineReports, replySupportTicket, closeSupportTicket } from '../api/support';
 import SupportModal from '../components/SupportModal';
+import ConfirmModal from '../components/ConfirmModal';
 import './SupportPage.css';
 
 function SupportPage() {
@@ -18,6 +20,8 @@ function SupportPage() {
   const [replyText, setReplyText] = useState('');
   const [replySending, setReplySending] = useState(false);
   const [replyError, setReplyError] = useState(null);
+  // The ticket waiting on the "Mark as resolved" confirmation.
+  const [closing, setClosing] = useState(null);
 
   useEffect(() => {
     fetchData();
@@ -72,6 +76,26 @@ function SupportPage() {
     }
   };
 
+  // Closing is final for the user (a closed ticket takes no replies), hence
+  // the confirmation; a failure shows where reply errors do.
+  const closeTicket = async (ticketId) => {
+    setReplyError(null);
+    try {
+      const res = await closeSupportTicket(apiFetch, ticketId);
+      const data = await res.json();
+      if (!res.ok) {
+        setReplyError(data.error || t('support.closeFailed', 'Could not close the ticket — try again.'));
+      } else {
+        setReplyText('');
+        setTickets(ts => ts.map(tk => tk._id === ticketId ? data.ticket : tk));
+      }
+    } catch {
+      setReplyError(t('support.closeFailed', 'Could not close the ticket — try again.'));
+    } finally {
+      setClosing(null);
+    }
+  };
+
   return (
     <div className="support-page">
       <div className="support-header">
@@ -80,6 +104,12 @@ function SupportPage() {
           {t('support.newTicket')}
         </button>
       </div>
+      {/* Most questions already have an answer in Help: point there first,
+          in one quiet line that does not stand in the way of a ticket. */}
+      <p className="support-help-hint">
+        {t('support.helpFirst', 'Have a question? Look in Help first — most answers are already there.')}{' '}
+        <Link to="/help">{t('support.helpLink', 'Open Help')}</Link>
+      </p>
 
       <div className="support-tabs">
         <button
@@ -170,16 +200,25 @@ function SupportPage() {
                           disabled={replySending}
                         />
                         {replyError && <p className="support-error">{replyError}</p>}
-                        <button
-                          className="btn btn-primary"
-                          onClick={() => sendReply(ticket._id)}
-                          disabled={replySending || !replyText.trim()}
-                        >
-                          {replySending ? t('support.sendingReply') : t('support.sendReply')}
-                        </button>
+                        <div className="support-reply-actions">
+                          <button
+                            className="btn btn-secondary"
+                            onClick={() => setClosing(ticket)}
+                            disabled={replySending}
+                          >
+                            {t('support.markResolved', 'Mark as resolved')}
+                          </button>
+                          <button
+                            className="btn btn-primary"
+                            onClick={() => sendReply(ticket._id)}
+                            disabled={replySending || !replyText.trim()}
+                          >
+                            {replySending ? t('support.sendingReply') : t('support.sendReply')}
+                          </button>
+                        </div>
                       </div>
                     ) : (
-                      <p className="support-awaiting">{t('support.closedNoReply')}</p>
+                      <p className="support-awaiting">{t('support.closedNoReply', 'This ticket is closed — open a new ticket if you need more help.')}</p>
                     )}
                   </div>
                 )}
@@ -258,6 +297,18 @@ function SupportPage() {
             setShowModal(false);
             fetchData();
           }}
+        />
+      )}
+
+      {closing && (
+        <ConfirmModal
+          title={t('support.closeConfirmTitle', 'Mark this ticket as resolved?')}
+          message={t('support.closeConfirmMessage', 'The ticket "{{subject}}" will be closed. A closed ticket can\'t take more replies, so if you need help with it again, open a new ticket.', { subject: closing.subject })}
+          warning={replyText.trim() ? t('support.closeDiscardsReply', 'The reply you have written will not be sent.') : undefined}
+          confirmLabel={t('support.markResolved', 'Mark as resolved')}
+          confirmClass="btn btn-primary btn-small"
+          onConfirm={() => closeTicket(closing._id)}
+          onCancel={() => setClosing(null)}
         />
       )}
     </div>

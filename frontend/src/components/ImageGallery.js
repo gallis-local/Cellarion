@@ -9,7 +9,11 @@ import Modal from './Modal';
 // routes/images.js — the server validates, this only labels.
 const REPORT_REASONS = ['private-info', 'not-this-wine', 'poor-quality', 'offensive', 'other'];
 
-const ImageGallery = forwardRef(function ImageGallery({ bottleId, wineDefinitionId, size = 'medium', onEmpty, onLoaded, defaultImageId: externalDefaultId, onSetDefault, showAll = false }, ref) {
+// `vintage`: the bottle's vintage, so a wine-level photo of ANOTHER year can
+// say so on the slide (support ticket 2026-10-09).
+// `vintageScope` (the vintage page): the photos of every bottle of this
+// bottle's wine and vintage in its cellar, not only its own.
+const ImageGallery = forwardRef(function ImageGallery({ bottleId, wineDefinitionId, vintage, vintageScope = false, size = 'medium', onEmpty, onLoaded, defaultImageId: externalDefaultId, onSetDefault, showAll = false }, ref) {
   const { apiFetch, user } = useAuth();
   const { t } = useTranslation();
   const [images, setImages] = useState([]);
@@ -25,6 +29,7 @@ const ImageGallery = forwardRef(function ImageGallery({ bottleId, wineDefinition
         ? `/api/images/bottle/${bottleId}`
         : `/api/images/wine/${wineDefinitionId}`;
       if (!bottleId && showAll) endpoint += '?all=true';
+      if (bottleId && vintageScope) endpoint += '?scope=vintage';
 
       const res = await apiFetch(endpoint);
       const data = await res.json();
@@ -66,7 +71,7 @@ const ImageGallery = forwardRef(function ImageGallery({ bottleId, wineDefinition
     } finally {
       setLoading(false);
     }
-  }, [apiFetch, bottleId, wineDefinitionId, showAll, onEmpty, onLoaded]);
+  }, [apiFetch, bottleId, wineDefinitionId, showAll, vintageScope, onEmpty, onLoaded]);
 
   useEffect(() => {
     if (!bottleId && !wineDefinitionId) {
@@ -162,6 +167,7 @@ const ImageGallery = forwardRef(function ImageGallery({ bottleId, wineDefinition
       <ImageCarousel
         images={images}
         size={size}
+        vintage={vintage}
         defaultImageId={resolvedDefaultId}
         onSetDefault={handleSetDefault}
         currentUserId={user?._id || user?.id}

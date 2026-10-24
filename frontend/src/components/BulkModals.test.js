@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 vi.mock('../api/bottles', () => ({
   bulkUpdateBottles: vi.fn(),
   bulkConsumeBottles: vi.fn(),
+  bulkRestoreBottles: vi.fn(),
 }));
 vi.mock('../api/wineLists', () => ({
   getWineLists: vi.fn(),
@@ -26,7 +27,7 @@ vi.mock('../contexts/AuthContext', () => ({
   useAuth: () => ({ apiFetch, user: { preferences: { currency: 'SEK' } } }),
 }));
 
-const { bulkUpdateBottles, bulkConsumeBottles } = await import('../api/bottles');
+const { bulkUpdateBottles, bulkConsumeBottles, bulkRestoreBottles } = await import('../api/bottles');
 const { getWineLists, getWineList, addBottlesToWineList } = await import('../api/wineLists');
 const BulkPurchaseModal = (await import('./BulkPurchaseModal')).default;
 const BulkConsumeModal = (await import('./BulkConsumeModal')).default;
@@ -87,6 +88,83 @@ describe('BulkConsumeModal', () => {
     }));
     expect(await screen.findByText('bulk.doneInfo:{"count":3}')).toBeTruthy();
     expect(screen.queryByText('bulk.consumeReservedToo')).toBeNull();
+  });
+
+  // The cellar list's "Mark as drunk" and the pick list's "Mark picked as
+  // drunk" both end here: the whole batch can be put back, as one drink can.
+  test('Undo puts every bottle the batch took out back — the reserved ones taken out after too', async () => {
+    bulkConsumeBottles
+      .mockResolvedValueOnce(okResult({ done: 2, doneIds: ['b1', 'b2'], skipped: [{ id: 'b3', reason: 'reserved' }] }))
+      .mockResolvedValueOnce(okResult({ done: 1, doneIds: ['b3'], skipped: [] }));
+    bulkRestoreBottles.mockResolvedValue(okResult({ done: 3, doneIds: ['b1', 'b2', 'b3'], skipped: [] }));
+    const onDone = vi.fn();
+    render(<BulkConsumeModal bottleIds={['b1', 'b2', 'b3']} onClose={() => {}} onDone={onDone} />);
+
+    fireEvent.click(screen.getByText('bulk.consumeSubmit:{"count":3}'));
+    fireEvent.click(await screen.findByText('bulk.consumeReservedToo'));
+    expect(await screen.findByText('bulk.doneInfo:{"count":3}')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'common.undo' }));
+
+    expect(await screen.findByText('trash.restoredInfo:{"count":3}')).toBeTruthy();
+    // ONE request for the whole batch — not one per bottle under the write limit.
+    expect(bulkRestoreBottles).toHaveBeenCalledTimes(1);
+    expect(bulkRestoreBottles).toHaveBeenCalledWith(apiFetch, ['b1', 'b2', 'b3']);
+    expect(screen.getByText('trash.restoredTitle')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'common.undo' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'common.retry' })).toBeNull();
+    fireEvent.click(screen.getByText('bulk.close'));
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  test('a part-done Undo counts what did not come back and retries only those; one already back counts as back', async () => {
+    bulkConsumeBottles.mockResolvedValueOnce(okResult({ done: 4, doneIds: ['b1', 'b2', 'b3', 'b4'], skipped: [] }));
+    bulkRestoreBottles
+      .mockResolvedValueOnce(okResult({ done: 1, doneIds: ['b1'], skipped: [{ id: 'b2', reason: 'not_consumed' }, { id: 'b3', reason: 'error' }, { id: 'b4', reason: 'error' }] }))
+      .mockResolvedValueOnce(okResult({ done: 2, doneIds: ['b3', 'b4'], skipped: [] }));
+    render(<BulkConsumeModal bottleIds={['b1', 'b2', 'b3', 'b4']} onClose={() => {}} onDone={() => {}} />);
+
+    fireEvent.click(screen.getByText('bulk.consumeSubmit:{"count":4}'));
+    fireEvent.click(await screen.findByRole('button', { name: 'common.undo' }));
+
+    expect(await screen.findByText('trash.restoredInfo:{"count":2}')).toBeTruthy();
+    expect(screen.getByText('bulk.consumeUndoFailed:{"count":2}')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'common.retry' }));
+
+    expect(await screen.findByText('trash.restoredInfo:{"count":4}')).toBeTruthy();
+    expect(bulkRestoreBottles).toHaveBeenLastCalledWith(apiFetch, ['b3', 'b4']);
+    expect(screen.queryByText(/bulk\.consumeUndoFailed/)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'common.retry' })).toBeNull();
+  });
+
+  test('an Undo refused as a whole (rate limit) says why, keeps the take-out\'s title and offers Retry', async () => {
+    bulkConsumeBottles.mockResolvedValueOnce(okResult({ done: 3, doneIds: ['b1', 'b2', 'b3'], skipped: [] }));
+    bulkRestoreBottles
+      .mockResolvedValueOnce({ ok: false, status: 429, json: async () => ({ error: 'Too many write requests' }) })
+      .mockResolvedValueOnce(okResult({ done: 3, doneIds: ['b1', 'b2', 'b3'], skipped: [] }));
+    render(<BulkConsumeModal bottleIds={['b1', 'b2', 'b3']} onClose={() => {}} onDone={() => {}} />);
+
+    fireEvent.click(screen.getByText('bulk.consumeSubmit:{"count":3}'));
+    fireEvent.click(await screen.findByRole('button', { name: 'common.undo' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('errors.rateLimited');
+    // Nothing came back: never "Bottles restored".
+    expect(screen.queryByText('trash.restoredTitle')).toBeNull();
+    expect(screen.getByText('bulk.consumeDoneTitle')).toBeTruthy();
+    expect(screen.getByText('bulk.consumeUndoFailed:{"count":3}')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'common.retry' }));
+    expect(await screen.findByText('trash.restoredInfo:{"count":3}')).toBeTruthy();
+    expect(bulkRestoreBottles).toHaveBeenLastCalledWith(apiFetch, ['b1', 'b2', 'b3']);
+  });
+
+  test('nothing taken out, nothing to undo', async () => {
+    bulkConsumeBottles.mockResolvedValueOnce(okResult({ done: 0, doneIds: [], skipped: [{ id: 'b1', reason: 'not_active' }] }));
+    render(<BulkConsumeModal bottleIds={['b1']} onClose={() => {}} onDone={() => {}} />);
+
+    fireEvent.click(screen.getByText('bulk.consumeSubmit:{"count":1}'));
+    expect(await screen.findByText('bulk.doneInfo:{"count":0}')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'common.undo' })).toBeNull();
   });
 });
 

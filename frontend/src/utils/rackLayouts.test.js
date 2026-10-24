@@ -1,7 +1,9 @@
 import {
   computeLayout, computeModularLayout, getModularTotalSlots, getTotalSlots,
   SLOT_RADIUS, validDoubleHeightRows, DOUBLE_ROW_HEADROOM, cabinetShelfRows,
-  cabinetRowWidth, cabinetBayCapacity, cabinetBays, cabinetBayUnits,
+  cabinetRowWidth, cabinetBayCapacity, cabinetBays, cabinetBayUnits, cabinetHeadToTail,
+  cabinetShelfSideways, cabinetSlotSideways, cabinetRestsBehindAcross, cabinetRowOffset,
+  CELL_SIZE, getSubOffsets, getSubRadius, multiBottleCells, cellNumberSize,
 } from './rackLayouts';
 
 describe('computeLayout', () => {
@@ -250,6 +252,84 @@ describe('computeLayout', () => {
     });
   });
 
+  // The layout leaves a multi-bottle cell's bottles on the cell centre; every
+  // 2D map fans them out with these (a reported overlap: the print map drew
+  // them as given, on top of each other).
+  describe('multi-bottle cells', () => {
+    const R = SLOT_RADIUS;
+    const key = (p) => `${p.dx ?? p.cx},${p.dy ?? p.cy}`;
+
+    it('getSubOffsets: one distinct offset per bottle, inside the cell, for every allowed count', () => {
+      for (let bpc = 2; bpc <= 20; bpc++) {
+        const offsets = getSubOffsets(bpc, R);
+        expect(offsets).toHaveLength(bpc);
+        expect(new Set(offsets.map(key)).size).toBe(bpc);
+        for (const o of offsets) {
+          expect(Math.abs(o.dx)).toBeLessThanOrEqual(R * 0.42 + 1e-9);
+          expect(Math.abs(o.dy)).toBeLessThanOrEqual(R * 0.42 + 1e-9);
+        }
+      }
+      expect(getSubOffsets(2, R)).toEqual([{ dx: -R * 0.42, dy: 0 }, { dx: R * 0.42, dy: 0 }]);
+    });
+
+    it('getSubRadius shrinks with the count', () => {
+      expect(getSubRadius(2, R)).toBeCloseTo(R * 0.45);
+      expect(getSubRadius(4, R)).toBeCloseTo(R * 0.4);
+      expect(getSubRadius(5, R)).toBeCloseTo(R * 0.3);
+      expect(getSubRadius(20, 14)).toBeCloseTo(14 * 0.3);
+    });
+
+    it('is null where each cell holds one bottle', () => {
+      expect(multiBottleCells(computeLayout('grid', 2, 3))).toBeNull();
+      expect(multiBottleCells(computeLayout('shelf', 2, 3, { backCols: 2 }))).toBeNull();
+      expect(multiBottleCells(computeLayout('shelf', 2, 3, { bottlesPerCell: 1 }))).toBeNull();
+      expect(multiBottleCells(computeLayout('cabinet', 2, 4, { shelfRows: [2, 1] }))).toBeNull();
+    });
+
+    it('a 1×1 shelf of 5: one cell, five bottles fanned out around its centre', () => {
+      const layout = computeLayout('shelf', 1, 1, { bottlesPerCell: 5, backCols: 0 });
+      const cells = multiBottleCells(layout);
+      expect(cells).toHaveLength(1);
+      const [cell] = cells;
+      expect([cell.cx, cell.cy]).toEqual([layout.slots[0].cx, layout.slots[0].cy]);
+      expect(cell.isBack).toBe(false);
+      expect(cell.r).toBeCloseTo(getSubRadius(5, R));
+      expect(cell.size).toBe(CELL_SIZE - 6);
+      expect(cell.pitch).toBeCloseTo(R * 0.42);
+      expect(cell.bottles.map(b => b.position)).toEqual([1, 2, 3, 4, 5]);
+      expect(new Set(cell.bottles.map(key)).size).toBe(5);
+      getSubOffsets(5, R).forEach((o, i) => {
+        expect(cell.bottles[i].cx).toBeCloseTo(cell.cx + o.dx);
+        expect(cell.bottles[i].cy).toBeCloseTo(cell.cy + o.dy);
+      });
+    });
+
+    it('every position once; back-row cells are fanned out at the back radius', () => {
+      const layout = computeLayout('shelf', 2, 3, { bottlesPerCell: 4, backCols: 2 });
+      const cells = multiBottleCells(layout);
+      expect(cells).toHaveLength(2 * (3 + 2));
+      const positions = cells.flatMap(c => c.bottles.map(b => b.position)).sort((a, b) => a - b);
+      expect(positions).toEqual(Array.from({ length: 40 }, (_, i) => i + 1));
+      const back = cells.filter(c => c.isBack);
+      expect(back).toHaveLength(4);
+      for (const c of back) {
+        expect(c.r).toBeCloseTo(getSubRadius(4, layout.backRadius));
+        expect(c.size).toBeCloseTo(layout.backRadius * 2 + 4);
+      }
+      for (const c of cells.filter(x => !x.isBack)) expect(c.r).toBeCloseTo(getSubRadius(4, R));
+    });
+
+    it('cellNumberSize: the radius ratio, shrunk where a long number would reach the next bottle', () => {
+      const five = multiBottleCells(computeLayout('shelf', 1, 1, { bottlesPerCell: 5 }))[0];
+      expect(cellNumberSize(five, 0.66, 1)).toBeCloseTo(five.r * 0.66);
+      // A stacked shelf of ten per cell with three-digit positions sits tighter.
+      const ten = multiBottleCells(computeLayout('shelf', 6, 7, { bottlesPerCell: 10 }))[0];
+      const size = cellNumberSize(ten, 0.66, 3);
+      expect(size).toBeLessThan(ten.r * 0.66);
+      expect(3 * 0.6 * size).toBeLessThan(ten.pitch);
+    });
+  });
+
   describe('unknown type falls back to grid', () => {
     it('returns rows × cols', () => {
       expect(computeLayout('nonexistent', 3, 5).totalSlots).toBe(15);
@@ -297,6 +377,94 @@ describe('computeLayout', () => {
       const p = (n) => single.slots.find(s => s.position === n);
       expect(p(5).cy).toBeLessThan(p(1).cy); // row 2 above row 1 in the top bay
       expect(p(9).cy).toBeGreaterThan(p(1).cy); // bottom bay below
+    });
+
+    it('head to tail: every other bottle of a one-deep row lies neck forward, numbering unchanged', () => {
+      const plain = computeLayout('cabinet', 2, 4, { shelfRows: [2, 1], twoDeep: false });
+      const h2t = computeLayout('cabinet', 2, 4, { shelfRows: [2, 1], twoDeep: false, headToTail: true });
+      // Drawing only: same slots, same places.
+      expect(h2t.totalSlots).toBe(plain.totalSlots);
+      expect(h2t.slots.map(({ position, cx, cy }) => [position, cx, cy]))
+        .toEqual(plain.slots.map(({ position, cx, cy }) => [position, cx, cy]));
+      // The 2nd and 4th bottle of each row, every row.
+      expect(h2t.slots.filter((s) => s.isNeck).map((s) => s.position)).toEqual([2, 4, 6, 8, 10, 12]);
+      expect(plain.slots.some((s) => s.isNeck)).toBe(false);
+      expect(h2t.cabinet.headToTail).toBe(true);
+    });
+
+    // Support forum 2026-10-13: a slim fridge lays one bottle across the front
+    // of each shelf and fills its bin with bottles lying across.
+    it('shelfSideways: lying bottles are marked in their own cells, numbering and places unchanged', () => {
+      const base = { shelfRows: [1, 2, 2], shelfCols: [5, 4, 4], twoDeep: false };
+      const plain = computeLayout('cabinet', 3, 5, base);
+      const side = computeLayout('cabinet', 3, 5, { ...base, shelfSideways: ['front', '', 'all'] });
+      expect(side.totalSlots).toBe(plain.totalSlots);
+      expect(side.viewBox).toEqual(plain.viewBox);
+      expect(side.slots.map(({ position, cx, cy }) => [position, cx, cy]))
+        .toEqual(plain.slots.map(({ position, cx, cy }) => [position, cx, cy]));
+      // Shelf 1 (positions 1..5): only its first bottle lies across. Shelf 3
+      // (positions 14..21): every bottle does.
+      expect(side.slots.filter((s) => s.isSideways).map((s) => s.position)).toEqual([1, 14, 15, 16, 17, 18, 19, 20, 21]);
+      expect(side.cabinet.bays.map((b) => b.sideways)).toEqual(['front', '', 'all']);
+      expect(plain.slots.some((s) => s.isSideways)).toBe(false);
+    });
+
+    it('shelfSideways with head to tail: the bottles behind an across bottle alternate from the first of them', () => {
+      const lay = computeLayout('cabinet', 1, 5, { shelfRows: [1], twoDeep: false, headToTail: true, shelfSideways: ['front'] });
+      // 1 lies across; 2, 4 base forward; 3, 5 neck forward.
+      expect(lay.slots.filter((s) => s.isNeck).map((s) => s.position)).toEqual([3, 5]);
+      expect(lay.slots.find((s) => s.position === 1).isNeck).toBeUndefined();
+    });
+
+    it('cabinetShelfSideways / cabinetSlotSideways: fitted list, one rule for every view', () => {
+      expect(cabinetShelfSideways(3, { shelfSideways: ['all', 'up'] })).toEqual(['all', '', '']);
+      expect(cabinetShelfSideways(2, {})).toEqual(['', '']);
+      expect(cabinetSlotSideways({ sideways: 'front' }, 1, 0)).toBe(true);
+      expect(cabinetSlotSideways({ sideways: 'front' }, 1, 1)).toBe(false);
+      expect(cabinetSlotSideways({ sideways: 'front' }, 2, 0)).toBe(false);
+      expect(cabinetSlotSideways({ sideways: 'all' }, 3, 2)).toBe(true);
+      expect(cabinetSlotSideways({ sideways: '' }, 1, 0)).toBe(false);
+    });
+
+    // Forum 2026-10-14: 1 across + 4, with 3 in the grooves on top (it used
+    // to stack 4 on the 3 beside the bottle across). Mirrors the backend.
+    it('a bottle across a stacked one-deep shelf: the levels above count and draw from the bottles behind it', () => {
+      const front = { twoDeep: false, sideways: 'front' };
+      expect([1, 2, 3].map((r) => cabinetRowWidth(r, 5, { ...front, alternate: true }))).toEqual([5, 3, 4]);
+      expect([1, 2, 3].map((r) => cabinetRowWidth(r, 5, { ...front, alternate: false }))).toEqual([5, 4, 4]);
+      expect(cabinetBayCapacity(2, 5, { ...front, alternate: true })).toBe(8);
+      expect([1, 2, 3, 4].map((r) => cabinetRowWidth(r, 6, { twoDeep: true, alternate: true, sideways: 'front' }))).toEqual([6, 5, 5, 6]);
+      expect(cabinetRestsBehindAcross({ sideways: 'front', cols: 5 }, 2, false)).toBe(true);
+      expect(cabinetRestsBehindAcross({ sideways: 'front', cols: 5 }, 1, false)).toBe(false);
+      expect(cabinetRestsBehindAcross({ sideways: 'front', cols: 5 }, 2, true)).toBe(false);
+      expect(cabinetRestsBehindAcross({ sideways: 'all', cols: 5 }, 2, false)).toBe(false);
+      // Release audit 2026-10-14: a one-wide shelf has nothing behind the bottle
+      // across, and moving its levels a cell over drew them outside the bay.
+      expect(cabinetRestsBehindAcross({ sideways: 'front', cols: 1 }, 2, false)).toBe(false);
+      const narrow = computeLayout('cabinet', 1, 1, { shelfRows: [3], twoDeep: false, shelfSideways: ['front'] });
+      expect(narrow.slots.map((s) => s.cx)).toEqual(computeLayout('cabinet', 1, 1, { shelfRows: [3], twoDeep: false }).slots.map((s) => s.cx));
+      // Drawn one cell in (the bottle across), then nested as usual.
+      const bay = { rows: 3, cols: 5, alternate: true, sideways: 'front' };
+      expect([1, 2, 3].map((r) => cabinetRowOffset(bay, r, { twoDeep: false, stagger: true }))).toEqual([0, 1.5, 1]);
+      // Any other bay keeps the old nudge exactly.
+      expect([1, 2].map((r) => cabinetRowOffset({ rows: 2, cols: 5, alternate: false, sideways: '' }, r, { twoDeep: false, stagger: true }))).toEqual([0, 0.5]);
+
+      // The map: the level above sits between the bottles behind the one across.
+      const tc = { shelfRows: [2], shelfCols: [5], shelfAlternate: [true], twoDeep: false, shelfSideways: ['front'] };
+      expect(getTotalSlots('cabinet', 1, 5, tc)).toBe(8);
+      const lay = computeLayout('cabinet', 1, 5, tc);
+      const at = (p) => lay.slots.find((s) => s.position === p);
+      expect(at(1).isSideways).toBe(true);
+      [6, 7, 8].forEach((p, i) => expect(at(p).cx).toBeCloseTo((at(i + 2).cx + at(i + 3).cx) / 2));
+    });
+
+    it('head to tail never applies to a two-deep cabinet (rows lie neck to neck there)', () => {
+      expect(cabinetHeadToTail({ headToTail: true })).toBe(false);
+      expect(cabinetHeadToTail({ twoDeep: true, headToTail: true })).toBe(false);
+      expect(cabinetHeadToTail({ twoDeep: false, headToTail: true })).toBe(true);
+      expect(cabinetHeadToTail({ twoDeep: false })).toBe(false);
+      const twoDeep = computeLayout('cabinet', 1, 4, { shelfRows: [2], twoDeep: true, headToTail: true });
+      expect(twoDeep.slots.some((s) => s.isNeck)).toBe(false);
     });
 
     it('stagger (default): stacked levels nest — offset half a bottle, sitting closer together, same positions', () => {
@@ -436,7 +604,7 @@ describe('computeLayout', () => {
         const explicit = computeLayout('cabinet', 2, 6, { shelfRows: [2, 3], twoDeep: true, shelfCols: [6, 6], shelfAlternate: [false, false] });
         expect(explicit.slots).toEqual(plain.slots);
         expect(explicit.viewBox).toEqual(plain.viewBox);
-        expect(cabinetBays(2, 6, { shelfRows: [1, 2], shelfCols: [3] })).toEqual([{ rows: 1, cols: 3, alternate: false }, { rows: 2, cols: 6, alternate: false }]);
+        expect(cabinetBays(2, 6, { shelfRows: [1, 2], shelfCols: [3] })).toEqual([{ rows: 1, cols: 3, alternate: false, sideways: '' }, { rows: 2, cols: 6, alternate: false, sideways: '' }]);
         // Every slot stays inside the drawing.
         l.slots.forEach((slot) => {
           expect(slot.cx + SLOT_RADIUS).toBeLessThanOrEqual(l.viewBox.width);
@@ -663,4 +831,19 @@ describe('cabinetBayUnits', () => {
     // An alternating bay never pokes out: its offset rows are the narrow ones.
     expect(cabinetBayUnits({ ...bay, alternate: true }, { twoDeep: true, stagger: true })).toBe(6);
   });
+});
+
+// Release review: from 10 per cell the rack view's bottles cover the next
+// bottle's centre; the print map and the zone editor fit them to the spacing.
+test('multiBottleCells with fit: no bottle wider than the spacing; without it the rack view is unchanged', () => {
+  const layout = computeLayout('shelf', 1, 1, { bottlesPerCell: 10 });
+  const plain = multiBottleCells(layout)[0];
+  const fitted = multiBottleCells(layout, { fit: true })[0];
+  expect(plain.r).toBeGreaterThan(plain.pitch / 2);
+  expect(fitted.r).toBeLessThanOrEqual(fitted.pitch / 2 + 1e-9);
+  expect(fitted.bottles).toEqual(plain.bottles);
+  const few = computeLayout('shelf', 1, 1, { bottlesPerCell: 2 });
+  // Two per cell overlap a little in the rack view too: fitted, they just touch.
+  expect(multiBottleCells(few, { fit: true })[0].r).toBeLessThanOrEqual(multiBottleCells(few)[0].r);
+  expect(multiBottleCells(few, { fit: true })[0].r).toBeLessThanOrEqual(multiBottleCells(few)[0].pitch / 2 + 1e-9);
 });

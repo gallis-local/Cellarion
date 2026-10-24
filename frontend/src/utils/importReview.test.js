@@ -4,10 +4,15 @@ import {
   mergeRetryResults,
   mergeValidateSummaries,
   autoSelectionsFor,
+  preselectableMatch,
   canResumeValidation,
   restoreSessionMeta,
   nextAiBudgetRequestState,
   isAiBudgetRequestPending,
+  propagationTargets,
+  lookUpTargets,
+  lookUpSiblingResult,
+  undoSelections,
 } from './importReview';
 
 // ---------------------------------------------------------------------------
@@ -224,6 +229,21 @@ describe('autoSelectionsFor', () => {
     expect(autoSelectionsFor(conflicted)).toEqual({ 0: 'clean' });
   });
 
+  it('never pre-selects a colourConflict match — an ai_match of the other colour is left for the user', () => {
+    // A red row whose name the registry knows only as the white: the server
+    // marks the match and the client must not choose it for the user.
+    const conflicted = [
+      { index: 0, status: 'ai_match', matches: [
+        { wineId: 'white', colourConflict: 'the file says red, the registry wine is white' },
+      ] },
+      { index: 1, status: 'fuzzy', matches: [
+        { wineId: 'white', colourConflict: 'the file says red, the registry wine is white' },
+        { wineId: 'red', colourConflict: null },
+      ] },
+    ];
+    expect(autoSelectionsFor(conflicted)).toEqual({ 1: 'red' });
+  });
+
   it("pre-selects 'create' for ai_new rows with a proposal — and nothing without one", () => {
     const aiRows = [
       { index: 6, status: 'ai_new', matches: [], aiProposed: { name: 'X', producer: 'Y' } },
@@ -327,5 +347,158 @@ describe('isAiBudgetRequestPending', () => {
   it('is not pending once both signals are clear', () => {
     expect(isAiBudgetRequestPending({ pendingRequest: false }, 'idle')).toBe(false);
     expect(isAiBudgetRequestPending(null, 'idle')).toBe(false);
+  });
+});
+
+describe('preselectableMatch', () => {
+  it('returns the first match carrying neither conflict, or null', () => {
+    expect(preselectableMatch([{ wineId: 'a' }, { wineId: 'b' }])).toEqual({ wineId: 'a' });
+    expect(preselectableMatch([
+      { wineId: 's', styleConflict: 'x' },
+      { wineId: 'c', colourConflict: 'y' },
+      { wineId: 'ok' },
+    ])).toEqual({ wineId: 'ok' });
+    expect(preselectableMatch([{ wineId: 'c', colourConflict: 'y' }])).toBeNull();
+    expect(preselectableMatch([])).toBeNull();
+    expect(preselectableMatch(undefined)).toBeNull();
+  });
+});
+
+describe('reconcileRetrySelections — conflicted refresh', () => {
+  it('never fills an empty pick with a conflicted match, and clears a stale one', () => {
+    const updated = new Map([
+      [0, { index: 0, status: 'ai_match', matches: [{ wineId: 'white', colourConflict: 'z' }] }],
+      [1, { index: 1, status: 'ai_match', matches: [{ wineId: 'white', colourConflict: 'z' }] }],
+    ]);
+    const next = reconcileRetrySelections({ 1: 'gone' }, updated, {});
+    expect(next).toEqual({});
+  });
+
+  it('still fills an empty pick with the best clean match', () => {
+    const updated = new Map([[0, { index: 0, status: 'fuzzy', matches: [{ wineId: 'white', colourConflict: 'z' }, { wineId: 'red' }] }]]);
+    expect(reconcileRetrySelections({}, updated, {})).toEqual({ 0: 'red' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One decision, the whole line: "Request wine" on one of three identical
+// bottles used to leave the other two on their automatic 'create', so the
+// import minted the wine AND filed a request for it.
+// ---------------------------------------------------------------------------
+describe('propagationTargets', () => {
+  const row = (index, extra = {}) => ({
+    index,
+    item: { producer: 'Domaine Exemple', wineName: 'Cuvée A Spätlese', type: 'white', ...(extra.item || {}) },
+    status: 'ai_new',
+    aiProposed: { name: 'Cuvée A Spätlese' },
+    ...extra,
+  });
+  const other = { index: 9, item: { producer: 'Domaine Exemple', wineName: 'Brut', type: 'sparkling' }, status: 'ai_new', aiProposed: {} };
+
+  it("carries 'request' over the siblings still on the automatic 'create'", () => {
+    const results = [row(0), row(1), row(2), other];
+    const selections = { 0: 'create', 1: 'create', 2: 'create', 9: 'create' };
+    expect(propagationTargets(results, selections, 0, 'request')).toEqual([1, 2]);
+  });
+
+  it('still fills siblings that have no decision yet', () => {
+    const results = [row(0), row(1)];
+    expect(propagationTargets(results, {}, 0, 'request')).toEqual([1]);
+  });
+
+  it('keeps a sibling the user set differently', () => {
+    const results = [row(0), row(1), row(2)];
+    const selections = { 0: 'create', 1: 'skip', 2: 'wine-x' };
+    expect(propagationTargets(results, selections, 0, 'request')).toEqual([]);
+  });
+
+  it('never spreads a skip over a decided sibling (skipping one bottle of three is a real choice)', () => {
+    const results = [row(0), row(1), row(2)];
+    expect(propagationTargets(results, { 0: 'create', 1: 'create', 2: 'create' }, 0, 'skip')).toEqual([]);
+    expect(propagationTargets(results, { 0: 'create' }, 0, 'skip')).toEqual([1, 2]); // undecided rows still follow
+  });
+
+  it('moves siblings that shared a picked wine to the newly picked one', () => {
+    const results = [row(0), row(1)];
+    expect(propagationTargets(results, { 0: 'wine-a', 1: 'wine-a' }, 0, 'wine-b')).toEqual([1]);
+  });
+
+  it('leaves the other colour of a same-name pair alone once it is decided', () => {
+    const results = [row(0), row(1, { item: { type: 'red' } })];
+    expect(propagationTargets(results, { 0: 'create', 1: 'create' }, 0, 'request')).toEqual([]);
+  });
+
+  it("gives 'create' only to siblings that carry their own proposal", () => {
+    const results = [row(0), row(1, { status: 'no_match', aiProposed: undefined })];
+    expect(propagationTargets(results, {}, 0, 'create')).toEqual([]);
+  });
+
+  it('returns nothing for an unknown row', () => {
+    expect(propagationTargets([row(0)], {}, 5, 'request')).toEqual([]);
+  });
+});
+
+describe('lookUpTargets', () => {
+  const fuzzy = (index, type = 'white') => ({
+    index,
+    item: { producer: 'Weingut Beispiel', wineName: 'Lage Riesling Kabinett', type },
+    status: 'fuzzy',
+  });
+
+  it("answers the siblings still on the looked-up row's pick, and the undecided ones", () => {
+    const results = [fuzzy(0), fuzzy(1), fuzzy(2), fuzzy(3)];
+    const selections = { 0: 'fuzzy-pick', 1: 'fuzzy-pick', 3: 'request' };
+    expect(lookUpTargets(results, selections, 0)).toEqual([1, 2]);
+  });
+
+  it('leaves a same-name row of another colour on its own pick', () => {
+    const results = [fuzzy(0), fuzzy(1, 'red')];
+    expect(lookUpTargets(results, { 0: 'p', 1: 'p' }, 0)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Release audit 2026-10-13 of #1506.
+// ---------------------------------------------------------------------------
+describe('propagation — colour', () => {
+  const r = (index, type, extra = {}) => ({ index, item: { producer: 'P', wineName: 'W', type }, status: 'fuzzy', ...extra });
+
+  it('never carries a decision to an UNDECIDED row of another colour', () => {
+    expect(propagationTargets([r(0, 'red'), r(1, 'white')], { 0: 'x' }, 0, 'y')).toEqual([]);
+    expect(lookUpTargets([r(0, 'red'), r(1, 'white')], { 0: 'x' }, 0)).toEqual([]);
+  });
+
+  it('treats a row that states no colour as compatible (like the server)', () => {
+    expect(propagationTargets([r(0, 'red'), r(1, undefined)], { 0: 'x', 1: 'x' }, 0, 'y')).toEqual([1]);
+    expect(lookUpTargets([r(0, ''), r(1, 'white')], { 0: 'x', 1: 'x' }, 0)).toEqual([1]);
+  });
+});
+
+describe('lookUpSiblingResult', () => {
+  it("takes the looked-up row's identity and keeps the sibling's own row and price warnings", () => {
+    const updated = { index: 0, item: { price: 10 }, status: 'ai_new', matches: [], aiProposed: { name: 'W' }, priceWarnings: ['src'] };
+    const sibling = { index: 3, item: { price: 900 }, status: 'fuzzy', matches: [{ wineId: 'm' }], aiSkipped: true, priceWarnings: ['own'] };
+    expect(lookUpSiblingResult(updated, sibling)).toEqual({
+      index: 3, item: { price: 900 }, status: 'ai_new', matches: [], aiProposed: { name: 'W' }, priceWarnings: ['own'],
+    });
+  });
+});
+
+describe('undoSelections', () => {
+  const aiNew = (index, extra = {}) => ({ index, item: { producer: 'P', wineName: 'W', type: 'red' }, status: 'ai_new', matches: [], aiProposed: { name: 'W' }, ...extra });
+
+  it("undoing a request brings the line back to its automatic 'create'", () => {
+    const results = [aiNew(0), aiNew(1), aiNew(2)];
+    expect(undoSelections(results, { 0: 'request', 1: 'request', 2: 'request' }, 1)).toEqual({ 0: 'create', 1: 'create', 2: 'create' });
+  });
+
+  it('an undone skip stays on the clicked row', () => {
+    const results = [aiNew(0), aiNew(1)];
+    expect(undoSelections(results, { 0: 'skip', 1: 'skip' }, 0)).toEqual({ 0: 'create', 1: 'skip' });
+  });
+
+  it('leaves rows on another choice alone, and clears a row with no automatic choice', () => {
+    const results = [aiNew(0), aiNew(1), { index: 2, item: { producer: 'P', wineName: 'W', type: 'red' }, status: 'no_match', matches: [] }];
+    expect(undoSelections(results, { 0: 'request', 1: 'wine-x', 2: 'request' }, 2)).toEqual({ 0: 'create', 1: 'wine-x' });
   });
 });

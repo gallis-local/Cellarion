@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
-import { getMaturityStatus, getPersonalWindowStatus } from '../../utils/drinkStatus';
+import { getMaturityStatus, getPersonalWindowStatus, maturityBadgeText } from '../../utils/drinkStatus';
 import { isReserved, reservationSummary } from '../../utils/reservation';
 import { bottleAnchorYear } from '../../utils/maturityUtils';
 import { convertAmountHistorical } from '../../utils/currency';
@@ -12,12 +12,13 @@ import safeUrl from '../../utils/safeUrl';
 import RatingDisplay from '../RatingDisplay';
 import ContributePrompt from './ContributePrompt';
 import WineRecordSection from './WineRecordSection';
+import CollapsibleBlock from '../CollapsibleBlock';
 import DraftWineBanner from './DraftWineBanner';
 import MaturityPhaseTable from './MaturityPhaseTable';
 import PriceHistoryTimeline from './PriceHistoryTimeline';
 import PriceTrackingToggle from './PriceTrackingToggle';
 
-function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory, currentRelease, rates, userCurrency, canEdit, hasImage, onEdit, onRemove, onReportWine, suggestFixSignal = 0, wineDraft = null, onDraftChanged, draftNotice = null }) {
+function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory, currentRelease, rates, userCurrency, canEdit, hasImage, onEdit, onRemove, onReportWine, suggestFixSignal = 0, wineDraft = null, onDraftChanged, draftNotice = null, recordFold = null }) {
   const { t } = useTranslation();
   const { user, apiFetch } = useAuth();
   const anchorYear = bottleAnchorYear(bottle);
@@ -32,6 +33,18 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
   const maturityReviewed = vintageProfile?.status === 'reviewed' && (!isNv || vintageProfile.relative);
   const [showSommNotes, setShowSommNotes] = useState(false);
   const wine = bottle.wineDefinition;
+  const record = (
+    <WineRecordSection
+      wine={wine}
+      vintage={bottle?.vintage}
+      canSuggest={!user?.isDemo && wine?.draft !== true}
+      apiFetch={apiFetch}
+      // The "no grapes yet" invitation stays for whoever looks after the
+      // bottle, as it always was — it now opens the record's own grape form.
+      promptMissingGrapes={canEdit}
+      suggestSignal={suggestFixSignal}
+    />
+  );
 
   return (
     <div className="bd-details card">
@@ -44,6 +57,12 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
           <div className="bd-detail-item">
             <span className="bd-detail-label">{t('bottleDetail.size')}</span>
             <span className="bd-detail-value">{bottleSizeLabel(bottle.bottleSize, t)}</span>
+          </div>
+        )}
+        {bottle.barcode && (
+          <div className="bd-detail-item">
+            <span className="bd-detail-label">{t('bottleDetail.barcode', 'Barcode')}</span>
+            <span className="bd-detail-value" style={{ fontVariantNumeric: 'tabular-nums' }}>{bottle.barcode}</span>
           </div>
         )}
         {bottle.rating && (
@@ -145,18 +164,16 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
 
       {/* The full public record with visible blanks + per-field suggestions
           (#985). Demo visitors see the record but not the suggest actions
-          (writes are requireNonDemo). */}
-      <WineRecordSection
-        wine={wine}
-        vintage={bottle?.vintage}
-        canSuggest={!user?.isDemo && wine?.draft !== true}
-        apiFetch={apiFetch}
-        // The "no grapes yet" invitation stays for whoever looks after the
-        // bottle, as it always was — it now opens the record's own grape form.
-        promptMissingGrapes={canEdit}
-        suggestSignal={suggestFixSignal}
-      />
-
+          (writes are requireNonDemo). It folds to its title row like the
+          vintage page's (2026-10-14): a flat inner "card" lets the shared
+          folding rules find its title row inside this card. */}
+      {/* No registry wine (a bottle waiting on its request): the record shows
+          nothing, so there is nothing to fold (audit 2026-10-14). */}
+      {recordFold && wine ? (
+        <CollapsibleBlock nested {...recordFold}>
+          <div className="card bd-record-fold">{record}</div>
+        </CollapsibleBlock>
+      ) : record}
       {/* Personal drink window — the user's own drinkFrom/drinkTo. Takes
           precedence over the sommelier profile status below, so the profile
           badge is suppressed while this is set. */}
@@ -209,7 +226,7 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
                   the personal window (above) takes precedence. */}
               {maturityStatus && !personalWindow && (
                 <span className={`maturity-badge maturity-badge--${maturityStatus.status}`}>
-                  {maturityStatus.label}
+                  {maturityBadgeText(maturityStatus, t)}
                 </span>
               )}
               <MaturityPhaseTable profile={vintageProfile} anchorYear={anchorYear} />
@@ -285,7 +302,7 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
             {bottle.purchaseLocation && <span>{bottle.purchaseLocation}</span>}
             {safeUrl(bottle.purchaseUrl) && (
               <a href={safeUrl(bottle.purchaseUrl)} target="_blank" rel="noreferrer" className="bd-purchase-link">
-                <span aria-hidden="true">{'\u{1F517}'}</span> Link
+                <span aria-hidden="true">{'\u{1F517}'}</span> {t('bottleDetail.purchaseLink', 'Link')}
               </a>
             )}
           </div>
@@ -318,7 +335,7 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
           {/* Wrap the handler — passing it directly would hand the click
               event to the `reason` parameter and break the report form */}
           <button className="btn-report-wine" onClick={() => onReportWine()}>
-            Report an issue with this wine
+            {t('bottleDetail.reportWineIssue', 'Report an issue with this wine')}
           </button>
         </div>
       )}

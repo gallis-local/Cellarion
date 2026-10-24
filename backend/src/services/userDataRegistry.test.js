@@ -96,6 +96,58 @@ describe('userDataRegistry', () => {
       updateSpy.mockRestore();
     }
   });
+
+  // Sign-up, e-mail verification and sign-in rows have NO actor (nobody is
+  // signed in yet): the account is the resource, and the detail carries its
+  // username and e-mail. The actor-scoped scrub never reached them, so a
+  // deleted account's name, address and IP stayed in the log.
+  test('AuditLog purge also scrubs the rows ABOUT the account (sign-up, sign-in)', async () => {
+    const audit = REGISTRY.find(e => e.model.modelName === 'AuditLog');
+    const updateSpy = jest.spyOn(AuditLog, 'updateMany').mockResolvedValue({});
+
+    try {
+      await audit.purge({ userId: 'u1', deletedUserId: 'del1' });
+      const about = updateSpy.mock.calls.find(([filter]) => filter['resource.id'] === 'u1');
+      expect(about[0]).toEqual({ 'resource.type': 'user', 'resource.id': 'u1' });
+      const [setStage, unsetStage] = about[1];
+      expect(setStage.$set['resource.id']).toBeNull();
+      // The IP and browser go only where nobody was signed in: an admin's or
+      // another member's action on the account keeps whoever acted.
+      expect(setStage.$set['actor.ipAddress'].$cond[1]).toBeNull();
+      expect(setStage.$set['actor.ipAddress'].$cond[2]).toBe('$actor.ipAddress');
+      expect(setStage.$set.userAgent.$cond[1]).toBe('$$REMOVE');
+      expect(unsetStage).toEqual({ $unset: ['detail.email', 'detail.username'] });
+
+      // Once more after the batch: a sign-in logged while it ran.
+      updateSpy.mockClear();
+      await audit.postPurge({ userId: 'u1' });
+      expect(updateSpy).toHaveBeenCalledWith({ 'resource.type': 'user', 'resource.id': 'u1' }, expect.any(Array));
+    } finally {
+      updateSpy.mockRestore();
+    }
+  });
+
+  test('the export carries the rows about the account written before sign-in', async () => {
+    const audit = REGISTRY.find(e => e.model.modelName === 'AuditLog');
+    const chain = { sort: () => chain, limit: () => chain, lean: async () => [] };
+    const findSpy = jest.spyOn(AuditLog, 'find').mockReturnValue(chain);
+    try {
+      await audit.exportFragment({ userId: 'u1', truncated: {} });
+      expect(findSpy).toHaveBeenCalledWith({ $or: [
+        { 'actor.userId': 'u1' },
+        { 'resource.type': 'user', 'resource.id': 'u1', 'actor.userId': null },
+      ] });
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+
+  test('the rows about an account are found by an index (erasure runs hourly)', () => {
+    const indexes = AuditLog.schema.indexes();
+    const about = indexes.find(([keys]) => keys['resource.id'] === 1);
+    expect(about).toBeTruthy();
+    expect(about[1].partialFilterExpression).toEqual({ 'resource.type': 'user' });
+  });
 });
 
 // L-17: a deleted user's display name must not survive erasure inside OTHER
@@ -269,6 +321,7 @@ describe('WineOwnerInquiry — recipient-entry erasure + asker nulling', () => {
         myResponse: 'Label says E. Pira e Figli',
         respondedAt: 'r1',
         notifiedAt: 'n1',
+        emailedAt: null,
         curatorReply: 'Thank you — the producer is now recorded as E. Pira e Figli.',
         createdAt: 'c1',
         resolvedAt: 'r0',
@@ -334,6 +387,34 @@ describe('WineCorrectionProposal export', () => {
         decidedAt: 'd1',
       });
       expect(frag.wineCorrectionProposals[1]).toMatchObject({ amendments: [], rejectReason: null, appliedNote: 'Applied: producer', wine: null });
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+});
+
+// Portability of beta feedback (early access, 2026-10-10): a 'beta' ticket
+// names the feature it is about. The row is selected AND mapped field by
+// field, so a new field has to be added in both places — this pins the second.
+describe('SupportTicket export', () => {
+  const SupportTicket = require('../models/SupportTicket');
+  const entry = REGISTRY.find((e) => e.model === SupportTicket);
+
+  test('carries the feature a beta ticket is about; other tickets carry none', async () => {
+    const c = {};
+    for (const m of ['select', 'limit']) c[m] = jest.fn(() => c);
+    c.lean = jest.fn(async () => [
+      { category: 'beta', feature: 'pickLists', subject: 'Beta feedback: Pick lists', message: 'm', status: 'open', createdAt: 'c1', replies: [] },
+      { category: 'bug', subject: 'Crash', message: 'n', status: 'closed', createdAt: 'c2', replies: [{ author: 'admin', by: 'admin-id', message: 'Fixed', createdAt: 'r1' }] },
+    ]);
+    const findSpy = jest.spyOn(SupportTicket, 'find').mockReturnValue(c);
+    try {
+      const frag = await entry.exportFragment({ userId: 'u1', truncated: {} });
+      expect(c.select.mock.calls[0][0]).toEqual(expect.stringContaining('feature'));
+      expect(frag.supportTickets[0]).toMatchObject({ category: 'beta', feature: 'pickLists', subject: 'Beta feedback: Pick lists' });
+      expect(frag.supportTickets[1]).not.toHaveProperty('feature');
+      // The admin's account id is not the exporting user's data.
+      expect(frag.supportTickets[1].replies).toEqual([{ author: 'admin', message: 'Fixed', createdAt: 'r1' }]);
     } finally {
       findSpy.mockRestore();
     }

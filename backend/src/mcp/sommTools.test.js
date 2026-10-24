@@ -75,7 +75,12 @@ jest.mock('../models/ProfileAuditSample', () => ({ create: jest.fn(), find: jest
 jest.mock('../models/WineReport', () => ({ find: jest.fn(), findById: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../utils/cellarCred', () => ({ incrementCred: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../utils/rackGeometry', () => ({ getMaxPosition: jest.fn(() => 12) }));
-jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn(), indexWine: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn(), indexWine: jest.fn().mockResolvedValue(undefined), fullSync: jest.fn().mockResolvedValue([]) }));
+// edit_grape runs regional names through the admin editor's validator and
+// clears the public taxonomy list cache after a grape save; both are pinned
+// in editGrape.regionalNames.test.js, so here they pass through.
+jest.mock('../services/grapeRegionalNames', () => ({ validateGrapeRegionalNames: jest.fn(async (value) => ({ value })) }));
+jest.mock('../routes/taxonomy', () => ({ clearTaxonomyListCache: jest.fn() }));
 jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), buildEmptyStats: jest.fn() }));
 jest.mock('../services/vectorStore', () => ({ getPoints: jest.fn(), searchSimilar: jest.fn() }));
 jest.mock('../config/aiConfig', () => ({ get: jest.fn(() => ({ vectorIndex: 'v1' })) }));
@@ -652,6 +657,72 @@ describe('set_vintage_price', () => {
     const { createNotification } = require('../services/notifications');
     expect(createNotification).not.toHaveBeenCalled(); // no requesters on this pair
   });
+
+  // The snapshot is stored with the bottles' canonical vintage, so it matches
+  // the bottles (value report) and the request it answers. It used to be
+  // stored as typed: "nv" never matched NV bottles, "2O15" matched nothing.
+  test('"nv" is stored and looked up as NV', async () => {
+    WineDefinition.findById.mockReturnValue(chain({ _id: oid('f'), name: 'Barolo' }));
+    const PriceTrackingRequest = require('../models/PriceTrackingRequest');
+    PriceTrackingRequest.findOne.mockReturnValue(chain(null));
+    const body = parse(await tool('set_vintage_price').handler({ wine_id: oid('f'), vintage: 'nv', price: 40 }, SOMM_CTX));
+    expect(body.error).toBeUndefined();
+    expect(WineVintagePrice.mock.calls[0][0].vintage).toBe('NV');
+    expect(PriceTrackingRequest.findOne).toHaveBeenCalledWith({ wineDefinition: oid('f'), vintage: 'NV' });
+  });
+
+  test('a malformed year is refused: nothing saved, nobody notified', async () => {
+    WineDefinition.findById.mockReturnValue(chain({ _id: oid('f'), name: 'Barolo' }));
+    const body = parse(await tool('set_vintage_price').handler({ wine_id: oid('f'), vintage: '2O15', price: 40 }, SOMM_CTX));
+    expect(body.error.code).toBe('invalid_input');
+    expect(body.error.message).toMatch(/Invalid vintage "2O15"/);
+    expect(WineVintagePrice).not.toHaveBeenCalled();
+    expect(require('../services/notifications').createNotification).not.toHaveBeenCalled();
+  });
+
+  test('a whitespace-only vintage is refused, not stored as NV (release audit 2026-10-23)', async () => {
+    const body = parse(await tool('set_vintage_price').handler({ wine_id: oid('f'), vintage: ' ', price: 40 }, SOMM_CTX));
+    expect(body.error.code).toBe('invalid_input');
+    expect(WineVintagePrice).not.toHaveBeenCalled();
+  });
+
+  test('an unknown vintage has no vintage price', async () => {
+    const body = parse(await tool('set_vintage_price').handler({ wine_id: oid('f'), vintage: 'unknown', price: 40 }, SOMM_CTX));
+    expect(body.error.code).toBe('invalid_input');
+    expect(WineVintagePrice).not.toHaveBeenCalled();
+  });
+
+  // One notification from either door: the REST route's title and body, and a
+  // link a requester (a member, not a sommelier) can open. The MCP tool used
+  // its own wording and the somm-only /somm/prices page (Access Denied).
+  test('requesters get the REST wording and the public wine page link', async () => {
+    WineDefinition.findById.mockReturnValue(chain({ _id: oid('f'), name: 'Barolo Castiglione', producer: 'Vietti' }));
+    const PriceTrackingRequest = require('../models/PriceTrackingRequest');
+    PriceTrackingRequest.findOne.mockReturnValue(chain({ requesters: [{ user: oid('b') }] }));
+    const body = parse(await tool('set_vintage_price').handler({ wine_id: oid('f'), vintage: '2019', price: 45, currency: 'EUR' }, SOMM_CTX));
+    expect(body.error).toBeUndefined();
+    await new Promise((r) => setImmediate(r));
+    const { createNotification } = require('../services/notifications');
+    expect(createNotification).toHaveBeenCalledWith(oid('b'), 'price_tracked', 'Market price updated',
+      'A sommelier just added a market price for Vietti — Barolo Castiglione 2019: EUR 45.', `/wines/${oid('f')}`);
+    expect(createNotification.mock.calls[0]).toHaveLength(5); // no category argument
+  });
+
+  test('the day\'s rate snapshot is taken before the save, and its failure does not fail the tool', async () => {
+    const { getOrCreateDailySnapshot } = require('../utils/exchangeRates');
+    WineDefinition.findById.mockReturnValue(chain({ _id: oid('f'), name: 'Barolo', producer: 'P' }));
+    const PriceTrackingRequest = require('../models/PriceTrackingRequest');
+    PriceTrackingRequest.findOne.mockReturnValue(chain(null));
+
+    await tool('set_vintage_price').handler({ wine_id: oid('f'), vintage: '2019', price: 40 }, SOMM_CTX);
+    const save = WineVintagePrice.mock.instances[0].save;
+    expect(getOrCreateDailySnapshot.mock.invocationCallOrder[0]).toBeLessThan(save.mock.invocationCallOrder[0]);
+
+    getOrCreateDailySnapshot.mockRejectedValueOnce(new Error('rates down'));
+    const body = parse(await tool('set_vintage_price').handler({ wine_id: oid('f'), vintage: '2019', price: 40 }, SOMM_CTX));
+    expect(body.error).toBeUndefined();
+    expect(WineVintagePrice.mock.instances[1].save).toHaveBeenCalled();
+  });
 });
 
 describe('list_price_tracking_requests', () => {
@@ -1013,6 +1084,56 @@ describe('held-profile review queue over MCP (somm ticket 2026-08-18)', () => {
     // read "the true producing estate is unclear to me" with nothing left to
     // qualify it, and no lever existed to correct it.
     describe('the producerNote goes with the flag it explains', () => {
+      // Projection-aware for this block: the handler only ever sees the fields
+      // its .select() asked for, as with the real query. The outer mock hands
+      // back the whole doc, which is how a select without producerNote let
+      // every case below pass while the note was never cleared in production.
+      const pickPaths = (doc, proj) => {
+        const out = { _id: doc._id };
+        for (const p of String(proj || '').split(/\s+/).filter(Boolean)) {
+          const parts = p.split('.');
+          let src = doc;
+          for (const k of parts) src = src == null ? undefined : src[k];
+          if (src === undefined) continue;
+          let dst = out;
+          for (const k of parts.slice(0, -1)) dst = (dst[k] = dst[k] || {});
+          dst[parts.at(-1)] = src;
+        }
+        return out;
+      };
+      const selectChain = (doc) => ({ select: jest.fn((proj) => Promise.resolve(pickPaths(doc, proj))) });
+
+      test('the select asks for aiProfile.producerNote', async () => {
+        WineDefinition.findById.mockReturnValue(selectChain(publishedSuspect({ producerNote: 'x' })));
+        await tool('review_held_profile').handler({ wine_id: oid('7'), decision: 'confirm' }, SOMM_CTX);
+        expect(WineDefinition.findById.mock.results[0].value.select)
+          .toHaveBeenCalledWith(expect.stringContaining('aiProfile.producerNote'));
+      });
+
+      test('the reply says the note went with the flag, never that it stays', async () => {
+        WineDefinition.findById.mockReturnValue(selectChain(publishedSuspect({ producerNote: 'unclear producer' })));
+        const body = parse(await tool('review_held_profile').handler({ wine_id: oid('7'), decision: 'confirm' }, SOMM_CTX));
+        expect(body.summary).toMatch(/suspect flag is CLEARED/);
+        expect(body.summary).toMatch(/producer note went with the flag/);
+        expect(body.summary).not.toMatch(/stays/);
+      });
+
+      test('an unknown-only confirm never claims a suspect flag was cleared', async () => {
+        WineDefinition.findById.mockReturnValue(selectChain(publishedSuspect({ producerSuspect: false, producerUnknown: true })));
+        const body = parse(await tool('review_held_profile').handler({ wine_id: oid('7'), decision: 'confirm' }, SOMM_CTX));
+        expect(body.summary).not.toMatch(/suspect flag is CLEARED/);
+        expect(body.summary).toMatch(/producer placed/);
+      });
+
+      test('a rule-downgraded confirm names the rule tag it cleared', async () => {
+        WineDefinition.findById.mockReturnValue(selectChain(publishedSuspect({
+          producerSuspect: false, producerUnknown: false, suspectDowngradedBy: 'note_doubts_cuvee_not_producer',
+        })));
+        const body = parse(await tool('review_held_profile').handler({ wine_id: oid('7'), decision: 'confirm' }, SOMM_CTX));
+        expect(body.summary).toMatch(/note_doubts_cuvee_not_producer tag is cleared/);
+        expect(body.summary).not.toMatch(/suspect flag is CLEARED/);
+      });
+
       test('confirm clears the note alongside producerSuspect', async () => {
         WineDefinition.findById.mockReturnValue(selectChain(publishedSuspect({
           producerNote: 'This appears to be a branded line rather than a wine made by Donnafugata.',
@@ -1380,9 +1501,9 @@ describe('add_grape (somm-owned taxonomy, 2026-08-22)', () => {
 
   test('a synonym that repeats the canonical name is dropped, not double-claimed', async () => {
     probeReturns(null);
-    const body = parse(await tool('add_grape').handler({ name: 'Vidal', colour: 'White', synonyms: ['VIDAL', 'Vidal Blanc'] }, SOMM_CTX));
+    const body = parse(await tool('add_grape').handler({ name: 'Norton', colour: 'Red', synonyms: ['NORTON', 'Cynthiana'] }, SOMM_CTX));
     expect(body.error).toBeUndefined();
-    expect(Grape.mock.calls[0][0].synonyms).toEqual(['Vidal Blanc']);
+    expect(Grape.mock.calls[0][0].synonyms).toEqual(['Cynthiana']);
   });
 
   test('write scope + somm role are both required', async () => {
@@ -1652,6 +1773,40 @@ describe('propose_wine_correction', () => {
       expect(approveProposal).not.toHaveBeenCalled();
     });
 
+    // 2026-10-13: beers and ciders sat in public search for hours after the
+    // curator had named them, waiting on an admin.
+    test('a non-wine flag applies on filing through the same approveProposal', async () => {
+      const w = mkWine();
+      WineCorrectionProposal.create.mockResolvedValue({ _id: 'prop-7' });
+      classifyProposal.mockResolvedValueOnce({ direct: true, reason: 'A reversible flag on a row few members hold.' });
+      approveProposal.mockResolvedValueOnce({ status: 200, body: { appliedNote: 'Quarantined as non-wine; 1 pending maturity-queue row(s) removed' } });
+
+      const body = parse(await tool('propose_wine_correction').handler({
+        wine_id: WINE_ID, kind: 'non_wine', reason: REASON,
+      }, SOMM_CTX));
+
+      expect(classifyProposal).toHaveBeenCalledWith(w, 'non_wine', null);
+      expect(approveProposal).toHaveBeenCalledWith('prop-7', expect.anything());
+      expect(body.data.status).toBe('approved');
+      expect(body.data.applied_note).toMatch(/^Quarantined as non-wine/);
+      expect(body.data.note).toMatch(/owners keep their bottles/i);
+      expect(body.data.undo).toMatch(/admin restores it/);
+    });
+
+    test('a non-wine flag on a row many members hold waits for an admin', async () => {
+      mkWine();
+      WineCorrectionProposal.create.mockResolvedValue({ _id: 'prop-8' });
+      classifyProposal.mockResolvedValueOnce({ direct: false, reason: '5 members hold bottles of this wine' });
+
+      const body = parse(await tool('propose_wine_correction').handler({
+        wine_id: WINE_ID, kind: 'non_wine', reason: REASON,
+      }, SOMM_CTX));
+
+      expect(body.data.status).toBe('pending');
+      expect(body.data.why_reviewed).toMatch(/5 members/);
+      expect(approveProposal).not.toHaveBeenCalled();
+    });
+
     test('merges never reach the classifier at all', async () => {
       mkWine();
       WineDefinition.findById.mockReturnValueOnce(chain(mkWine()))
@@ -1842,6 +1997,16 @@ describe('propose_wine_correction', () => {
     expect(WineCorrectionProposal.create).not.toHaveBeenCalled();
   });
 
+  test('merge kind: the same wine spelled in another letter case is refused too', async () => {
+    const body = parse(await tool('propose_wine_correction').handler({
+      wine_id: WINE_ID, kind: 'merge', merge_target_id: WINE_ID.toUpperCase(), reason: REASON,
+    }, SOMM_CTX));
+    expect(body.error.code).toBe('invalid_input');
+    expect(body.error.message).toMatch(/DIFFERENT wine/);
+    expect(WineDefinition.findById).not.toHaveBeenCalled();
+    expect(WineCorrectionProposal.create).not.toHaveBeenCalled();
+  });
+
   test('a short reason is refused before any read', async () => {
     const body = parse(await tool('propose_wine_correction').handler({
       wine_id: WINE_ID, kind: 'non_wine', reason: 'too short',
@@ -1885,13 +2050,15 @@ describe('propose_wine_correction', () => {
       { _id: 'wp', reversed: false }, { $set: { reversed: true, idempotencyKey: null } });
   });
 
-  test('undo refuses once an admin decided — the decision stands, nothing claimed or deleted', async () => {
+  test('undo refuses an applied non-wine flag — an admin restores it, nothing claimed or deleted', async () => {
     const row = { _id: 'wp', action: 'somm_proposal', reversed: false, detail: { proposalId: 'prop-1', wineId: WINE_ID, kind: 'non_wine' } };
     McpActionLog.findOne.mockReturnValue(chain(row));
     WineCorrectionProposal.findById.mockReturnValue(chain({ _id: 'prop-1', status: 'approved', kind: 'non_wine' }));
     const res = await tool('undo_last').handler({}, { ...SOMM_CTX, scopes: ['consume', 'write'] });
     expect(parse(res).error.code).toBe('conflict');
-    expect(parse(res).error.message).toMatch(/approved/);
+    // Not worded as an admin decision: a non-wine flag usually applied on filing.
+    expect(parse(res).error.message).toMatch(/already been applied/);
+    expect(parse(res).error.message).toMatch(/Admin → Wines → Proposals/);
     expect(McpActionLog.findOneAndUpdate).not.toHaveBeenCalled();
     expect(WineCorrectionProposal.deleteOne).not.toHaveBeenCalled();
   });

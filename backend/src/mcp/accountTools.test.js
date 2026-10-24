@@ -40,6 +40,7 @@ jest.mock('../services/accountOps', () => ({
   updateProfile: jest.fn(),
   createSupportTicket: jest.fn(),
   replyToTicket: jest.fn(),
+  closeTicket: jest.fn(),
   createWineRequest: jest.fn(),
   // The tool descriptions read these allow-lists at module load — keep them real-ish.
   ALLOWED_CURRENCIES: ['USD', 'EUR', 'SEK'],
@@ -104,6 +105,7 @@ describe('get_preferences / get_profile', () => {
     expect(body.data.notifications.drink_window.enabled).toBe(false);
     expect(body.data.notifications.community_reply.push).toBe(true); // default
     expect(body.data.notifications.support_reply.email).toBe(true); // a service email: on unless turned off
+    expect(body.data.notifications.owner_inquiry.email).toBe(true); // curators' questions: on unless turned off
     expect(body.data.cellar_sort).toBe('-createdAt'); // never picked: newest first
   });
 
@@ -138,9 +140,9 @@ describe('update_preferences', () => {
   test('maps snake_case params to the camelCase accountOps body and echoes the result', async () => {
     accountOps.updatePreferences.mockResolvedValue({ user: { preferences: { currency: 'EUR' } }, changed: ['preferences.currency'] });
     const body = parse(await tool('update_preferences').handler(
-      { currency: 'EUR', rating_scale: '100', cellar_sort: 'maturity', default_cellar_id: null, notifications: { drinkWindow: { push: true }, supportReply: { email: false } } }, CTX));
+      { currency: 'EUR', rating_scale: '100', cellar_sort: 'maturity', default_cellar_id: null, notifications: { drinkWindow: { push: true }, supportReply: { email: false }, ownerInquiry: { email: false } } }, CTX));
     expect(accountOps.updatePreferences).toHaveBeenCalledWith(ME, {
-      currency: 'EUR', ratingScale: '100', cellarSort: 'maturity', defaultCellarId: null, notifications: { drinkWindow: { push: true }, supportReply: { email: false } },
+      currency: 'EUR', ratingScale: '100', cellarSort: 'maturity', defaultCellarId: null, notifications: { drinkWindow: { push: true }, supportReply: { email: false }, ownerInquiry: { email: false } },
     });
     expect(body.data.currency).toBe('EUR');
   });
@@ -311,6 +313,40 @@ describe('reply_to_ticket (continuing the support conversation)', () => {
   });
 });
 
+describe('close_ticket (the user ends the conversation)', () => {
+  test('is write-scoped, idempotent and destructive (the user cannot reopen it)', () => {
+    const t = tool('close_ticket');
+    expect(t.scope).toBe('write');
+    expect(t.annotations.readOnlyHint).toBe(false);
+    expect(t.annotations.idempotentHint).toBe(true);
+    expect(t.annotations.destructiveHint).toBe(true);
+  });
+
+  test('delegates to the shared accountOps service and audits via mcp — no ledger row', async () => {
+    const McpActionLog = require('../models/McpActionLog');
+    accountOps.closeTicket.mockResolvedValue({ ticket: { _id: 't1', subject: 'Import stuck', status: 'closed' }, alreadyClosed: false });
+    const body = parse(await tool('close_ticket').handler({ ticket_id: 'f'.repeat(24) }, CTX));
+    expect(accountOps.closeTicket).toHaveBeenCalledWith(ME, 'f'.repeat(24));
+    expect(body.data).toMatchObject({ ticket_id: 't1', status: 'closed', already_closed: false });
+    expect(body.summary).toMatch(/Closed "Import stuck"/);
+    expect(logAudit).toHaveBeenCalledWith(CTX.req, 'support.ticket.closed_by_user', expect.any(Object), expect.objectContaining({ via: 'mcp' }));
+    expect(McpActionLog.create).not.toHaveBeenCalled();
+  });
+
+  test('an already closed ticket: reported, not audited again', async () => {
+    accountOps.closeTicket.mockResolvedValue({ ticket: { _id: 't1', subject: 'S', status: 'closed' }, alreadyClosed: true });
+    const body = parse(await tool('close_ticket').handler({ ticket_id: 'f'.repeat(24) }, CTX));
+    expect(body.data.already_closed).toBe(true);
+    expect(body.summary).toMatch(/already closed/);
+    expect(logAudit).not.toHaveBeenCalled();
+  });
+
+  test('a missing or foreign ticket maps to not_found', async () => {
+    accountOps.closeTicket.mockResolvedValue({ error: { status: 404, message: 'Ticket not found' } });
+    expect(parse(await tool('close_ticket').handler({ ticket_id: 'f'.repeat(24) }, CTX)).error.code).toBe('not_found');
+  });
+});
+
 describe('idempotency on the human-queue writes (support ticket 2026-09-12)', () => {
   const McpActionLog = require('../models/McpActionLog');
   const claimed = () => ({ lastErrorObject: { updatedExisting: false } });
@@ -351,10 +387,28 @@ describe('idempotency on the human-queue writes (support ticket 2026-09-12)', ()
     expect(McpActionLog.create).toHaveBeenCalledWith(expect.objectContaining({ tool: 'request_wine_addition', action: 'wine_request' }));
   });
 
-  test('every irreversible write declares idempotency_key and says to read back on a transport error', () => {
+  test('every irreversible write declares idempotency_key; the ticket writes say to read back on a transport error', () => {
     for (const n of ['create_support_ticket', 'reply_to_ticket', 'request_wine_addition']) {
       expect(tool(n).inputSchema.idempotency_key).toBeDefined();
+    }
+    for (const n of ['create_support_ticket', 'reply_to_ticket']) {
       expect(tool(n).description).toMatch(/read back/);
     }
+    // No tool lists wine requests, so the key is the only safe retry path.
+    expect(tool('request_wine_addition').description).toMatch(/ALWAYS pass an idempotency_key/);
+  });
+});
+
+describe('request_wine_addition — links and the back label (#1460)', () => {
+  test('source_urls and back_image_url pass through to the shared service', async () => {
+    accountOps.createWineRequest.mockResolvedValue({ wineRequest: { _id: 'wr2', wineName: 'Barolo', status: 'pending' } });
+    await tool('request_wine_addition').handler({
+      wine_name: 'Barolo', source_url: 'https://winery.example/b', source_urls: ['https://review.example/b'], back_image_url: 'https://winery.example/back.jpg',
+    }, CTX);
+    expect(accountOps.createWineRequest).toHaveBeenCalledWith(
+      ME,
+      { wineName: 'Barolo', sourceUrl: 'https://winery.example/b', sourceUrls: ['https://review.example/b'], image: undefined, backImage: 'https://winery.example/back.jpg' },
+      expect.objectContaining({ via: 'mcp' })
+    );
   });
 });

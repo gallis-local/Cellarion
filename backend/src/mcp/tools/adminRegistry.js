@@ -17,6 +17,7 @@ const { z } = require('zod');
 const WineDefinition = require('../../models/WineDefinition');
 const { registerTool } = require('../registry');
 const { logAudit } = require('../../services/audit');
+const { announceMintedWine } = require('../../services/wineCommit');
 const { isValidId } = require('../../utils/validation');
 const { ok, fail, wineSummary } = require('../toolUtil');
 const { safeFetchImage } = require('../../utils/safeImageFetch');
@@ -98,6 +99,7 @@ registerTool({
         logAudit(ctx.req, 'wine.create',
           { type: 'wine', id: wineDoc._id },
           { via: 'mcp', admin: true, name: wineDoc.name, producer: wineDoc.producer });
+        announceMintedWine(wineDoc);
       }
     }
 
@@ -320,7 +322,7 @@ registerTool({
     'that fold to the same string go quiet with it. Use for strings that are NOT appellations (quality tiers like ' +
     '"Qualitätswein", fantasy names, label slogans); for a real appellation use promote_appellation instead. The ' +
     'wines keep their free-text value either way — this only silences the review queue. Same terminal-state ' +
-    'pattern as reject_price_request (ticket 6a842d5e).',
+    'pattern as reject_price_request.',
   scope: 'write',
   requireRole: ['admin'],
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },

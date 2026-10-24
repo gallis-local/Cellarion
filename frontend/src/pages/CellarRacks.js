@@ -1,10 +1,12 @@
 import { useState, useEffect, useMemo, useCallback, useRef, Suspense } from 'react';
 import { lazy } from '../utils/lazyWithReload';
 import { useParams, Link, useSearchParams, useNavigate, useLocation } from 'react-router-dom';
+import { useBackHere } from '../utils/useBackHere';
+import { useBackToClose } from '../utils/useBackToClose';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { getCellar } from '../api/cellars';
-import { getRacks, deleteRack, updateSlot, clearSlot, moveSlot, createRack, updateRack, disableSlot, enableSlot, previewArrange, applyArrange } from '../api/racks';
+import { getRacks, deleteRack, updateSlot, clearSlot, moveSlot, createRack, updateRack, disableSlot, enableSlot, previewArrange, applyArrange, moveRackBottles } from '../api/racks';
 import { consumeBottle, pourBottle, openBottle } from '../api/bottles';
 import { glassesLeft, daysLeft, freshnessStatus, remainingMl } from '../utils/openBottle';
 import PreservationPickerModal from '../components/bottle/PreservationPickerModal';
@@ -20,8 +22,10 @@ import {
   CABINET_PRESETS, CABINET_PRESET_GROUPS, CABINET_DEFAULT, CABINET_MAX_ROWS_PER_SHELF,
   fitShelfRows, cabinetCapacity,
 } from '../utils/cabinetPresets';
-import { cabinetShelfCols, cabinetShelfAlternate } from '../utils/rackLayouts';
-import RatingInput from '../components/RatingInput';
+import { cabinetShelfCols, cabinetShelfAlternate, cabinetShelfSideways } from '../utils/rackLayouts';
+import { ConsumeModal } from '../components/ConsumeModal';
+import BottleUndoNotice, { bottleNoticeName } from '../components/BottleUndoNotice';
+import { isReserved, reservationSummary } from '../utils/reservation';
 import WineImage from '../components/WineImage';
 import ConfirmModal from '../components/ConfirmModal';
 import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
@@ -33,8 +37,13 @@ import CellarNav from '../components/CellarNav';
 import CellarPageHeader from '../components/CellarPageHeader';
 import DialogBox from '../components/DialogBox';
 import EditRackModal from '../components/racks/EditRackModal';
+import MoveRackBottlesModal from '../components/racks/MoveRackBottlesModal';
+import BetaBadge from '../components/BetaBadge';
+import { useFeature } from '../utils/featureFlags';
 import { groupRacks, groupNames } from '../utils/rackGroups';
 import { swatchType, wineTypeLabel } from '../utils/wineColour';
+import { friendlyError, messageForResponse } from '../utils/friendlyError';
+import ActionNotice from '../components/ActionNotice';
 import './CellarRacks.css';
 
 function CellarRacks() {
@@ -134,12 +143,36 @@ function CellarRacks() {
 
   // active popup: { rackId, position, slot: slotData|null } — rendered as fixed modal
   const [activePopup, setActivePopup] = useState(null);
+  // Why the last rack action failed (translated), shown by ActionNotice — the
+  // rack actions used English browser alerts, and some failed silently.
+  const [actionError, setActionError] = useState(null);
+  // Slot actions in flight, by what they act on: a double tap on the same
+  // slot sent two requests, and the second came back as a conflict alert for
+  // a move that had in fact worked. Other slots stay usable meanwhile.
+  const slotActionsBusy = useRef(new Set());
+  // Move mode — "Move" in a filled slot's popup, then a tap on the slot the
+  // bottle should go to: { rackId, position, bottle } or null (handleMoveTap).
+  const [moving, setMoving] = useState(null);
+  const movingOn = !!moving;
+  // The phone's Back and Escape leave it, as they close a pop-up. Escape with
+  // a pop-up open over the page is that pop-up's.
+  useBackToClose(() => setMoving(null), movingOn);
+  useEffect(() => {
+    if (!movingOn) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'Escape' && !document.querySelector('[role="dialog"]')) setMoving(null);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [movingOn]);
 
   // --- post-add placing mode (issue #1055) — HOOKS live up here, before the
   // page's early `if (error) return` (audit 2026-09-14 H: hooks declared after
   // a conditional return crash the page on a load error). The handlers that
   // use them sit further down, next to the render.
   const location = useLocation();
+  // Handed to the bottle page so its back link returns here (BottleDetail).
+  const backHere = useBackHere('racks');
   const [placeQueue, setPlaceQueue] = useState(() => readPlaceQueue(location.state));
   const [placeTotal] = useState(() => readPlaceQueue(location.state).length);
   const [placeNotice, setPlaceNotice] = useState(null);
@@ -166,6 +199,15 @@ function CellarRacks() {
   // Rack tools (⋮) dropdown in the lens toolbar
   const [toolsOpen, setToolsOpen] = useState(false);
 
+  // Early access: "Move bottles to another rack" (MoveRackBottlesModal). Holds
+  // the SOURCE rack's id while open — pinned, because reloading the racks
+  // after the move can change which rack the page has selected (a ?highlight
+  // follows its bottle into the target).
+  const moveRackOn = useFeature('rackMoveBottles');
+  // Early access: "Move" in a slot's pop-up, then a tap on the slot it goes to.
+  const slotMoveOn = useFeature('rackSlotMove');
+  const [moveOpen, setMoveOpen] = useState(null);
+
   // Zone editor modal
   const [zonesOpen, setZonesOpen] = useState(false);
 
@@ -174,6 +216,11 @@ function CellarRacks() {
 
   // consumed bottle awaiting the "add to journal?" prompt, or null
   const [journalBottle, setJournalBottle] = useState(null);
+  // The bottle just taken out of a slot, said with Undo (components/
+  // BottleUndoNotice) — a member could not undo a drink from the racks page.
+  // It floats above the journal prompt, as on the cellar list. It remembers
+  // the slot, so Undo can put the bottle back there (handleUndone).
+  const [drunkNotice, setDrunkNotice] = useState(null);
 
   // NFC modal: { rackId } or null
   const [nfcModal, setNfcModal] = useState(null);
@@ -182,6 +229,8 @@ function CellarRacks() {
   const [deleteConfirm, setDeleteConfirm] = useState(null);
 
   useEffect(() => {
+    // A move begun in another cellar must never reach this one's racks.
+    setMoving(null);
     fetchAll();
   }, [id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -240,7 +289,35 @@ function CellarRacks() {
     }
   };
 
+  // Re-read the racks after a move refused because a rack changed meanwhile,
+  // so the next try works on the real layout. Quietly: the notice already
+  // says why, and a failed re-read keeps what is shown (never the page error).
+  const reloadRacks = async () => {
+    try {
+      const res = await getRacks(apiFetch, id);
+      if (!res.ok) return;
+      const data = await res.json();
+      setRacks(data.racks || []);
+    } catch {
+      // keep what is shown
+    }
+  };
+
   // --- create rack ---
+  // A refused rack action, worded for the person (rate limit with its wait,
+  // server down, or the server's own reason) and shown by ActionNotice.
+  const failed = (res, body, fallback) => {
+    setActionError(messageForResponse(res, body, fallback, t));
+  };
+  // Runs a slot action unless the same one (same rack + slot) is already in
+  // flight — a repeat tap is dropped rather than sent twice.
+  const slotAction = async (key, run) => {
+    if (slotActionsBusy.current.has(key)) return;
+    slotActionsBusy.current.add(key);
+    setActionError(null);
+    try { await run(); } finally { slotActionsBusy.current.delete(key); }
+  };
+
   const handleCreateRack = async (e) => {
     e.preventDefault();
     setSaving(true);
@@ -271,14 +348,21 @@ function CellarRacks() {
           typeConfig.twoDeep = typeConfig.twoDeep !== false;
           typeConfig.stagger = typeConfig.stagger !== false;
           typeConfig.alternate = typeConfig.alternate === true;
+          // Head to tail is for a one-deep cabinet only (the backend refuses
+          // it with two deep), and stored only when on.
+          if (typeConfig.twoDeep === false && typeConfig.headToTail === true) typeConfig.headToTail = true; else delete typeConfig.headToTail;
           // Per-shelf width / pattern: fitted to the final shelf count and
           // width, and stored only where a shelf differs from the cabinet.
           const widths = cabinetShelfCols(newRack.rows, newRack.cols, typeConfig);
           if (widths.some((w) => w !== newRack.cols)) typeConfig.shelfCols = widths; else delete typeConfig.shelfCols;
           const patterns = cabinetShelfAlternate(newRack.rows, typeConfig);
           if (patterns.some((a) => a !== typeConfig.alternate)) typeConfig.shelfAlternate = patterns; else delete typeConfig.shelfAlternate;
+          // How each shelf's bottles lie (drawing only): fitted to the final
+          // shelf count, and stored only when some shelf lies sideways.
+          const lies = cabinetShelfSideways(newRack.rows, typeConfig);
+          if (lies.some(Boolean)) typeConfig.shelfSideways = lies; else delete typeConfig.shelfSideways;
         } else {
-          for (const k of ['shelfRows', 'twoDeep', 'stagger', 'alternate', 'shelfCols', 'shelfAlternate']) delete typeConfig[k];
+          for (const k of ['shelfRows', 'twoDeep', 'stagger', 'headToTail', 'alternate', 'shelfCols', 'shelfAlternate', 'shelfSideways']) delete typeConfig[k];
         }
         payload.typeConfig = typeConfig;
       }
@@ -289,9 +373,12 @@ function CellarRacks() {
         setSelectedRackId(data.rack._id);
         setNewRack({ name: '', type: 'grid', rows: 4, cols: 8, typeConfig: {} });
         setShowNewRack(false);
+        setActionError(null);
       } else {
-        alert(data.error || 'Failed to create rack');
+        failed(res, data, t('racks.errors.create', 'The rack could not be created.'));
       }
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     } finally {
       setSaving(false);
     }
@@ -320,34 +407,42 @@ function CellarRacks() {
       if (res.ok) {
         const remaining = racks.filter(r => r._id !== rackId);
         setRacks(remaining);
+        setActionError(null);
+        setMoving(m => (m?.rackId === rackId ? null : m));
         if (selectedRackId === rackId) {
           setSelectedRackId(remaining.length > 0 ? remaining[0]._id : null);
         }
       } else {
-        const data = await res.json();
-        alert(data.error || 'Failed to delete rack');
+        const data = await res.json().catch(() => null);
+        failed(res, data, t('racks.errors.delete', 'The rack could not be deleted.'));
       }
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     } finally {
       setDeleteConfirm(null);
     }
   };
 
   // --- assign bottle to slot ---
-  const handleAssign = async (rackId, position, bottleId) => {
-    const res = await updateSlot(apiFetch, rackId, position, { bottleId });
-    const data = await res.json();
-    if (res.ok) {
-      setRacks(racks.map(r => r._id === rackId ? data.rack : r));
-    } else {
-      alert(data.error || 'Failed to assign');
+  const handleAssign = (rackId, position, bottleId) => slotAction(`${rackId}:${position}`, async () => {
+    try {
+      const res = await updateSlot(apiFetch, rackId, position, { bottleId });
+      const data = await res.json();
+      if (res.ok) {
+        setRacks(prev => prev.map(r => r._id === rackId ? data.rack : r));
+      } else {
+        failed(res, data, t('racks.errors.assign', 'The bottle could not be placed.'));
+      }
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     }
     setActivePopup(null);
-  };
+  });
 
   // --- case placement: assign several bottles of the same wine to the free
   // positions from startPosition onward. Sequential on purpose — each save
   // bumps the rack version, so parallel PUTs would 409 each other.
-  const handleAssignMany = async (rackId, startPosition, bottleIds) => {
+  const handleAssignMany = (rackId, startPosition, bottleIds) => slotAction(`${rackId}:${startPosition}`, async () => {
     const r = racks.find(x => x._id === rackId);
     if (!r) return;
     const total = r.isModular && r.modules?.length > 0
@@ -364,61 +459,69 @@ function CellarRacks() {
         const res = await updateSlot(apiFetch, rackId, targets[i], { bottleId: bottleIds[i] });
         const data = await res.json();
         if (!res.ok) {
-          alert(data.error || 'Failed to place bottles');
+          failed(res, data, t('racks.errors.assignMany', 'Not all the bottles could be placed.'));
           break;
         }
         setRacks(prev => prev.map(x => x._id === rackId ? data.rack : x));
-      } catch {
-        alert('Network error — please try again.');
+      } catch (err) {
+        setActionError(friendlyError(err, t));
         break;
       }
     }
     setActivePopup(null);
-  };
+  });
 
   // --- remove bottle from slot (keep bottle in cellar) ---
-  const handleRemoveFromRack = async (rackId, position) => {
+  const handleRemoveFromRack = (rackId, position) => slotAction(`${rackId}:${position}`, async () => {
     try {
       const res = await clearSlot(apiFetch, rackId, position);
       const data = await res.json();
       if (res.ok) {
-        setRacks(racks.map(r => r._id === rackId ? data.rack : r));
+        setRacks(prev => prev.map(r => r._id === rackId ? data.rack : r));
       } else {
-        alert(data.error || 'Failed to remove from rack');
+        failed(res, data, t('racks.errors.removeFromRack', 'The bottle could not be taken out of the rack.'));
       }
-    } catch {
-      alert('Network error — please try again.');
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     } finally {
       setActivePopup(null);
     }
-  };
+  });
 
   // --- disable / re-enable a slot position ---
-  const handleDisableSlot = async (rackId, position) => {
-    const res = await disableSlot(apiFetch, rackId, position);
-    const data = await res.json();
-    if (res.ok) {
-      setRacks(racks.map(r => r._id === rackId ? data.rack : r));
-    } else {
-      alert(data.error || 'Failed to disable slot');
+  const handleDisableSlot = (rackId, position) => slotAction(`${rackId}:${position}`, async () => {
+    try {
+      const res = await disableSlot(apiFetch, rackId, position);
+      const data = await res.json();
+      if (res.ok) {
+        setRacks(prev => prev.map(r => r._id === rackId ? data.rack : r));
+      } else {
+        failed(res, data, t('racks.errors.disableSlot', 'The slot could not be marked unusable.'));
+      }
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     }
     setActivePopup(null);
-  };
+  });
 
-  const handleEnableSlot = async (rackId, position) => {
-    const res = await enableSlot(apiFetch, rackId, position);
-    const data = await res.json();
-    if (res.ok) {
-      setRacks(racks.map(r => r._id === rackId ? data.rack : r));
-    } else {
-      alert(data.error || 'Failed to enable slot');
+  const handleEnableSlot = (rackId, position) => slotAction(`${rackId}:${position}`, async () => {
+    try {
+      const res = await enableSlot(apiFetch, rackId, position);
+      const data = await res.json();
+      if (res.ok) {
+        setRacks(prev => prev.map(r => r._id === rackId ? data.rack : r));
+      } else {
+        failed(res, data, t('racks.errors.enableSlot', 'The slot could not be made usable again.'));
+      }
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     }
     setActivePopup(null);
-  };
+  });
 
   // --- soft-remove bottle via the shared consume endpoint ---
   const handleConsumeSubmit = async (reason, note, rating, consumedRatingScale, consumedAt) => {
-    const { bottleId, bottle } = consumeModal;
+    const { bottleId, bottle, slot } = consumeModal;
     try {
       const res = await consumeBottle(apiFetch, bottleId, { reason, note, rating, consumedRatingScale, consumedAt });
       const data = await res.json();
@@ -432,42 +535,95 @@ function CellarRacks() {
           })
         })));
         setConsumeModal(null);
+        setActionError(null);
+        setDrunkNotice({ kind: 'consumed', reason, bottleId, slot, name: bottleNoticeName(bottle), at: Date.now() });
         if (reason === 'drank' && !journalPromptOptedOut()) {
           setJournalBottle(bottle);
         }
       } else {
-        alert(data.error || 'Failed to remove bottle');
+        // The dialog stays open (nothing typed is lost); the notice floats
+        // above it.
+        failed(res, data, t('racks.errors.consume', 'The bottle could not be taken out.'));
       }
-    } catch {
+    } catch (err) {
       // Don't rethrow — ConsumeModal awaits this and must reach setSaving(false)
-      alert('Network error — please try again.');
+      setActionError(friendlyError(err, t));
     }
   };
 
+  // After an Undo from the drunk notice. The journal prompt for that bottle
+  // closes (it was not drunk after all). The bottle goes back into the slot it
+  // came from when that slot is still free — the server checks it is still
+  // empty (expectOccupant: null), so a bottle placed there meanwhile is never
+  // displaced; otherwise it stays unplaced, which the notice's "back in the
+  // cellar" covers, and the racks are read again quietly (reloadRacks — a
+  // failed re-read keeps what is shown, never the whole-page error).
+  const handleUndone = async (notice) => {
+    setJournalBottle((prev) => (prev && String(prev._id) === String(notice.bottleId) ? null : prev));
+    const { slot } = notice;
+    const rack = slot && racks.find((r) => r._id === slot.rackId);
+    const free = !!rack && !(rack.disabledPositions || []).includes(slot.position)
+      && !rack.slots.some((s) => s.position === slot.position && s.bottle);
+    if (free) {
+      try {
+        const res = await updateSlot(apiFetch, slot.rackId, slot.position, { bottleId: notice.bottleId, expectOccupant: null });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.rack) {
+          setRacks((prev) => prev.map((r) => (r._id === slot.rackId ? data.rack : r)));
+          return;
+        }
+      } catch { /* it stays unplaced */ }
+    }
+    await reloadRacks();
+  };
+
   // --- drag & drop: move a bottle to another slot / swap two bottles ---
-  const handleSlotMove = async (rackId, fromPosition, toPosition) => {
+  // Also the move mode's, which passes `expect` (what it saw in both slots).
+  const handleSlotMove = (rackId, fromPosition, toPosition, expect) => slotAction(`${rackId}:${fromPosition}`, async () => {
     try {
-      const res = await moveSlot(apiFetch, rackId, fromPosition, toPosition);
+      const res = await moveSlot(apiFetch, rackId, fromPosition, toPosition, expect);
       const data = await res.json();
       if (res.ok) {
         setRacks(prev => prev.map(r => r._id === rackId ? data.rack : r));
       } else {
-        alert(data.error || 'Failed to move bottle');
+        failed(res, data, t('racks.errors.move', 'The bottle could not be moved.'));
+        // The move mode's 409: the rack is not what the page shows.
+        if (expect && res.status === 409) await reloadRacks();
       }
-    } catch {
-      alert('Network error — please try again.');
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     }
+  });
+
+  // A drop (mouse/pen) of the bottle the move mode is moving — or onto its
+  // slot — has moved it already: the mode ends.
+  const handleDrop = (rackId, fromPosition, toPosition) => {
+    setMoving(m => (m?.rackId === rackId && (m.position === fromPosition || m.position === toPosition) ? null : m));
+    return handleSlotMove(rackId, fromPosition, toPosition);
   };
 
   // "Just a glass — keep the bottle": escape hatch out of the remove flow.
   // Already-open bottles pour immediately; unopened ones ask for the
   // preservation method first. Both land on the bottle page, where the
   // open-bottle panel shows the result.
+  // "Just a glass": pour one from an open bottle, or open it first, then
+  // show the bottle. A refusal says why and stays here — nothing changed, so
+  // the bottle page would have nothing to show. Opened but the glass refused:
+  // the bottle page shows it open, where a glass is one tap.
   const handlePartial = async (bottle) => {
     setConsumeModal(null);
     if (bottle.openedAt) {
-      try { await pourBottle(apiFetch, bottle._id); } catch { /* bottle page shows truth */ }
-      navigate(`/cellars/${id}/bottles/${bottle._id}`);
+      try {
+        const res = await pourBottle(apiFetch, bottle._id);
+        if (!res.ok) {
+          failed(res, await res.json().catch(() => ({})), t('racks.errors.pour', 'The glass could not be recorded.'));
+          return;
+        }
+      } catch (err) {
+        setActionError(friendlyError(err, t));
+        return;
+      }
+      navigate(`/cellars/${id}/bottles/${bottle._id}`, { state: backHere });
     } else {
       setPartialPicker({ bottleId: bottle._id });
     }
@@ -478,11 +634,19 @@ function CellarRacks() {
     setPartialBusy(true);
     try {
       const res = await openBottle(apiFetch, bottleId, method);
-      if (res.ok) await pourBottle(apiFetch, bottleId);
-    } catch { /* bottle page shows truth */ }
-    setPartialBusy(false);
-    setPartialPicker(null);
-    navigate(`/cellars/${id}/bottles/${bottleId}`);
+      if (!res.ok) {
+        failed(res, await res.json().catch(() => ({})), t('racks.errors.open', 'The bottle could not be opened.'));
+        return;
+      }
+      await pourBottle(apiFetch, bottleId).catch(() => {});
+    } catch (err) {
+      setActionError(friendlyError(err, t));
+      return;
+    } finally {
+      setPartialBusy(false);
+      setPartialPicker(null);
+    }
+    navigate(`/cellars/${id}/bottles/${bottleId}`, { state: backHere });
   };
 
   // Pour a glass from an open (Coravin'd) bottle right from the slot popup.
@@ -493,9 +657,10 @@ function CellarRacks() {
       const res = await pourBottle(apiFetch, bottleId);
       const data = await res.json();
       if (!res.ok) {
-        alert(data.error || 'Failed to record pour');
+        failed(res, data, t('racks.errors.pour', 'The glass could not be recorded.'));
         return;
       }
+      setActionError(null);
       const patch = {
         openedAt: data.bottle.openedAt,
         preservationMethod: data.bottle.preservationMethod,
@@ -518,8 +683,8 @@ function CellarRacks() {
         if (bid?.toString() !== bottleId) return prev;
         return { ...prev, slot: { ...prev.slot, bottle: { ...prev.slot.bottle, ...patch } } };
       });
-    } catch {
-      alert('Network error — please try again.');
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     }
   };
 
@@ -575,6 +740,23 @@ function CellarRacks() {
     }
   };
 
+  // Every bottle of one rack into another, in order (early access
+  // 'rackMoveBottles'). Both racks change, so reload them all.
+  const handleMoveBottles = async (rackId, toRackId) => {
+    try {
+      const res = await moveRackBottles(apiFetch, rackId, toRackId);
+      const data = await res.json();
+      // Reload on a refusal too: a move refused halfway can leave bottles
+      // unplaced, and the page must not keep showing them in their old slots.
+      await fetchAll();
+      if (!res.ok) return { ok: false, error: data?.error };
+      return { ok: true, data };
+    } catch {
+      fetchAll();
+      return { ok: false };
+    }
+  };
+
   // Rename / regroup (support ticket 2026-09-06): PUT name + group and adopt
   // the returned values. An empty group clears it.
   const handleEditRackSave = async (rackId, { name, group, typeConfig }) => {
@@ -604,12 +786,13 @@ function CellarRacks() {
       if (res.ok) {
         setRacks(racks.map(r => r._id === rackId ? { ...r, rfidTag: data.rack.rfidTag } : r));
         setNfcModal(null);
+        setActionError(null);
       } else {
         // Keep the modal open so the user can retry instead of silently losing the tag
-        alert(data.error || 'Failed to save NFC tag');
+        failed(res, data, t('racks.errors.nfc', 'The NFC tag could not be saved.'));
       }
-    } catch {
-      alert('Network error — please try again.');
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     }
   };
 
@@ -617,6 +800,56 @@ function CellarRacks() {
 
   const rack = racks.find(r => r._id === selectedRackId) || racks[0];
   const canEdit = cellar?.userRole !== 'viewer';
+  // Shelves and wine cabinets drawn in 3D hide the lens toolbar (and the rack
+  // header with its pencil lives only in the Compact view).
+  const shelf3d = !!rack && (rack.type === 'shelf' || rack.type === 'cabinet') && !rack.isModular && viewMode === '3d';
+
+  // Rack tools (⋮), for editors, in every view and whether or not the rack
+  // holds bottles. Rename sits here too: the header pencil is missing in the
+  // Shelf and 3D views of shelves and wine cabinets, and a rack you cannot
+  // find a way to rename gets deleted and rebuilt (forum feedback 2026-10-12).
+  const rackToolsMenu = rack && canEdit ? (
+    <div className="rack-tools">
+      <button
+        type="button"
+        className="btn btn-secondary btn-small rack-tools-btn"
+        onClick={() => setToolsOpen(o => !o)}
+        aria-haspopup="menu"
+        aria-expanded={toolsOpen}
+        aria-label={t('racks.toolsMenu', 'Rack tools')}
+        title={t('racks.toolsMenu', 'Rack tools')}
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <circle cx="12" cy="5" r="1.9" /><circle cx="12" cy="12" r="1.9" /><circle cx="12" cy="19" r="1.9" />
+        </svg>
+      </button>
+      {toolsOpen && (
+        <>
+          <div className="rack-tools-backdrop" onClick={() => setToolsOpen(false)} aria-hidden="true" />
+          <div className="rack-tools-menu" role="menu">
+            <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); setEditRack(rack._id); }}>
+              {t('racks.renameMenuItem', 'Rename or group…')}
+            </button>
+            {rack.slots.length >= 2 && (
+              <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); setArrangeOpen(true); }}>
+                {t('arrange.openBtn', 'Organize…')}
+              </button>
+            )}
+            {moveRackOn && rack.slots.length > 0 && (
+              <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); setMoveOpen(rack._id); }}>
+                {t('racks.moveBottles.menuItem', 'Move bottles to another rack…')}
+              </button>
+            )}
+            {rack.slots.length > 0 && (
+              <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); setAuditOpen(true); }}>
+                {t('audit.openBtn', 'Audit')}
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  ) : null;
 
   // --- post-add placing mode (issue #1055): handlers ---
   // The add flow hands over the ids of the bottles it just created as router
@@ -704,8 +937,75 @@ function CellarRacks() {
     }
   };
 
+  // --- move mode: the way to move a bottle without dragging (drag & drop is
+  // mouse/pen only — hooks/useSlotDrag). Within the bottle's own rack a tap
+  // does what a drop does: an empty slot takes it, an occupied one swaps. In
+  // another rack (its tab chosen while the mode stays on) an empty slot takes
+  // it and the server clears its old slot. The mode ends after one try at a
+  // move, done or refused by the server (a 409 re-reads the racks), and on a
+  // tap on the bottle's own slot, Cancel, Escape or Back. Only a slot refused
+  // here before any request (unusable, or occupied in another rack) keeps it
+  // on, for another pick.
+  // Returns true when the tap was consumed by the move mode.
+  const handleMoveTap = async (targetRack, pos, slotData) => {
+    if (!moving || !canEdit) return false;
+    const { rackId: fromRackId, position: from, bottle } = moving;
+    const done = () => setMoving(m => (m === moving ? null : m));
+    if (targetRack._id === fromRackId && pos === from) { done(); return true; }
+    if ((targetRack.disabledPositions || []).includes(pos)) {
+      setActionError(t('racks.disabledSlotNote'));
+      return true;
+    }
+    const bottleId = String(bottle._id || bottle);
+    const occupant = slotData ? String(slotData.bottle?._id || slotData.bottle) : null;
+    if (targetRack._id === fromRackId) {
+      // The mode can stay open a while: send what the person saw, so a rack
+      // changed meanwhile is refused instead of moving or swapping a bottle
+      // they did not pick.
+      await handleSlotMove(fromRackId, from, pos, { expectFrom: bottleId, expectTo: occupant });
+      done();
+      return true;
+    }
+    // Across racks a placement would push the other bottle out, not swap it.
+    if (occupant) {
+      setActionError(t('racks.moveMode.otherRackFilled', 'In another rack, choose an empty slot — bottles only swap places within one rack.'));
+      return true;
+    }
+    await slotAction(`${fromRackId}:${from}`, async () => {
+      try {
+        const res = await updateSlot(apiFetch, targetRack._id, pos, { bottleId, expectOccupant: null });
+        const data = await res.json();
+        if (res.ok) {
+          // The server took the bottle out of its old rack too.
+          setRacks(prev => prev.map(r => r._id === targetRack._id ? data.rack : {
+            ...r,
+            slots: r.slots.filter(s => String(s.bottle?._id || s.bottle) !== bottleId),
+          }));
+        } else {
+          failed(res, data, t('racks.errors.move', 'The bottle could not be moved.'));
+          if (res.status === 409) await reloadRacks();
+        }
+      } catch (err) {
+        setActionError(friendlyError(err, t));
+      }
+    });
+    done();
+    return true;
+  };
+
   return (
     <div className="cellar-racks-page">
+      <ActionNotice message={actionError} onDismiss={() => setActionError(null)} />
+      {drunkNotice && (
+        <BottleUndoNotice
+          key={`${drunkNotice.bottleId}:${drunkNotice.at}`}
+          floating
+          notice={drunkNotice}
+          cellarId={id}
+          onUndone={() => handleUndone(drunkNotice)}
+          onDismiss={() => setDrunkNotice(null)}
+        />
+      )}
       <CellarPageHeader
         backTo={`/cellars/${id}`}
         backLabel={t('racks.backToCellar')}
@@ -743,6 +1043,22 @@ function CellarRacks() {
               {placeQueue.length > 0 ? t('racks.placeQueue.leaveMode') : t('common.done', 'Done')}
             </button>
           </span>
+        </div>
+      )}
+
+      {/* Move mode: which bottle, and the way out */}
+      {moving && !loading && (
+        <div className="alert alert-info place-queue-bar" role="status">
+          <span>
+            {t('racks.moveMode.hint', 'Tap the slot to move {{name}} to', { name: bottleNoticeName(moving.bottle) || t('common.unknown') })}
+            {racks.length > 1 && <> · {t('racks.moveMode.otherRackHint', 'for another rack, open its tab first')}</>}
+          </span>
+          <span className="place-queue-bar__actions">
+            <button type="button" className="btn btn-small" onClick={() => setMoving(null)}>
+              {t('common.cancel')}
+            </button>
+          </span>
+          <BetaBadge feature="rackSlotMove" note={t('racks.moveMode.betaNote', 'Moving a bottle by tapping is in early access.')} />
         </div>
       )}
 
@@ -839,38 +1155,7 @@ function CellarRacks() {
                     {t('rackLens.lensRating', 'My rating')}
                   </button>
                 </div>
-                {canEdit && rack.slots.length > 0 && (
-                  <div className="rack-tools">
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-small rack-tools-btn"
-                      onClick={() => setToolsOpen(o => !o)}
-                      aria-haspopup="menu"
-                      aria-expanded={toolsOpen}
-                      aria-label={t('racks.toolsMenu', 'Rack tools')}
-                      title={t('racks.toolsMenu', 'Rack tools')}
-                    >
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                        <circle cx="12" cy="5" r="1.9" /><circle cx="12" cy="12" r="1.9" /><circle cx="12" cy="19" r="1.9" />
-                      </svg>
-                    </button>
-                    {toolsOpen && (
-                      <>
-                        <div className="rack-tools-backdrop" onClick={() => setToolsOpen(false)} aria-hidden="true" />
-                        <div className="rack-tools-menu" role="menu">
-                          {rack.slots.length >= 2 && (
-                            <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); setArrangeOpen(true); }}>
-                              {t('arrange.openBtn', 'Organize…')}
-                            </button>
-                          )}
-                          <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); setAuditOpen(true); }}>
-                            {t('audit.openBtn', 'Audit')}
-                          </button>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                )}
+                {rackToolsMenu}
               </div>
               <div className="rack-lens-legend" aria-hidden="true">
                 {getLensLegend(lens).map(e => (
@@ -882,11 +1167,14 @@ function CellarRacks() {
               </div>
               {canEdit && (
                 <p className="rack-drag-hint">
-                  {t('rackLens.dragHint', 'Tip: drag a bottle to an empty slot to move it, onto another bottle to swap them.')}
+                  {slotMoveOn
+                    ? t('rackLens.dragHintMove', 'Tip: drag a bottle to an empty slot to move it, onto another bottle to swap them — or tap the bottle and choose Move.')
+                    : t('rackLens.dragHint', 'Tip: drag a bottle to an empty slot to move it, onto another bottle to swap them.')}
                 </p>
               )}
             </>
           )}
+          {shelf3d && rackToolsMenu && <div className="rack-tools-row">{rackToolsMenu}</div>}
           {(rack.type === 'shelf' || rack.type === 'cabinet') && !rack.isModular && (
             <div className="rack-view-mode-toggle" role="tablist">
               <button
@@ -919,6 +1207,8 @@ function CellarRacks() {
           {(rack.type === 'shelf' || rack.type === 'cabinet') && !rack.isModular && (viewMode === 'shelf' || viewMode === '3d') ? (
             (() => {
               const handleClick = async (pos, slotData) => {
+                // Move mode consumes every tap while it is on.
+                if (moving && await handleMoveTap(rack, pos, slotData)) return;
                 // Placing mode consumes a tap on a free slot (issue #1055).
                 if (placeQueue.length && await handlePlaceTap(rack, pos, slotData)) return;
                 const isDisabled = (rack.disabledPositions || []).includes(pos);
@@ -930,33 +1220,38 @@ function CellarRacks() {
                   setActivePopup({ rackId: rack._id, position: pos, slot: slotData || null });
                 }
               };
+              const movingPos = moving?.rackId === rack._id ? moving.position : null;
               const commonProps = {
                 rack,
                 activePosition: activePopup?.rackId === rack._id ? activePopup.position : null,
                 highlightPos: highlightPos?.rackId === rack._id ? highlightPos.position : null,
                 onSlotClick: handleClick,
                 getSlotStyle,
-                onSlotMove: canEdit ? (from, to) => handleSlotMove(rack._id, from, to) : undefined,
+                onSlotMove: canEdit ? (from, to) => handleDrop(rack._id, from, to) : undefined,
               };
               if (viewMode === '3d') {
+                // 3D has no selected-slot ring (its "selected" note points at
+                // the popup): the bottle being moved glows like a highlight.
                 return (
                   <Suspense fallback={<div className="loading">{t('common.loading')}</div>}>
-                    <ShelfView3D key={rack._id} {...commonProps} />
+                    <ShelfView3D key={rack._id} {...commonProps} highlightPos={movingPos ?? commonProps.highlightPos} />
                   </Suspense>
                 );
               }
-              return <ShelfView key={rack._id} {...commonProps} />;
+              return <ShelfView key={rack._id} {...commonProps} activePosition={movingPos ?? commonProps.activePosition} />;
             })()
           ) : (
             <RackRenderer
               rack={rack}
               canEdit={canEdit}
-              activeRackId={activePopup?.rackId}
-              activePosition={activePopup?.position}
+              activeRackId={(moving || activePopup)?.rackId}
+              activePosition={(moving || activePopup)?.position}
               highlightPos={highlightPos?.rackId === rack._id ? highlightPos.position : null}
               getSlotStyle={getSlotStyle}
-              onSlotMove={canEdit ? (from, to) => handleSlotMove(rack._id, from, to) : undefined}
+              onSlotMove={canEdit ? (from, to) => handleDrop(rack._id, from, to) : undefined}
               onSlotClick={async (pos, slotData) => {
+                // Move mode consumes every tap while it is on.
+                if (moving && await handleMoveTap(rack, pos, slotData)) return;
                 // Placing mode consumes a tap on a free slot (issue #1055).
                 if (placeQueue.length && await handlePlaceTap(rack, pos, slotData)) return;
                 // Viewers can only inspect filled or disabled slots, not interact with empty ones
@@ -1016,8 +1311,17 @@ function CellarRacks() {
                   canEdit={canEdit}
                   onPour={() => handlePour(activePopup.rackId, (activePopup.slot.bottle?._id || activePopup.slot.bottle).toString())}
                   onRemoveFromRack={() => handleRemoveFromRack(activePopup.rackId, activePopup.position)}
+                  onMove={slotMoveOn ? () => {
+                    setMoving({ rackId: activePopup.rackId, position: activePopup.position, bottle: activePopup.slot.bottle });
+                    setActivePopup(null);
+                    setActionError(null);
+                  } : undefined}
                   onConsume={() => {
-                    setConsumeModal({ bottleId: activePopup.slot.bottle._id, bottle: activePopup.slot.bottle });
+                    setConsumeModal({
+                      bottleId: activePopup.slot.bottle._id,
+                      bottle: activePopup.slot.bottle,
+                      slot: { rackId: activePopup.rackId, position: activePopup.position },
+                    });
                     setActivePopup(null);
                   }}
                   onClose={() => setActivePopup(null)}
@@ -1050,13 +1354,17 @@ function CellarRacks() {
         );
       })()}
 
-      {/* Consume/remove modal */}
+      {/* The one "take out of the cellar" dialog the bottle page uses too,
+          with "Just a glass" on top — the bottle page's separate "Open
+          bottle…" button is not at hand from a slot. */}
       {consumeModal && (
         <ConsumeModal
+          wineName={bottleNoticeName(consumeModal.bottle)}
           defaultRatingScale={user?.preferences?.ratingScale || '5'}
-          onSubmit={handleConsumeSubmit}
+          reservationText={isReserved(consumeModal.bottle) ? reservationSummary(consumeModal.bottle, t) : undefined}
+          onConfirm={handleConsumeSubmit}
           onCancel={() => setConsumeModal(null)}
-          onPartial={() => handlePartial(consumeModal.bottle)}
+          onJustAGlass={() => handlePartial(consumeModal.bottle)}
         />
       )}
 
@@ -1083,6 +1391,20 @@ function CellarRacks() {
           onClose={() => setArrangeOpen(false)}
         />
       )}
+
+      {/* Early access: move every bottle to another rack */}
+      {moveOpen && (() => {
+        const source = racks.find(r => r._id === moveOpen);
+        return source ? (
+          <MoveRackBottlesModal
+            rack={source}
+            racks={racks}
+            onMove={(toRackId) => handleMoveBottles(source._id, toRackId)}
+            onShowRack={(rackId) => { setMoveOpen(null); setSelectedRackId(rackId); }}
+            onClose={() => setMoveOpen(null)}
+          />
+        ) : null;
+      })()}
 
       {/* Zone editor modal */}
       {zonesOpen && rack && (
@@ -1187,6 +1509,13 @@ function CabinetShapeFields({ newRack, setNewRack }) {
   const alternate = newRack.typeConfig?.alternate === true;
   const allAlternate = shelfAlt.length > 0 && shelfAlt.every(Boolean);
   const stagger = allAlternate || newRack.typeConfig?.stagger !== false;
+  const headToTailOn = useFeature('cabinetHeadToTail');
+  const headToTail = !twoDeep && newRack.typeConfig?.headToTail === true;
+  // How each shelf's bottles lie (early access, 'cabinetSideways'): the
+  // per-shelf choice and the presets built on it show only with the flag.
+  const sidewaysOn = useFeature('cabinetSideways');
+  const shelfSide = cabinetShelfSideways(newRack.rows, newRack.typeConfig);
+  const presetShown = (p) => !p.feature || (p.feature === 'cabinetSideways' && sidewaysOn);
   const preset = CABINET_PRESETS.find((p) => p.key === presetKey);
   // The shelves / bottles-across inputs live in the parent form, so editing
   // them must drop the preset label: the shape is no longer that model.
@@ -1208,6 +1537,7 @@ function CabinetShapeFields({ newRack, setNewRack }) {
         shelfRows: [...p.shelfRows], twoDeep: p.twoDeep, stagger: p.stagger !== false, alternate: p.alternate === true,
         shelfCols: p.shelfCols ? [...p.shelfCols] : undefined,
         shelfAlternate: p.shelfAlternate ? [...p.shelfAlternate] : undefined,
+        shelfSideways: p.shelfSideways ? [...p.shelfSideways] : undefined,
       },
     });
   };
@@ -1230,6 +1560,11 @@ function CabinetShapeFields({ newRack, setNewRack }) {
     next[i] = !!value;
     setShelf({ shelfAlternate: next });
   };
+  const setSide = (i, value) => {
+    const next = [...shelfSide];
+    next[i] = value;
+    setShelf({ shelfSideways: next });
+  };
 
   return (
     <>
@@ -1237,9 +1572,9 @@ function CabinetShapeFields({ newRack, setNewRack }) {
         <label>{t('racks.cabinetPresetLabel', 'Start from')}</label>
         <select value={presetKey} onChange={(e) => applyPreset(e.target.value)}>
           <option value="custom">{t('racks.cabinetPresetCustom', 'Custom shape')}</option>
-          {CABINET_PRESET_GROUPS.map((group) => (
+          {CABINET_PRESET_GROUPS.filter((group) => CABINET_PRESETS.some((p) => p.group === group && presetShown(p))).map((group) => (
             <optgroup key={group} label={t(`racks.cabinetPresetGroup_${group}`, group)}>
-              {CABINET_PRESETS.filter((p) => p.group === group).map((p) => (
+              {CABINET_PRESETS.filter((p) => p.group === group && presetShown(p)).map((p) => (
                 <option key={p.key} value={p.key}>{t(`racks.cabinetPreset_${p.key}`, p.key)}</option>
               ))}
             </optgroup>
@@ -1262,6 +1597,7 @@ function CabinetShapeFields({ newRack, setNewRack }) {
               <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
                 <input
                   type="number"
+                  inputMode="numeric"
                   min={1} max={CABINET_MAX_ROWS_PER_SHELF}
                   value={v}
                   onChange={(e) => setRow(i, e.target.value)}
@@ -1273,6 +1609,7 @@ function CabinetShapeFields({ newRack, setNewRack }) {
               <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
                 <input
                   type="number"
+                  inputMode="numeric"
                   min={1} max={newRack.cols || 1}
                   value={shelfCols[i]}
                   onChange={(e) => setWidth(i, e.target.value)}
@@ -1290,11 +1627,26 @@ function CabinetShapeFields({ newRack, setNewRack }) {
                 />
                 <span>{t('racks.cabinetShelfAlternateShort', '6 / 5 alternating')}</span>
               </label>
+              {sidewaysOn && (
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                  <span>{t('racks.cabinetShelfSidewaysShort', 'bottles lie')}</span>
+                  <select
+                    value={shelfSide[i]}
+                    onChange={(e) => setSide(i, e.target.value)}
+                    aria-label={`${t('racks.cabinetShelfN', { n: i + 1 })} ${t('racks.cabinetShelfSidewaysShort', 'bottles lie')}`}
+                  >
+                    <option value="">{t('racks.cabinetSidewaysNone', 'front to back')}</option>
+                    <option value="front">{t('racks.cabinetSidewaysFront', 'one across the front')}</option>
+                    <option value="all">{t('racks.cabinetSidewaysAll', 'all across')}</option>
+                  </select>
+                </label>
+              )}
             </div>
           ))}
         </div>
         <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
           {t('racks.cabinetShelfRowsHelp', 'Rows: 1 = a sliding shelf with a single row, more = a stacking bay. Across: a shelf narrower than the cabinet is drawn centred. Alternating: the rows of that shelf go full width, one fewer, full width … (6 in front of 5, then 5 in front of 6). The maker\'s presets fill this in; change any shelf to match how you load yours.')}
+          {sidewaysOn ? ` ${t('racks.cabinetSidewaysHelp', 'Bottles lie: front to back, one bottle lying across the front of the others (as in a slim fridge), or all lying across (as in a bottom bin). On a shelf stacked in levels of a one-deep cabinet, the level above a bottle lying across rests on the bottles behind it, so it holds one fewer. Otherwise the number of bottles and the slot numbers stay the same.')}` : ''}
         </small>
       </div>
 
@@ -1345,6 +1697,25 @@ function CabinetShapeFields({ newRack, setNewRack }) {
             : t('racks.cabinetStaggerHelp', 'Each stacked row sits in the grooves of the row below, offset half a bottle, the way bottles actually stack on a shelf. Turn it off for rows stacked squarely on top of each other. Drawing only — the number of bottles is the same.')}
         </small>
       </div>
+
+      {headToTailOn && (
+        <div className="form-group">
+          <label>
+            <input
+              type="checkbox"
+              checked={headToTail}
+              disabled={twoDeep}
+              onChange={(e) => setNewRack({ ...newRack, typeConfig: { ...newRack.typeConfig, headToTail: e.target.checked } })}
+            />
+            {' '}{t('racks.cabinetHeadToTailLabel', 'Bottles lie head to tail')}
+          </label>
+          <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
+            {twoDeep
+              ? t('racks.cabinetHeadToTailNeedsSingle', 'Head to tail is for bottles that lie one deep: untick Two deep first.')
+              : t('racks.cabinetHeadToTailHelp', 'For bottles that lie one deep, base forward and neck forward in turn, so a row fits more. Every other bottle is drawn neck forward. Drawing only — the number of bottles and the slot numbers stay the same.')}
+          </small>
+        </div>
+      )}
     </>
   );
 }
@@ -1352,6 +1723,8 @@ function CabinetShapeFields({ newRack, setNewRack }) {
 // ---- New rack creation form with type selector ----
 function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, groups = [] }) {
   const { t } = useTranslation();
+  const headToTailOn = useFeature('cabinetHeadToTail');
+  const sidewaysOn = useFeature('cabinetSideways');
   const dims = TYPE_DIMENSIONS[newRack.type] || TYPE_DIMENSIONS.grid;
   const [showPreview, setShowPreview] = useState(false);
   // Which preview to draw. A cabinet or an open shelf is about its SHAPE, so
@@ -1399,6 +1772,7 @@ function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, grou
   };
 
   return (
+    <>
     <form className="card new-rack-form" onSubmit={onSubmit}>
       <h3>{t('racks.newRackTitle')}</h3>
 
@@ -1437,6 +1811,7 @@ function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, grou
             <label>{t(dims.rowLabel || 'racks.rowsLabel')}</label>
             <input
               type="number"
+              inputMode="numeric"
               min={1} max={20}
               value={newRack.rows}
               onChange={e => setNewRack({ ...newRack, rows: parseInt(e.target.value) || dims.defaultRows })}
@@ -1449,6 +1824,7 @@ function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, grou
             <label>{t(dims.colLabel || 'racks.colsLabel')}</label>
             <input
               type="number"
+              inputMode="numeric"
               min={1} max={20}
               value={newRack.cols}
               onChange={e => setNewRack({ ...newRack, cols: parseInt(e.target.value) || dims.defaultCols })}
@@ -1461,7 +1837,6 @@ function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, grou
             <label>{t('racks.doubleHeightRowsLabel', 'Double-height rows')}</label>
             <input
               type="text"
-              inputMode="numeric"
               value={doubleRowsText}
               placeholder={t('racks.doubleHeightRowsPlaceholder', 'e.g. 1,3')}
               onChange={e => {
@@ -1527,6 +1902,7 @@ function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, grou
               <label>{t('racks.moduleRowsLabel')}</label>
               <input
                 type="number"
+                inputMode="numeric"
                 min={1} max={10}
                 value={newRack.typeConfig?.moduleRows || 2}
                 onChange={e => setNewRack({
@@ -1539,6 +1915,7 @@ function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, grou
               <label>{t('racks.moduleColsLabel')}</label>
               <input
                 type="number"
+                inputMode="numeric"
                 min={1} max={10}
                 value={newRack.typeConfig?.moduleCols || 2}
                 onChange={e => setNewRack({
@@ -1559,6 +1936,7 @@ function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, grou
             <label>{t('racks.bottlesPerCellLabel', 'Bottles per cell')}</label>
             <input
               type="number"
+              inputMode="numeric"
               min={1} max={20}
               value={newRack.typeConfig?.bottlesPerCell || 1}
               onChange={e => setNewRack({
@@ -1574,6 +1952,7 @@ function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, grou
             <label>{t('racks.backColsLabel', 'Back row bottles (per shelf)')}</label>
             <input
               type="number"
+              inputMode="numeric"
               min={0} max={20}
               value={newRack.typeConfig?.backCols ?? 0}
               onChange={e => setNewRack({
@@ -1589,6 +1968,7 @@ function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, grou
             <label>{t('racks.bottlesPerSectionLabel', 'Bottles per section')}</label>
             <input
               type="number"
+              inputMode="numeric"
               min={1} max={30}
               value={newRack.typeConfig?.bottlesPerSection || 10}
               onChange={e => setNewRack({
@@ -1660,6 +2040,15 @@ function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, grou
         </div>
       )}
     </form>
+    {/* Outside the form: the feedback dialog has a form of its own, and a
+        submit inside this one created the rack (release audit 2026-10-12). */}
+    {newRack.type === 'cabinet' && headToTailOn && (
+      <BetaBadge feature="cabinetHeadToTail" note={t('racks.cabinetHeadToTailBeta', 'Bottles head to tail is in early access.')} />
+    )}
+    {newRack.type === 'cabinet' && sidewaysOn && (
+      <BetaBadge feature="cabinetSideways" note={t('racks.cabinetSidewaysBeta', 'Bottles lying sideways is in early access.')} />
+    )}
+    </>
   );
 }
 
@@ -1680,15 +2069,23 @@ function EmptySlotContent({ position, zone, apiFetch, cellarId, canEdit, onAssig
   const [search, setSearch] = useState('');
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(true);
+  // A failed load shows a retry, not "no unplaced bottles".
+  const [loadFailed, setLoadFailed] = useState(false);
   // Case placement: the group being quantity-picked, chosen quantity, busy flag
   const [caseGroup, setCaseGroup] = useState(null);
   const [caseQty, setCaseQty] = useState(2);
   const [placing, setPlacing] = useState(false);
   const timerRef = useRef(null);
+  // Only the latest request may fill the list: an older search can answer last.
+  const seqRef = useRef(0);
+  // Retry gives way to the loading line; focus goes here, not to the page.
+  const searchRef = useRef(null);
 
   // Fetch bottles from backend, excluding already-placed bottles server-side
   const fetchBottles = useCallback(async (term) => {
+    const seq = ++seqRef.current;
     setLoading(true);
+    setLoadFailed(false);
     try {
       const params = new URLSearchParams({ limit: '30' });
       if (term) params.set('search', term);
@@ -1697,10 +2094,13 @@ function EmptySlotContent({ position, zone, apiFetch, cellarId, canEdit, onAssig
       params.set('excludePlaced', '1');
       const res = await getCellar(apiFetch, cellarId, params.toString());
       const data = await res.json();
-      if (res.ok) {
-        setResults(data.bottles?.items || []);
-      }
-    } catch { /* ignore */ }
+      if (seq !== seqRef.current) return;
+      if (res.ok) setResults(data.bottles?.items || []);
+      else setLoadFailed(true);
+    } catch {
+      if (seq !== seqRef.current) return;
+      setLoadFailed(true);
+    }
     setLoading(false);
   }, [apiFetch, cellarId]);
 
@@ -1732,6 +2132,7 @@ function EmptySlotContent({ position, zone, apiFetch, cellarId, canEdit, onAssig
         <button className="slot-popup-close" onClick={onClose} aria-label="Close">&times;</button>
       </div>
       <input
+        ref={searchRef}
         type="text"
         className="slot-search"
         placeholder={t('racks.searchWines')}
@@ -1796,6 +2197,13 @@ function EmptySlotContent({ position, zone, apiFetch, cellarId, canEdit, onAssig
       <div className="slot-bottle-list">
         {loading ? (
           <p className="slot-empty-msg">…</p>
+        ) : loadFailed ? (
+          <p className="slot-empty-msg">
+            <span role="alert">{t('racks.unplacedLoadFailed', "Couldn't load your bottles.")}</span>{' '}
+            <button type="button" className="btn btn-secondary btn-small" onClick={() => { searchRef.current?.focus(); fetchBottles(search); }}>
+              {t('common.retry', 'Retry')}
+            </button>
+          </p>
         ) : results.length === 0 ? (
           <p className="slot-empty-msg">{t('racks.noUnplacedBottles')}</p>
         ) : (
@@ -1871,7 +2279,7 @@ function DisabledSlotContent({ position, canEdit, onEnable, onClose }) {
 }
 
 // ---- Content for filled slot: show bottle info + actions ----
-function FilledSlotContent({ position, slot, zone, canEdit, onRemoveFromRack, onConsume, onPour, onClose }) {
+function FilledSlotContent({ position, slot, zone, canEdit, onRemoveFromRack, onMove, onConsume, onPour, onClose }) {
   const { t } = useTranslation();
   const bottle = slot.bottle;
   const wine = bottle?.wineDefinition;
@@ -1924,6 +2332,12 @@ function FilledSlotContent({ position, slot, zone, canEdit, onRemoveFromRack, on
               {t('racks.pourGlass', 'Pour a glass')}
             </button>
           )}
+          {/* Then a tap on the slot it should go to — dragging is mouse/pen only */}
+          {onMove && (
+            <button className="btn btn-secondary btn-small" onClick={onMove}>
+              {t('racks.moveMode.button', 'Move')}
+            </button>
+          )}
           <button className="btn btn-secondary btn-small" onClick={onRemoveFromRack}>
             {t('racks.removeFromRack')}
           </button>
@@ -1933,110 +2347,6 @@ function FilledSlotContent({ position, slot, zone, canEdit, onRemoveFromRack, on
         </div>
       )}
     </>
-  );
-}
-
-// ---- Consume / remove modal ----
-// Local calendar date, YYYY-MM-DD — what <input type="date"> speaks.
-const todayLocal = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-};
-
-// onSubmit(reason, note, rating, ratingScale, consumedAt) — consumedAt is the
-// day the bottle was actually drunk (YYYY-MM-DD, default today), mirroring
-// components/ConsumeModal and BulkConsumeModal (support ticket 2026-09-13).
-function ConsumeModal({ defaultRatingScale, onSubmit, onCancel, onPartial }) {
-  const { t } = useTranslation();
-  const [reason,       setReason]      = useState('drank');
-  const [note,         setNote]        = useState('');
-  const [rating,       setRating]      = useState('');
-  const [ratingScale,  setRatingScale] = useState(defaultRatingScale || '5');
-  const [date,         setDate]        = useState(todayLocal);
-  const [saving,       setSaving]      = useState(false);
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setSaving(true);
-    try {
-      await onSubmit(reason, note || undefined, rating || undefined, ratingScale, date || undefined);
-    } finally {
-      // Always re-enable the button — a rejected onSubmit must not leave the
-      // modal stuck on "Saving...".
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div className="slot-modal-overlay" onClick={onCancel}>
-      <DialogBox
-        className="slot-modal consume-modal-box"
-        onClick={e => e.stopPropagation()}
-        onClose={onCancel}
-        label={t('bottleDetail.removeBottleTitle')}
-      >
-        <div className="slot-popup-header">
-          <span className="slot-popup-title">{t('bottleDetail.removeBottleTitle')}</span>
-          <button className="slot-popup-close" onClick={onCancel} aria-label="Close">&times;</button>
-        </div>
-        {onPartial && (
-          <div className="consume-partial-row">
-            <button type="button" className="btn btn-secondary consume-partial-btn" onClick={onPartial}>
-              🍷 {t('openBottle.partialOption', 'Just a glass — keep the bottle')}
-            </button>
-            <span className="consume-partial-or">{t('openBottle.partialOr', 'or remove it completely:')}</span>
-          </div>
-        )}
-        <form onSubmit={handleSubmit} className="consume-modal-form">
-          <div className="form-group">
-            <label>{t('common.reason')}</label>
-            <select value={reason} onChange={e => setReason(e.target.value)}>
-              <option value="drank">{t('bottleDetail.drinkReason')}</option>
-              <option value="gifted">{t('bottleDetail.giftedReason')}</option>
-              <option value="sold">{t('bottleDetail.soldReason')}</option>
-              <option value="other">{t('bottleDetail.otherReason')}</option>
-            </select>
-          </div>
-          <label className="form-group">
-            <span>{t('bulk.consumeDate')}</span>
-            <input
-              type="date"
-              value={date}
-              max={todayLocal()}
-              onChange={e => setDate(e.target.value)}
-              disabled={saving}
-            />
-          </label>
-          {reason === 'drank' && (
-            <div className="form-group">
-              <label>{t('bottleDetail.ratingOptional')}</label>
-              <RatingInput
-                value={rating}
-                scale={ratingScale}
-                onChange={v => setRating(v ?? '')}
-                onScaleChange={s => { setRatingScale(s); setRating(''); }}
-                allowScaleOverride
-              />
-            </div>
-          )}
-          <div className="form-group">
-            <label>{t('bottleDetail.noteOptional')}</label>
-            <textarea
-              value={note}
-              onChange={e => setNote(e.target.value)}
-              rows={2}
-              placeholder={t('racks.consumeNotePlaceholder')}
-            />
-          </div>
-          <div className="consume-modal-actions">
-            <button type="button" className="btn btn-secondary" onClick={onCancel}>{t('common.cancel')}</button>
-            <button type="submit" className="btn btn-consume" disabled={saving}>
-              {saving ? t('common.saving') : t('common.confirm')}
-            </button>
-          </div>
-        </form>
-      </DialogBox>
-    </div>
   );
 }
 

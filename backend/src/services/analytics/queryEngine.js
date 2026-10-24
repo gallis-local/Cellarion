@@ -43,6 +43,13 @@ const { resolveForVintage } = require('../registryDataOps');
 const { resolveField, opsForType } = require('./fieldCatalogue');
 const { validateValue } = require('../../utils/personalDataTypes');
 const { ANCHORS, COL, toNormalized, fromNormalized } = require('../../utils/ratingUtils');
+const { currencySpellings, normalizeCurrency } = require('../../config/currencies');
+// A request can ask for its ratings in the viewer's own scale (Settings →
+// rating scale); stars stay the default and the sort order (the scales are
+// monotone, so it never changes). A rating filter carries the scale its
+// value was typed in, so a saved view means the same after a settings change.
+const RATING_SCALES = ['5', '20', '100'];
+const RATING_MAX = { 5: 5, 20: 20, 100: 100 };
 const { getOrCreateDailySnapshot, convertCurrency } = require('../../utils/exchangeRates');
 const { classifyMaturity, buildProfileMap, resolveEffectiveWindow } = require('../../utils/maturityUtils');
 
@@ -440,17 +447,26 @@ async function compileFilters(filters, userId, scopeCellars = null) {
     if (!field.filterable) throw new QueryError(400, `Field "${f.field}" is not filterable`);
 
     if (field.normalized) {
-      // Ratings filter in STARS against the converted expression (audit F3):
-      // the raw stored values mix three scales, so a raw comparison ranks a
-      // 60-point Parker above a 5-star bottle.
-      const castStars = (raw) => {
+      // Ratings filter against the converted expression (audit F3): the raw
+      // stored values mix three scales, so a raw comparison ranks a 60-point
+      // Parker above a 5-star bottle. In stars unless the filter names the
+      // scale its value is in (f.scale: '5' | '20' | '100').
+      const scale = f.scale === undefined || f.scale === null ? '5' : f.scale;
+      if (!RATING_SCALES.includes(scale)) throw new QueryError(400, `Filter on ${field.key}: scale must be 5, 20 or 100`);
+      const castRating = (raw) => {
         const n = castStatic({ ...field, type: 'decimal' }, raw);
-        if (n < 0 || n > 5) throw new QueryError(400, `Filter on ${field.key}: stars run 0–5`);
+        if (n < 0 || n > RATING_MAX[scale]) {
+          throw new QueryError(400, scale === '5'
+            ? `Filter on ${field.key}: stars run 0–5`
+            : `Filter on ${field.key}: the ${scale}-point scale runs 0–${RATING_MAX[scale]}`);
+        }
         return n;
       };
+      // Rounded to the scale's step, as the rows display it, so a bottle
+      // shown as 83pts is found by "≥ 83" (release audit 2026-10-12).
       exprFilters.push({
-        expr: ratingConversionExpr(field.path, field.scalePath, '5'),
-        pred: predicate({ ...field, type: 'decimal' }, f.op, f.value, castStars),
+        expr: { $round: [ratingConversionExpr(field.path, field.scalePath, scale), scale === '100' ? 0 : 1] },
+        pred: predicate({ ...field, type: 'decimal' }, f.op, f.value, castRating),
       });
     } else if (field.source === 'personal' || field.source === 'registry') {
       pre.push(await kvCondition(field, f.op, f.value, userId));
@@ -497,13 +513,18 @@ function exprFilterStages(exprFilters) {
 /**
  * Piecewise-linear rating conversion as an aggregation expression, generated
  * from ratingUtils.ANCHORS — the same table toNormalized/fromNormalized read.
- * `toKey` picks the target column: 'norm' (0–100) or '5' (stars — the one
- * scale this surface speaks after audit F3). A direct from→to piecewise
+ * `toKey` picks the target column: 'norm' (0–100), '5' (stars — the default
+ * this surface speaks since audit F3), or '20' / '100' when a request asks
+ * for the viewer's own scale. A direct from→to piecewise
  * equals the toNormalized∘fromNormalized composition because both walk the
  * same anchor rows; the parity tests pin that.
  */
 function ratingConversionExpr(valuePath, scalePath, toKey = '5') {
   const perScale = (scaleKey) => {
+    // Already in the target scale: the value as entered, never clamped to the
+    // anchor range (a 5/20 stays 5, as the rows show it — release audit
+    // 2026-10-12).
+    if (scaleKey === toKey) return `$${valuePath}`;
     const fromCol = COL[scaleKey];
     const toCol = COL[toKey];
     const v = `$${valuePath}`;
@@ -566,10 +587,16 @@ function convertedPriceExpr(valuePath, currencyPath, rates, target) {
   if (!rates || !rates[target]) return { expr: null, reason: 'no_rates' };
   const branches = Object.entries(rates)
     .filter(([, r]) => typeof r === 'number' && r > 0)
-    .map(([code, r]) => ({
-      case: { $eq: [`$${currencyPath}`, code] },
-      then: { $multiply: [`$${valuePath}`, rates[target] / r] },
-    }));
+    .map(([code, r]) => {
+      // A row stored under an alias ("EURO") converts as its code.
+      const spellings = currencySpellings(code);
+      return {
+        case: spellings.length === 1
+          ? { $eq: [`$${currencyPath}`, code] }
+          : { $in: [`$${currencyPath}`, spellings] },
+        then: { $multiply: [`$${valuePath}`, rates[target] / r] },
+      };
+    });
   return {
     expr: {
       $cond: [
@@ -593,24 +620,33 @@ const WINE_LOOKUP = [
  * `$<alias>`, so KV fields can be sorted, grouped and aggregated server-side.
  * Personal entries apply the same precedence as the bottle page — bottle
  * entry beats a vintage-scoped wine entry beats a vintage-null wine entry —
- * enforced by the _prio sort inside the sub-pipeline. Registry reads the one
- * published row per (wine, key). Both sub-pipelines are $limit 1 and run on
- * indexed keys, bounded by the outer maxTimeMS like everything else.
+ * enforced by the _prio sort inside the sub-pipeline. Registry applies the
+ * hydrated column's rule (registryDataOps.resolveForVintage): the published
+ * override for the bottle's vintage beats the wine-wide default, and another
+ * vintage's override never applies. Rows of either collection written before
+ * the vintage field existed carry no `vintage` at all (and in $expr a missing
+ * field is not null) — $ifNull reads them as the every-vintage slot, as the
+ * column does. Both sub-pipelines are $limit 1 and run on indexed keys,
+ * bounded by the outer maxTimeMS like everything else.
  */
 function kvJoinStages(field, alias, userId) {
   const keyOid = new mongoose.Types.ObjectId(field.keyId);
+  const slot = { $ifNull: ['$vintage', null] };
   if (field.source === 'registry') {
     return [
       {
         $lookup: {
           from: 'registrydatavalues',
-          let: { wid: '$wineDefinition' },
+          let: { wid: '$wineDefinition', vint: '$vintage' },
           pipeline: [
             { $match: { $expr: { $and: [
               { $eq: ['$wineDefinition', '$$wid'] },
               { $eq: ['$key', keyOid] },
               { $eq: ['$status', 'published'] },
+              { $in: [slot, [null, '$$vint']] },
             ] } } },
+            { $addFields: { _prio: { $cond: [{ $eq: [slot, null] }, 1, 0] } } },
+            { $sort: { _prio: 1 } },
             { $limit: 1 },
             { $project: { _id: 0, value: 1 } },
           ],
@@ -632,16 +668,19 @@ function kvJoinStages(field, alias, userId) {
             { $eq: ['$key', keyOid] },
             { $or: [
               { $eq: ['$bottle', '$$bid'] },
+              // targetType too: on a bottle with no registry wine yet $$wid is
+              // missing, and so is every bottle entry's wineDefinition.
               { $and: [
+                { $eq: ['$targetType', 'wine'] },
                 { $eq: ['$wineDefinition', '$$wid'] },
-                { $in: ['$vintage', [null, '$$vint']] },
+                { $in: [slot, [null, '$$vint']] },
               ] },
             ] },
           ] } } },
           { $addFields: { _prio: { $switch: {
             branches: [
               { case: { $eq: ['$targetType', 'bottle'] }, then: 0 },
-              { case: { $ne: ['$vintage', null] }, then: 1 },
+              { case: { $ne: [slot, null] }, then: 1 },
             ],
             default: 2,
           } } } },
@@ -674,7 +713,7 @@ function baseMatch(scopeCellarIds, bottleScope, preConds) {
 
 // ── rows mode ──────────────────────────────────────────────────────────────
 
-async function runRows({ userId, scopeCellars, bottleScope, filters, sort, limit, offset, columns }) {
+async function runRows({ userId, scopeCellars, bottleScope, filters, sort, limit, offset, columns, ratingScale = '5' }) {
   const { pre, post, exprFilters, needsWine: filterNeedsWine } = await compileFilters(filters, userId, scopeCellars);
 
   // Sort: one field, validated; default = newest first. _id tiebreaker always.
@@ -732,7 +771,7 @@ async function runRows({ userId, scopeCellars, bottleScope, filters, sort, limit
   const pageIds = (facet?.ids || []).map((r) => r._id);
   const total = facet?.total?.[0]?.n || 0;
 
-  const rows = await hydrateRows({ userId, pageIds, columns, scopeCellars });
+  const rows = await hydrateRows({ userId, pageIds, columns, scopeCellars, ratingScale });
   return {
     mode: 'rows',
     total,
@@ -742,7 +781,7 @@ async function runRows({ userId, scopeCellars, bottleScope, filters, sort, limit
 }
 
 /** find() + populate for the page, then per-column value extraction. */
-async function hydrateRows({ userId, pageIds, columns, scopeCellars }) {
+async function hydrateRows({ userId, pageIds, columns, scopeCellars, ratingScale = '5' }) {
   if (!pageIds.length) return [];
   const fields = [];
   for (const key of columns) {
@@ -783,7 +822,10 @@ async function hydrateRows({ userId, pageIds, columns, scopeCellars }) {
   // KV hydration: two indexed queries for the whole page.
   const personalFields = fields.filter((f) => f.source === 'personal');
   const registryFields = fields.filter((f) => f.source === 'registry');
-  const wineIds = [...new Set(ordered.map((b) => String(b.wineDefinition?._id || b.wineDefinition)).filter(Boolean))];
+  // A bottle with no registry wine yet has no id to add: dropped before the
+  // String(), which would turn it into "undefined"/"null" — an id no model can
+  // cast, failing the whole page.
+  const wineIds = [...new Set(ordered.map((b) => b.wineDefinition?._id || b.wineDefinition).filter(Boolean).map(String))];
 
   let personalEntries = [];
   if (personalFields.length) {
@@ -861,12 +903,15 @@ async function hydrateRows({ userId, pageIds, columns, scopeCellars }) {
       case 'bottle': {
         const v = f.path.split('.').reduce((o, k) => (o == null ? o : o[k]), b);
         if (f.normalized) {
-          // Ratings display in STARS (audit F3), the same scale the filter
-          // takes and the sort orders by — one decimal, honest across a
-          // cellar whose rows mix 5/20/100-scale entries.
+          // Ratings display in one scale for the whole table (audit F3) —
+          // stars unless the request asks for the viewer's own — honest
+          // across a cellar whose rows mix 5/20/100-scale entries. A rating
+          // already in that scale is shown exactly as entered.
           if (v == null) return null;
-          const stars = fromNormalized(toNormalized(v, b[f.scalePath]), '5');
-          return stars == null ? null : Math.round(stars * 10) / 10;
+          const stored = b[f.scalePath] || '5';
+          if (stored === ratingScale && Number.isFinite(Number(v))) return Number(v);
+          const out = fromNormalized(toNormalized(v, stored), ratingScale);
+          return out == null ? null : Math.round(out * 10) / 10;
         }
         return f.type === 'date' ? iso(v) : v ?? null;
       }
@@ -912,7 +957,7 @@ async function hydrateRows({ userId, pageIds, columns, scopeCellars }) {
 
 // ── grouped mode ───────────────────────────────────────────────────────────
 
-async function runGrouped({ userId, scopeCellars, bottleScope, filters, dimensions, measures }) {
+async function runGrouped({ userId, scopeCellars, bottleScope, filters, dimensions, measures, ratingScale = '5' }) {
   const { pre, post, exprFilters, needsWine: filterNeedsWine } = await compileFilters(filters, userId, scopeCellars);
 
   // ZERO dimensions is the KPI shape (dashboards, R-E): one bucket holding
@@ -983,9 +1028,9 @@ async function runGrouped({ userId, scopeCellars, bottleScope, filters, dimensio
       currencyMeta.fields.push({ i, path: f.path, currencyPath: 'currency' });
       valueExpr = null; // filled in below once the target currency is known
     } else if (f.normalized) {
-      // Stars, not the 0–100 normal form (audit F3) — the same scale the
-      // filter takes, the sort orders by and the column displays.
-      valueExpr = ratingConversionExpr(f.path, f.scalePath, '5');
+      // Stars (or the viewer's own scale when asked), not the 0–100 normal
+      // form (audit F3) — the same scale the column displays.
+      valueExpr = ratingConversionExpr(f.path, f.scalePath, ratingScale);
     }
     measureSpecs.push({ out: `m${i}`, label: `${m.agg}(${f.key})`, agg: m.agg, valueExpr, field: f });
   }
@@ -1002,7 +1047,9 @@ async function runGrouped({ userId, scopeCellars, bottleScope, filters, dimensio
       { $sort: { n: -1, _id: 1 } },
       { $limit: 1 },
     ]).option({ maxTimeMS: MAX_TIME_MS });
-    targetCurrency = top?._id || 'USD';
+    // An alias as the most common stored spelling reads as its code (release
+    // audit 2026-10-13: a cellar mostly stored as "EURO" got no rate at all).
+    targetCurrency = normalizeCurrency(top?._id) || 'USD';
     for (const cf of currencyMeta.fields) {
       const { expr } = convertedPriceExpr(cf.path, cf.currencyPath, rates, targetCurrency);
       const spec = measureSpecs[cf.i];
@@ -1012,7 +1059,8 @@ async function runGrouped({ userId, scopeCellars, bottleScope, filters, dimensio
     // filtered population as the buckets (audit F5: counting before the
     // wine-side and expression filters overstated the exclusions).
     if (rates && rates[targetCurrency]) {
-      const known = Object.keys(rates);
+      // Every spelling convertedPriceExpr converts counts as known (aliases too).
+      const known = Object.keys(rates).flatMap((code) => currencySpellings(code));
       const [uc] = await Bottle.aggregate([
         { $match: baseMatch(cellarIds, bottleScope, pre) },
         ...(needsWine ? WINE_LOOKUP : []),
@@ -1093,7 +1141,8 @@ async function runGrouped({ userId, scopeCellars, bottleScope, filters, dimensio
 /**
  * @param {string} userId
  * @param {object} q  { scope: {cellars, bottles}, mode, filters, columns,
- *                      sort, limit, offset, dimensions, measures }
+ *                      sort, limit, offset, dimensions, measures,
+ *                      ratingScale ('5' default | '20' | '100') }
  */
 async function runQuery(userId, q = {}) {
   const scopeReq = q.scope || {};
@@ -1101,6 +1150,8 @@ async function runQuery(userId, q = {}) {
   if (!BOTTLE_SCOPES[bottleScope]) {
     throw new QueryError(400, 'scope.bottles must be active, consumed or all');
   }
+  const ratingScale = q.ratingScale === undefined || q.ratingScale === null ? '5' : q.ratingScale;
+  if (!RATING_SCALES.includes(ratingScale)) throw new QueryError(400, 'ratingScale must be 5, 20 or 100');
   const scopeCellars = await deriveScope(userId, scopeReq.cellars);
 
   const envelopeScope = {
@@ -1111,18 +1162,18 @@ async function runQuery(userId, q = {}) {
   if (q.mode === 'grouped') {
     const out = await runGrouped({
       userId, scopeCellars, bottleScope,
-      filters: q.filters, dimensions: q.dimensions, measures: q.measures,
+      filters: q.filters, dimensions: q.dimensions, measures: q.measures, ratingScale,
     });
-    return { ...out, scope: envelopeScope };
+    return { ...out, scope: envelopeScope, ratingScale };
   }
 
   const columns = Array.isArray(q.columns) && q.columns.length ? q.columns : ['wine.producer', 'wine.name', 'bottle.vintage'];
   if (columns.length > 30) throw new QueryError(400, 'At most 30 columns');
   const out = await runRows({
     userId, scopeCellars, bottleScope,
-    filters: q.filters, sort: q.sort, limit: q.limit, offset: q.offset, columns,
+    filters: q.filters, sort: q.sort, limit: q.limit, offset: q.offset, columns, ratingScale,
   });
-  return { ...out, scope: envelopeScope };
+  return { ...out, scope: envelopeScope, ratingScale };
 }
 
 module.exports = {

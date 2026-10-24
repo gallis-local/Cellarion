@@ -82,6 +82,34 @@ export const restoreBottle = (apiFetch, id) =>
     method: 'POST',
   });
 
+// A bottle on order has been delivered: it becomes an ordinary (unplaced)
+// bottle in its cellar. arrivedAt is an optional 'YYYY-MM-DD'; default today.
+export const markBottleArrived = (apiFetch, id, arrivedAt) =>
+  apiFetch(`/api/bottles/${id}/arrive`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(arrivedAt ? { arrivedAt } : {}),
+  });
+
+// A delivery of MANY bottles on order, one day for all (action 'arrive').
+// A bottle that is not on order comes back in `skipped` as 'not_on_order'.
+export const bulkArriveBottles = (apiFetch, bottleIds, arrivedAt) =>
+  apiFetch('/api/bottles/bulk', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ action: 'arrive', bottleIds, ...(arrivedAt ? { arrivedAt } : {}) }),
+  });
+
+// The bottle was saved under the wrong registry wine: move it to another one,
+// keeping all its own data. applyToLot also moves the other bottles of the
+// same wine and vintage in the user's own cellars.
+export const changeBottleWine = (apiFetch, id, wineDefinitionId, { applyToLot = false } = {}) =>
+  apiFetch(`/api/bottles/${id}/change-wine`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ wineDefinitionId, ...(applyToLot ? { applyToLot: true } : {}) }),
+  });
+
 export const moveBottle = (apiFetch, id, toCellarId) =>
   apiFetch(`/api/bottles/${id}/move`, {
     method: 'POST',
@@ -98,8 +126,31 @@ export const bulkMoveBottles = (apiFetch, bottleIds, toCellarId) =>
     body: JSON.stringify({ bottleIds, toCellarId }),
   });
 
+// Move MANY bottles to the cellar's "Recently deleted" (POST
+// /api/bottles/bulk-delete). Kept 30 days, restorable; the response carries
+// the batchId an Undo restores.
+export const bulkDeleteBottles = (apiFetch, bottleIds, { onlyOnOrder = false } = {}) =>
+  apiFetch('/api/bottles/bulk-delete', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(onlyOnOrder ? { bottleIds, onlyOnOrder: true } : { bottleIds }),
+  });
+
+// A cellar's "Recently deleted", newest first.
+export const getRecentlyDeleted = (apiFetch, cellarId) =>
+  apiFetch(`/api/bottles/trash?cellar=${encodeURIComponent(cellarId)}`);
+
+// Bring bottles back from "Recently deleted": trash row `ids`, a whole
+// `batchId`, or both.
+export const restoreRecentlyDeleted = (apiFetch, cellarId, { ids, batchId } = {}) =>
+  apiFetch('/api/bottles/trash/restore', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ cellar: cellarId, ...(ids && ids.length ? { ids } : {}), ...(batchId ? { batchId } : {}) }),
+  });
+
 // ONE edit applied to MANY bottles (POST /api/bottles/bulk, action 'update').
-// `fields` is limited server-side to purchase details, reservation and the drink window.
+// `fields` is limited server-side to purchase details, reservation, the drink window and notes.
 export const bulkUpdateBottles = (apiFetch, bottleIds, fields) =>
   apiFetch('/api/bottles/bulk', {
     method: 'POST',
@@ -115,6 +166,16 @@ export const bulkConsumeBottles = (apiFetch, bottleIds, { reason, note, consumed
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ action: 'consume', bottleIds, reason, note, consumedAt, ...(includeReserved ? { includeReserved: true } : {}) }),
+  });
+
+// Put MANY taken-out bottles back (action 'restore') — the Undo of a bulk
+// "mark as drunk", in one request. Per bottle: done, or skipped as
+// 'not_consumed' (already back), 'restore_window_expired', 'not_found'.
+export const bulkRestoreBottles = (apiFetch, bottleIds) =>
+  apiFetch('/api/bottles/bulk', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ action: 'restore', bottleIds }),
   });
 
 export const updateConsumedRating = (apiFetch, id, data) =>
@@ -137,6 +198,17 @@ export const validateImport = (apiFetch, data) =>
     headers: JSON_HEADERS,
     body: JSON.stringify(data),
   });
+
+// POST /api/bottles/import/receipt — multipart, field `files`: up to five
+// photos of one receipt, or one PDF. apiFetch leaves the Content-Type to the
+// browser so the multipart boundary is set. Answers
+// { receipt: { documentType, store, purchaseDate, currency }, items, skipped, warnings };
+// the items go through validateImport like any parsed file.
+export const scanReceipt = (apiFetch, files) => {
+  const fd = new FormData();
+  for (const file of files) fd.append('files', file);
+  return apiFetch('/api/bottles/import/receipt', { method: 'POST', body: fd });
+};
 
 export const confirmImport = (apiFetch, data) =>
   apiFetch('/api/bottles/import/confirm', {

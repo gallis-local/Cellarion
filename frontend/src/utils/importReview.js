@@ -4,6 +4,164 @@
 // request still pending" decisions are unit-testable without rendering the page.
 
 /**
+ * The match a row may be PRE-selected with: the best one (the list is score-
+ * ordered) the server did not mark as conflicting, or null.
+ *
+ * styleConflict: the row and the candidate NAME a different Prädikat or
+ * sweetness, so they are two wines from one producer's range (issue #1134).
+ * colourConflict: the row and the candidate state different colours — the
+ * other bottle of a red/white pair sharing one name. Either way the user can
+ * still pick it by hand; it is only never chosen FOR them. Every preselection
+ * path (first load, retry, AI re-search, the bulk "select all") reads this one
+ * rule, so a conflicted match cannot slip in through a side door.
+ *
+ * @param {Array} matches  a row's score-ordered matches
+ * @returns {object|null}  the match to preselect
+ */
+export function preselectableMatch(matches) {
+  if (!Array.isArray(matches)) return null;
+  return matches.find((m) => m && !m.styleConflict && !m.colourConflict) || null;
+}
+
+// The file's bottles of one wine: same name + producer (the grouping the
+// review step has always used for duplicate rows).
+const duplicateWineKey = (item) =>
+  `${(item?.wineName || '').toLowerCase()}|${(item?.producer || '').toLowerCase()}`;
+// Two rows may share a decision unless they state DIFFERENT colours — the
+// other bottle of a red/white pair sharing one name is another wine. A row
+// that states no colour is compatible, the same reading as the server's
+// rowColourConflict.
+const colourCompatible = (a, b) => {
+  const ca = (a?.type || '').trim().toLowerCase();
+  const cb = (b?.type || '').trim().toLowerCase();
+  return !ca || !cb || ca === cb;
+};
+
+// Siblings of `source` that follow a decision on it: same name + producer,
+// compatible colour, and either no decision yet or — when the decision is
+// about WHICH wine this is — still holding what the source row held before
+// (the same automatic preselection).
+function followingSiblings(results, selections, sourceIndex, identityChoice) {
+  const rows = results || [];
+  const sel = selections || {};
+  const source = rows.find((r) => r.index === sourceIndex);
+  if (!source) return [];
+  const key = duplicateWineKey(source.item);
+  const before = sel[sourceIndex];
+  return rows.filter((r) => {
+    if (r.index === sourceIndex || duplicateWineKey(r.item) !== key) return false;
+    if (!colourCompatible(r.item, source.item)) return false;
+    const cur = sel[r.index];
+    if (cur == null) return true;
+    // A skip is a decision only an undo on that row reverses: a sibling
+    // skipped on purpose never follows a wine choice (audit 2026-10-14).
+    return identityChoice && before != null && before !== 'skip' && cur === before;
+  });
+}
+
+/**
+ * The other rows a decision on one row carries to: the file's other bottles
+ * of the same wine.
+ *
+ * Rows without a decision always follow. A row that already holds one follows
+ * only when it still holds what the acted-on row held before (the same
+ * automatic preselection) and names the same colour, and only when the
+ * decision says WHICH wine this is (a wine, 'create', 'request'). A row the
+ * user set differently keeps its choice, and a skip never spreads over a
+ * decided row: skipping one of six bottles is a real choice.
+ *
+ * Without the second rule, "Request wine" on one of three identical bottles
+ * left the other two on their automatic 'create': /confirm minted the wine
+ * AND filed a request for the same wine.
+ *
+ * @param {Array} results       validation-result rows ({ index, item, aiProposed })
+ * @param {object} selections   current selections map
+ * @param {number} sourceIndex  the row the user acted on
+ * @param {*} selValue          the new value: wineId | 'create' | 'request' | 'skip'
+ * @returns {number[]} indices of the rows that take selValue too
+ */
+export function propagationTargets(results, selections, sourceIndex, selValue) {
+  return followingSiblings(results, selections, sourceIndex, selValue !== 'skip')
+    // 'create' mints from the row's OWN proposal; a row without one would
+    // reach /confirm with nothing to create and silently drop out.
+    .filter((r) => selValue !== 'create' || r.aiProposed != null)
+    .map((r) => r.index);
+}
+
+/**
+ * The rows a per-row AI look-up ("Look up") also answers: the same wine's
+ * other bottles that still share the looked-up row's state. They take the
+ * refreshed result and its selection, so one look-up never leaves the rest
+ * of the line on the old fuzzy pick.
+ *
+ * @param {Array} results       validation-result rows
+ * @param {object} selections   current selections map
+ * @param {number} sourceIndex  the looked-up row
+ * @returns {number[]} indices of the sibling rows
+ */
+export function lookUpTargets(results, selections, sourceIndex) {
+  return followingSiblings(results, selections, sourceIndex, true).map((r) => r.index);
+}
+
+// The fields of a validate result that say WHICH wine a row is. Everything
+// else on a row is its own: the file row (item), its index, and the price
+// warnings the server computed from that row's own price.
+const LOOKUP_IDENTITY_FIELDS = ['status', 'matches', 'aiProposed', 'aiDebug', 'aiSkipped', 'aiBypassed'];
+
+/**
+ * A sibling row after a Look-up answered for it: the looked-up row's identity
+ * (status, matches, AI proposal and flags) on the sibling's own row.
+ *
+ * @param {object} updated  the looked-up row's fresh validate result
+ * @param {object} sibling  the sibling's current result row
+ * @returns {object} the sibling's next result row
+ */
+export function lookUpSiblingResult(updated, sibling) {
+  const next = { ...sibling };
+  for (const f of LOOKUP_IDENTITY_FIELDS) {
+    if (updated && updated[f] !== undefined) next[f] = updated[f];
+    else delete next[f];
+  }
+  return next;
+}
+
+/**
+ * Selections after "Undo" on a skipped or requested row.
+ *
+ * The row goes back to its automatic choice (autoSelectionsFor — the same
+ * rule the first load used), not to "no selection": an AI-new row without
+ * fuzzy candidates has no other control that offers 'create' again, so
+ * clearing it left the bottle out of the import. A request spreads over the
+ * line (propagationTargets), so undoing one brings back the same wine's other
+ * requested rows too; a skip never spreads over a decided row, so its undo
+ * stays on the clicked row.
+ *
+ * @param {Array} results       validation-result rows
+ * @param {object} selections   current selections map
+ * @param {number} index        the row whose Undo was clicked
+ * @returns {object} the next selections map
+ */
+export function undoSelections(results, selections, index) {
+  const rows = results || [];
+  const sel = selections || {};
+  const value = sel[index];
+  const back = [index];
+  if (value === 'request') {
+    for (const r of followingSiblings(rows, sel, index, true)) {
+      if (sel[r.index] === 'request') back.push(r.index);
+    }
+  }
+  const next = { ...sel };
+  for (const i of back) {
+    const row = rows.find((r) => r.index === i);
+    const auto = row ? autoSelectionsFor([row])[i] : undefined;
+    if (auto != null) next[i] = auto;
+    else delete next[i];
+  }
+  return next;
+}
+
+/**
  * Rows the bulk "Retry AI lookups" should re-validate: those still needing an
  * AI look-up (aiSkipped fallback or an outright no_match) that the user has NOT
  * already resolved. A committed decision — skip, request, or a manual search
@@ -59,7 +217,11 @@ export function reconcileRetrySelections(prevSelections, updatedByIndex, manualW
     if (hasMatch) {
       const stillPresent = cur != null && r.matches.some((m) => m.wineId === cur);
       if (cur == null || !stillPresent) {
-        next[idx] = r.matches[0].wineId;
+        // Only a non-conflicting match may replace the pick; with none, a
+        // stale pick of a wine the row no longer offers is cleared, not kept.
+        const top = preselectableMatch(r.matches);
+        if (top) next[idx] = top.wineId;
+        else delete next[idx];
       }
     } else {
       // Same replace-a-stale-pick rule as matches: fill an empty selection, or
@@ -123,13 +285,12 @@ export function autoSelectionsFor(rows) {
       (r.status === 'exact' || r.status === 'fuzzy' || r.status === 'ai_match') &&
       Array.isArray(r.matches) && r.matches.length > 0
     ) {
-      // Never preselect a match the server marked styleConflict: the row and
-      // that candidate NAME a different Prädikat/sweetness, so they are two
-      // wines from one producer's range — bulk-confirming the preselection is
-      // exactly how issue #1134 replays at import scale. The best
-      // non-conflicting candidate (list is score-ordered) is preselected
-      // instead; if every candidate conflicts, the row is left for the user.
-      const top = r.matches.find((m) => !m.styleConflict);
+      // Never preselect a match the server marked styleConflict or
+      // colourConflict (preselectableMatch): bulk-confirming the preselection
+      // is exactly how issue #1134 replays at import scale. The best
+      // non-conflicting candidate is preselected instead; if every candidate
+      // conflicts, the row is left for the user.
+      const top = preselectableMatch(r.matches);
       if (top) sel[r.index] = top.wineId;
     } else if (r.status === 'ai_new' && r.aiProposed != null) {
       // AI-identified NEW wines default to 'create' — the wine is minted at

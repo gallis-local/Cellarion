@@ -67,6 +67,21 @@ describe('buildPreferencesUpdate', () => {
     expect((await buildPreferencesUpdate(UID, { cellarSort: { $ne: '' } })).error.status).toBe(400);
   });
 
+  // Beta feedback 2026-10-12: the wine and vintage page's blocks fold away,
+  // and stay folded on any device.
+  test('collapsedBlocks: the whole list of folded blocks, known names only', async () => {
+    expect((await buildPreferencesUpdate(UID, { collapsedBlocks: ['vintage.reviews', 'vintage.tasting'] })).update)
+      .toEqual({ 'preferences.collapsedBlocks': ['vintage.reviews', 'vintage.tasting'] });
+    // Unfolding everything stores an empty list; repeats are dropped.
+    expect((await buildPreferencesUpdate(UID, { collapsedBlocks: [] })).update).toEqual({ 'preferences.collapsedBlocks': [] });
+    expect((await buildPreferencesUpdate(UID, { collapsedBlocks: ['vintage.wine', 'vintage.wine'] })).update)
+      .toEqual({ 'preferences.collapsedBlocks': ['vintage.wine'] });
+    expect((await buildPreferencesUpdate(UID, { collapsedBlocks: ['vintage.nope'] })).error.status).toBe(400);
+    expect((await buildPreferencesUpdate(UID, { collapsedBlocks: 'vintage.wine' })).error.status).toBe(400);
+    expect((await buildPreferencesUpdate(UID, { collapsedBlocks: [{ $ne: '' }] })).error.status).toBe(400);
+    expect((await buildPreferencesUpdate(UID, { collapsedBlocks: Array(50).fill('vintage.wine') })).error.status).toBe(400);
+  });
+
   test('only the allow-listed notification leaves are set — arbitrary keys are ignored', async () => {
     const { update } = await buildPreferencesUpdate(UID, {
       notifications: {
@@ -75,6 +90,7 @@ describe('buildPreferencesUpdate', () => {
         evil: { hacked: true },              // ignored: not a known category
         communityFollow: { email: true },    // ignored: follow has no email leaf
         supportReply: { email: false, push: true }, // push ignored: support answers are email-only
+        ownerInquiry: { email: false, push: true }, // push ignored: owner questions' setting is email-only
       },
     });
     expect(update).toEqual({
@@ -82,6 +98,7 @@ describe('buildPreferencesUpdate', () => {
       'preferences.notifications.drinkWindow.push': true,
       'preferences.notifications.communityReply.email': true,
       'preferences.notifications.supportReply.email': false,
+      'preferences.notifications.ownerInquiry.email': false,
       emailOptOutAt: null, // an email turned on withdraws the unsubscribe-all objection
     });
     expect(Object.keys(update).some((k) => k.includes('evil') || k.includes('hacked'))).toBe(false);
@@ -124,6 +141,13 @@ describe('buildPreferencesUpdate', () => {
   test('an empty patch is a 400 (nothing to change)', async () => {
     expect((await buildPreferencesUpdate(UID, {})).error.status).toBe(400);
   });
+
+  test('earlyAccess ("Try new features early") takes a real boolean only — a stray string never switches a user into beta', async () => {
+    expect((await buildPreferencesUpdate(UID, { earlyAccess: true })).update).toEqual({ 'preferences.earlyAccess': true });
+    expect((await buildPreferencesUpdate(UID, { earlyAccess: false })).update).toEqual({ 'preferences.earlyAccess': false });
+    expect((await buildPreferencesUpdate(UID, { earlyAccess: 'true' })).error.status).toBe(400);
+    expect((await buildPreferencesUpdate(UID, { earlyAccess: 1 })).error.status).toBe(400);
+  });
 });
 
 describe('updatePreferences', () => {
@@ -132,7 +156,20 @@ describe('updatePreferences', () => {
     const res = await updatePreferences(UID, { currency: 'eur' });
     expect(res.error).toBeUndefined();
     expect(res.changed).toEqual(['preferences.currency']);
-    expect(User.findByIdAndUpdate).toHaveBeenCalledWith(UID, { $set: { 'preferences.currency': 'EUR' } }, { new: true });
+    // A chosen currency also ends the first-sign-in guess (User.localeDefaultsPending).
+    expect(User.findByIdAndUpdate).toHaveBeenCalledWith(
+      UID, { $set: { 'preferences.currency': 'EUR' }, $unset: { localeDefaultsPending: 1 } }, { new: true },
+    );
+  });
+
+  test('a chosen language ends the pending first-sign-in guess; other settings leave it', async () => {
+    User.findByIdAndUpdate.mockResolvedValue({ toJSON: () => ({}), preferences: {} });
+    await updatePreferences(UID, { language: 'de' });
+    expect(User.findByIdAndUpdate.mock.calls[0][1]).toMatchObject({ $unset: { localeDefaultsPending: 1 } });
+
+    User.findByIdAndUpdate.mockClear();
+    await updatePreferences(UID, { ratingScale: '100' });
+    expect(User.findByIdAndUpdate.mock.calls[0][1]).not.toHaveProperty('$unset');
   });
 
   test('a validation error short-circuits before any DB write', async () => {
@@ -189,6 +226,27 @@ describe('createSupportTicket', () => {
     expect(SupportTicket.create).toHaveBeenCalledWith({
       user: UID, category: 'help', subject: 'Hi there', message: 'Need help',
     });
+  });
+
+  test('beta feedback names its feature; without a subject it takes the feature\'s English title', async () => {
+    SupportTicket.create.mockResolvedValue({ _id: 't2', category: 'beta', status: 'open' });
+    const res = await createSupportTicket(UID, { category: 'beta', feature: 'pickLists', message: 'Love the bar at the bottom' });
+    expect(res.error).toBeUndefined();
+    expect(SupportTicket.create).toHaveBeenCalledWith({
+      user: UID, category: 'beta', feature: 'pickLists',
+      subject: 'Beta feedback: Pick lists', message: 'Love the bar at the bottom',
+    });
+    // A subject the sender wrote wins; beta feedback with no feature still files.
+    await createSupportTicket(UID, { category: 'beta', feature: 'pickLists', subject: 'Rows', message: 'm' });
+    expect(SupportTicket.create).toHaveBeenLastCalledWith(expect.objectContaining({ subject: 'Rows', feature: 'pickLists' }));
+    await createSupportTicket(UID, { category: 'beta', message: 'm' });
+    expect(SupportTicket.create).toHaveBeenLastCalledWith({ user: UID, category: 'beta', subject: 'Beta feedback', message: 'm' });
+  });
+
+  test('a feature key is checked: unknown keys and keys on non-beta tickets are refused', async () => {
+    expect((await createSupportTicket(UID, { category: 'beta', feature: 'noSuchThing', message: 'm' })).error.status).toBe(400);
+    expect((await createSupportTicket(UID, { category: 'bug', feature: 'pickLists', subject: 's', message: 'm' })).error.status).toBe(400);
+    expect(SupportTicket.create).not.toHaveBeenCalled();
   });
 });
 
@@ -307,5 +365,98 @@ describe('replyToTicket', () => {
     expect(ticket.replies[0]).toMatchObject({ author: 'user', by: UID, message: 'Still broken on Firefox' });
     expect(ticket.status).toBe('open');
     expect(ticket.save).toHaveBeenCalled();
+  });
+});
+
+describe('closeTicket (the user marks their own ticket resolved)', () => {
+  const { closeTicket } = require('./accountOps');
+  const TID = 'e'.repeat(24);
+  const ticketOf = (over = {}) => ({
+    _id: TID, user: UID, status: 'in_progress', replies: [], save: jest.fn().mockResolvedValue(undefined), ...over,
+  });
+
+  test('404s a malformed id without querying, and a foreign/missing ticket (user-scoped query)', async () => {
+    expect((await closeTicket(UID, 'not-an-id')).error.status).toBe(404);
+    expect(SupportTicket.findOne).not.toHaveBeenCalled();
+    SupportTicket.findOne.mockResolvedValue(null);
+    expect((await closeTicket(UID, TID)).error.status).toBe(404);
+    expect(SupportTicket.findOne).toHaveBeenCalledWith({ _id: TID, user: UID });
+  });
+
+  test('closes an open or answered ticket', async () => {
+    const ticket = ticketOf();
+    SupportTicket.findOne.mockResolvedValue(ticket);
+    const res = await closeTicket(UID, TID);
+    expect(res).toEqual({ ticket, alreadyClosed: false });
+    expect(ticket.status).toBe('closed');
+    expect(ticket.save).toHaveBeenCalled();
+  });
+
+  test('an already closed ticket is left as it is and reported as such', async () => {
+    const ticket = ticketOf({ status: 'closed' });
+    SupportTicket.findOne.mockResolvedValue(ticket);
+    expect(await closeTicket(UID, TID)).toEqual({ ticket, alreadyClosed: true });
+    expect(ticket.save).not.toHaveBeenCalled();
+  });
+});
+
+describe('createWineRequest — links and the back label (#1460)', () => {
+  test('sourceUrls follow sourceUrl in order, trimmed and without repeats; sourceUrl is the first', async () => {
+    const res = await createWineRequest(UID, {
+      wineName: 'X', sourceUrl: ' https://winery.example/x ', sourceUrls: ['https://review.example/x', 'https://winery.example/x', ''],
+    });
+    expect(res.error).toBeUndefined();
+    expect(WineRequest).toHaveBeenCalledWith(expect.objectContaining({
+      sourceUrl: 'https://winery.example/x', sourceUrls: ['https://winery.example/x', 'https://review.example/x'],
+    }));
+  });
+
+  test('the first link may arrive in sourceUrls alone; a request with no link at all is refused as before', async () => {
+    await createWineRequest(UID, { wineName: 'X', sourceUrls: ['https://a.example'] });
+    expect(WineRequest).toHaveBeenCalledWith(expect.objectContaining({ sourceUrl: 'https://a.example', sourceUrls: ['https://a.example'] }));
+    expect((await createWineRequest(UID, { wineName: 'X', sourceUrls: [] })).error.message).toBe('Source URL is required');
+  });
+
+  test('every link is checked like sourceUrl; more than three, a non-list and a non-string are refused', async () => {
+    const submit = (sourceUrls) => createWineRequest(UID, { wineName: 'X', sourceUrl: 'https://a.example', sourceUrls });
+    expect((await submit(['http://10.0.0.1/x'])).error.message).toMatch(/private\/internal/);
+    expect((await submit(['https://b.example', 'https://c.example', 'https://d.example'])).error.message).toMatch(/At most 3/);
+    expect((await submit('https://b.example')).error.status).toBe(400);
+    expect((await submit([42])).error.status).toBe(400);
+  });
+
+  test('the back label takes the shapes the front photo does, and is named in its error', async () => {
+    const submit = (backImage) => createWineRequest(UID, { wineName: 'X', sourceUrl: 'https://a.example', backImage });
+    expect((await submit('data:image/png;base64,iVBORw0KGgo=')).wineRequest.backImage).toBe('data:image/png;base64,iVBORw0KGgo=');
+    expect((await submit('https://img.example.com/back.png')).wineRequest.backImage).toBe('https://img.example.com/back.png');
+    expect((await submit(undefined)).wineRequest.backImage).toBeNull();
+    const bad = await submit('javascript:alert(1)');
+    expect(bad.error.status).toBe(400);
+    expect(bad.error.message).toMatch(/^Back label:/);
+    expect((await submit('d'.repeat(500001))).error.status).toBe(400);
+  });
+});
+
+// The repeat check is quadratic in the list and the route takes megabytes of
+// JSON: the length is refused BEFORE the loop (release audit 2026-10-09, H2).
+describe('createWineRequest — an oversized link list is refused at once', () => {
+  test('a list of 200,000 one-character strings is refused in well under a second', async () => {
+    const sourceUrls = Array.from({ length: 200000 }, (_, i) => String(i));
+    const started = Date.now();
+    const res = await createWineRequest(UID, { wineName: 'X', sourceUrl: 'https://a.example', sourceUrls });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(res.error.status).toBe(400);
+    expect(res.error.message).toMatch(/At most 3/);
+  });
+
+  test('the form\'s list (sourceUrl repeated inside sourceUrls, three in all) still passes', async () => {
+    const res = await createWineRequest(UID, { wineName: 'X', sourceUrl: 'https://a.example', sourceUrls: ['https://a.example', 'https://b.example', 'https://c.example'] });
+    expect(res.error).toBeUndefined();
+    expect(WineRequest).toHaveBeenCalledWith(expect.objectContaining({ sourceUrls: ['https://a.example', 'https://b.example', 'https://c.example'] }));
+  });
+
+  test('four entries are refused even when they collapse to fewer distinct links', async () => {
+    const res = await createWineRequest(UID, { wineName: 'X', sourceUrl: 'https://a.example', sourceUrls: ['https://a.example', 'https://a.example', 'https://a.example', 'https://b.example'] });
+    expect(res.error.message).toMatch(/At most 3/);
   });
 });

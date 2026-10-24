@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
-import CellarionLogo from '../components/CellarionLogo';
+import AuthLogo from '../components/AuthLogo';
 import './Login.css';
 
 function VerifyEmail() {
@@ -38,8 +38,10 @@ function VerifyEmail() {
       if (result.success) {
         setStatus('success');
         // Verification no longer logs the user in (security audit M-1) — send
-        // them to log in rather than into an authenticated view.
-        setTimeout(() => navigate('/login', { replace: true }), 1500);
+        // them to log in rather than into an authenticated view. The flag lets
+        // the login page say why they are there: on a phone this usually opens
+        // in the mail app's own browser, where no session exists yet.
+        setTimeout(() => navigate('/login', { replace: true, state: { verified: true } }), 1500);
       } else {
         setStatus('error');
         setErrorMessage(result.error || t('auth.verificationFailed'));
@@ -67,7 +69,7 @@ function VerifyEmail() {
     <div className="login-page">
       <div className="login-card">
         <div className="login-header">
-          <CellarionLogo size={90} color="var(--color-primary)" showText />
+          <AuthLogo />
           <p>{t('auth.emailVerification')}</p>
         </div>
 
@@ -90,6 +92,7 @@ function VerifyEmail() {
             <div className="form-group">
               <input
                 type="email"
+                autoComplete="email"
                 placeholder={t('auth.emailExamplePlaceholder')}
                 value={resendEmail}
                 onChange={e => setResendEmail(e.target.value)}

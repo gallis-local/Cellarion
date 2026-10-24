@@ -1,6 +1,6 @@
 import { useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { computeLayout, computeModularLayout, SLOT_RADIUS, CELL_SIZE } from '../../utils/rackLayouts';
+import { computeLayout, computeModularLayout, SLOT_RADIUS, SLOT_HIT_FACTOR, minSlotDistance, multiBottleCells } from '../../utils/rackLayouts';
 import useSlotDrag from '../../hooks/useSlotDrag';
 import { isReserved } from '../../utils/reservation';
 import { swatchType } from '../../utils/wineColour';
@@ -25,47 +25,6 @@ const SHELF_COLOR   = '#D4BA94';
 const DISABLED_FILL   = '#BFB09A';
 const DISABLED_STROKE = '#A89880';
 const DISABLED_CROSS  = 'rgba(90, 74, 56, 0.45)';
-
-/** Sub-circle offsets for multi-bottle cells (dx, dy from cell centre) */
-function getSubOffsets(bpc, R) {
-  const g = R * 0.42;
-  switch (bpc) {
-    case 2: return [{ dx: -g, dy: 0 }, { dx: g, dy: 0 }];
-    case 3: {
-      // Equilateral triangle, slightly tighter so the cluster reads as one unit
-      const t = R * 0.38;
-      return [
-        { dx: 0,             dy: -t * 0.85 },
-        { dx: -t * 0.85,     dy:  t * 0.55 },
-        { dx:  t * 0.85,     dy:  t * 0.55 },
-      ];
-    }
-    case 4: return [{ dx: -g, dy: -g }, { dx: g, dy: -g }, { dx: -g, dy: g }, { dx: g, dy: g }];
-    default: {
-      // General grid arrangement
-      const cols = Math.ceil(Math.sqrt(bpc));
-      const rows = Math.ceil(bpc / cols);
-      const offsets = [];
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          if (offsets.length >= bpc) break;
-          offsets.push({
-            dx: -g + (2 * g * c) / Math.max(cols - 1, 1),
-            dy: -g + (2 * g * r) / Math.max(rows - 1, 1),
-          });
-        }
-      }
-      return offsets;
-    }
-  }
-}
-
-/** Sub-circle radius for multi-bottle cells */
-function getSubRadius(bpc, R) {
-  if (bpc <= 2) return R * 0.45;
-  if (bpc <= 4) return R * 0.40;
-  return R * 0.3;
-}
 
 /** Wood-tone cell tray colour — slightly darker than the rack background */
 const CELL_TRAY_FILL = '#C8AD82';
@@ -110,33 +69,32 @@ export default function RackRenderer({
   const activePos = activeRackId === rack._id ? activePosition : null;
   const R = SLOT_RADIUS;
 
+  // On a phone a slot is small (an 8-column rack: ~30 px) and the gap between
+  // two is dead space. On a touch screen each slot also answers taps a little
+  // beyond its circle, invisibly (the same forgiveness a dragged bottle's drop
+  // gets), up to half the way to its nearest neighbour — never into it. One
+  // bottle per cell and no back row only (sub-circles and back slots sit too
+  // close); racks whose slots are tighter than that keep the circle.
+  const hitR = useMemo(() => {
+    if ((layout.bottlesPerCell || 1) !== 1 || layout.backRadius) return null;
+    const r = Math.min(R * SLOT_HIT_FACTOR, minSlotDistance(layout.slots) / 2);
+    return r > R ? r : null;
+  }, [layout, R]);
+
+  // Multi-bottle cells (bottlesPerCell > 1), fanned out; null otherwise.
+  const cells = useMemo(() => multiBottleCells(layout), [layout]);
+
   // Actual rendered slot centers (mirrors the render logic below, including
   // the sub-circle offsets of multi-bottle cells) — the drag hit map.
   const slotCenters = useMemo(() => {
-    const bpc = layout.bottlesPerCell || 1;
     const backR = layout.backRadius;
-    if (bpc === 1) {
+    if (!cells) {
       return layout.slots.map(s => ({
         position: s.position, cx: s.cx, cy: s.cy, r: s.isBack && backR ? backR : R,
       }));
     }
-    const cellMap = {};
-    layout.slots.forEach(s => {
-      const key = `${s.cx},${s.cy}`;
-      if (!cellMap[key]) cellMap[key] = { cx: s.cx, cy: s.cy, isBack: !!s.isBack, positions: [] };
-      cellMap[key].positions.push(s.position);
-    });
-    const centers = [];
-    Object.values(cellMap).forEach(cell => {
-      const useR = cell.isBack && backR ? getSubRadius(bpc, backR) : getSubRadius(bpc, R);
-      const useOff = cell.isBack && backR ? getSubOffsets(bpc, backR) : getSubOffsets(bpc, R);
-      cell.positions.forEach((pos, idx) => {
-        const off = useOff[idx] || { dx: 0, dy: 0 };
-        centers.push({ position: pos, cx: cell.cx + off.dx, cy: cell.cy + off.dy, r: useR });
-      });
-    });
-    return centers;
-  }, [layout, R]);
+    return cells.flatMap(cell => cell.bottles.map(b => ({ position: b.position, cx: b.cx, cy: b.cy, r: cell.r })));
+  }, [layout, cells, R]);
 
   const { drag, startDrag, shouldSuppressClick } = useSlotDrag({
     svgRef,
@@ -328,15 +286,17 @@ export default function RackRenderer({
 
           {/* Slots */}
           {(() => {
-            const bpc = layout.bottlesPerCell || 1;
             const backR = layout.backRadius;
 
-            if (bpc === 1) {
-              return layout.slots.map(({ position, cx, cy, isBack }) => (
+            if (!cells) {
+              return layout.slots.map(({ position, cx, cy, isBack, isNeck, isSideways }) => (
                 <SlotCircle
                   key={position}
                   position={position}
                   cx={cx} cy={cy} R={isBack && backR ? backR : R}
+                  hitR={hitR}
+                  isNeck={!!isNeck}
+                  isSideways={!!isSideways}
                   slot={slotMap[position]}
                   disabled={disabledSet.has(position)}
                   isActive={activePos === position}
@@ -350,30 +310,12 @@ export default function RackRenderer({
               ));
             }
 
-            // Multi-bottle cells: group positions sharing the same (cx,cy),
-            // then render a wood-tone "tray" behind each cell so the cluster
-            // of sub-circles visually reads as a single cell, then each
-            // bottle as an individual smaller circle in a sub-grid.
-            const cellMap = {};
-            layout.slots.forEach(s => {
-              const key = `${s.cx},${s.cy}`;
-              if (!cellMap[key]) cellMap[key] = { cx: s.cx, cy: s.cy, isBack: !!s.isBack, positions: [] };
-              cellMap[key].positions.push(s.position);
-            });
-
-            const subOffsets = getSubOffsets(bpc, R);
-            const subR = getSubRadius(bpc, R);
-            const backSubOffsets = backR ? getSubOffsets(bpc, backR) : subOffsets;
-            const backSubR = backR ? getSubRadius(bpc, backR) : subR;
-
-            const trayPad = 3;
-            const traySize = CELL_SIZE - trayPad * 2;
-            const backTraySize = backR ? backR * 2 + 4 : traySize;
-
-            return Object.values(cellMap).map(cell => {
-              const useOff = cell.isBack ? backSubOffsets : subOffsets;
-              const useR = cell.isBack ? backSubR : subR;
-              const sz = cell.isBack ? backTraySize : traySize;
+            // Multi-bottle cells (multiBottleCells): a wood-tone "tray"
+            // behind each cell so the cluster of sub-circles visually reads
+            // as a single cell, then each bottle as an individual smaller
+            // circle in a sub-grid.
+            return cells.map(cell => {
+              const sz = cell.size;
               return (
                 <g key={`cell-${cell.cx},${cell.cy}`}>
                   <rect
@@ -388,27 +330,24 @@ export default function RackRenderer({
                     opacity={0.7}
                     pointerEvents="none"
                   />
-                  {cell.positions.map((pos, idx) => {
-                    const off = useOff[idx] || { dx: 0, dy: 0 };
-                    return (
-                      <SlotCircle
-                        key={pos}
-                        position={pos}
-                        cx={cell.cx + off.dx}
-                        cy={cell.cy + off.dy}
-                        R={useR}
-                        slot={slotMap[pos]}
-                        disabled={disabledSet.has(pos)}
-                        isActive={activePos === pos}
-                        isHighlight={highlightPos === pos}
-                        onSlotClick={handleSlotClick}
-                        getSlotStyle={getSlotStyle}
-                        onDragStart={onSlotMove ? startDrag : undefined}
-                        isDragOrigin={drag?.from === pos}
-                        isDragTarget={drag?.over === pos}
-                      />
-                    );
-                  })}
+                  {cell.bottles.map(({ position: pos, cx, cy }) => (
+                    <SlotCircle
+                      key={pos}
+                      position={pos}
+                      cx={cx}
+                      cy={cy}
+                      R={cell.r}
+                      slot={slotMap[pos]}
+                      disabled={disabledSet.has(pos)}
+                      isActive={activePos === pos}
+                      isHighlight={highlightPos === pos}
+                      onSlotClick={handleSlotClick}
+                      getSlotStyle={getSlotStyle}
+                      onDragStart={onSlotMove ? startDrag : undefined}
+                      isDragOrigin={drag?.from === pos}
+                      isDragTarget={drag?.over === pos}
+                    />
+                  ))}
                 </g>
               );
             });
@@ -462,8 +401,12 @@ export function ReservedRibbon({ cx, cy, r }) {
   );
 }
 
-/** Single slot circle (bpc=1 standard rendering) */
-function SlotCircle({ position, cx, cy, R, slot, disabled, isActive, isHighlight, onSlotClick, getSlotStyle, onDragStart, isDragOrigin, isDragTarget }) {
+/**
+ * Single slot circle (bpc=1 standard rendering). A bottle is seen end-on:
+ * base forward shows the dark punt; `isNeck` (a head-to-tail cabinet's
+ * every other bottle) shows the light capsule inside the shoulder instead.
+ */
+function SlotCircle({ position, cx, cy, R, hitR = null, isNeck = false, isSideways = false, slot, disabled, isActive, isHighlight, onSlotClick, getSlotStyle, onDragStart, isDragOrigin, isDragTarget }) {
   const { t } = useTranslation();
   const wine = slot?.bottle?.wineDefinition;
   const wineType = swatchType(wine, 'red');
@@ -501,6 +444,7 @@ function SlotCircle({ position, cx, cy, R, slot, disabled, isActive, isHighlight
           stroke={DISABLED_CROSS} strokeWidth={1.5} strokeLinecap="round" pointerEvents="none" />
         <line x1={cx - d} y1={cy + d} x2={cx + d} y2={cy - d}
           stroke={DISABLED_CROSS} strokeWidth={1.5} strokeLinecap="round" pointerEvents="none" />
+        {hitR && <circle cx={cx} cy={cy} r={hitR} fill="transparent" className="rack-slot-hit" />}
       </g>
     );
   }
@@ -517,21 +461,42 @@ function SlotCircle({ position, cx, cy, R, slot, disabled, isActive, isHighlight
       role="button"
       tabIndex={0}
       aria-label={slot
-        ? `${wine?.name || '?'} (${slot.bottle?.vintage || ''})${isReserved(slot.bottle) ? ` — ${t('rackView.reservedAria', 'reserved')}` : ''}`
-        : `Empty slot ${position}`}
+        ? `${wine?.name || '?'} (${slot.bottle?.vintage || ''})${isNeck ? `, ${t('rackView.neckForwardAria', 'neck forward')}` : ''}${isSideways ? `, ${t('rackView.sidewaysAria', 'lying across')}` : ''}${isReserved(slot.bottle) ? ` — ${t('rackView.reservedAria', 'reserved')}` : ''}`
+        : `Empty slot ${position}${isSideways ? `, ${t('rackView.sidewaysAria', 'lying across')}` : ''}`}
       style={{ cursor: draggable ? 'grab' : 'pointer', ...dimStyle }}
     >
-      <circle cx={cx + 1} cy={cy + 1} r={R} fill="rgba(0,0,0,0.08)" pointerEvents="none" />
-      <circle
-        cx={cx} cy={cy} r={R}
-        fill={fillColor}
-        stroke={isActive || isHighlight ? ACTIVE_STROKE : strokeColor}
-        strokeWidth={isActive || isHighlight ? 3 : 1.5}
-      />
-      <circle cx={cx} cy={cy} r={R * 0.82} fill="none"
-        stroke={slot ? 'rgba(0,0,0,0.15)' : 'rgba(0,0,0,0.08)'} strokeWidth={0.8} pointerEvents="none" />
-      {slot && <circle cx={cx} cy={cy} r={R * 0.3} fill="rgba(0,0,0,0.4)" pointerEvents="none" />}
-      {slot && <circle cx={cx} cy={cy} r={R * 0.18} fill="rgba(255,255,255,0.15)" pointerEvents="none" />}
+      {isSideways ? (
+        // A bottle lying across, seen from the front: its side, base left,
+        // neck right — same cell, so the numbering on the map is unchanged.
+        <>
+          <rect x={cx - R + 1} y={cy - R * 0.55 + 1} width={R * 1.55} height={R * 1.1} rx={R * 0.5} fill="rgba(0,0,0,0.08)" pointerEvents="none" />
+          <rect x={cx + R * 0.5} y={cy - R * 0.2} width={R * 0.5} height={R * 0.4} rx={R * 0.12}
+            fill={fillColor} stroke={strokeColor} strokeWidth={1} pointerEvents="none" />
+          <rect
+            x={cx - R} y={cy - R * 0.55} width={R * 1.55} height={R * 1.1} rx={R * 0.5}
+            fill={fillColor}
+            stroke={isActive || isHighlight ? ACTIVE_STROKE : strokeColor}
+            strokeWidth={isActive || isHighlight ? 3 : 1.5}
+          />
+          {slot && <rect x={cx - R * 0.55} y={cy - R * 0.32} width={R * 0.7} height={R * 0.64} rx={R * 0.08} fill="rgba(255,255,255,0.55)" pointerEvents="none" />}
+        </>
+      ) : (
+        <>
+          <circle cx={cx + 1} cy={cy + 1} r={R} fill="rgba(0,0,0,0.08)" pointerEvents="none" />
+          <circle
+            cx={cx} cy={cy} r={R}
+            fill={fillColor}
+            stroke={isActive || isHighlight ? ACTIVE_STROKE : strokeColor}
+            strokeWidth={isActive || isHighlight ? 3 : 1.5}
+          />
+          <circle cx={cx} cy={cy} r={R * (isNeck ? 0.62 : 0.82)} fill="none"
+            stroke={slot ? 'rgba(0,0,0,0.15)' : 'rgba(0,0,0,0.08)'} strokeWidth={0.8} pointerEvents="none" />
+          {slot && !isNeck && <circle cx={cx} cy={cy} r={R * 0.3} fill="rgba(0,0,0,0.4)" pointerEvents="none" />}
+          {slot && !isNeck && <circle cx={cx} cy={cy} r={R * 0.18} fill="rgba(255,255,255,0.15)" pointerEvents="none" />}
+          {slot && isNeck && <circle cx={cx} cy={cy} r={R * 0.34} fill="rgba(255,255,255,0.6)" stroke="rgba(0,0,0,0.35)" strokeWidth={0.8} pointerEvents="none" />}
+          {slot && isNeck && <circle cx={cx} cy={cy} r={R * 0.14} fill="rgba(0,0,0,0.18)" pointerEvents="none" />}
+        </>
+      )}
       {slot && isReserved(slot.bottle) && <ReservedRibbon cx={cx} cy={cy} r={R} />}
       {!slot && (
         <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central" className="slot-number" pointerEvents="none">
@@ -544,6 +509,9 @@ function SlotCircle({ position, cx, cy, R, slot, disabled, isActive, isHighlight
       {isDragTarget && (
         <circle cx={cx} cy={cy} r={R + 3} fill="none" stroke={ACTIVE_STROKE} strokeWidth={2.5} strokeDasharray="5 3" />
       )}
+      {/* The larger, invisible tap area (see hitR). Last, so the slot's own
+          :first-child styling never lands on it. */}
+      {hitR && <circle cx={cx} cy={cy} r={hitR} fill="transparent" className="rack-slot-hit" />}
     </g>
   );
 }

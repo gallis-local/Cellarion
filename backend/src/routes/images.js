@@ -4,6 +4,7 @@ const fs = require('fs');
 const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
 const { requireAuth, requireNonDemo } = require('../middleware/auth');
+const liveWindowLimiter = require('../middleware/liveWindowLimiter');
 const { upload, ORIGINALS_DIR } = require('../config/upload');
 const BottleImage = require('../models/BottleImage');
 const Bottle = require('../models/Bottle');
@@ -16,6 +17,7 @@ const { ingestBottleImage } = require('../services/imageOps');
 const { mayCurationReadScan, logCurationImageRead } = require('../services/labelScanAccess');
 const { isValidId } = require('../utils/validation');
 const { stripHtml } = require('../utils/sanitize');
+const { photoVintage, vintageOfficialOrder } = require('../utils/imageVintage');
 const rateLimitsConfig = require('../config/rateLimits');
 const { logAudit } = require('../services/audit');
 
@@ -51,11 +53,9 @@ const bgRemovalLimiter = rateLimit({
 // Per-user upload cap on /upload. The per-bottle MAX_IMAGES_PER_BOTTLE limits
 // per-resource growth, but doesn't stop a user creating bottles + uploading
 // in a loop to fill the disk. Keyed on req.user.id (not IP) so an attacker
-// rotating IPs can't bypass.
-const imageUploadLimiter = rateLimit({
-  // windowMs is read once at limiter creation (express-rate-limit doesn't
-  // support a functional windowMs in v7). Matches the chatBurst pattern.
-  windowMs: 60 * 60 * 1000,
+// rotating IPs can't bypass. Window and max are admin-tunable and read live.
+const imageUploadLimiter = liveWindowLimiter({
+  windowMs: () => rateLimitsConfig.get().imageUploadBurst.windowMs,
   max:      () => rateLimitsConfig.get().imageUploadBurst.max,
   keyGenerator: (req) => String(req.user?.id || ''),
   standardHeaders: true,
@@ -124,9 +124,16 @@ router.post('/upload', requireAuth, requireNonDemo, imageUploadLimiter, handleIm
         safeUnlink(req.file.path);
         return res.status(404).json({ error: 'Bottle not found' });
       }
+      // Same rule as middleware/bottleAccess: a soft-deleted cellar and a
+      // caller with no role both read as a missing bottle; only a viewer,
+      // who can see the bottle, is told they may not add to it.
       const cellar = await Cellar.findById(bottle.cellar);
-      const cellarRole = cellar ? getCellarRole(cellar, req.user.id) : null;
-      if (!cellarRole || cellarRole === 'viewer') {
+      const cellarRole = cellar && !cellar.deletedAt ? getCellarRole(cellar, req.user.id) : null;
+      if (!cellarRole) {
+        safeUnlink(req.file.path);
+        return res.status(404).json({ error: 'Bottle not found' });
+      }
+      if (cellarRole === 'viewer') {
         safeUnlink(req.file.path);
         return res.status(403).json({ error: 'Not authorized to upload images for this bottle' });
       }
@@ -155,6 +162,8 @@ router.post('/upload', requireAuth, requireNonDemo, imageUploadLimiter, handleIm
       wineDefinitionId: wineDefinitionId ? String(wineDefinitionId) : null,
       credit,
       keepBackground,
+      // Named in the 'image.attach' audit row the pipeline writes for a bottle.
+      via: 'web',
     }, req);
     if (result.error) {
       return res.status(result.error.status).json({ error: result.error.message });
@@ -168,17 +177,19 @@ router.post('/upload', requireAuth, requireNonDemo, imageUploadLimiter, handleIm
 });
 
 // GET /api/images/bottle/:bottleId - Get images for a bottle
+const VINTAGE_GALLERY_BOTTLES = 500; // the vintage page's own cap (routes/cellars VINTAGE_PAGE_LIMIT)
 router.get('/bottle/:bottleId', requireAuth, async (req, res) => {
   try {
     if (!isValidId(req.params.bottleId)) return res.status(400).json({ error: 'Invalid ID' });
 
-    // Verify bottle access (owner or shared cellar viewer+)
+    // Verify bottle access (owner or shared cellar viewer+); a soft-deleted
+    // cellar's bottles are not found, as in middleware/bottleAccess.
     const bottle = await Bottle.findById(req.params.bottleId);
     if (!bottle) {
       return res.status(404).json({ error: 'Bottle not found' });
     }
     const cellar = await Cellar.findById(bottle.cellar);
-    const cellarRole = cellar ? getCellarRole(cellar, req.user.id) : null;
+    const cellarRole = cellar && !cellar.deletedAt ? getCellarRole(cellar, req.user.id) : null;
     if (!cellarRole) {
       return res.status(404).json({ error: 'Bottle not found' });
     }
@@ -193,8 +204,24 @@ router.get('/bottle/:bottleId', requireAuth, async (req, res) => {
     // Handing it back took the whole bottle page down for its owner (support
     // ticket 2026-09-03: ImageCarousel called .startsWith on the null URL and
     // the ErrorBoundary swallowed the page) — 138 bottles / 47 owners on prod.
+    // ?scope=vintage (the vintage page): the photos of EVERY bottle of this
+    // wine and vintage in this cellar, not just this one — a label photo
+    // added through one bottle belongs to the vintage, and the page must not
+    // lose it when that bottle is drunk or another one sorts first. Same
+    // visibility rule per photo; the caller already has a role on the cellar,
+    // so its sibling bottles are theirs to see.
+    let bottleIds = null;
+    if (req.query.scope === 'vintage' && bottle.wineDefinition) {
+      const v = typeof bottle.vintage === 'string' && bottle.vintage.trim() ? bottle.vintage.trim() : 'NV';
+      const siblings = await Bottle.find({
+        cellar: bottle.cellar,
+        wineDefinition: bottle.wineDefinition,
+        vintage: v === 'NV' ? { $in: ['NV', '', null] } : v,
+      }).select('_id').limit(VINTAGE_GALLERY_BOTTLES).lean();
+      bottleIds = [...new Set([String(bottle._id), ...siblings.map((s) => String(s._id))])];
+    }
     const bottleImages = await BottleImage.find({
-      bottle: req.params.bottleId,
+      bottle: bottleIds ? { $in: bottleIds } : req.params.bottleId,
       $or: [
         { status: 'approved', visibility: 'public' },
         { uploadedBy: req.user.id, status: { $ne: 'rejected' } }
@@ -212,6 +239,20 @@ router.get('/bottle/:bottleId', requireAuth, async (req, res) => {
       }).sort({ assignedToWine: -1, createdAt: -1 });
       // Exclude any that are already in the bottle-specific list
       wineImages = wineImages.filter(img => !bottleImageIds.has(img._id.toString()));
+      // Photos of THIS vintage first (support ticket 2026-10-09), led by the
+      // vintage's official photo: the first wine-level slide is the one a
+      // bottle without its own photo opens on, and a 2016 bottle should open
+      // on a 2016 label when one exists. With none, the wine's official image
+      // leads, as before. Within each part the official-first, newest-first
+      // order of the query holds.
+      const thisVintage = photoVintage(bottle.vintage);
+      if (thisVintage) {
+        const same = wineImages.filter(img => img.vintage === thisVintage);
+        const other = wineImages.filter(img => img.vintage !== thisVintage);
+        // All rows here are this bottle's wine, so the rule is just the order.
+        const official = [...same].sort(vintageOfficialOrder)[0] || null;
+        wineImages = [...(official ? [official] : []), ...same.filter(img => img !== official), ...other];
+      }
     }
 
     // Audit 2026-09 D05-1: the gallery is read by every cellar member, viewers
@@ -379,7 +420,8 @@ router.get('/:id', requireAuth, async (req, res) => {
       }
       if (!authorized && bottle && bottle.cellar) {
         const cellar = await Cellar.findById(bottle.cellar);
-        if (cellar && getCellarRole(cellar, req.user.id)) {
+        // Membership of a soft-deleted cellar grants nothing until it is restored.
+        if (cellar && !cellar.deletedAt && getCellarRole(cellar, req.user.id)) {
           authorized = true;
         }
       }
@@ -485,17 +527,18 @@ router.post('/link-to-bottle', requireAuth, async (req, res) => {
     }
 
     // Verify cellar access — bottles are owned by the cellar owner, so shared-cellar
-    // editors must be allowed to link the images they uploaded (mirrors /upload).
+    // editors must be allowed to link the images they uploaded (mirrors /upload,
+    // including its 404 for a soft-deleted cellar or a caller with no role).
     const bottle = await Bottle.findById(bottleId);
     if (!bottle) {
       return res.status(404).json({ error: 'Bottle not found' });
     }
     const cellar = await Cellar.findById(bottle.cellar);
-    if (!cellar) {
+    const cellarRole = cellar && !cellar.deletedAt ? getCellarRole(cellar, req.user.id) : null;
+    if (!cellarRole) {
       return res.status(404).json({ error: 'Bottle not found' });
     }
-    const cellarRole = getCellarRole(cellar, req.user.id);
-    if (!cellarRole || cellarRole === 'viewer') {
+    if (cellarRole === 'viewer') {
       return res.status(403).json({ error: 'Not authorized to link images to this bottle' });
     }
 
@@ -506,10 +549,19 @@ router.post('/link-to-bottle', requireAuth, async (req, res) => {
       return res.status(400).json({ error: `Maximum of ${MAX_IMAGES_PER_BOTTLE} images per bottle reached` });
     }
 
-    await BottleImage.updateMany(
-      { _id: { $in: imageIds }, uploadedBy: req.user.id },
-      { bottle: bottleId }
-    );
+    // Only the caller's own uploads are linked; the audit row names exactly
+    // those, and a request that matches none of them writes no row.
+    const own = { _id: { $in: imageIds }, uploadedBy: req.user.id };
+    const ownIds = new Set((await BottleImage.distinct('_id', own)).map(String));
+    const linkedIds = [...new Set(imageIds.map(String))].filter(id => ownIds.has(id));
+
+    // The AddBottle flow uploads before the bottle exists, so the photo learns
+    // its vintage here, with its bottle (support ticket 2026-10-09).
+    await BottleImage.updateMany(own, { bottle: bottleId, vintage: photoVintage(bottle.vintage) });
+    if (linkedIds.length) {
+      logAudit(req, 'image.link', { type: 'bottle', id: bottle._id, cellarId: bottle.cellar },
+        { imageIds: linkedIds, via: 'web' });
+    }
 
     res.json({ message: 'Images linked to bottle' });
   } catch (error) {
@@ -546,6 +598,8 @@ router.post('/:id/retry', requireAuth, requireNonDemo, async (req, res) => {
     processImage(image._id).catch(err =>
       console.error('Retry processing error:', err.message)
     );
+    logAudit(req, 'image.retry', { type: 'image', id: image._id },
+      { bottleId: image.bottle ? String(image.bottle) : null });
 
     res.json({ message: 'Processing restarted' });
   } catch (error) {
@@ -578,43 +632,15 @@ const REPORTS_MAX = 20;
 router.delete('/:id', requireAuth, async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
-    const image = await BottleImage.findById(req.params.id);
-    if (!image) return res.status(404).json({ error: 'Image not found' });
-
-    // 404 rather than 403 for someone else's photo: a stranger's image id is
-    // not something this endpoint should confirm the existence of.
-    if (String(image.uploadedBy) !== String(req.user.id)) {
-      return res.status(404).json({ error: 'Image not found' });
+    // Shared with the MCP delete_bottle_image tool (services/imageOps): a
+    // stranger's photo is a 404, not a 403 (its existence is not confirmed);
+    // a registry picture is refused; references are cleared before the files go.
+    const { deleteOwnImage } = require('../services/imageOps');
+    const result = await deleteOwnImage(req.params.id, req.user.id, req);
+    if (result.error) {
+      const { status, message, code } = result.error;
+      return res.status(status).json({ error: message, ...(code ? { code } : {}) });
     }
-    if (image.assignedToWine) {
-      return res.status(409).json({
-        error: 'This photo is being used as the wine\'s picture in the shared registry, so removing it would change the wine page for everyone. Report it instead and an admin will take it down.',
-        code: 'assigned_to_wine',
-      });
-    }
-
-    // Clear every reference before the files go, so nothing renders a hole.
-    await Bottle.updateMany({ defaultImage: image._id }, { $set: { defaultImage: null } });
-    if (image.wineDefinition) {
-      const WineDefinition = require('../models/WineDefinition');
-      await WineDefinition.updateOne(
-        { _id: image.wineDefinition, scanImage: image._id }, { $set: { scanImage: null } }
-      );
-      await WineDefinition.updateOne(
-        { _id: image.wineDefinition, scanImageBack: image._id }, { $set: { scanImageBack: null } }
-      );
-    }
-
-    const { unlinkImageFiles } = require('../services/imageProcessor');
-    try { await unlinkImageFiles(image); } catch (err) {
-      // The row is what makes the photo reachable; a stranded file is a
-      // janitorial problem, not a reason to tell the user it is still there.
-      console.warn('[images] unlink failed during user delete (continuing):', err.message);
-    }
-    await BottleImage.deleteOne({ _id: image._id });
-
-    logAudit(req, 'image.delete', { type: 'image', id: image._id },
-      { kind: image.kind, visibility: image.visibility, status: image.status, byOwner: true });
 
     res.json({ message: 'Photo deleted' });
   } catch (error) {

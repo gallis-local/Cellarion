@@ -30,7 +30,9 @@ const {
   isApiTokenCredential,
   authenticateApiToken,
   isRequestAllowed,
+  classifyRequest,
 } = require('./apiTokenAuth');
+const { SUNSET } = require('../config/apiDeprecations');
 
 beforeEach(() => jest.clearAllMocks());
 
@@ -67,6 +69,7 @@ describe('isRequestAllowed (default-deny)', () => {
     ['GET', '/api/notifications'],
     ['GET', '/api/racks'],
     ['GET', '/api/events/stream'],
+    ['GET', '/api/inventory'],
     ['GET', '/api/auth/whoami'],
     ['POST', '/api/mcp'],
   ])('read scope allows %s %s', (method, path) => {
@@ -116,6 +119,26 @@ describe('isRequestAllowed (default-deny)', () => {
     ['DELETE', '/api/users/me'],
   ])('read scope denies %s %s', (method, path) => {
     expect(isRequestAllowed(READ, method, path)).toBe(false);
+  });
+
+  // The integrations' inventory (docs/ha-push-events.md §4): the caller's own
+  // and shared cellars, database reads only. Exact-anchored to GET; no other
+  // scope reaches it, and an OAuth token (MCP audience) never does.
+  test('GET /api/inventory: read scope only, exact path, GET/HEAD only', () => {
+    expect(isRequestAllowed(READ, 'GET', '/api/inventory')).toBe(true);
+    expect(isRequestAllowed(READ, 'GET', '/api/inventory/')).toBe(true);
+    expect(isRequestAllowed(READ, 'HEAD', '/api/inventory')).toBe(true);
+    for (const p of ['/api/inventory/x', '/api/inventoryx', '/api/inventory/' + oid]) {
+      expect(isRequestAllowed(READ, 'GET', p)).toBe(false);
+    }
+    for (const m of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+      expect(isRequestAllowed(READ, m, '/api/inventory')).toBe(false);
+    }
+    expect(isRequestAllowed(CONSUME, 'GET', '/api/inventory')).toBe(false);
+    expect(isRequestAllowed(['write'], 'GET', '/api/inventory')).toBe(false);
+    expect(isRequestAllowed(['climate'], 'GET', '/api/inventory')).toBe(false);
+    // The offline snapshot it borrows its scope from stays session-only.
+    expect(isRequestAllowed(READ, 'GET', '/api/offline/snapshot')).toBe(false);
   });
 
   test('consume scope allows exactly POST /api/bottles/:id/consume', () => {
@@ -235,6 +258,57 @@ describe('isRequestAllowed (default-deny)', () => {
 // ---------------------------------------------------------------------------
 // authenticateApiToken
 // ---------------------------------------------------------------------------
+describe('classifyRequest: the documented reads, and the ones on their way out', () => {
+  const oid = 'a'.repeat(24);
+  const READ = ['read'];
+
+  test.each([
+    '/api/stats/overview', '/api/cellars', '/api/bottles', `/api/bottles/${oid}`,
+    '/api/notifications', '/api/notifications/unread-count', '/api/racks',
+    '/api/inventory', '/api/events/stream', '/api/auth/whoami',
+  ])('GET %s is allowed', (path) => {
+    expect(classifyRequest(READ, 'GET', path)).toBe('allowed');
+  });
+
+  test.each([
+    '/api/stats', '/api/stats/value-history', `/api/cellars/${oid}`, `/api/cellars/${oid}/statistics`,
+    '/api/cellars/multi/bottles', '/api/bottles/trash', `/api/bottles/${oid}/lot-history`, '/api/bottles/notanid',
+  ])('GET %s is deprecated: still answered, until the sunset', (path) => {
+    expect(classifyRequest(READ, 'GET', path)).toBe('deprecated');
+    expect(isRequestAllowed(READ, 'GET', path)).toBe(true);
+  });
+
+  test('a path in another letter case is checked as Express routes it (case-insensitively)', () => {
+    // Express routes /api/cellars/:id/Members to the members route: the
+    // exclusions must see it too, whatever the case.
+    expect(classifyRequest(READ, 'GET', `/api/cellars/${oid}/Members`)).toBe('denied');
+    expect(classifyRequest(READ, 'GET', `/api/cellars/${oid}/AUDIT/`)).toBe('denied');
+    expect(classifyRequest(READ, 'GET', '/api/bottles/IMPORT/sessions')).toBe('denied');
+    expect(classifyRequest(['write'], 'GET', '/API/STATS/OVERVIEW')).toBe('denied');
+    // Case changes nothing that was allowed or deprecated.
+    expect(classifyRequest(READ, 'GET', '/API/Inventory')).toBe('allowed');
+    expect(classifyRequest(READ, 'GET', `/api/bottles/${oid.toUpperCase()}`)).toBe('allowed');
+    expect(classifyRequest(READ, 'GET', '/api/Stats/Value-History')).toBe('deprecated');
+  });
+
+  test('from the sunset on, a deprecated route is denied', () => {
+    const path = '/api/stats/value-history';
+    expect(classifyRequest(READ, 'GET', path, SUNSET.getTime() - 1)).toBe('deprecated');
+    expect(classifyRequest(READ, 'GET', path, SUNSET.getTime())).toBe('denied');
+    // The documented reads are untouched by the date.
+    expect(classifyRequest(READ, 'GET', '/api/stats/overview', SUNSET.getTime() + 1)).toBe('allowed');
+  });
+
+  test('what was never reachable stays denied', () => {
+    expect(classifyRequest(READ, 'GET', `/api/cellars/${oid}/members`)).toBe('denied');
+    expect(classifyRequest(READ, 'GET', `/api/cellars/${oid}/audit`)).toBe('denied');
+    expect(classifyRequest(READ, 'GET', '/api/bottles/import/sessions')).toBe('denied');
+    expect(classifyRequest(READ, 'POST', `/api/cellars/${oid}`)).toBe('denied');
+    expect(classifyRequest(['consume'], 'GET', `/api/cellars/${oid}`)).toBe('denied');
+    expect(classifyRequest(['write'], 'GET', '/api/stats/value-history')).toBe('denied');
+  });
+});
+
 describe('authenticateApiToken', () => {
   const RAW = 'cel_' + 'f'.repeat(64);
   const userId = { toString: () => 'u1' };
@@ -266,6 +340,24 @@ describe('authenticateApiToken', () => {
     expect(req.user).toEqual({ id: 'u1', roles: ['user'], plan: 'free', planExpiresAt: null });
     expect(req.apiToken).toEqual({ id: 't1', scopes: ['read'] });
     expect(res.status).not.toHaveBeenCalled();
+  });
+
+  test('a deprecated route is answered with Deprecation, Sunset and Link; a documented one without', async () => {
+    const headersFor = async (baseUrl, path) => {
+      ApiToken.findOne.mockResolvedValue(activeToken());
+      User.findById.mockReturnValue(selectable(activeUser()));
+      const headers = {};
+      const res = { ...mockRes(), setHeader: jest.fn((k, val) => { headers[k] = val; }), on: jest.fn() };
+      const next = jest.fn();
+      await authenticateApiToken(mockReq('GET', baseUrl, path), res, next, RAW);
+      expect(next).toHaveBeenCalled();
+      return headers;
+    };
+    const old = await headersFor('/api/stats', '/value-history');
+    expect(old.Deprecation).toMatch(/^@\d+$/);
+    expect(old.Sunset).toBe(SUNSET.toUTCString());
+    expect(old.Link).toMatch(/\/developers>; rel="deprecation"/);
+    expect(await headersFor('/api/stats', '/overview')).toEqual({});
   });
 
   test('unknown or revoked token → 401 (findOne filters revokedAt null)', async () => {

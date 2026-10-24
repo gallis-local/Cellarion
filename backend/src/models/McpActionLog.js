@@ -26,13 +26,25 @@ const mcpActionLogSchema = new mongoose.Schema({
   // reserved atomically BEFORE the mutation runs, overwritten with the real
   // action on success. Never shown in the timeline, never undo-eligible.
   action: { type: String, enum: ['pending', 'consume', 'restore', 'add', 'update', 'lot_update', 'undo_add', 'bulk_preview', 'bulk_add', 'somm_maturity', 'somm_maturity_remove', 'somm_wine_profile', 'somm_price', 'somm_price_decline', 'somm_proposal', 'somm_grape', 'cellar_create', 'rack_create', 'place', 'unplace', 'move', 'arrange_preview', 'arrange', 'tasting_note', 'attach_image', 'winelist_add', 'winelist_price', 'open', 'pour', 'close', 'personal_data',
+    // A bottle on order marked as arrived (mark_arrived), and its undo.
+    'arrive', 'unarrive',
     // Irreversible writes that reach a human queue or the shared registry
     // (support ticket 2026-09-12): recorded so an idempotency_key can replay
     // them after an ambiguous transport failure. Never undo-eligible.
     'support_ticket', 'support_reply', 'wine_request', 'suggest_correction', 'suggest_value', 'propose_key',
     // An owner's answer to a curator's question (answer_curator_question,
     // 2026-09-24): single-shot on the inquiry itself, so never undo-eligible.
-    'inquiry_answer'], required: true },
+    'inquiry_answer',
+    // Curator queue closes (resolve_owner_inquiry, respond_to_wine_report,
+    // fix_pending_wine, review_image): notifications or a registry write are
+    // already out, so never undo-eligible.
+    'somm_owner_inquiry_resolve', 'somm_wine_report_close', 'somm_pending_fix', 'somm_image_review',
+    // Bottle corrections (2026-10-08): delete_bottle (reversible from the
+    // snapshot in prev), change_bottle_wine and set_bottle_default_image
+    // (reversible); delete_bottle_image (the file is gone) and a wine change
+    // on a bottle that had no wine before (nothing to go back to) are never
+    // undo-eligible.
+    'delete', 'change_wine', 'default_image', 'delete_image', 'change_wine_from_request'], required: true },
   bottle: { type: mongoose.Schema.Types.ObjectId, ref: 'Bottle' },
   cellar: { type: mongoose.Schema.Types.ObjectId, ref: 'Cellar' },
   // Small, non-PII operational detail (reason, ml, …) for the timeline.

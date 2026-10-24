@@ -154,15 +154,18 @@ function FilterSection({ label, icon, children, defaultExpanded = true }) {
 // applied server-side after search like Placement, so no facet counts.
 // ratingScale: the user's rating scale ('5' | '20' | '100') — the rating range
 // is typed in that scale and stored normalised.
-// maturityCounts: the cellar statistics' maturity buckets ({ peak, early,
-// late, declining, notReady, noProfile }) — rendered beside each maturity
-// pill so "Late (4) / Declining (0)" answers the question before the filter
-// is applied. null hides the counts (cross-cellar scope has no single stats).
+// maturityCounts: bottles per maturity stage ({ peak, early, late, declining,
+// notReady, noProfile } from GET /api/cellars/:id/maturity-counts — not the
+// statistics) — rendered beside each maturity pill so "Late (4) / Declining
+// (0)" answers the question before the filter is applied. null hides the
+// counts (the cross-cellar scope has none).
 function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, facetMeta, bottlesTotal, showRatingMaturity = true, showUnplaced = false, showReserved = false, storage = null, ratingScale = '5', maturityCounts = null }) {
   const { t } = useTranslation();
 
   // baseFacets = all options in the cellar (unfiltered) — used to LIST available pills
-  // facets = filtered counts — used to show how many match the current filter combination
+  // facets = the counts: a field with no choice made counts under every filter;
+  // a field with choices counts under every OTHER filter (the server counts it
+  // without its own), so "France (32)" with Red chosen means 32 red bottles
   const allFacets = baseFacets || facets;
 
   const toggle = (key, value) => {
@@ -187,26 +190,27 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
     (filters.vintage?.length || 0) + (filters.minRating || filters.maxRating ? 1 : 0) + (maturitySelected.length ? 1 : 0) +
     (filters.unplaced ? 1 : 0) + (filters.reserved ? 1 : 0) + (filters.storage ? 1 : 0);
 
-  // For a given facet key, decide which counts to use:
-  // - If THIS category has active selections, use baseFacets (so you can still add more)
-  // - Otherwise use filtered facets (cascading from other categories)
-  const countsFor = (facetKey, filterKey) => {
-    const hasSelection = Array.isArray(filters[filterKey]) ? filters[filterKey].length > 0 : !!filters[filterKey];
-    return hasSelection ? (allFacets?.[facetKey] || {}) : (facets?.[facetKey] || {});
-  };
+  // A pill's count: how many bottles choosing it gives, with the other
+  // fields' choices kept. Every pill of the cellar stays listed (allFacets),
+  // so a second country can still be added — a selected field used to show
+  // the whole cellar's counts instead, as if no other filter were on
+  // (support report 2026-10-16).
+  // No counts sent at all (a rack / storage filter the search cannot count):
+  // no numbers and nothing dimmed.
+  const countsFor = (facetKey) => (facets ? facets[facetKey] || {} : null);
 
   return (
     <Modal title={t('cellarDetail.filterModalTitle')} onClose={onClose} wide showClose>
       <div className="bfm-content">
         {/* Wine Type */}
         {allFacets?.type && Object.keys(allFacets.type).length > 0 && (() => {
-          const counts = countsFor('type', 'type');
+          const counts = countsFor('type');
           return (
             <FilterSection label={t('cellarDetail.wineType')} icon="🍷">
               {Object.entries(allFacets.type)
                 .sort(([, a], [, b]) => b - a)
                 .map(([typeName]) => {
-                  const count = counts[typeName] || 0;
+                  const count = counts ? counts[typeName] || 0 : null;
                   const selected = filters.type?.includes(typeName);
                   return (
                     <FilterPill
@@ -225,14 +229,14 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
 
         {/* Country */}
         {allFacets?.countryName && facetMeta?.countries && Object.keys(allFacets.countryName).length > 0 && (() => {
-          const counts = countsFor('countryName', 'country');
+          const counts = countsFor('countryName');
           return (
             <FilterSection label={t('cellarDetail.countryLabel')} icon="🌍">
               {Object.entries(allFacets.countryName)
                 .sort(([, a], [, b]) => b - a)
                 .map(([name]) => {
                   const id = facetMeta.countries[name];
-                  const count = counts[name] || 0;
+                  const count = counts ? counts[name] || 0 : null;
                   const selected = filters.country?.includes(id);
                   return id ? (
                     <FilterPill
@@ -251,14 +255,14 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
 
         {/* Region */}
         {allFacets?.regionName && facetMeta?.regions && Object.keys(allFacets.regionName).length > 0 && (() => {
-          const counts = countsFor('regionName', 'region');
+          const counts = countsFor('regionName');
           return (
             <FilterSection label={t('cellarDetail.regionLabel')} icon="📍" defaultExpanded={false}>
               {Object.entries(allFacets.regionName)
                 .sort(([, a], [, b]) => b - a)
                 .map(([name]) => {
                   const id = facetMeta.regions[name];
-                  const count = counts[name] || 0;
+                  const count = counts ? counts[name] || 0 : null;
                   const selected = filters.region?.includes(id);
                   return id ? (
                     <FilterPill
@@ -281,13 +285,13 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
         {(() => {
           const entries = Object.entries(allFacets?.appellation || {}).filter(([name]) => name !== '');
           if (entries.length === 0) return null;
-          const counts = countsFor('appellation', 'appellation');
+          const counts = countsFor('appellation');
           return (
             <FilterSection label={t('cellarDetail.appellationLabel', 'Appellation')} icon="🏷️" defaultExpanded={false}>
               {entries
                 .sort(([, a], [, b]) => b - a)
                 .map(([name]) => {
-                  const count = counts[name] || 0;
+                  const count = counts ? counts[name] || 0 : null;
                   const selected = filters.appellation?.includes(name);
                   return (
                     <FilterPill
@@ -306,7 +310,7 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
 
         {/* Grapes */}
         {facetMeta?.grapes && Object.keys(facetMeta.grapes).length > 0 && (() => {
-          const counts = countsFor('grapeIds', 'grapes');
+          const counts = countsFor('grapeIds');
           return (
             <FilterSection label={t('cellarDetail.grapeLabel')} icon="🍇" defaultExpanded={false}>
               {Object.entries(facetMeta.grapes)
@@ -316,7 +320,7 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
                   return cb - ca;
                 })
                 .map(([name, grapeId]) => {
-                  const count = counts[grapeId] || 0;
+                  const count = counts ? counts[grapeId] || 0 : null;
                   const selected = filters.grapes?.includes(grapeId);
                   return (
                     <FilterPill
@@ -335,13 +339,13 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
 
         {/* Vintage */}
         {allFacets?.vintage && Object.keys(allFacets.vintage).length > 0 && (() => {
-          const counts = countsFor('vintage', 'vintage');
+          const counts = countsFor('vintage');
           return (
             <FilterSection label={t('cellarDetail.vintageLabel')} icon="📅">
               {Object.entries(allFacets.vintage)
                 .sort(([a], [b]) => b.localeCompare(a))
                 .map(([year]) => {
-                  const count = counts[year] || 0;
+                  const count = counts ? counts[year] || 0 : null;
                   const selected = filters.vintage?.includes(year);
                   return (
                     <FilterPill

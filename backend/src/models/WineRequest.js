@@ -33,6 +33,22 @@ const wineRequestSchema = new mongoose.Schema({
       message: 'Please provide a valid URL'
     }
   },
+  // Every link the requester gave, in their order, sourceUrl first. One link
+  // was all a request could carry; a winery page and a review page give a
+  // curator different evidence (#1460). sourceUrl stays the first of these,
+  // for the readers and the older installs that know only one.
+  // The service (accountOps.collectSourceUrls) is the real gate; the schema
+  // repeats the shape so a later writer that bypasses it cannot store a
+  // javascript: entry the admin page renders as a link.
+  sourceUrls: [{
+    type: String,
+    trim: true,
+    maxlength: 2048,
+    validate: {
+      validator: (v) => !v || /^https?:\/\/.+/.test(v),
+      message: 'Please provide a valid URL'
+    }
+  }],
   suggestedGrapes: [{
     type: String,
     trim: true
@@ -40,6 +56,17 @@ const wineRequestSchema = new mongoose.Schema({
   image: {
     type: String,
     trim: true
+  },
+  // The back label (#1460): often the producer, the appellation and the
+  // importer the front leaves out. Same shapes as image — an http(s) link or
+  // an inline data: image under the cap (services/accountOps
+  // MAX_IMAGE_REF_LENGTH, repeated here) — shown to the reviewing admin beside
+  // the front. Never the wine's picture; on approval it may be published as
+  // one of the wine's gallery photos (routes/admin/wineRequests.js).
+  backImage: {
+    type: String,
+    trim: true,
+    maxlength: 500000
   },
   // What the import FILE said about the wine (CellarTracker / Vivino / Ploc
   // all name these). Plain strings for the curator's benefit — prefilled on
@@ -91,6 +118,31 @@ const wineRequestSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
+  // Self-hosted installs only (Registry Bridge): the id the shared registry
+  // gave this request when it was forwarded there, and when its outcome was
+  // last asked for. A request answered on cellarion.app finishes here too
+  // (services/registryBridge.syncForwardedRequests).
+  registryRequestId: {
+    type: String,
+    default: null,
+    maxlength: 24
+  },
+  registryCheckedAt: {
+    type: Date,
+    default: null
+  },
+  // Registry side (cellarion.app) only, on a request a self-hosted install
+  // filed through the bridge: when that install showed it follows THIS
+  // request — it asked what became of it (GET /v1/requests, v1.252.0+) or
+  // said so when forwarding it. Such an install finishes the request itself
+  // and notifies its own requester, so the decision here does not notify the
+  // key owner a second time (services/wineRequestOps). Null = no sign the
+  // install will ever hear (older than v1.252.0, or forwarded before it
+  // upgraded): the notification here is then the only one, and it stays.
+  installFollowsAt: {
+    type: Date,
+    default: null
+  },
   createdAt: {
     type: Date,
     default: Date.now
@@ -106,6 +158,8 @@ wineRequestSchema.index({ status: 1, createdAt: -1 });
 // Provenance lookups: everything one install or one key sent us.
 wineRequestSchema.index({ bridgeKey: 1, createdAt: -1 }, { sparse: true });
 wineRequestSchema.index({ instanceHost: 1, createdAt: -1 }, { sparse: true });
+// The bridge request sync: pending requests forwarded to the registry.
+wineRequestSchema.index({ status: 1, registryRequestId: 1 }, { partialFilterExpression: { registryRequestId: { $type: 'string' } } });
 
 // Update timestamp on save
 wineRequestSchema.pre('save', function(next) {

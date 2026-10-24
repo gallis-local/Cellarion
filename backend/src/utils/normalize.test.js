@@ -1,5 +1,9 @@
 const {
   normalizeString,
+  normalizeWineName,
+  spellStarGrades,
+  pendingWineKey,
+  draftWineKey,
   tokenize,
   normalizeProducerKey,
   generateWineKey,
@@ -48,6 +52,43 @@ describe('normalizeString', () => {
 
   test('trims leading and trailing whitespace', () => {
     expect(normalizeString('  trimmed  ')).toBe('trimmed');
+  });
+
+  test('still strips stars: they mean nothing outside a wine name (release audit 2026-10-13)', () => {
+    // A star-only placeholder must stay empty, and a footnote star on a
+    // grape / region / country must not make it a different one.
+    expect(normalizeString('*')).toBe('');
+    expect(normalizeString('***')).toBe('');
+    expect(normalizeString('Riesling*')).toBe('riesling');
+    expect(isUnknownName('*')).toBe(true);
+    expect(isRecognizedCountry('France*')).toBe(true);
+  });
+});
+
+describe('normalizeWineName (star grades)', () => {
+  test('reads a run of stars in a name as a grade word', () => {
+    // Molitor's Auslese*, ** and *** are three wines; stripped, they were one.
+    expect(normalizeWineName('Zeltinger Sonnenuhr Riesling Auslese***')).toBe('zeltinger sonnenuhr riesling auslese 3star');
+    expect(normalizeWineName('Auslese ** Goldkapsel')).toBe('auslese 2star goldkapsel');
+    expect(normalizeWineName('Auslese*')).toBe('auslese 1star');
+    expect(normalizeWineName('Auslese ★★★')).toBe('auslese 3star');
+    expect(normalizeWineName('Auslese * * *')).toBe('auslese 3star');
+    expect(normalizeWineName('Auslese**')).not.toBe(normalizeWineName('Auslese***'));
+  });
+
+  test('a name that is only stars is a placeholder, not a grade', () => {
+    expect(normalizeWineName('*')).toBe('');
+    expect(normalizeWineName('* * *')).toBe('');
+    expect(spellStarGrades('***')).toBe('***');
+  });
+
+  test('a run longer than the largest grade is decoration', () => {
+    expect(normalizeWineName('Cuvée ******')).toBe('cuvee');
+  });
+
+  test('is idempotent', () => {
+    const once = normalizeWineName('Zeltinger Auslese** Goldkapsel');
+    expect(normalizeWineName(once)).toBe(once);
   });
 });
 
@@ -255,6 +296,17 @@ describe('generateWineKey', () => {
   test('normalizes all three components', () => {
     const key = generateWineKey('Château Pétrus', 'Pétrus', 'Pomerol');
     expect(key).toBe('petrus:chateau petrus:pomerol');
+  });
+  test('keeps two star grades of one wine apart', () => {
+    expect(generateWineKey('Zeltinger Sonnenuhr Riesling Auslese** Goldkapsel', 'Markus Molitor', 'Mosel'))
+      .not.toBe(generateWineKey('Zeltinger Sonnenuhr Riesling Auslese*** Goldkapsel', 'Markus Molitor', 'Mosel'));
+    expect(generateWineKey('Auslese***', 'Markus Molitor')).toBe('markus molitor:auslese 3star:');
+  });
+
+  test('grades the name only — a star on the producer or appellation is still punctuation', () => {
+    expect(generateWineKey('Auslese**', 'Molitor*', 'Mosel*')).toBe('molitor:auslese 2star:mosel');
+    expect(pendingWineKey('Auslese***', 'u1', 'Mosel')).toBe('pending~u1:auslese 3star:mosel');
+    expect(draftWineKey('Auslese***', 'Markus Molitor', 'u1', 'Mosel')).toBe('draft~u1:markus molitor:auslese 3star:mosel');
   });
 });
 

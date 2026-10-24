@@ -160,7 +160,9 @@ const CASES = [
     id: 'attach-photo',
     prompt: 'Here is the label photo for that Barolo — https://example.com/barolo-label.jpg — put it on the bottle.',
     expect: { anyOf: ['attach_bottle_image', 'search_bottles'] }, // may resolve the bottle id first
-    args: (a) => a.image_url === undefined || /barolo-label/.test(a.image_url),
+    // A "label photo" found on the web is a product image, not a frame-
+    // filling crop of the label: label_only stays off for it.
+    args: (a) => (a.image_url === undefined || /barolo-label/.test(a.image_url)) && a.label_only !== true,
   },
 
   // ── Phase 7: self-service account tools ──
@@ -203,6 +205,13 @@ const CASES = [
     // Continuing the conversation — the model may need the ticket_id first.
     prompt: 'Reply to my open support ticket: thanks for the fix, but the room view still crashes on Firefox.',
     expect: { anyOf: ['reply_to_ticket', 'list_my_tickets'] },
+  },
+  {
+    id: 'close-resolved-ticket',
+    // The user ends the conversation themselves — the model may need the
+    // ticket_id first.
+    prompt: 'Support fixed my import problem — please close that ticket.',
+    expect: { anyOf: ['close_ticket', 'list_my_tickets'] },
   },
   {
     id: 'request-missing-wine',
