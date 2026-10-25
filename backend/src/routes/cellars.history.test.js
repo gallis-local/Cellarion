@@ -262,3 +262,31 @@ describe('GET /api/cellars/multi/history', () => {
     expect(body.total).toBe(7);
   });
 });
+
+// A bottle rated only when it was drunk (support ticket 2026-10-11): the
+// rating filter reads the rating given then, as the statistics count it.
+describe('rating filter on drink-time ratings', () => {
+  test('a bottle rated only when drinking is found by its drink-time rating', async () => {
+    ROWS.push({ _id: id(19), cellar: CELLAR_ID, status: 'drank', consumedReason: 'drank', consumedAt: day(3), consumedRating: 5, consumedRatingScale: '5' });
+    ROWS.push({ _id: id(20), cellar: CELLAR_ID, status: 'drank', consumedReason: 'drank', consumedAt: day(3), consumedRating: 2, consumedRatingScale: '5' });
+    const { body } = await multi('minRating=90');
+    expect(ids(body.bottles)).toContain(id(19));
+    expect(ids(body.bottles)).not.toContain(id(20));
+    const low = await multi('maxRating=40');
+    expect(ids(low.body.bottles)).toEqual([id(20)]);
+  });
+});
+
+describe('the band filter from a statistics band link', () => {
+  test('?ratingBand selects exactly the bottles counted in the band, edges included; a nonsense min is ignored', async () => {
+    // Davis 18.2 is ~80.8: counted in '81-100', so listed there and nowhere else.
+    ROWS.push({ _id: id(21), cellar: CELLAR_ID, status: 'drank', consumedReason: 'drank', consumedAt: day(3), consumedRating: 18.2, consumedRatingScale: '20' });
+    const top = await multi('ratingBand=81-100');
+    expect(ids(top.body.bottles)).toContain(id(21));
+    const below = await multi('ratingBand=61-80');
+    expect(ids(below.body.bottles)).not.toContain(id(21));
+    const all = await multi('');
+    const ignored = await multi('minRating=abc');
+    expect(ids(ignored.body.bottles)).toEqual(ids(all.body.bottles));
+  });
+});

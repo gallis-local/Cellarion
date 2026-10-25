@@ -68,6 +68,10 @@ import { analyzeBinGroups } from './binCodeParser';
  * Returns NaN for empty / unparseable input — drop-in safe replacement
  * for parseFloat on any caller that already handles NaN.
  */
+// Currencies written in front of a price: ISO codes and the usual short
+// forms (Fr. / SFr. for Swiss francs, kr for the Nordic crowns).
+const LEADING_CURRENCY = /^(?:usd|eur|gbp|sek|nok|dkk|isk|chf|aud|nzd|cad|jpy|hkd|sgd|zar|cny|inr|brl|mxn|pln|czk|huf|sfr\.?|fr\.?|kr\.?)\s*(?=[+-]?[\d.,])/i;
+
 export function parseLocaleNumber(input) {
   if (input == null) return NaN;
   let s = String(input).trim();
@@ -75,6 +79,11 @@ export function parseLocaleNumber(input) {
 
   // Strip currency symbols and surrounding whitespace
   s = s.replace(/[$€£¥¢฿₹₽₺]/g, '');
+  // A currency written BEFORE the number ("AUD 45.00", "SEK 199", "Fr. 30") —
+  // only a known currency, so "WS 95" (a critic score) or "Lot 12" stays text.
+  s = s.replace(LEADING_CURRENCY, '');
+  // Swiss thousands: "1'200.00", "1’250".
+  s = s.replace(/(\d)['’](?=\d)/g, '$1');
   // Strip trailing currency words (kr, USD, EUR, etc.) and leading sign words
   s = s.replace(/^[+-]?\s*/, m => m.replace(/\s+/g, ''));
   s = s.replace(/\s*[a-zA-Z]+\s*$/, '');
@@ -123,36 +132,63 @@ export function parseLocaleNumber(input) {
   return isNaN(n) ? NaN : n;
 }
 
+const NAMED_CHAR_REFS = { amp: '&', quot: '"', apos: "'", nbsp: ' ' };
+// Windows-1252 for 0x80–0x9F; \0 marks the five bytes it leaves undefined.
+const CP1252_C1 = '€\0‚ƒ„…†‡ˆ‰Š‹Œ\0Ž\0'
+  + '\0‘’“”•–—˜™š›œ\0žŸ';
+
 /**
- * Parse CSV text into an array of row objects.
- * Handles quoted fields, embedded commas, and newlines within quotes.
- * Production callers should pre-detect the delimiter via detectDelimiter()
- * before calling this (see parseAndMap below).
+ * Turn HTML character references in one field back into the characters they
+ * stand for. CellarTracker writes every letter outside Latin-1 that way
+ * ("Fetească" arrives as "Feteasc&#259;"). Decimal and hex references plus
+ * &amp; &quot; &apos; &nbsp; are decoded in a single pass, so "&amp;#259;"
+ * becomes the literal "&#259;". References in 128–159 mean Windows-1252
+ * characters, as browsers read them.
+ *
+ * Left as written: "<" and ">" (the server strips anything from a "<" to the
+ * next ">" as a tag, so a decoded "score &lt; 95" note would be cut short),
+ * control characters other than tab and line breaks, and invalid code points.
  */
-export function parseCSV(text, delimiter = ',') {
-  // A double-quote is only STRUCTURAL when it sits at a field boundary: an
-  // opening quote immediately follows a delimiter or line-start; a closing
-  // quote is immediately followed by a delimiter, line-end, or a doubled quote
-  // (the RFC 4180 escape). A quote anywhere else — e.g. an inch mark in a
-  // tasting note (Poured a 2" taste) — is a LITERAL character and must NOT
-  // toggle quote state. The old code toggled on every quote, so a single
-  // stray quote left the parser "in quotes" across the row-terminating newline
-  // and swallowed every following row into one merged line.
+export function decodeCharRefs(text) {
+  if (!text || !text.includes('&')) return text;
+  return text.replace(/&(?:#(\d{1,7})|#[xX]([0-9a-fA-F]{1,6})|(amp|quot|apos|nbsp));/g, (ref, dec, hex, named) => {
+    if (named) return NAMED_CHAR_REFS[named];
+    const cp = dec ? parseInt(dec, 10) : parseInt(hex, 16);
+    if (cp >= 0x80 && cp <= 0x9F) return CP1252_C1[cp - 0x80] === '\0' ? ref : CP1252_C1[cp - 0x80];
+    if (cp === 0x3C || cp === 0x3E || cp === 0x7F || (cp < 0x20 && cp !== 0x09 && cp !== 0x0A && cp !== 0x0D)) return ref;
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return ref;
+    return String.fromCodePoint(cp);
+  });
+}
+
+// A double-quote is only STRUCTURAL when it sits at a field boundary: an
+// opening quote immediately follows a delimiter or line-start; a closing
+// quote is immediately followed by a delimiter, line-end, or a doubled quote
+// (the RFC 4180 escape). A quote anywhere else — e.g. an inch mark in a
+// tasting note (Poured a 2" taste) — is a LITERAL character and must NOT
+// toggle quote state. Toggling on every quote would leave a single stray
+// quote "in quotes" across the row-terminating newline and swallow every
+// following row into one merged line.
+
+/**
+ * Pass 1 of CSV parsing: split text into logical lines. Newlines inside a
+ * properly-quoted field are kept as content; quote characters are preserved
+ * for splitCsvFields to re-parse. Leading blank lines are dropped.
+ */
+function splitLogicalLines(text, delimiter) {
   const isBoundary = (c) => c === undefined || c === delimiter || c === '\n' || c === '\r';
 
   const lines = [];
   let current = '';
   let inQuotes = false;
 
-  // Pass 1: split into logical lines. Newlines inside a properly-quoted field
-  // are kept as content; quote characters are preserved for pass 2 to re-parse.
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (ch === '"') {
       if (inQuotes) {
         if (text[i + 1] === '"') {
           current += '""';
-          i++; // keep the escaped pair intact for splitLine
+          i++; // keep the escaped pair intact for splitCsvFields
         } else if (isBoundary(text[i + 1])) {
           inQuotes = false; // closing quote
           current += '"';
@@ -175,42 +211,62 @@ export function parseCSV(text, delimiter = ',') {
     }
   }
   if (current.trim()) lines.push(current);
+  return lines;
+}
 
+/**
+ * Pass 2 of CSV parsing: split one logical line into fields, honoring quotes
+ * with the same boundary rule so an unbalanced quote can't eat the delimiters
+ * after it. Character references are decoded per field (decodeCharRefs),
+ * after the split, so an encoded comma or quote can never change the row's
+ * shape. `trim: false` keeps each field's surrounding whitespace.
+ */
+function splitCsvFields(line, delimiter, { trim = true } = {}) {
+  const fields = [];
+  let field = '';
+  let inQ = false;
+  const finish = (value) => (trim ? decodeCharRefs(value).trim() : decodeCharRefs(value));
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQ) {
+        if (line[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else if (line[i + 1] === undefined || line[i + 1] === delimiter) {
+          inQ = false; // closing quote
+        } else {
+          field += '"'; // stray quote inside the field — literal
+        }
+      } else if (field === '') {
+        inQ = true; // opening quote at field start
+      } else {
+        field += '"'; // stray quote mid-field — literal
+      }
+    } else if (c === delimiter && !inQ) {
+      fields.push(finish(field));
+      field = '';
+    } else {
+      field += c;
+    }
+  }
+  fields.push(finish(field));
+  return fields;
+}
+
+/**
+ * Parse CSV text into an array of row objects.
+ * Handles quoted fields, embedded commas, and newlines within quotes.
+ * Character references are decoded per field (decodeCharRefs), after the
+ * split, so an encoded comma or quote can never change the row's shape.
+ * Production callers should pre-detect the delimiter via detectDelimiter()
+ * before calling this (see parseAndMap below).
+ */
+export function parseCSV(text, delimiter = ',') {
+  const lines = splitLogicalLines(text, delimiter);
   if (lines.length < 2) return [];
 
-  // Pass 2: split one logical line into fields, honoring quotes with the same
-  // boundary rule so an unbalanced quote can't eat the delimiters after it.
-  const splitLine = (line) => {
-    const fields = [];
-    let field = '';
-    let inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const c = line[i];
-      if (c === '"') {
-        if (inQ) {
-          if (line[i + 1] === '"') {
-            field += '"';
-            i++;
-          } else if (line[i + 1] === undefined || line[i + 1] === delimiter) {
-            inQ = false; // closing quote
-          } else {
-            field += '"'; // stray quote inside the field — literal
-          }
-        } else if (field === '') {
-          inQ = true; // opening quote at field start
-        } else {
-          field += '"'; // stray quote mid-field — literal
-        }
-      } else if (c === delimiter && !inQ) {
-        fields.push(field.trim());
-        field = '';
-      } else {
-        field += c;
-      }
-    }
-    fields.push(field.trim());
-    return fields;
-  };
+  const splitLine = (line) => splitCsvFields(line, delimiter);
 
   const headers = splitLine(lines[0]);
   const rows = [];
@@ -252,6 +308,41 @@ export function detectFormat(headers) {
   if (h.has('wine') && h.has('vintage') && (h.has('locale') || h.has('bin'))) return 'cellartracker';
 
   return 'generic';
+}
+
+/**
+ * The logical records of an Oeno export. A quoted Bottle Note may span lines,
+ * but the bare dialect does not escape a quote at the start of a cell
+ * ("Reserve" bottle for Dad), and the CSV rule would then keep that quote
+ * open to the end of the file. So a record that spans lines is accepted only
+ * when it splits into exactly as many cells as its section's header row and
+ * none of its continuation lines is a whole row by itself (a quote closing at
+ * a later row's note can make the count match). Any other one is a runaway
+ * quote: its first line stands alone, as a line-by-line split reads it, and
+ * the records are read again from the line after it.
+ */
+function splitOenoRecords(text) {
+  const records = [];
+  let headerCells = 0; // cells in the current section's header row
+  let rest = text;
+  const swallowsRows = (record) => record.split('\n').slice(1)
+    .some((line) => splitCSVLine(line.replace(/\r$/, '')).length === headerCells);
+  for (;;) {
+    const lines = splitLogicalLines(rest, ',');
+    let runaway = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const cells = splitCSVLine(lines[i]);
+      const first = (cells[0] || '').trim();
+      if (first === 'Cabinet ID' || first === 'Bottle ID') headerCells = cells.length;
+      if (lines[i].includes('\n') && (cells.length !== headerCells || swallowsRows(lines[i]))) { runaway = i; break; }
+      records.push(lines[i]);
+    }
+    if (runaway === -1) return records;
+    const record = lines[runaway];
+    const cut = record.indexOf('\n');
+    records.push(record.slice(0, cut).replace(/\r$/, ''));
+    rest = [record.slice(cut + 1), ...lines.slice(runaway + 1)].join('\n');
+  }
 }
 
 /**
@@ -351,18 +442,6 @@ export function summariseRacks(items) {
 }
 
 /**
- * Normalise a bottle-size value. Accepts strings like "750ml", "1.5L", or a
- * bare number ("750" / 750) which is treated as millilitres.
- */
-function normaliseBottleSize(value) {
-  if (value === undefined || value === null || value === '') return undefined;
-  const s = String(value).trim();
-  if (!s) return undefined;
-  if (/^\d+(\.\d+)?$/.test(s)) return `${s}ml`;
-  return s;
-}
-
-/**
  * Decode a raw import file (ArrayBuffer/Uint8Array) into text with encoding
  * detection. CellarTracker's browser-UI export is Windows-1252 — reading it
  * as UTF-8 silently corrupts every accented producer (Pétrus → P�trus).
@@ -423,18 +502,118 @@ export function detectDelimiter(text) {
 // ── Shared row-mapper helpers ───────────────────────────────────────────────
 
 /**
+ * A header as a person may have typed it, reduced to one form: case, spaces
+ * at either end, and runs of spaces, "_", "-" or "." between words do not
+ * matter ("Purchase_Price", " PRICE ", "purchase-price" → "purchase price").
+ */
+export function normHeader(header) {
+  return String(header).replace(/^﻿/, '')
+    .replace(/([a-z])([A-Z])/g, '$1 $2') // "PurchasePrice" → "Purchase Price"
+    .toLowerCase().replace(/[\s_.-]+/g, ' ').trim();
+}
+
+/**
  * Build a header-tolerant accessor over a parsed CSV row: get(keys) returns
- * the first non-empty value among the given header names (each also tried
- * lowercased), trimmed — or '' when none match.
+ * the first non-empty value among the given header names, trimmed — or ''
+ * when none match. Each name is tried as written, lowercased, and then in its
+ * normHeader form against the row's headers in theirs (forum feedback
+ * 2026-10-12: a price column that was not spelled exactly "Price" was
+ * dropped without a word).
  */
 function makeGetter(row) {
+  let normalized = null; // header form → value, built on first use
+  const loose = (k) => {
+    if (!normalized) {
+      normalized = new Map();
+      for (const [header, value] of Object.entries(row)) {
+        const key = normHeader(header);
+        if (value && String(value).trim() && !normalized.has(key)) normalized.set(key, String(value));
+      }
+    }
+    return normalized.get(normHeader(k));
+  };
+  // Name by name, in the caller's order of preference: an earlier name
+  // written loosely ("purchase_date") beats a later one written exactly
+  // ("date") — the order is the priority (release audit 2026-10-12).
   return (keys) => {
     for (const k of keys) {
-      const val = row[k] || row[k.toLowerCase()];
+      const val = row[k] || row[k.toLowerCase()] || loose(k);
       if (val) return val.trim();
     }
     return '';
   };
+}
+
+// ── Prices ──────────────────────────────────────────────────────────────────
+
+// The names a purchase-price column goes by in files people write by hand or
+// export from other apps, matched in normHeader form. "Value" is left out on
+// purpose: in a hand-made file it is a valuation, not what was paid.
+// Most specific first: the first column whose value reads as a number wins,
+// so a per-bottle price beats a bare "Cost" (often per case). A bare "Paid"
+// is left out — it is as often a yes/no or 0/1 column as a price.
+export const PRICE_HEADERS = [
+  'Price per Bottle', 'Price/Bottle', 'Bottle Price', 'Unit Price', 'Purchase Price',
+  'Price Paid', 'Buy Price', 'Price', 'Cost per Bottle', 'Unit Cost', 'Purchase Cost',
+  'Pris', 'Inköpspris', 'Prix', "Prix d'achat", 'Preis', 'Kaufpreis', 'Einkaufspreis',
+  'Prezzo', 'Precio', 'Prijs', 'Hinta', 'Cost',
+];
+const PRICE_HEADER_SET = new Set(PRICE_HEADERS.map(normHeader));
+
+// The first price column whose value reads as a number — "Paid" is the price
+// in one file and a yes/no column in the next, and must not hide a real one.
+function firstPrice(get) {
+  for (const k of PRICE_HEADERS) {
+    const text = get([k]);
+    if (text && !looksLikeDate(text) && !isNaN(parseLocaleNumber(text))) return text;
+  }
+  return '';
+}
+
+// "2021-09-12", "12/09/2021", "12.09.21" — a date read as a number would be a
+// price of 2021 or 12.
+function looksLikeDate(text) {
+  return /^\d{4}-\d{1,2}-\d{1,2}/.test(text) || /^\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}$/.test(text.trim());
+}
+
+// Currency marks a price header may carry. "$" and "kr" are each used by
+// several currencies, so they are recognised as a currency mark but do not
+// set one.
+const HEADER_CURRENCY_SYMBOLS = { '€': 'EUR', '£': 'GBP', '¥': 'JPY', '$': null, 'kr': null };
+const HEADER_CURRENCY_CODES = new Set([
+  'USD', 'EUR', 'GBP', 'SEK', 'NOK', 'DKK', 'CHF', 'CAD', 'AUD', 'NZD', 'JPY', 'HKD', 'SGD', 'ZAR',
+]);
+
+/**
+ * A price column that names its currency in the header: "Price (AUD)",
+ * "Price [EUR]", "Price in GBP", "Cost €", "Pris kr". Returns the header's
+ * value and the currency it names ({ value, currency }), or null. A currency
+ * mark shared by several currencies ($, kr) gives currency undefined.
+ */
+export function priceFromCurrencyHeader(row) {
+  for (const [header, value] of Object.entries(row || {})) {
+    if (!value || !String(value).trim()) continue;
+    const m = /^(.*?)\s*(?:[([]\s*(?:in\s+)?([^)\]]+?)\s*[)\]]|\s(?:in\s+)?([A-Za-z]{3}|kr)|\s*([€£¥$]))\s*$/i.exec(String(header).replace(/^﻿/, '').trim());
+    if (!m || !PRICE_HEADER_SET.has(normHeader(m[1]))) continue;
+    const mark = (m[2] || m[3] || m[4] || '').trim();
+    const code = mark.toUpperCase();
+    let currency;
+    if (HEADER_CURRENCY_CODES.has(code)) currency = code;
+    else if (Object.prototype.hasOwnProperty.call(HEADER_CURRENCY_SYMBOLS, mark.toLowerCase())) currency = HEADER_CURRENCY_SYMBOLS[mark.toLowerCase()] || undefined;
+    else continue; // "(per case)", "(incl. tax)" — not a currency mark
+    return { value: String(value).trim(), currency };
+  }
+  return null;
+}
+
+// A header that reads like a price column, in any of the languages above —
+// for the "prices were not read" warning, not for reading values.
+const PRICE_LIKE_HEADER = /\b(price|prices|cost|pris|prix|preis|prezzo|precio|prijs|hinta|paid|kostnad|inköpspris|kaufpreis|einkaufspreis)\b/;
+// A valuation is not what was paid: "Market price", "Value", "Estimate".
+const VALUATION_HEADER = /\b(market|value|valuation|estimate|estimated|auction|retail)\b/;
+export function looksLikePriceHeader(header) {
+  const h = normHeader(header);
+  return PRICE_LIKE_HEADER.test(h) && !VALUATION_HEADER.test(h);
 }
 
 /**
@@ -997,11 +1176,12 @@ function ctCommonFields(get, { sizeKeys = ['Size'] } = {}) {
 }
 
 // -- Per-table mappers (WebQuery fingerprinted files) ------------------------
-// Items flagged `_ctPending` are pending (undelivered) purchases — Cellarion
-// has no on-order state, so parseAndMap skips them and reports a warning.
+// Items flagged `_ctPending` are pending (undelivered) purchases. parseAndMap
+// imports them as bottles ON ORDER (`onOrder: true`): kept out of the cellar
+// until the user marks them as arrived, and reported in a warning.
 
 /** List: one row per WINE with Quantity (+ Pending). Quantity expands to N
- *  bottles; Quantity 0 + Pending > 0 rows are on-order only → skipped. */
+ *  bottles in the cellar; Pending adds that many bottles on order. */
 function mapCtListRow(row) {
   const get = makeGetter(row);
   const qty = parseInt(get(['Quantity']), 10);
@@ -1011,15 +1191,20 @@ function mapCtListRow(row) {
     ...ctMoney(get),
     quantity: Number.isNaN(qty) ? 1 : qty,
   };
-  if (item.quantity === 0 && pending > 0) {
-    item._ctPending = true;
-    item._ctPendingCount = pending;
+  if (pending > 0) {
+    if (item.quantity === 0) {
+      item._ctPending = true;
+      item._ctPendingCount = pending;
+    } else {
+      // Some in the cellar, some still on their way: both come across.
+      item._ctAlsoPending = pending;
+    }
   }
   return item;
 }
 
 /** Inventory: one row per physical in-cellar bottle (plus pending rows,
- *  marked Location "(pending)", which are skipped). */
+ *  marked Location "(pending)", which come in on order). */
 function mapCtInventoryRow(row) {
   const get = makeGetter(row);
   const item = {
@@ -1037,13 +1222,20 @@ function mapCtInventoryRow(row) {
 }
 
 /** Bottles: one row per bottle in ANY state.
- *  BottleState: -1 = pending (skip), 0 = consumed (history), 1 = in cellar. */
+ *  BottleState: -1 = pending (on order), 0 = consumed (history), 1 = in cellar. */
 function mapCtBottlesRow(row) {
   const get = makeGetter(row);
   const common = ctCommonFields(get, { sizeKeys: ['BottleSize', 'Size'] });
   const state = get(['BottleState']).trim();
   if (state === '-1') {
-    return { ...common, quantity: 1, _ctPending: true };
+    return {
+      ...common,
+      ...ctMoney(get, { priceKeys: ['BottleCost'], currencyKeys: ['BottleCostCurrency'] }),
+      quantity: 1,
+      purchaseDate: ctDate(get(['PurchaseDate'])),
+      purchaseLocation: ctClean(get(['Store', 'StoreName'])),
+      _ctPending: true,
+    };
   }
   const qty = parseInt(get(['Quantity']), 10);
   const item = {
@@ -1082,17 +1274,20 @@ function mapCtConsumedRow(row) {
 
 /** Purchase / Pending: one row per purchase ORDER with Quantity — expanded.
  *  The two tables share a schema; a file whose rows are all Delivered=False
- *  is relabeled 'pending' by parseAndMap. */
+ *  is relabeled 'pending' by parseAndMap. A row not delivered yet comes in
+ *  on order. */
 function mapCtPurchaseRow(row) {
   const get = makeGetter(row);
   const qty = parseInt(get(['Quantity']), 10);
-  return {
+  const item = {
     ...ctCommonFields(get),
     ...ctMoney(get),
     quantity: Number.isNaN(qty) || qty < 1 ? 1 : qty,
     purchaseDate: ctDate(get(['PurchaseDate'])),
     purchaseLocation: ctClean(get(['StoreName', 'Store'])),
   };
+  if ((get(['Delivered']) || '').trim().toLowerCase() === 'false') item._ctPending = true;
+  return item;
 }
 
 const CT_TABLE_MAPPERS = {
@@ -1101,6 +1296,7 @@ const CT_TABLE_MAPPERS = {
   bottles: mapCtBottlesRow,
   consumed: mapCtConsumedRow,
   purchase: mapCtPurchaseRow,
+  pending: mapCtPurchaseRow,
 };
 
 /**
@@ -1173,7 +1369,12 @@ function mapCellarTrackerRow(row) {
 function mapGenericRow(row) {
   const get = makeGetter(row);
 
-  const price = parseLocaleNumber(get(['Price', 'price', 'Cost', 'cost']));
+  // Any of the usual price names; failing that, a price column that names its
+  // currency in the header ("Price (AUD)") — which then also gives the
+  // currency when the file has no Currency column.
+  const priceText = firstPrice(get);
+  const headerPrice = priceText ? null : priceFromCurrencyHeader(row);
+  const price = parseLocaleNumber(priceText || headerPrice?.value);
   const rating = parseLocaleNumber(get(['Rating', 'rating', 'Score', 'score']));
   const qty = parseInt(get(['Quantity', 'quantity', 'Qty', 'qty', 'Count', 'count']), 10);
 
@@ -1201,8 +1402,8 @@ function mapGenericRow(row) {
     appellation,
     type: mapWineType(get(['Type', 'type', 'Color', 'Colour', 'Category', 'category'])),
     price: isNaN(price) ? undefined : price,
-    currency: get(['Currency', 'currency']) || undefined,
-    bottleSize: normaliseBottleSize(get(['Size', 'size', 'Bottle Size', 'BottleSize'])) || '750ml',
+    currency: get(['Currency', 'currency']) || headerPrice?.currency || undefined,
+    bottleSize: normalizeBottleSize(get(['Size', 'size', 'Bottle Size', 'BottleSize'])) || '750ml',
     quantity: isNaN(qty) || qty < 1 ? 1 : qty,
     purchaseDate: get(['Purchase Date', 'PurchaseDate', 'Date', 'date']),
     purchaseLocation: get(['Store', 'store', 'Purchase Location', 'Vendor', 'vendor']),
@@ -1388,7 +1589,8 @@ export function parseJSON(text) {
  */
 export function parseOenoExport(text) {
   const cleaned = text.replace(/^\uFEFF/, '');
-  const lines = cleaned.split(/\r?\n/);
+  // Logical records, not raw lines: a quoted Bottle Note may span lines.
+  const lines = splitOenoRecords(cleaned);
   const boundary = detectOenoExportBoundary(lines);
   if (boundary === -1) {
     return null;
@@ -1408,8 +1610,9 @@ export function parseOenoExport(text) {
   for (let i = 0; i < boundary; i++) {
     if (firstCell(lines[i]) === 'Cabinet ID') { cabinetHeader = i; break; }
   }
+  const cabinetCells = cabinetHeader === -1 ? 0 : splitCSVLine(lines[cabinetHeader]).length;
   for (let i = cabinetHeader + 1; i < boundary; i++) {
-    const cells = splitCSVLine(lines[i]);
+    const cells = oenoCells(lines[i], cabinetCells);
     if (!cells[0] || !cells[0].trim()) continue;
     const cabinetId = cells[0].trim();
     if (!cabinetId) continue;
@@ -1492,7 +1695,7 @@ export function parseOenoExport(text) {
   const occupiedByRack = new Map();
 
   for (let i = boundary + 1; i < lines.length; i++) {
-    const cells = splitCSVLine(lines[i]);
+    const cells = oenoCells(lines[i], bottleHeaders.length);
     if (!cells[idx.bottleId] || !cells[idx.bottleId].trim()) continue;
 
     const cabinetIdRaw = (cells[idx.cabinetId] || '').trim();
@@ -1688,32 +1891,41 @@ function geometryForColumn(col, rows) {
 
 /**
  * Split one CSV line respecting double-quoted fields (which may contain
- * commas). Same logic as parseCSV's inner splitLine but exposed for the
- * Oeno-export parser to use on individual lines.
+ * commas). parseCSV's field splitter without the trim, for the Oeno-export
+ * parser, which trims each cell itself.
  */
 function splitCSVLine(line, delimiter = ',') {
   if (!line) return [];
+  return splitCsvFields(line, delimiter, { trim: false });
+}
+
+/**
+ * The cells of one Oeno row. The boundary-aware split keeps a stray inch mark
+ * literal, but in the bare dialect it also keeps a quote at the start of a
+ * cell open when its closing quote is not at a boundary ("Reserve" bottle),
+ * and the row then comes out short. When the row does not split into the
+ * header's number of cells, a split that toggles on every quote is tried, the
+ * way the bare dialect was always read, and kept when it does.
+ */
+function oenoCells(line, expected) {
+  const cells = splitCSVLine(line);
+  if (!expected || cells.length === expected) return cells;
   const fields = [];
   let field = '';
   let inQ = false;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
     if (c === '"') {
-      if (inQ && line[i + 1] === '"') {
-        field += '"';
-        i++;
-      } else {
-        inQ = !inQ;
-      }
-    } else if (c === delimiter && !inQ) {
-      fields.push(field);
+      if (inQ && line[i + 1] === '"') { field += '"'; i++; } else inQ = !inQ;
+    } else if (c === ',' && !inQ) {
+      fields.push(decodeCharRefs(field));
       field = '';
     } else {
       field += c;
     }
   }
-  fields.push(field);
-  return fields;
+  fields.push(decodeCharRefs(field));
+  return fields.length === expected ? fields : cells;
 }
 
 // ── CellarTracker Location/Bin → rack auto-map ─────────────────────────────
@@ -1758,8 +1970,8 @@ export function applyCtRackAutoMap(items, opts = {}) {
     if (!item || typeof item !== 'object') return;
     const loc = (item._ctLocation || '').trim();
     if (!loc) return;
-    // Never re-place consumed history or items that already carry a rack signal.
-    if (item.addToHistory || item.rackName || item.rackPosition || item.row || item.col) return;
+    // Never re-place consumed history, bottles still on order, or items that already carry a rack signal.
+    if (item.addToHistory || item.onOrder || item.rackName || item.rackPosition || item.row || item.col) return;
     if (!groupIndexes.has(loc)) groupIndexes.set(loc, []);
     groupIndexes.get(loc).push(i);
   });
@@ -2273,8 +2485,8 @@ export function parsePlocFiles(texts) {
  *   `warnings` are non-blocking notices:
  *     { code: 'ct-truncated' }                       \u2014 exactly 25 data rows
  *       (CellarTracker's "Only wines on this page" default page size)
- *     { code: 'ct-pending-skipped', count, wines }   \u2014 undelivered bottles
- *       skipped (Cellarion has no on-order state)
+ *     { code: 'ct-pending-on-order', count, wines }  \u2014 undelivered bottles
+ *       imported ON ORDER (onOrder: true), kept out of the cellar until arrival
  *     { code: 'no-identity-skipped', count }         \u2014 rows with neither a
  *       wine name nor a producer skipped (e.g. failed Vivino scans)
  * @throws Error with code 'ct-error-page' for HTML error pages, or
@@ -2335,20 +2547,31 @@ export function parseAndMap(text, forceFormat, opts = {}) {
 
   // Map rows and expand quantity > 1 into individual items
   const items = [];
-  const ctPendingSkipped = { count: 0, wines: [] };
+  const ctPendingOnOrder = { count: 0, wines: [] };
+  const notePending = (wineName, count) => {
+    ctPendingOnOrder.count += count;
+    if (wineName && !ctPendingOnOrder.wines.includes(wineName)) ctPendingOnOrder.wines.push(wineName);
+  };
   let noIdentitySkipped = 0;
   for (const row of rows) {
     const mapped = mapper(row);
 
-    // Pending (undelivered) CT bottles: Cellarion has no on-order state \u2014
-    // skip them but keep an honest count for the review-step warning.
+    // Pending (undelivered) CT bottles come in ON ORDER: kept out of the
+    // cellar until marked as arrived. Not in a rack yet, so no placement.
     if (mapped._ctPending) {
-      ctPendingSkipped.count += mapped._ctPendingCount || 1;
-      if (mapped.wineName && !ctPendingSkipped.wines.includes(mapped.wineName)) {
-        ctPendingSkipped.wines.push(mapped.wineName);
-      }
-      continue;
+      if (mapped._ctPendingCount) mapped.quantity = mapped._ctPendingCount;
+      mapped.onOrder = true;
+      delete mapped._ctPending;
+      delete mapped._ctPendingCount;
+      delete mapped._ctLocation;
+      delete mapped._ctBin;
+      // Not in the cellar yet, so in no place of it (CT writes "(pending)").
+      delete mapped.location;
     }
+    // A List row with bottles in the cellar AND more pending: the pending
+    // ones are pushed as on-order copies after the in-cellar expansion.
+    const alsoPending = mapped._ctAlsoPending || 0;
+    delete mapped._ctAlsoPending;
 
     // Normalise dates (mirror parseJSON)
     if (mapped.purchaseDate) mapped.purchaseDate = tryParseDate(mapped.purchaseDate);
@@ -2367,6 +2590,8 @@ export function parseAndMap(text, forceFormat, opts = {}) {
     // doc has always said wineName is required; now the gate agrees.
     // Name-only rows (no producer) still pass \u2014 those resolve fine.
     if (!mapped.wineName) { noIdentitySkipped++; continue; }
+    // Counted only once the row is known to import (a nameless one is skipped).
+    if (mapped.onOrder) notePending(mapped.wineName, mapped.quantity ?? 1);
 
     // `?? 1` not `|| 1`: CT List rows can legitimately carry quantity 0
     // (fully pending wines) and must expand to zero items. All other
@@ -2376,6 +2601,13 @@ export function parseAndMap(text, forceFormat, opts = {}) {
 
     for (let q = 0; q < qty; q++) {
       items.push({ ...mapped });
+    }
+    if (alsoPending > 0) {
+      notePending(mapped.wineName, alsoPending);
+      const { _ctLocation, _ctBin, location, ...rest } = mapped;
+      for (let q = 0; q < alsoPending; q++) {
+        items.push({ ...rest, onOrder: true });
+      }
     }
   }
 
@@ -2398,11 +2630,11 @@ export function parseAndMap(text, forceFormat, opts = {}) {
   if (format === 'cellartracker' && rows.length === 25) {
     warnings.push({ code: 'ct-truncated' });
   }
-  if (ctPendingSkipped.count > 0) {
+  if (ctPendingOnOrder.count > 0) {
     warnings.push({
-      code: 'ct-pending-skipped',
-      count: ctPendingSkipped.count,
-      wines: ctPendingSkipped.wines,
+      code: 'ct-pending-on-order',
+      count: ctPendingOnOrder.count,
+      wines: ctPendingOnOrder.wines,
     });
   }
   if (noIdentitySkipped > 0) {
@@ -2411,6 +2643,16 @@ export function parseAndMap(text, forceFormat, opts = {}) {
   const vintageMissing = items.filter((it) => it.vintageMissing).length;
   if (vintageMissing > 0) {
     warnings.push({ code: 'vintage-missing', count: vintageMissing });
+  }
+  // A filled-in column that reads like a price, and not one bottle got a
+  // price from it: its name was not one we know, or its values did not read
+  // as numbers. Said out loud instead of importing every bottle without its
+  // price in silence (forum feedback 2026-10-12).
+  if (items.length > 0 && !items.some((it) => it.price != null)) {
+    // "0" is how CellarTracker writes "no price entered" — not a price left unread.
+    const filled = (v) => { const s = v == null ? '' : String(v).trim(); return s !== '' && parseLocaleNumber(s) !== 0; };
+    const priceColumn = headers.find((h) => looksLikePriceHeader(h) && rows.some((r) => filled(r[h])));
+    if (priceColumn) warnings.push({ code: 'price-not-read', column: String(priceColumn).trim() });
   }
 
   return {

@@ -2,17 +2,19 @@ const express = require('express');
 const { requireAuth } = require('../middleware/auth');
 const { idempotency } = require('../middleware/idempotency');
 const { requireCellarAccess } = require('../middleware/cellarAccess');
+const { ROLE_LEVELS } = require('../middleware/bottleAccess');
 const Rack = require('../models/Rack');
 const { RACK_TYPES } = require('../models/Rack');
 const Cellar = require('../models/Cellar');
 const Bottle = require('../models/Bottle');
 const CellarLayout = require('../models/CellarLayout');
 const { getCellarRole } = require('../utils/cellarAccess');
-const { getMaxPosition, validateDoubleHeightRows, validateCabinetConfig, cabinetShelfAlternate } = require('../utils/rackGeometry');
+const { getMaxPosition, validateDoubleHeightRows, validateCabinetConfig, cabinetShelfAlternate, cabinetRows, modularTotalSlots } = require('../utils/rackGeometry');
 const {
   createGridRack, placeBottleInRack, clearRackSlot,
+  ARRANGE_SLOT_POPULATE, usablePositionCount,
   buildAnnotatedEntries, validateArrangementTarget, applyArrangement,
-  normalizeRackGroup,
+  normalizeRackGroup, moveRackBottles,
 } = require('../services/rackOps');
 const { ARRANGE_STRATEGIES, buildArrangePlan } = require('../utils/rackArrange');
 const { isValidId } = require('../utils/validation');
@@ -49,6 +51,12 @@ const SLOT_BOTTLES = {
 };
 
 const MAX_MODULES = 50;
+// A modular rack's slots in total. Within the per-module bounds alone, 50
+// modules of a 20×20 cube with 10×10 cells is two million slots — which the
+// racks page, the print map and the room then draw, one by one, for every
+// member of the cellar (audit 2026-10-14). The largest real cabinets are a
+// few thousand.
+const MAX_RACK_SLOTS = 10000;
 // Mirrors the Rack schema's rows/cols bounds (models/Rack.js). Checked at the
 // request boundary because geometry runs on the values BEFORE save() would
 // reject them (security audit 2026-09-02 D14-1).
@@ -80,6 +88,27 @@ async function withMaturity(rackOrRacks) {
 // typeConfig.doubleHeightRows request validation lives in utils/rackGeometry
 // (validateDoubleHeightRows) — shared with services/rackOps.createGridRack so
 // the create path and the update route below can't drift.
+
+// The routes under /:id reach the cellar through the rack, so they answer the
+// way requireCellarAccess does: a missing or soft-deleted cellar, and a caller
+// with no role on it, read exactly like a rack that does not exist (no
+// existence oracle for rack ids; a deleted cellar's racks stay frozen until
+// restore or purge). Only a member below minRole gets the 403, with the
+// route's own message. Sends the refusal itself and returns null; otherwise
+// returns the caller's role.
+async function rackAccess(req, res, rack, minRole, deniedMessage) {
+  const cellarDoc = await Cellar.findById(rack.cellar);
+  const role = cellarDoc && !cellarDoc.deletedAt ? getCellarRole(cellarDoc, req.user.id) : null;
+  if (!role) {
+    res.status(404).json({ error: 'Rack not found' });
+    return null;
+  }
+  if ((ROLE_LEVELS[role] || 0) < (ROLE_LEVELS[minRole] || 0)) {
+    res.status(403).json({ error: deniedMessage });
+    return null;
+  }
+  return role;
+}
 
 // GET /api/racks/nfc/:id  — resolve a rack ID to its cellar (for NFC tag redirect)
 // Requires auth so only logged-in users can follow NFC links.
@@ -159,6 +188,9 @@ router.post('/', requireCellarAccess('editor'), async (req, res) => {
           return res.status(400).json({ error: `Invalid module type: ${m.type}` });
         }
       }
+      if (modularTotalSlots(modules) > MAX_RACK_SLOTS) {
+        return res.status(400).json({ error: `A rack can hold at most ${MAX_RACK_SLOTS} slots in total` });
+      }
       // Racks are owned by the cellar owner
       const rack = new Rack({
         cellar: req.cellar._id,
@@ -196,11 +228,7 @@ router.put('/:id', async (req, res) => {
     const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null });
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
 
-    const cellarDoc = await Cellar.findById(rack.cellar);
-    const role = getCellarRole(cellarDoc, req.user.id);
-    if (!role || role === 'viewer') {
-      return res.status(403).json({ error: 'Not authorized to modify this rack' });
-    }
+    if (!(await rackAccess(req, res, rack, 'editor', 'Not authorized to modify this rack'))) return;
 
     const { name, type, rows, cols, typeConfig, isModular, modules, rfidTag, zones, group } = req.body;
 
@@ -248,6 +276,9 @@ router.put('/:id', async (req, res) => {
         if ((m.rows !== undefined && !isRackDim(m.rows)) || (m.cols !== undefined && !isRackDim(m.cols))) {
           return res.status(400).json({ error: `Module rows and cols must be whole numbers between 1 and ${MAX_RACK_DIM}` });
         }
+      }
+      if (modularTotalSlots(modules) > MAX_RACK_SLOTS) {
+        return res.status(400).json({ error: `A rack can hold at most ${MAX_RACK_SLOTS} slots in total` });
       }
     } else if (type && !RACK_TYPES.includes(type)) {
       return res.status(400).json({ error: `Invalid rack type. Must be one of: ${RACK_TYPES.join(', ')}` });
@@ -301,15 +332,35 @@ router.put('/:id', async (req, res) => {
       }
     }
 
-    // Two-deep is drawing-only on a plain cabinet, but on one whose rows
-    // alternate it decides which rows are the narrow ones (cabinetRowWidth),
-    // so flipping it renumbers every placed bottle. Fixed once bottles are in.
-    if (typeConfig && !rack.isModular && (type !== undefined ? type : rack.type) === 'cabinet' && (rack.slots || []).length > 0) {
+    // Two deep and how the bottles lie are mostly drawing, and the edit form
+    // offers them on a loaded cabinet for that reason. But each can change a
+    // row's width (rackGeometry.cabinetRowWidth), and the widths ARE the
+    // numbering: two deep decides which rows of an alternating bay are the
+    // narrow ones, and on a stacked one-deep shelf a bottle across the front
+    // leaves one bottle fewer on each level above. Then every slot after it
+    // would be renumbered under the bottles, zones and switched-off slots
+    // already numbered. So on a cabinet holding any of those, the widths with
+    // the stored two deep and lie must equal the new ones. Only those two
+    // come from the stored shape, so the other shape edits keep their own
+    // rules (release audit 2026-10-14: ticking Two deep moved a bottle).
+    const numbered = (rack.slots || []).length > 0 || (rack.disabledPositions || []).length > 0
+      || (rack.zones || []).some((z) => (z.positions || []).length > 0);
+    if (typeConfig && !rack.isModular && (type !== undefined ? type : rack.type) === 'cabinet' && numbered) {
       const effRows = rows !== undefined ? rows : rack.rows;
+      const effCols = cols !== undefined ? cols : rack.cols;
       const wasTwoDeep = rack.typeConfig?.twoDeep !== false;
       const willTwoDeep = typeConfig.twoDeep !== false;
       if (wasTwoDeep !== willTwoDeep && cabinetShelfAlternate(effRows, typeConfig).some(Boolean)) {
         return res.status(400).json({ error: 'Two deep cannot change on a loaded cabinet whose rows alternate: it decides which rows are the narrow ones. Clear the cabinet first.' });
+      }
+      const widths = (tc) => cabinetRows(effRows, effCols, tc).map((r) => r.width).join(',');
+      const stored = { ...typeConfig, twoDeep: wasTwoDeep, shelfSideways: rack.typeConfig?.shelfSideways };
+      if (widths(stored) !== widths(typeConfig)) {
+        return res.status(400).json({
+          error: wasTwoDeep !== willTwoDeep
+            ? 'Two deep cannot change on this loaded cabinet: with a bottle lying across the front of a stacked shelf it changes how many bottles the levels above hold, so every slot after it would be renumbered. Clear the cabinet first.'
+            : 'On a loaded cabinet, a bottle lying across the front of a stacked shelf cannot be switched: it changes how many bottles the levels above hold, so every slot after it would be renumbered. Clear the cabinet first.',
+        });
       }
     }
 
@@ -402,11 +453,7 @@ router.delete('/:id', async (req, res) => {
     const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null });
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
 
-    const cellarDoc = await Cellar.findById(rack.cellar);
-    const role = getCellarRole(cellarDoc, req.user.id);
-    if (role !== 'owner') {
-      return res.status(403).json({ error: 'Only the cellar owner can delete racks' });
-    }
+    if (!(await rackAccess(req, res, rack, 'owner', 'Only the cellar owner can delete racks'))) return;
 
     // Clear all bottle slot assignments before soft-deleting
     if (rack.slots.length > 0) {
@@ -462,11 +509,7 @@ router.put('/:id/slots/:position', async (req, res) => {
     const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null });
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
 
-    const cellarDoc = await Cellar.findById(rack.cellar);
-    const role = getCellarRole(cellarDoc, req.user.id);
-    if (!role || role === 'viewer') {
-      return res.status(403).json({ error: 'Not authorized to modify rack slots' });
-    }
+    if (!(await rackAccess(req, res, rack, 'editor', 'Not authorized to modify rack slots'))) return;
     if (slotChanged(rack, position, req.body.expectOccupant)) return res.status(409).json(SLOT_CHANGED);
 
     // Placement invariants + slot write are shared with the MCP place tool.
@@ -496,11 +539,7 @@ router.post('/:id/slots/:position/move', async (req, res) => {
     const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null });
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
 
-    const cellarDoc = await Cellar.findById(rack.cellar);
-    const role = getCellarRole(cellarDoc, req.user.id);
-    if (!role || role === 'viewer') {
-      return res.status(403).json({ error: 'Not authorized to modify rack slots' });
-    }
+    if (!(await rackAccess(req, res, rack, 'editor', 'Not authorized to modify rack slots'))) return;
 
     const maxPos = getMaxPosition(rack);
     if (from < 1 || from > maxPos || to < 1 || to > maxPos) {
@@ -536,6 +575,37 @@ router.post('/:id/slots/:position/move', async (req, res) => {
   }
 });
 
+// POST /api/racks/:id/move-bottles — move this rack's bottles into another
+// rack of the same cellar, keeping their order (services/rackOps.
+// moveRackBottles): they fill the other rack's free slots from the first one
+// on; when it has less room, the first ones by position move and the rest
+// stay. Owner or editor. Body: { toRackId }.
+// Response: { moved, left, moves: [{ bottleId, from, to }] }
+router.post('/:id/move-bottles', async (req, res) => {
+  try {
+    const { toRackId } = req.body || {};
+    if (!isValidId(req.params.id) || !isValidId(toRackId)) return res.status(400).json({ error: 'Invalid ID' });
+    const source = await Rack.findOne({ _id: req.params.id, deletedAt: null });
+    // The target is looked up IN the source's cellar: a rack elsewhere reads
+    // exactly like one that does not exist, so the answer cannot be used to
+    // probe for other people's rack ids (release audit 2026-10-12).
+    const target = source ? await Rack.findOne({ _id: toRackId, cellar: source.cellar, deletedAt: null }) : null;
+    if (!source || !target) return res.status(404).json({ error: 'Rack not found' });
+
+    if (!(await rackAccess(req, res, source, 'editor', 'Not authorized to modify rack slots'))) return;
+
+    const result = await moveRackBottles(source, target, req);
+    if (result.error) {
+      const { status, message, code, unplaced } = result.error;
+      return res.status(status).json({ error: message, ...(code ? { code } : {}), ...(unplaced ? { unplaced } : {}) });
+    }
+    res.json(result);
+  } catch (err) {
+    console.error('Move rack bottles error:', err);
+    res.status(500).json({ error: 'Failed to move the bottles' });
+  }
+});
+
 // ── Auto-arrange (one engine, two surfaces) ─────────────────────────────────
 // The SAME decision engine + atomic apply the MCP auto_arrange tool uses
 // (utils/rackArrange + rackOps.buildAnnotatedEntries/applyArrangement), so the
@@ -558,20 +628,11 @@ router.post('/:id/arrange/preview', async (req, res) => {
       return res.status(400).json({ error: `Invalid strategy. Must be one of: ${ARRANGE_STRATEGIES.join(', ')}` });
     }
 
-    const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null }).populate({
-      path: 'slots.bottle',
-      // purchaseDate/createdAt anchor relative (NV) profile windows for the
-      // maturity arrangement strategy.
-      select: 'vintage status drinkFrom drinkTo peakFrom peakUntil wineDefinition purchaseDate createdAt',
-      populate: { path: 'wineDefinition', select: 'name producer type' },
-    });
+    // The same load as MCP auto_arrange, so both surfaces plan alike.
+    const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null }).populate(ARRANGE_SLOT_POPULATE);
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
 
-    const cellarDoc = await Cellar.findById(rack.cellar);
-    const role = getCellarRole(cellarDoc, req.user.id);
-    if (!role || role === 'viewer') {
-      return res.status(403).json({ error: 'Not authorized to modify rack slots' });
-    }
+    if (!(await rackAccess(req, res, rack, 'editor', 'Not authorized to modify rack slots'))) return;
 
     const maxPos = getMaxPosition(rack);
     let positionOrder;
@@ -588,9 +649,7 @@ router.post('/:id/arrange/preview', async (req, res) => {
     if (entries.length === 0) {
       return res.json({ strategy, bottlesTotal: 0, changes: [], target: [], before: [] });
     }
-    const disabled = new Set(rack.disabledPositions || []);
-    const usableCount = (positionOrder || Array.from({ length: maxPos }, (_, i) => i + 1))
-      .filter((p) => !disabled.has(p)).length;
+    const usableCount = usablePositionCount(rack, positionOrder);
     if (entries.length > usableCount) {
       return res.status(409).json({ error: `This rack holds ${entries.length} bottles but only ${usableCount} usable positions — free up or re-enable slots first.` });
     }
@@ -632,11 +691,7 @@ router.post('/:id/arrange/apply', async (req, res) => {
     const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null });
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
 
-    const cellarDoc = await Cellar.findById(rack.cellar);
-    const role = getCellarRole(cellarDoc, req.user.id);
-    if (!role || role === 'viewer') {
-      return res.status(403).json({ error: 'Not authorized to modify rack slots' });
-    }
+    if (!(await rackAccess(req, res, rack, 'editor', 'Not authorized to modify rack slots'))) return;
 
     // Staleness guard: the rack must hold EXACTLY the occupancy the plan was
     // computed from — any placement, removal or move since = recompute.
@@ -677,11 +732,7 @@ router.delete('/:id/slots/:position', async (req, res) => {
     const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null });
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
 
-    const cellarDoc = await Cellar.findById(rack.cellar);
-    const role = getCellarRole(cellarDoc, req.user.id);
-    if (!role || role === 'viewer') {
-      return res.status(403).json({ error: 'Not authorized to modify rack slots' });
-    }
+    if (!(await rackAccess(req, res, rack, 'editor', 'Not authorized to modify rack slots'))) return;
 
     // ?expect=<bottleId> — the bottle the user saw in the slot (offline queue).
     if (req.query.expect !== undefined && slotChanged(rack, position, String(req.query.expect))) {
@@ -708,11 +759,7 @@ router.post('/:id/slots/:position/disable', async (req, res) => {
     const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null });
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
 
-    const cellarDoc = await Cellar.findById(rack.cellar);
-    const role = getCellarRole(cellarDoc, req.user.id);
-    if (!role || role === 'viewer') {
-      return res.status(403).json({ error: 'Not authorized to modify rack slots' });
-    }
+    if (!(await rackAccess(req, res, rack, 'editor', 'Not authorized to modify rack slots'))) return;
 
     const maxPos = getMaxPosition(rack);
     if (position < 1 || position > maxPos) {
@@ -752,11 +799,7 @@ router.delete('/:id/slots/:position/disable', async (req, res) => {
     const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null });
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
 
-    const cellarDoc = await Cellar.findById(rack.cellar);
-    const role = getCellarRole(cellarDoc, req.user.id);
-    if (!role || role === 'viewer') {
-      return res.status(403).json({ error: 'Not authorized to modify rack slots' });
-    }
+    if (!(await rackAccess(req, res, rack, 'editor', 'Not authorized to modify rack slots'))) return;
 
     if (rack.disabledPositions.includes(position)) {
       rack.disabledPositions = rack.disabledPositions.filter(p => p !== position);

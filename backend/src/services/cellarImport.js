@@ -37,6 +37,7 @@ const CellarLayout = require('../models/CellarLayout');
 const BottleImage = require('../models/BottleImage');
 const WineRequest = require('../models/WineRequest');
 const { findOrCreatePendingRequest, pickImportHints } = require('./wineRequestIntake');
+const { currencyOrFallback } = require('../config/currencies');
 const Review = require('../models/Review');
 const WineVintageProfile = require('../models/WineVintageProfile');
 
@@ -48,13 +49,16 @@ const { sanitizeImageBuffer, detectImageFormat } = require('./imageSanitizer');
 const { encodeKeptPhoto, KEPT_EXTENSION } = require('./photoFormat');
 const { ORIGINALS_DIR, PROCESSED_DIR } = require('../config/upload');
 const { planRackCreations, placeBottlesInRack, DEFAULT_ANCHOR } = require('../utils/rackImport');
-const { getMaxPosition, cabinetShelfRows, cabinetShelfCols, cabinetShelfAlternate } = require('../utils/rackGeometry');
+const { getMaxPosition, fitCabinetTypeConfig } = require('../utils/rackGeometry');
 const { resolveRating } = require('../utils/ratingUtils');
 const { normalizeBottleSize, DEFAULT_SIZE } = require('../config/bottleSizes');
+const { normalizeBarcode } = require('../utils/barcode');
 const { stripHtml } = require('../utils/sanitize');
 const { parseAndValidateVintage, parseDrinkYear } = require('../utils/validation');
+const { photoVintage } = require('../utils/imageVintage');
 const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
-const { CONSUMED_STATUSES } = require('../config/constants');
+const { CONSUMED_STATUSES, ORDERED_STATUS } = require('../config/constants');
+const { parseExpectedArrival } = require('../utils/onOrder');
 
 const EXPORT_SCHEMA = 'cellarion-export@1';
 const MAX_IMAGES_PER_BOTTLE = 20;
@@ -177,6 +181,7 @@ function exportBottleToItem(b) {
     purchaseDate: b.purchaseDate,
     purchaseLocation: b.purchaseLocation,
     purchaseUrl: b.purchaseUrl,
+    barcode: b.barcode,
     location: b.location,
     notes: b.notes,
     occasion: b.occasion,
@@ -198,6 +203,12 @@ function exportBottleToItem(b) {
     consumedNote: b.consumedNote,
     consumedRating: b.consumedRating,
     consumedRatingScale: b.consumedRatingScale,
+    // Bought, not delivered yet — re-created on order with its month. Without
+    // these an exported order came back as a bottle IN the cellar.
+    onOrder: b.onOrder === true,
+    expectedArrival: b.expectedArrival,
+    // When an order arrived (an active bottle's delivery day).
+    arrivedAt: b.arrivedAt,
     // Open-bottle (Coravin / preservation) state
     openedAt: b.openedAt,
     preservationMethod: b.preservationMethod,
@@ -334,15 +345,7 @@ async function createRacks(cellarId, userId, cellar, items, result) {
     // A cabinet from a (possibly hand-edited) export is stored with a fitted,
     // bounded shelf list — never a missing, short or million-entry one.
     if (safeType === 'cabinet') {
-      rackData.typeConfig = {
-        ...(rackData.typeConfig || {}),
-        shelfRows: cabinetShelfRows(rackData.rows, rackData.typeConfig),
-        twoDeep: rackData.typeConfig?.twoDeep !== false,
-        stagger: rackData.typeConfig?.stagger !== false,
-        alternate: rackData.typeConfig?.alternate === true,
-        ...(Array.isArray(rackData.typeConfig?.shelfCols) ? { shelfCols: cabinetShelfCols(rackData.rows, rackData.cols, rackData.typeConfig) } : {}),
-        ...(Array.isArray(rackData.typeConfig?.shelfAlternate) ? { shelfAlternate: cabinetShelfAlternate(rackData.rows, rackData.typeConfig) } : {}),
-      };
+      rackData.typeConfig = fitCabinetTypeConfig(rackData.rows, rackData.cols, rackData.typeConfig);
     }
     if (typeof spec?.group === 'string' && spec.group.trim()) rackData.group = spec.group.trim().slice(0, 40);
     const rackDoc = new Rack(rackData);
@@ -498,12 +501,15 @@ function buildBottle({ cellarId, ownerId, item, canonicalVintage, wineDefinition
     ...(wineDefinitionId ? { wineDefinition: wineDefinitionId } : { pendingWineRequest: pendingWineRequestId }),
     vintage: canonicalVintage,
     price: item.price || undefined,
-    currency: item.currency || defaultCurrency || 'USD',
+    // File data: a code the app knows, else the import's default (the
+    // importer's profile currency), as the CSV path does (audit 2026-10-14).
+    currency: currencyOrFallback(item.currency, currencyOrFallback(defaultCurrency, 'USD')),
     priceSetAt,
     bottleSize: normalizeBottleSize(item.bottleSize) || DEFAULT_SIZE,
     purchaseDate: item.purchaseDate || undefined,
     purchaseLocation: stripHtml(item.purchaseLocation),
     purchaseUrl: item.purchaseUrl || undefined,
+    barcode: normalizeBarcode(item.barcode) || undefined,
     location: stripHtml(item.location),
     notes: stripHtml(item.notes),
     occasion: stripHtml(item.occasion),
@@ -655,6 +661,7 @@ async function attachImages(bottle, images, userId, getFileBuffer, result, dedup
 
     const doc = await BottleImage.create({
       bottle: bottle._id,
+      vintage: photoVintage(bottle.vintage),
       uploadedBy: userId,
       originalUrl,
       processedUrl,
@@ -880,11 +887,21 @@ async function buildCellarContents({ cellarId, ownerId, userId, cellar, items, i
         bottle.consumedAt = item.consumedAt ? new Date(item.consumedAt) : new Date();
         if (item.consumedNote) bottle.consumedNote = stripHtml(item.consumedNote);
         if (cRating !== undefined) { bottle.consumedRating = cRating; bottle.consumedRatingScale = cScale; }
+      } else if (item.onOrder === true) {
+        // Bought, not delivered yet — re-created on order. An unreadable
+        // month is dropped, not fatal (same forgiveness as the other fields).
+        bottle.status = ORDERED_STATUS;
+        const ea = parseExpectedArrival(item.expectedArrival);
+        if (ea.ok && ea.value) bottle.expectedArrival = ea.value;
+      } else if (item.arrivedAt) {
+        const arrived = new Date(item.arrivedAt);
+        if (!isNaN(arrived.getTime())) bottle.arrivedAt = arrived;
       }
 
       // Restore open-bottle (Coravin / preservation) state — invalid values
       // are dropped rather than failing the bottle (schema-mirrored bounds).
-      if (item.openedAt) {
+      // Never on a bottle still on order: it cannot have been opened.
+      if (item.openedAt && bottle.status !== ORDERED_STATUS) {
         const openedDate = new Date(item.openedAt);
         if (!isNaN(openedDate.getTime())) {
           bottle.openedAt = openedDate;
@@ -916,8 +933,10 @@ async function buildCellarContents({ cellarId, ownerId, userId, cellar, items, i
       // reviewed window in the export (attachMaturity only restores existing
       // curated data). Mirrors the hand-add / CSV-import behaviour so imported
       // wines surface for a somm. Idempotent ($setOnInsert never clobbers the
-      // reviewed profile above) and deduped per wine+vintage.
-      if (!demoMode && wine.wineDefinitionId) {
+      // reviewed profile above) and deduped per wine+vintage. A bottle on
+      // order is queued when it arrives instead (its vintage may not be
+      // released yet) — and does not mark the pair as seen.
+      if (!demoMode && wine.wineDefinitionId && bottle.status !== ORDERED_STATUS) {
         const pk = `${wine.wineDefinitionId}:${canonicalVintage}`;
         if (!seenPendingProfile.has(pk)) {
           seenPendingProfile.add(pk);

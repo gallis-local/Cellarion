@@ -7,15 +7,17 @@
  * DELIBERATELY CONSERVATIVE. The registry is shared, so the wine is deleted
  * only when every guard agrees nothing else has grown around it:
  *   - zero bottles reference it (ANY user, ANY status — active or history);
- *   - no image has been approved as the wine's official photo
- *     (assignedToWine — an admin curated it; keep);
+ *   - no photo of it is registry content — the wine's chosen picture or any
+ *     approved public photo (the shared rule, services/photoRetention); such
+ *     a photo outlives its bottle and belongs to every owner, so keep;
  *   - every maturity profile is still the auto-seeded 'pending' stub
  *     (a somm reviewed one → keep everything).
  * If any guard fails the wine simply stays — the undo of the bottles is
  * already complete and correct.
  *
- * Cleanup on success: pending profiles, the wine's un-approved images (rows +
- * files), embedding rows with their vectors (best-effort), the Meilisearch
+ * Cleanup on success: pending profiles, the wine's remaining images — the
+ * uploader's own: pending, private, label scans — (rows + files), embedding
+ * rows with their vectors (best-effort), the Meilisearch
  * document, the WineDefinition itself, and a wine.undo_create audit entry.
  *
  * Callers pass wine ids their OWN ledger row recorded as created (add_bottle
@@ -28,7 +30,9 @@ const WineDefinition = require('../models/WineDefinition');
 const WineVintageProfile = require('../models/WineVintageProfile');
 const Bottle = require('../models/Bottle');
 const BottleImage = require('../models/BottleImage');
+const DeletedBottle = require('../models/DeletedBottle');
 const { logAudit } = require('./audit');
+const { REGISTRY_PHOTO } = require('./photoRetention');
 
 async function gcOrphanMintedWine(wineId, req) {
   try {
@@ -38,9 +42,12 @@ async function gcOrphanMintedWine(wineId, req) {
 
     const bottleCount = await Bottle.countDocuments({ wineDefinition: wineId });
     if (bottleCount > 0) return { removed: false, reason: `${bottleCount} bottle(s) still reference it` };
+    // A bottle in someone's "Recently deleted" may still come back to it.
+    const trashedCount = await DeletedBottle.countDocuments({ wineDefinition: wineId });
+    if (trashedCount > 0) return { removed: false, reason: `${trashedCount} recently deleted bottle(s) may be restored to it` };
 
-    const officialImage = await BottleImage.countDocuments({ wineDefinition: wineId, assignedToWine: true });
-    if (officialImage > 0) return { removed: false, reason: 'has an approved wine image' };
+    const registryPhotos = await BottleImage.countDocuments({ wineDefinition: wineId, ...REGISTRY_PHOTO });
+    if (registryPhotos > 0) return { removed: false, reason: 'has a published photo' };
 
     const reviewedProfiles = await WineVintageProfile.countDocuments({
       wineDefinition: wineId,
@@ -57,7 +64,8 @@ async function gcOrphanMintedWine(wineId, req) {
     // Guards passed — clean up everything the mint created, quietest first.
     await WineVintageProfile.deleteMany({ wineDefinition: wineId, status: 'pending' });
 
-    // Un-approved images (rows + files). unlinkImageFiles is best-effort.
+    // The images left are the uploader's own (rows + files). unlinkImageFiles
+    // is best-effort.
     const images = await BottleImage.find({ wineDefinition: wineId });
     if (images.length) {
       const { unlinkImageFiles } = require('./imageProcessor');

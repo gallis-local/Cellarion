@@ -54,9 +54,52 @@ describe('createNotifications SSE nudges', () => {
 
   test('total failure (no insertedDocs on the error) emits nothing and does not throw', async () => {
     Notification.insertMany.mockRejectedValue(new Error('connection lost'));
+    // The rows created are the answer: none here, so a caller counting what
+    // reached the bell counts zero (release audit 2026-10-10).
     await expect(createNotifications([
       { userId: 'u1', type: 'drink_window', title: 't', message: 'm' },
-    ])).resolves.toBeUndefined();
+    ])).resolves.toEqual([]);
     expect(eventBus.emit).not.toHaveBeenCalled();
+  });
+});
+
+describe('createNotifications and the notifications version', () => {
+  // routes/notifications answers API-token polls from memory while the
+  // recipient's notifications version holds (usage check 2026-10-09); every
+  // inserted row must move its recipient's version, and nobody else's.
+  test('every recipient of an inserted row gets a new version', async () => {
+    const { getNotificationsVersion } = require('./dataVersion');
+    Notification.insertMany.mockResolvedValue([
+      doc('n1', 'v-u1', 'drink_window'),
+      doc('n2', 'v-u1', 'drink_window'),
+      doc('n3', 'v-u2', 'community_reply'),
+    ]);
+    const before = ['v-u1', 'v-u2', 'v-u3'].map(getNotificationsVersion);
+
+    await createNotifications([
+      { userId: 'v-u1', type: 'drink_window', title: 't', message: 'm' },
+      { userId: 'v-u1', type: 'drink_window', title: 't', message: 'm' },
+      { userId: 'v-u2', type: 'community_reply', title: 't', message: 'm' },
+    ]);
+
+    expect(getNotificationsVersion('v-u1')).not.toBe(before[0]);
+    expect(getNotificationsVersion('v-u2')).not.toBe(before[1]);
+    expect(getNotificationsVersion('v-u3')).toBe(before[2]);
+  });
+});
+
+// Early access notices stay in the app (release audit 2026-10-10): the
+// permissive "any push toggle on" fallback for an unknown category must not
+// web-push a notice no member opted into push for.
+describe('pushAllowedFor', () => {
+  const { pushAllowedFor } = require('./notifications');
+  test('an in-app-only category is never pushed, whatever the member\'s push toggles', () => {
+    const prefs = { drinkWindow: { push: true }, communityReply: { push: true } };
+    expect(pushAllowedFor(prefs, 'earlyAccess')).toBe(false);
+    // The known categories and the legacy fallback are as before.
+    expect(pushAllowedFor(prefs, 'drinkWindow')).toBe(true);
+    expect(pushAllowedFor({ drinkWindow: { push: false } }, 'drinkWindow')).toBe(false);
+    expect(pushAllowedFor(prefs, undefined)).toBe(true);
+    expect(pushAllowedFor(null, 'drinkWindow')).toBe(false);
   });
 });

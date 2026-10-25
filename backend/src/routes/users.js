@@ -18,7 +18,6 @@ const RestockAlert = require('../models/RestockAlert');
 const PushSubscription = require('../models/PushSubscription');
 const CellarValueSnapshot = require('../models/CellarValueSnapshot');
 const WineList = require('../models/WineList');
-const PendingShare = require('../models/PendingShare');
 const Discussion = require('../models/Discussion');
 const DiscussionReply = require('../models/DiscussionReply');
 const DiscussionReaction = require('../models/DiscussionReaction');
@@ -33,10 +32,10 @@ const WishlistItem = require('../models/WishlistItem');
 const PriceTrackingRequest = require('../models/PriceTrackingRequest');
 const PriceTrackingSkip = require('../models/PriceTrackingSkip');
 const { requireAuth, requireNonDemo } = require('../middleware/auth');
-const { updatePreferences, updateProfile } = require('../services/accountOps');
+const { updatePreferences, updateProfile, buildPreferencesUpdate } = require('../services/accountOps');
 const { buildUserExport } = require('../services/userDataRegistry');
 const { sanitizeSignupSource } = require('../utils/signupSource');
-const { revokeAllSessions } = require('../services/authTokens');
+const { scheduleAccountDeletion } = require('../services/accountDeletion');
 const {
   buildCellarDataExport,
   IMAGE_EXPORT_COOLDOWN_MS,
@@ -46,7 +45,6 @@ const {
 } = require('../services/cellarExport');
 const { safeUploadPath } = require('../services/imageProcessor');
 const { logAudit } = require('../services/audit');
-const eventBus = require('../services/eventBus');
 const rateLimit = require('express-rate-limit');
 const { rateLimitKey } = require('../utils/clientIp');
 
@@ -182,6 +180,48 @@ router.post('/me/signup-source', requireAuth, async (req, res) => {
   }
 });
 
+// POST /api/users/me/locale-defaults — on an account's FIRST sign-in, save the
+// language the app is showing and a currency guessed from the device's region
+// as the account's preferences. Before this every new account started on
+// English + USD, and a Swedish visitor was switched to English at sign-up.
+//
+// One-shot: applies only while User.localeDefaultsPending is set (stamped at
+// account creation, never on older accounts), and the flag is removed by the
+// same conditional update, so a second call — another tab, a later sign-in —
+// changes nothing. Each value goes through the ordinary preferences validator;
+// one that fails it is skipped rather than failing the call, and the flag is
+// cleared anyway (the first sign-in has happened). Answers { applied, user }.
+router.post('/me/locale-defaults', requireAuth, async (req, res) => {
+  try {
+    const $set = {};
+    for (const key of ['language', 'currency']) {
+      const value = req.body?.[key];
+      if (value === undefined) continue;
+      const { update, error } = await buildPreferencesUpdate(req.user.id, { [key]: value });
+      if (!error) Object.assign($set, update);
+    }
+    const applied = await User.findOneAndUpdate(
+      { _id: req.user.id, localeDefaultsPending: true },
+      { ...(Object.keys($set).length ? { $set } : {}), $unset: { localeDefaultsPending: 1 } },
+      { new: true },
+    );
+    if (applied) {
+      // Recorded: the account's language/currency were set automatically, so
+      // "why is my account in SEK?" has an answer (CLAUDE.md, audit logging).
+      logAudit(req, 'user.locale_defaults', { type: 'user', id: applied._id }, {
+        language: $set['preferences.language'] || null,
+        currency: $set['preferences.currency'] || null,
+      });
+    }
+    const user = applied || await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ applied: Boolean(applied), user: user.toJSON() });
+  } catch (error) {
+    console.error('Locale defaults error:', error);
+    res.status(500).json({ error: 'Failed to save language and currency' });
+  }
+});
+
 // PATCH /api/users/preferences - Update current user's preferences
 // Validation allow-lists (currency source-of-truth = config/currencies.js) and
 // persistence now live in services/accountOps so the MCP tool shares them.
@@ -189,8 +229,20 @@ router.patch('/preferences', requireAuth, async (req, res) => {
   try {
     // Validation + persistence live in services/accountOps so the MCP
     // update_preferences tool applies byte-for-byte the same rules.
-    const { user, error } = await updatePreferences(req.user.id, req.body);
+    // Early access decides which screens a user sees, so switching it is
+    // logged (the other preferences are display settings and are not) — a
+    // real switch, not a form re-sending the value it already had.
+    let earlyAccessBefore;
+    if (req.body && typeof req.body.earlyAccess === 'boolean') {
+      const before = await User.findById(req.user.id).select('preferences.earlyAccess').lean();
+      earlyAccessBefore = before?.preferences?.earlyAccess === true;
+    }
+    const { user, error, changed } = await updatePreferences(req.user.id, req.body);
     if (error) return res.status(error.status).json({ error: error.message });
+    const earlyAccessNow = user.preferences?.earlyAccess === true;
+    if ((changed || []).includes('preferences.earlyAccess') && earlyAccessBefore !== earlyAccessNow) {
+      logAudit(req, 'user.early_access', { type: 'user', id: user._id }, { on: earlyAccessNow });
+    }
     res.json({ user: user.toJSON() });
   } catch (error) {
     console.error('Update preferences error:', error);
@@ -523,35 +575,7 @@ router.delete('/me', requireAuth, requireNonDemo, async (req, res) => {
       });
     }
 
-    const now = new Date();
-    const scheduledFor = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-
-    // Cancel Stripe subscription immediately if active
-    if (user.stripeSubscriptionId && process.env.STRIPE_SECRET_KEY) {
-      try {
-        const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-        await stripe.subscriptions.cancel(user.stripeSubscriptionId);
-        user.stripeSubscriptionId = null;
-        user.plan = 'free';
-      } catch (stripeErr) {
-        console.error('Failed to cancel Stripe subscription during deletion:', stripeErr.message);
-      }
-    }
-
-    user.deletionRequestedAt = now;
-    user.deletionScheduledFor = scheduledFor;
-    // Revoke every device session on the deletion request so a refresh token
-    // captured before deletion can't keep minting access tokens through the
-    // 7-day window. The user simply re-authenticates to use the account (or to
-    // cancel the deletion) — matching change-password / password-reset.
-    revokeAllSessions(user);
-    eventBus.dropUser(user._id); // and force-close open SSE event streams
-    await user.save();
-
-    // Clean up pending cellar invites sent by this user
-    PendingShare.deleteMany({ invitedBy: userId }).catch(() => {});
-
-    logAudit(req, 'user.deletion_requested', { type: 'user', id: user._id });
+    const scheduledFor = await scheduleAccountDeletion(user, req);
 
     res.json({
       message: 'Account deletion scheduled. Your account and all data will be permanently deleted in 7 days. You can cancel this from Settings.',
@@ -633,35 +657,108 @@ router.get('/unsubscribe', async (req, res) => {
   }
 });
 
-// GET /api/users/unsubscribe/support-replies?token=:token — one click, no
-// login: stop emailing ME answers to my support tickets, and nothing else.
-// The support-reply email links it beside "unsubscribe from all". Its token
-// is scoped (utils/unsubscribe), so it can't turn off any other category.
-// The answer still reaches the in-app bell and the support page.
-router.get('/unsubscribe/support-replies', async (req, res) => {
-  const { token } = req.query;
-  if (!token || typeof token !== 'string') {
-    return res.status(400).json({ error: 'Unsubscribe token is required' });
-  }
+// One click, no login: stop ONE email category and nothing else. The email
+// links it beside "unsubscribe from all". Its token is scoped
+// (utils/unsubscribe), so it can't turn off any other category; the bell
+// still carries what the email used to.
+function scopedUnsubscribe(scope, only) {
+  const flag = `preferences.notifications.${scope}.email`;
+  return async (req, res) => {
+    const { token } = req.query;
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ error: 'Unsubscribe token is required' });
+    }
+    try {
+      const { verifyScopedUnsubscribeToken } = require('../utils/unsubscribe');
+      const userId = verifyScopedUnsubscribeToken(token, scope);
+      if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+        return res.status(400).json({ error: 'Invalid unsubscribe link' });
+      }
+      // Filter on the cast id, and only write when the flag is not already off.
+      const result = await User.updateOne(
+        { _id: new mongoose.Types.ObjectId(userId), [flag]: { $ne: false } },
+        { $set: { [flag]: false } },
+      );
+      if (result.modifiedCount > 0) {
+        logAudit(req, `user.unsubscribe.${scope}`, { type: 'user', id: userId }, {});
+      }
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+      res.redirect(`${frontendUrl}/unsubscribed?only=${only}`);
+    } catch (error) {
+      console.error(`Scoped unsubscribe (${scope}) error:`, error);
+      res.status(500).json({ error: 'Failed to unsubscribe' });
+    }
+  };
+}
+
+// GET /api/users/unsubscribe/support-replies?token=:token — stop emailing ME
+// answers to my support tickets (they stay on the support page).
+router.get('/unsubscribe/support-replies', scopedUnsubscribe('supportReply', 'support'));
+
+// GET /api/users/unsubscribe/owner-questions?token=:token — stop emailing me
+// curators' questions about wines I own (2026-10-20; they stay on the bell
+// and the bottle page).
+router.get('/unsubscribe/owner-questions', scopedUnsubscribe('ownerInquiry', 'owner-questions'));
+
+// GET /api/users/unsubscribe/drink-window?token=:token — stop emailing me
+// drink-window alerts (they stay on the bell, and push as set).
+router.get('/unsubscribe/drink-window', scopedUnsubscribe('drinkWindow', 'drink-window'));
+
+// ── "Delete my account" from an email link (no login) ──────────────────────
+// The link (utils/accountDeletionLink, good for 14 days) opens the frontend
+// page /delete-account, which asks these two routes. Opening the link never
+// deletes anything — mail scanners open links on their own — only the button
+// on that page does, and then through the same 7-day scheduled deletion as
+// Settings. The token travels in the body, never the URL, so it stays out of
+// access logs. Every failure answers the same 400, so a link reveals nothing
+// about an account it doesn't belong to.
+const LINK_INVALID = { error: 'This link is no longer valid.', code: 'LINK_INVALID' };
+
+async function userFromDeleteLink(req, select) {
+  const { verifyDeleteAccountToken } = require('../utils/accountDeletionLink');
+  const userId = verifyDeleteAccountToken(req.body?.token);
+  if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return null;
+  const query = User.findById(userId);
+  const user = await (select ? query.select(select) : query);
+  return user && !user.isDemo ? user : null;
+}
+
+// POST /api/users/delete-account/preview — body { token }: which account the
+// link deletes and what is in it, so the page can say so before the button.
+router.post('/delete-account/preview', async (req, res) => {
   try {
-    const { verifyScopedUnsubscribeToken } = require('../utils/unsubscribe');
-    const userId = verifyScopedUnsubscribeToken(token, 'supportReply');
-    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ error: 'Invalid unsubscribe link' });
-    }
-    // Filter on the cast id, and only write when the flag is not already off.
-    const result = await User.updateOne(
-      { _id: new mongoose.Types.ObjectId(userId), 'preferences.notifications.supportReply.email': { $ne: false } },
-      { $set: { 'preferences.notifications.supportReply.email': false } },
-    );
-    if (result.modifiedCount > 0) {
-      logAudit(req, 'user.unsubscribe.supportReply', { type: 'user', id: userId }, {});
-    }
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    res.redirect(`${frontendUrl}/unsubscribed?only=support`);
+    const user = await userFromDeleteLink(req, 'username isDemo deletionScheduledFor stripeSubscriptionId');
+    if (!user) return res.status(400).json(LINK_INVALID);
+    const cellarIds = await Cellar.distinct('_id', { user: user._id, deletedAt: null });
+    const bottles = cellarIds.length
+      ? await Bottle.countDocuments({ cellar: { $in: cellarIds }, status: { $in: ['active', 'ordered'] } })
+      : 0;
+    res.json({
+      username: user.username,
+      bottles,
+      supporter: !!user.stripeSubscriptionId,
+      deletionScheduledFor: user.deletionScheduledFor || null,
+    });
   } catch (error) {
-    console.error('Support-reply unsubscribe error:', error);
-    res.status(500).json({ error: 'Failed to unsubscribe' });
+    console.error('Delete-link preview error:', error);
+    res.status(500).json({ error: 'Failed to check the link' });
+  }
+});
+
+// POST /api/users/delete-account — body { token }: schedule the deletion.
+// Pressing it again on an already scheduled account changes nothing.
+router.post('/delete-account', async (req, res) => {
+  try {
+    const user = await userFromDeleteLink(req);
+    if (!user) return res.status(400).json(LINK_INVALID);
+    if (user.deletionScheduledFor) {
+      return res.json({ deletionScheduledFor: user.deletionScheduledFor, alreadyScheduled: true });
+    }
+    const deletionScheduledFor = await scheduleAccountDeletion(user, req, { via: 'email-link' });
+    res.json({ deletionScheduledFor });
+  } catch (error) {
+    console.error('Delete-link deletion error:', error);
+    res.status(500).json({ error: 'Failed to schedule deletion' });
   }
 });
 

@@ -12,12 +12,15 @@
 // that reaches the ESM-only meilisearch package (services/search) must never be
 // a top-level require here: jest cannot parse it, and it would break every
 // suite that loads the MCP tool registry (the #702 failure mode).
-const { CONSUMED_STATUSES } = require('../config/constants');
+const { CONSUMED_STATUSES, ORDERED_STATUS } = require('../config/constants');
 const { resolveRating } = require('../utils/ratingUtils');
 const resolveRatingUtil = resolveRating;
 const { stripHtml, isSafeUrl } = require('../utils/sanitize');
 const { parseAndValidateVintage, parseDrinkYear } = require('../utils/validation');
 const { normalizeBottleSize, DEFAULT_SIZE } = require('../config/bottleSizes');
+const { normalizeCurrency, parseCurrency } = require('../config/currencies');
+const { normalizeBarcode } = require('../utils/barcode');
+const { parseExpectedArrival } = require('../utils/onOrder');
 const { logAudit } = require('./audit');
 const Rack = require('../models/Rack');
 const Bottle = require('../models/Bottle');
@@ -27,6 +30,14 @@ const WineRequest = require('../models/WineRequest');
 // Restores are "undo an accidental log", not resurrection of a bottle drunk
 // long ago (see the /restore route docs). Shared so REST and MCP agree.
 const RESTORE_WINDOW_MS = 2 * 24 * 60 * 60 * 1000; // 2 days
+
+// A bottle on order is not in the cellar yet: nothing can be drunk, opened,
+// poured or closed until it is marked as arrived. One error for REST and MCP.
+const NOT_ARRIVED_ERROR = Object.freeze({
+  status: 409,
+  code: 'not_arrived',
+  message: 'This bottle is on order and has not arrived yet. Mark it as arrived first.',
+});
 
 /** Free any rack slot holding this bottle (consume/delete paths). */
 async function removeFromRacks(bottleId) {
@@ -63,6 +74,7 @@ function parseConsumedAt(value) {
 }
 
 async function consumeBottle(bottle, { reason = 'drank', note, rating, ratingScale, consumedAt, skipRestockCheck = false } = {}, req) {
+  if (bottle.status === ORDERED_STATUS) return { error: { ...NOT_ARRIVED_ERROR } };
   if (!CONSUMED_STATUSES.includes(reason)) {
     return { error: { status: 400, message: 'Invalid reason' } };
   }
@@ -112,9 +124,12 @@ async function consumeBottle(bottle, { reason = 'drank', note, rating, ratingSca
   // un-cached (wine, vintage) pair this fires a paid Voyage embedding call,
   // which would breach the demo's "zero AI spend" guarantee.
   // skipRestockCheck: the bulk route runs one check per wine+vintage itself.
+  // A consume made with an API or OAuth token (req.apiToken — Home Assistant,
+  // a connected AI) compares stored vectors only and never embeds: nothing a
+  // token can reach may spend AI money. The web app's session is unchanged.
   if (reason === 'drank' && !skipRestockCheck && !req?.user?.isDemo) {
     const { checkRestockGap } = require('./restockChecker');
-    checkRestockGap(req.user.id, bottle._id, bottle.cellar).catch(() => {});
+    checkRestockGap(req.user.id, bottle._id, bottle.cellar, { storedVectorOnly: !!req?.apiToken }).catch(() => {});
   }
 
   return { bottle };
@@ -181,6 +196,7 @@ const MAX_OPEN_BACKDATE_MS = 90 * 24 * 60 * 60 * 1000;
  * Returns { error } | { bottle }.
  */
 async function openBottle(bottle, { preservationMethod, openedAt } = {}, req) {
+  if (bottle.status === ORDERED_STATUS) return { error: { ...NOT_ARRIVED_ERROR } };
   if (CONSUMED_STATUSES.includes(bottle.status)) {
     return { error: { status: 400, message: 'Bottle is already consumed' } };
   }
@@ -221,14 +237,24 @@ async function openBottle(bottle, { preservationMethod, openedAt } = {}, req) {
  * full batch up front, so there is never a partially-committed batch (the
  * MCP pour_glass ledger row can then always say recorded = requested).
  * Mirrors POST /api/bottles/:id/pour exactly (REST always passes count 1).
+ * `expectPours` (sent by the offline queue only): the number of pours the
+ * user saw on the bottle; the pour is recorded only while the bottle still
+ * has exactly that many. Absent → recorded whatever is poured.
  * Returns { error } | { bottle }.
  */
-async function pourFromBottle(bottle, { ml, count } = {}, req) {
+async function pourFromBottle(bottle, { ml, count, expectPours } = {}, req) {
+  if (bottle.status === ORDERED_STATUS) return { error: { ...NOT_ARRIVED_ERROR } };
   if (CONSUMED_STATUSES.includes(bottle.status)) {
     return { error: { status: 400, message: 'Bottle is already consumed' } };
   }
   if (!bottle.openedAt) {
     return { error: { status: 400, message: 'Open the bottle first', code: 'not_open' } };
+  }
+  // A queued pour can reach the server after its Idempotency-Key record has
+  // expired (models/IdempotencyRecord): a retry whose first attempt already
+  // landed must be refused, not add the glass a second time.
+  if (expectPours !== undefined && expectPours !== null && Number(expectPours) !== bottle.pours.length) {
+    return { error: { status: 409, message: 'Glasses were poured from this bottle meanwhile', code: 'state_changed' } };
   }
   const amount = ml === undefined || ml === null ? DEFAULT_POUR_ML : Number(ml);
   if (!Number.isFinite(amount) || amount < 1 || amount > 6000) {
@@ -338,15 +364,37 @@ function validatePeakWindow(peakFromRaw, peakUntilRaw, fromValue, toValue) {
   return { peakFrom: pFrom.value, peakUntil: pUntil.value };
 }
 
+/**
+ * The on-order pair of the bottle-create surface: `onOrder: true` creates the
+ * bottle as bought-not-delivered (status 'ordered'), with an optional
+ * `expectedArrival` month. A bottle cannot be on order and already drunk.
+ * Returns { error } | { onOrder: boolean, expectedArrival: Date|null }.
+ */
+function parseOnOrderFields({ onOrder, expectedArrival, addToHistory } = {}) {
+  const on = onOrder === true || onOrder === 'true';
+  if (!on) return { onOrder: false, expectedArrival: null };
+  if (addToHistory) {
+    return { error: { status: 400, message: 'A bottle cannot be both on order and added to history' } };
+  }
+  const ea = parseExpectedArrival(expectedArrival);
+  if (!ea.ok) return { error: { status: 400, message: ea.error } };
+  return { onOrder: true, expectedArrival: ea.value };
+}
+
 function validateBottleCommitFields(fields = {}) {
+  const currencyCheck = parseCurrency(fields.currency);
+  if (!currencyCheck.ok) return { error: { status: 400, message: currencyCheck.error } };
   const {
     vintage, purchaseLocation, purchaseUrl, location,
     notes, occasion, rating, ratingScale, drinkFrom, drinkTo, peakFrom, peakUntil,
     addToHistory, consumedReason, consumedRating, consumedRatingScale,
+    onOrder, expectedArrival,
   } = fields;
 
   const parsedVintage = parseAndValidateVintage(vintage);
   if (!parsedVintage.ok) return { error: { status: 400, message: parsedVintage.error } };
+  const orderCheck = parseOnOrderFields({ onOrder, expectedArrival, addToHistory });
+  if (orderCheck.error) return orderCheck;
   const from = parseDrinkYear(drinkFrom, 'drinkFrom');
   if (!from.ok) return { error: { status: 400, message: from.error } };
   const to = parseDrinkYear(drinkTo, 'drinkTo');
@@ -397,10 +445,17 @@ async function addBottle(cellarDoc, wineDoc, fields = {}, req) {
     // Migration helpers — backdate the bottle, or add it directly to history.
     dateAdded, addToHistory,
     consumedAt, consumedReason, consumedNote, consumedRating, consumedRatingScale,
+    barcode,
+    // Bought, not delivered yet (en primeur, a pre-order): status 'ordered'.
+    onOrder, expectedArrival,
   } = fields;
 
   const parsedVintage = parseAndValidateVintage(vintage);
   if (!parsedVintage.ok) return { error: { status: 400, message: parsedVintage.error } };
+  const order = parseOnOrderFields({ onOrder, expectedArrival, addToHistory });
+  if (order.error) return order;
+  const parsedCurrency = parseCurrency(currency);
+  if (!parsedCurrency.ok) return { error: { status: 400, message: parsedCurrency.error } };
 
   const from = parseDrinkYear(drinkFrom, 'drinkFrom');
   if (!from.ok) return { error: { status: 400, message: from.error } };
@@ -461,7 +516,7 @@ async function addBottle(cellarDoc, wineDoc, fields = {}, req) {
     vintage: parsedVintage.value,
     // Kept even without a price — the add form lets users pick their currency
     // before (or without) entering a price; the schema default fills 'USD'.
-    currency: currency || 'USD',
+    currency: parsedCurrency.value || 'USD',
     bottleSize: normalizeBottleSize(bottleSize) || DEFAULT_SIZE,
     purchaseDate: purchaseDate || new Date(), // REST defaults this too
   };
@@ -471,6 +526,10 @@ async function addBottle(cellarDoc, wineDoc, fields = {}, req) {
   }
   if (purchaseLocation) doc.purchaseLocation = stripHtml(purchaseLocation);
   if (purchaseUrl) doc.purchaseUrl = purchaseUrl;
+  // A scanned retail barcode. Never a reason to refuse an add: a code that is
+  // not a valid public GTIN (misread, shop-internal) is simply not stored.
+  const code = normalizeBarcode(barcode);
+  if (code) doc.barcode = code;
   if (location) doc.location = stripHtml(location);
   if (notes) doc.notes = stripHtml(notes);
   if (occasion) doc.occasion = stripHtml(occasion);
@@ -489,6 +548,11 @@ async function addBottle(cellarDoc, wineDoc, fields = {}, req) {
   // Seed the cellar journey: the bottle enters this cellar at its added date.
   bottle.addedToCellarAt = bottle.createdAt;
   bottle.cellarHistory = [{ cellar: cellarDoc._id, cellarName: cellarDoc.name, enteredAt: bottle.createdAt }];
+  // On order: in this cellar's books but not on its shelves until it arrives.
+  if (order.onOrder) {
+    bottle.status = ORDERED_STATUS;
+    if (order.expectedArrival) bottle.expectedArrival = order.expectedArrival;
+  }
   // Migration helper: create the bottle directly as consumed history.
   if (addToHistory) {
     const reason = consumedReason || 'drank';
@@ -510,10 +574,15 @@ async function addBottle(cellarDoc, wineDoc, fields = {}, req) {
   }
 
   // Post-save side effects, one order for both surfaces.
-  try {
-    const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
-    await ensurePendingVintageProfile(wineDoc._id, bottle.vintage);
-  } catch (err) { /* profile bookkeeping must never fail the add */ }
+  // A bottle ON ORDER is not queued for a sommelier drink window yet: an en
+  // primeur vintage may not even be released, so there is nothing to judge.
+  // markArrived queues it the day it arrives.
+  if (!order.onOrder) {
+    try {
+      const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
+      await ensurePendingVintageProfile(wineDoc._id, bottle.vintage);
+    } catch (err) { /* profile bookkeeping must never fail the add */ }
+  }
   // A bottle added to the creator's private draft is a "touch": the draft's
   // untouched clock restarts (draft design 2026-09-12). Best-effort.
   if (wineDoc.draft === true) {
@@ -524,7 +593,7 @@ async function addBottle(cellarDoc, wineDoc, fields = {}, req) {
   // bare vintage with no wine name). wineDoc is the resolved registry wine.
   logAudit(req, addToHistory ? 'bottle.addToHistory' : 'bottle.add',
     { type: 'bottle', id: bottle._id, cellarId: cellarDoc._id },
-    { wineName: wineDoc.name, vintage: bottle.vintage });
+    { wineName: wineDoc.name, vintage: bottle.vintage, ...(order.onOrder ? { onOrder: true } : {}) });
   // Fire-and-forget AI enrichment — both calls carry their own kill-switch /
   // per-user budget gates (embeddingJob: chatEnabled; enrichmentJob: tryDebitAi).
   const { embedSinglePair } = require('./embeddingJob');
@@ -545,6 +614,12 @@ const UPDATABLE_FIELDS = [
   'purchaseDate', 'purchaseLocation', 'purchaseUrl',
   'location', 'notes', 'occasion', 'rating', 'ratingScale',
   'drinkFrom', 'drinkTo', 'peakFrom', 'peakUntil', 'reservedFor', 'reservedUntil',
+  // Only on a bottle still on order; ignored on any other (see below).
+  'expectedArrival',
+  // The retail barcode, added to a bottle already in the cellar (the bottle
+  // page's "Add barcode"); the add sets it from the scan. Not in the MCP
+  // update_bottle schema.
+  'barcode',
 ];
 
 // Normalize a value for change detection: Date objects and ISO-ish strings
@@ -569,9 +644,9 @@ function normForCompare(v) {
  * scale, drink-window ordering + notifier-marker reset, priceSetAt
  * re-anchoring, HTML stripping, re-index, and the { field: { from, to } }
  * audit shape CellarAudit renders.
- * Returns { error } | { bottle, changes, prev }.
+ * Returns { error } | { bottle, changes, prev }. `restoringPrev` (undo) lets a bottle's previous currency back even when it is not a supported code.
  */
-async function updateBottleFields(bottle, fields, req) {
+async function updateBottleFields(bottle, fields, req, { restoringPrev = false } = {}) {
   fields = { ...(fields || {}) }; // shallow copy — REST passes req.body
   const changes = {};
   const prev = {};
@@ -675,6 +750,35 @@ async function updateBottleFields(bottle, fields, req) {
     reservedUntilYear = p.value !== undefined ? p.value : null;
   }
 
+  // Barcode: the same canonical form the add stores. Unlike on add, a code
+  // that is not a valid public GTIN is refused — the user asked for exactly
+  // this change, so a typo must not vanish silently. Empty clears it. Each
+  // barcode is a vote in the shared barcode lookup (services/barcodeLookup),
+  // so demo accounts, thrown away within hours, cannot add one.
+  if (fields.barcode !== undefined) {
+    if (fields.barcode === null || fields.barcode === '') {
+      fields.barcode = null;
+    } else {
+      if (req?.user?.isDemo) return { error: { status: 403, message: 'Demo accounts cannot add barcodes' } };
+      const code = normalizeBarcode(fields.barcode);
+      if (!code) return { error: { status: 400, message: 'Not a valid barcode (EAN-13, EAN-8 or UPC-A)' } };
+      fields.barcode = code;
+    }
+  }
+
+  // Expected arrival (a month) belongs to a bottle on order. On any other
+  // bottle it is dropped, not refused: the field means nothing once the
+  // bottle is in the cellar, and a bulk edit can span both.
+  if (fields.expectedArrival !== undefined) {
+    if (bottle.status !== ORDERED_STATUS) {
+      delete fields.expectedArrival;
+    } else {
+      const p = parseExpectedArrival(fields.expectedArrival);
+      if (!p.ok) return { error: { status: 400, message: p.error } };
+      fields.expectedArrival = p.value;
+    }
+  }
+
   if (fields.rating === null || fields.rating === '') {
     // Explicit clear — needed so undoing a rating-SET can restore "unrated"
     // (resolveRating treats null/'' as "no input" and would silently skip it,
@@ -694,6 +798,23 @@ async function updateBottleFields(bottle, fields, req) {
     // UNRATED bottle a scale-only change is harmless and allowed (the web
     // form always sends the scale).
     return { error: { status: 400, message: 'Send rating together with ratingScale when changing the rating scale' } };
+  }
+
+  // Currency: an alias is stored as its code ("EURO" → "EUR"), and a CHANGE to
+  // a code the app doesn't support is refused. The bottle's own code passes
+  // even when it isn't supported (an older import): the web form sends the
+  // whole form on every save.
+  // An undo (restoringPrev) puts back the bottle's previous code, supported or
+  // not (release audit 2026-10-13: undoing a change away from an old import's
+  // code was refused).
+  if (fields.currency !== undefined && fields.currency !== null && fields.currency !== '') {
+    const own = normalizeCurrency(bottle.currency || '');
+    const sent = typeof fields.currency === 'string' ? normalizeCurrency(fields.currency) : null;
+    if (sent === null || (sent !== own && !restoringPrev)) {
+      const parsed = parseCurrency(fields.currency);
+      if (!parsed.ok) return { error: { status: 400, message: parsed.error } };
+    }
+    fields.currency = sent;
   }
 
   const apply = (key, value) => {
@@ -744,6 +865,10 @@ async function updateBottleFields(bottle, fields, req) {
   if ('reservedUntil' in changes) {
     bottle.reservationNotifiedAt = null;
   }
+  // A new expected month re-arms the "should have arrived by now" reminder.
+  if ('expectedArrival' in changes) {
+    bottle.arrivalNotifiedAt = undefined;
+  }
 
   try {
     await bottle.save();
@@ -752,14 +877,37 @@ async function updateBottleFields(bottle, fields, req) {
     if (err?.name === 'VersionError') return { error: { status: 409, message: 'This bottle was modified by another request. Please refresh and try again.' } };
     throw err;
   }
-  // Vintage changed: the old (wine, oldVintage) embedding is still stored
-  // but no longer matches this bottle — embed the new pair. Skipped for demo
-  // accounts (a novel year misses the cache and would fire a paid Voyage call).
-  if ('vintage' in changes && !req?.user?.isDemo) {
+  if ('vintage' in changes) {
+    // The bottle's photos are photos of THIS bottle, so they follow its
+    // vintage (support ticket 2026-10-09: same-vintage photos are preferred
+    // over the wine's generic image). Bookkeeping: never fails the edit.
+    try {
+      const { photoVintage } = require('../utils/imageVintage');
+      // An admin's "official for this vintage" was a choice about the OLD
+      // vintage; it does not travel to the new one.
+      await BottleImage.updateMany({ bottle: bottle._id }, { $set: { vintage: photoVintage(bottle.vintage), assignedToVintage: false } });
+    } catch (err) {
+      console.error('Photo vintage sync failed:', err.message);
+    }
     const wineId = bottle.wineDefinition && (bottle.wineDefinition._id || bottle.wineDefinition);
     if (wineId) {
-      const { embedSinglePair } = require('./embeddingJob');
-      embedSinglePair(wineId, bottle.vintage).catch(() => {});
+      // The new (wine, vintage) is a pair a sommelier may never have seen:
+      // queue it for a drink window exactly as adding a bottle of it would
+      // (addBottle), and with the same exception — a bottle on order is
+      // queued the day it arrives (markArrived). Until 2026-10-09 an edited
+      // vintage never reached the queue, from the app or over MCP.
+      if (bottle.status !== ORDERED_STATUS) {
+        try {
+          await require('../utils/vintageProfile').ensurePendingVintageProfile(wineId, bottle.vintage);
+        } catch { /* queue bookkeeping must never fail the edit */ }
+      }
+      // The old (wine, oldVintage) embedding is still stored but no longer
+      // matches this bottle — embed the new pair. Skipped for demo accounts
+      // (a novel year misses the cache and would fire a paid Voyage call).
+      if (!req?.user?.isDemo) {
+        const { embedSinglePair } = require('./embeddingJob');
+        embedSinglePair(wineId, bottle.vintage).catch(() => {});
+      }
     }
   }
   // Audit in the SAME { field: { from, to } } shape the REST PUT /bottles/:id
@@ -784,10 +932,14 @@ async function updateBottleFields(bottle, fields, req) {
  * file unlink, wine-assigned image unassignment, pending wine request, then
  * the bottle document itself). auditAction distinguishes 'bottle.undo' from
  * 'bottle.delete', which run the identical cascade.
+ * options.anyStatus also removes a consumed bottle (a duplicate history row
+ * from an import is deleted the same way); options.auditDetail replaces the
+ * default { reason: 'mistake' }.
  * Returns { error } | { removed: true }.
  */
-async function removeBottleCascade(bottle, req, auditAction) {
-  if (bottle.status !== 'active') {
+async function removeBottleCascade(bottle, req, auditAction, options = {}) {
+  // A bottle on order qualifies too: a cancelled order is removed this way.
+  if (!options.anyStatus && bottle.status !== 'active' && bottle.status !== ORDERED_STATUS) {
     return { error: { status: 400, message: 'Only an active bottle can be removed this way' } };
   }
   const bottleId = bottle._id;
@@ -795,14 +947,18 @@ async function removeBottleCascade(bottle, req, auditAction) {
 
   await removeFromRacks(bottleId);
 
-  const { unlinkImageFiles } = require('./imageProcessor');
   // The user's own photos go with the bottle; registry photos (the wine's
   // picture, or any photo approved as public — services/photoRetention) are
-  // kept and detached, other people see them.
+  // kept and detached, other people see them. A bottle moved to "Recently
+  // deleted" (services/bottleTrash) keeps its own photos instead: they come
+  // back with it on restore, and the trash purge deletes them later.
   const { REGISTRY_PHOTO, OWN_PHOTO } = require('./photoRetention');
-  const ownImages = await BottleImage.find({ bottle: bottleId, ...OWN_PHOTO });
-  for (const img of ownImages) await unlinkImageFiles(img);
-  await BottleImage.deleteMany({ bottle: bottleId, ...OWN_PHOTO });
+  if (!options.keepOwnPhotos) {
+    const { unlinkImageFiles } = require('./imageProcessor');
+    const ownImages = await BottleImage.find({ bottle: bottleId, ...OWN_PHOTO });
+    for (const img of ownImages) await unlinkImageFiles(img);
+    await BottleImage.deleteMany({ bottle: bottleId, ...OWN_PHOTO });
+  }
   await BottleImage.updateMany(
     { bottle: bottleId, ...REGISTRY_PHOTO },
     { $set: { bottle: null } }
@@ -834,14 +990,266 @@ async function removeBottleCascade(bottle, req, auditAction) {
 
   logAudit(req, auditAction || 'bottle.undo',
     { type: 'bottle', id: bottleId, cellarId },
-    { reason: 'mistake' });
+    options.auditDetail || { reason: 'mistake' });
 
   return { removed: true };
 }
 
+/**
+ * What an undo needs to bring a deleted bottle back (MCP delete_bottle):
+ * the bottle document as stored, its rack slot, the registry photos it
+ * points at, and an import request the delete is about to withdraw (no other
+ * bottle waits on it). Taken BEFORE the delete, and the caller stores it
+ * before deleting anything — a bottle must never be gone without its way back.
+ *
+ * Restoring with the SAME _id reconnects everything else that refers to the
+ * bottle by id (tasting notes, personal data, lists). The owner's own photos
+ * cannot come back: the delete removes their files. ownPhotos says how many
+ * that is, so the caller can say so first.
+ * Returns { snapshot, ownPhotos }.
+ */
+async function snapshotBottleForDelete(bottle) {
+  const { REGISTRY_PHOTO, OWN_PHOTO } = require('./photoRetention');
+  const raw = typeof bottle.toObject === 'function'
+    ? bottle.toObject({ depopulate: true, virtuals: false })
+    : { ...bottle };
+  const rack = await Rack.findOne({ 'slots.bottle': bottle._id }).select('_id slots').lean();
+  const slot = rack ? (rack.slots || []).find((s) => String(s.bottle) === String(bottle._id)) : null;
+  const registryPhotos = await BottleImage.find({ bottle: bottle._id, ...REGISTRY_PHOTO }).select('_id').lean();
+  const ownPhotos = await BottleImage.countDocuments({ bottle: bottle._id, ...OWN_PHOTO });
+  let wineRequest = null;
+  if (bottle.pendingWineRequest) {
+    const others = await Bottle.countDocuments({ pendingWineRequest: bottle.pendingWineRequest, _id: { $ne: bottle._id } });
+    if (others === 0) wineRequest = await WineRequest.findOne({ _id: bottle.pendingWineRequest, status: 'pending' }).lean();
+  }
+  return {
+    snapshot: {
+      bottle: raw,
+      rack: slot ? { rackId: rack._id, position: slot.position } : null,
+      registryPhotoIds: registryPhotos.map((p) => p._id),
+      wineRequest,
+    },
+    ownPhotos,
+  };
+}
+
+/**
+ * Bring back a bottle from a snapshotBottleForDelete snapshot, under its
+ * original _id. Refuses (409) when the world moved on: the id is in use
+ * again, the cellar is gone, or the wine was merged away or removed since.
+ * Access is the caller's to check (the cellar's editor role).
+ *
+ * The bottle insert is the one step that decides success, so it runs first;
+ * everything after it (registry photos re-linked, a withdrawn request
+ * recreated, the rack slot re-taken while it is still free) is best effort
+ * and never throws, so a hiccup there can't leave the bottle back while the
+ * undo looks failed. A default photo that was one of the deleted own photos
+ * is dropped rather than restored as a dangling id.
+ * `via` names the path in the audit row: 'undo' (MCP undo_last) or 'trash'
+ * (a restore from "Recently deleted", services/bottleTrash).
+ * Returns { error: { status, code, message } } | { bottle, placed, position }.
+ */
+async function restoreDeletedBottle(snapshot, req, { via = 'undo' } = {}) {
+  const raw = snapshot && snapshot.bottle ? { ...snapshot.bottle } : null;
+  if (!raw || !raw._id) return { error: { status: 409, code: 'no_snapshot', message: 'There is no snapshot to restore from' } };
+  if (await Bottle.exists({ _id: raw._id })) {
+    return { error: { status: 409, code: 'exists', message: 'The bottle already exists again' } };
+  }
+  const Cellar = require('../models/Cellar');
+  if (!(await Cellar.exists({ _id: raw.cellar, deletedAt: null }))) {
+    return { error: { status: 409, code: 'cellar_gone', message: 'Its cellar no longer exists' } };
+  }
+  if (raw.wineDefinition) {
+    const WineDefinition = require('../models/WineDefinition');
+    if (!(await WineDefinition.exists({ _id: raw.wineDefinition }))) {
+      return { error: { status: 409, code: 'wine_gone', message: 'Its wine has been merged or removed from the registry since' } };
+    }
+  }
+  if (raw.defaultImage && !(await BottleImage.exists({ _id: raw.defaultImage }))) {
+    raw.defaultImage = null;
+  }
+  // The stored document as it was: same id, same dates, no defaults re-run —
+  // except a currency alias, which the raw insert would bypass the schema's
+  // setter for ("EURO" → "EUR"; release audit 2026-10-13).
+  if (typeof raw.currency === 'string') raw.currency = normalizeCurrency(raw.currency);
+  await Bottle.collection.insertOne(raw);
+
+  const bestEffort = async (label, fn) => {
+    try { return await fn(); } catch (err) {
+      console.warn(`[bottleOps] restore of ${raw._id}: ${label} failed (bottle is back):`, err.message);
+      return null;
+    }
+  };
+  if (snapshot.registryPhotoIds && snapshot.registryPhotoIds.length) {
+    await bestEffort('registry photo re-link', () => BottleImage.updateMany(
+      { _id: { $in: snapshot.registryPhotoIds }, bottle: null }, { $set: { bottle: raw._id } }));
+  }
+  if (snapshot.wineRequest) {
+    await bestEffort('wine request recreate', async () => {
+      if (!(await WineRequest.exists({ _id: snapshot.wineRequest._id }))) {
+        await WineRequest.collection.insertOne(snapshot.wineRequest);
+      }
+    });
+  }
+  let placed = false;
+  if (snapshot.rack && raw.status === 'active') {
+    placed = !!(await bestEffort('rack slot', async () => {
+      const rack = await Rack.findOne({ _id: snapshot.rack.rackId, deletedAt: null });
+      const taken = rack && (rack.slots || []).some((s) => s.position === snapshot.rack.position);
+      if (!rack || taken) return false;
+      // Lazy: services/rackOps top-requires this module.
+      const { placeBottleInRack } = require('./rackOps');
+      const r = await placeBottleInRack(rack, snapshot.rack.position, raw._id, req);
+      return !r.error;
+    }));
+  }
+  logAudit(req, 'bottle.restore_deleted',
+    { type: 'bottle', id: raw._id, cellarId: raw.cellar },
+    { via, placed });
+  const bottle = (await bestEffort('reload', () => Bottle.findById(raw._id))) || raw;
+  return { bottle, placed, position: placed ? snapshot.rack.position : null };
+}
+
+/**
+ * A bottle on order has been delivered: status ordered → active. It lands
+ * UNPLACED in its cellar, like a moved or restored bottle, and from now on
+ * counts everywhere an active bottle does. `arrivedAt` is an optional day
+ * ("it came on Friday"), never in the future; default now. The order date
+ * stays purchaseDate/createdAt; addedToCellarAt, "when it entered this
+ * cellar", becomes the delivery day.
+ * Mirrors POST /api/bottles/:id/arrive and the bulk 'arrive' action.
+ * Returns { error } | { bottle }.
+ */
+async function markArrived(bottle, { arrivedAt } = {}, req) {
+  if (bottle.status !== ORDERED_STATUS) {
+    return { error: { status: 409, code: 'not_on_order', message: 'This bottle is not on order' } };
+  }
+  let when = new Date();
+  if (arrivedAt !== undefined && arrivedAt !== null && arrivedAt !== '') {
+    const d = parseConsumedAt(arrivedAt);
+    if (Number.isNaN(d.getTime()) || d.getTime() > Date.now() + FUTURE_SLACK_MS || d.getFullYear() < 1990) {
+      return { error: { status: 400, message: 'arrivedAt must be a valid date and not in the future' } };
+    }
+    // Not before the order itself (compared by day: an order placed this
+    // afternoon may arrive "today", noon UTC).
+    const orderedOn = bottle.createdAt ? new Date(bottle.createdAt).toISOString().slice(0, 10) : null;
+    if (orderedOn && d.toISOString().slice(0, 10) < orderedOn) {
+      return { error: { status: 400, message: 'arrivedAt cannot be before the bottle was ordered' } };
+    }
+    when = d;
+  }
+  const expected = bottle.expectedArrival || null;
+  bottle.status = 'active';
+  bottle.arrivedAt = when;
+  bottle.addedToCellarAt = when;
+  bottle.arrivalNotifiedAt = undefined;
+  try {
+    await bottle.save();
+  } catch (err) {
+    if (err?.name === 'VersionError') return { error: { status: 409, message: 'This bottle was modified by another request. Please refresh and try again.' } };
+    throw err;
+  }
+  logAudit(req, 'bottle.arrive',
+    { type: 'bottle', id: bottle._id, cellarId: bottle.cellar },
+    { ...(expected ? { expectedArrival: expected } : {}) });
+  // In the cellar now: THIS is when its vintage enters the sommelier maturity
+  // queue (a bottle on order never does — an en primeur vintage may not be
+  // released yet), and the pair is embedded as an add does. Both are
+  // idempotent and never fail the arrival; the embedding is skipped for demo
+  // accounts (zero AI spend).
+  const wineId = bottle.wineDefinition && (bottle.wineDefinition._id || bottle.wineDefinition);
+  if (wineId) {
+    try {
+      await require('../utils/vintageProfile').ensurePendingVintageProfile(wineId, bottle.vintage);
+    } catch { /* bookkeeping only */ }
+    if (!req?.user?.isDemo) {
+      require('./embeddingJob').embedSinglePair(wineId, bottle.vintage).catch(() => {});
+    }
+  }
+  return { bottle };
+}
+
+/**
+ * "Change wine": the bottle was saved under the wrong registry wine (a red
+ * filed under the estate's white, a twin picked from the search). It moves to
+ * `wineDoc` and keeps everything that is the owner's own: dates, price,
+ * notes, rating, rack slot, journey, personal data and barcode (which from
+ * now on counts for the right wine). Before this existed the only way out was
+ * remove + add again, which lost all of that.
+ *
+ * Also: the bottle's own photos follow it (an official registry picture of
+ * the old wine stays put: that is curation); a bottle still waiting on an
+ * import wine request leaves the request, which is withdrawn when no bottle
+ * waits on it any more; the new vintage is queued for a drink window (not
+ * for a bottle on order — it is queued when it arrives) and embedded.
+ *
+ * `wineDoc` must already be visibility-checked by the caller
+ * (services/wineVisibility.findVisibleWine). Mirrors POST /api/bottles/:id/change-wine.
+ * Returns { error } | { bottle, from }.
+ */
+async function changeBottleWine(bottle, wineDoc, req) {
+  const fromId = bottle.wineDefinition ? String(bottle.wineDefinition._id || bottle.wineDefinition) : null;
+  if (fromId && fromId === String(wineDoc._id)) {
+    return { error: { status: 400, code: 'same_wine', message: 'The bottle is already this wine' } };
+  }
+  let fromName = null;
+  if (fromId) {
+    const WineDefinition = require('../models/WineDefinition');
+    const from = await WineDefinition.findById(fromId).select('producer name').lean();
+    fromName = from ? [from.producer, from.name].filter(Boolean).join(' — ') : null;
+  }
+  const pendingRequestId = bottle.pendingWineRequest || null;
+
+  bottle.wineDefinition = wineDoc._id;
+  bottle.pendingWineRequest = undefined;
+  try {
+    await bottle.save();
+  } catch (err) {
+    if (err?.name === 'VersionError') return { error: { status: 409, message: 'This bottle was modified by another request. Please refresh and try again.' } };
+    if (err?.name === 'ValidationError') return { error: { status: 400, message: err.message } };
+    throw err;
+  }
+
+  // The bottle's own photos show this bottle, so they follow it. An image the
+  // old wine uses as its official picture stays: that is a registry decision.
+  await BottleImage.updateMany(
+    { bottle: bottle._id, assignedToWine: { $ne: true } },
+    { $set: { wineDefinition: wineDoc._id } }
+  );
+
+  // Same rule as removeBottleCascade: one import request covers every bottle
+  // of that wine, so it goes only when THIS was the last bottle waiting on it.
+  if (pendingRequestId) {
+    const stillWaiting = await Bottle.countDocuments({ pendingWineRequest: pendingRequestId });
+    if (stillWaiting === 0) {
+      await WineRequest.deleteOne({ _id: pendingRequestId, status: 'pending' });
+    }
+  }
+
+  logAudit(req, 'bottle.change_wine',
+    { type: 'bottle', id: bottle._id, cellarId: bottle.cellar },
+    { fromWineId: fromId, fromWine: fromName, toWineId: String(wineDoc._id), toWine: [wineDoc.producer, wineDoc.name].filter(Boolean).join(' — '), vintage: bottle.vintage });
+
+  // Bookkeeping for the new (wine, vintage): never fails the change.
+  if (bottle.status !== ORDERED_STATUS) {
+    try {
+      await require('../utils/vintageProfile').ensurePendingVintageProfile(wineDoc._id, bottle.vintage);
+    } catch { /* bookkeeping only */ }
+  }
+  if (!req?.user?.isDemo) {
+    require('./embeddingJob').embedSinglePair(wineDoc._id, bottle.vintage).catch(() => {});
+  }
+  if (wineDoc.draft === true) {
+    try { await require('./wineDraftOps').touchDraft(wineDoc._id); } catch { /* never fails the change */ }
+  }
+  return { bottle, from: fromId };
+}
+
 module.exports = {
   consumeBottle, restoreBottle, removeFromRacks, RESTORE_WINDOW_MS,
+  markArrived, parseOnOrderFields, NOT_ARRIVED_ERROR, changeBottleWine,
   addBottle, validateBottleCommitFields, updateBottleFields, removeBottleCascade, UPDATABLE_FIELDS,
+  snapshotBottleForDelete, restoreDeletedBottle,
   openBottle, pourFromBottle, closeBottle,
   PRESERVATION_METHODS, DEFAULT_POUR_ML, MAX_POURS,
 };

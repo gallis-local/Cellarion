@@ -1,14 +1,17 @@
 import { useId, useState, useEffect } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { useTranslation, Trans } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import useVersion from '../hooks/useVersion';
+import { wasSessionExpired } from '../utils/sessionExpired';
 import { stashPostLoginRedirect, takePostLoginRedirect, isSafeInternalPath } from '../utils/postLoginRedirect';
 import { stashSignupSourceForSso } from '../utils/signupSource';
+// Checked before submitting, so a newcomer learns the rules in their own
+// language, not from an English server refusal afterwards.
+import { USERNAME_RULE, PASSWORD_POLICY } from '../utils/accountRules';
 import './Login.css';
+import AuthLogo from '../components/AuthLogo';
 
-const LOGO_WEBP = '/cellarion-logo-light.webp';
-const LOGO_PNG  = '/cellarion-logo-light.png';
 
 // Google's "G" mark, per their branding guidelines, as an inline SVG so it
 // needs no extra asset/request.
@@ -23,12 +26,18 @@ function GoogleIcon() {
   );
 }
 
+
 function Login() {
   const usernameId = useId();
   const emailId = useId();
   const passwordId = useId();
   const forgotEmailId = useId();
-  const [mode, setMode] = useState('login');
+  const usernameHintId = useId();
+  const passwordHintId = useId();
+  // Every "Create account" button links here with ?mode=register, so a
+  // newcomer lands on the form they came for instead of the sign-in tab.
+  const [searchParams] = useSearchParams();
+  const [mode, setMode] = useState(() => (searchParams.get('mode') === 'register' ? 'register' : 'login'));
   const [formData, setFormData] = useState({ username: '', email: '', password: '' });
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -43,12 +52,19 @@ function Login() {
   const [googleEnabled, setGoogleEnabled] = useState(false);
   // null when no OIDC provider is configured; { name } when one is.
   const [oidcProvider, setOidcProvider] = useState(null);
+  // Arrived here because the server ended a session that was in use — say so,
+  // or the page reads as "the app threw me out". The word stays (this tab only)
+  // until the next sign-in clears it: clearing it on mount lost it to React's
+  // dev double-mount, and to the parallel sign-outs a burst of refused
+  // requests sets off, which can finish after this page has mounted.
+  const [sessionEnded] = useState(() => wasSessionExpired());
 
   const { t } = useTranslation();
   const { login, register } = useAuth();
   const navigate = useNavigate();
   // Where ProtectedRoute sent them from, when a deep link bounced them here
-  // (issue #1165). Set by ProtectedRoute itself, never read from the URL.
+  // (issue #1165), or the community page whose sign-in link they followed.
+  // Router state set by the app itself, never read from the URL.
   const location = useLocation();
   const appVersion = useVersion();
 
@@ -72,13 +88,30 @@ function Login() {
     setError(null);
     setPendingVerificationEmail(null);
     setResendStatus(null);
+
+    // Phone keyboards add a space after an autocompleted word or address, and
+    // the server would read "anna@example.com " as an unknown account.
+    const username = formData.username.trim();
+    const email = formData.email.trim();
+
+    if (mode === 'register') {
+      if (!USERNAME_RULE.test(username)) {
+        setError(t('auth.usernameRuleError', 'Usernames are 3–30 characters and may use letters, numbers, dots, underscores and hyphens — no spaces.'));
+        return;
+      }
+      if (!PASSWORD_POLICY.test(formData.password)) {
+        setError(t('auth.passwordRuleError', 'Your password needs at least 12 characters, with an uppercase letter, a lowercase letter, a number and a symbol.'));
+        return;
+      }
+    }
+
     setLoading(true);
 
     let result;
     if (mode === 'login') {
-      result = await login(formData.username, formData.password, rememberMe);
+      result = await login(username, formData.password, rememberMe);
     } else {
-      result = await register(formData.username, formData.email, formData.password, consentAccepted);
+      result = await register(username, email, formData.password, consentAccepted);
     }
 
     setLoading(false);
@@ -106,7 +139,11 @@ function Login() {
       if (result.code === 'EMAIL_NOT_VERIFIED') {
         setPendingVerificationEmail(result.email);
       }
-      setError(result.error);
+      // Deliberately the same answer whether the username or the email is the
+      // one taken (no account enumeration), but one that says what to try next.
+      setError(result.code === 'REGISTRATION_REJECTED'
+        ? t('auth.registrationRejected', 'That username or email can’t be used. Try another username — or, if you already have an account, log in or reset your password.')
+        : result.error);
     }
   };
 
@@ -180,10 +217,7 @@ function Login() {
       <div className="login-page">
         <div className="login-card">
           <div className="login-header">
-            <picture>
-              <source srcSet={LOGO_WEBP} type="image/webp" />
-              <img src={LOGO_PNG} alt="Cellarion" className="login-logo" width="159" height="128" />
-            </picture>
+            <AuthLogo />
             <p>{t('auth.resetYourPassword')}</p>
           </div>
 
@@ -210,6 +244,7 @@ function Login() {
                 <input
                   id={forgotEmailId}
                   type="email"
+                  autoComplete="email"
                   value={forgotEmail}
                   onChange={(e) => setForgotEmail(e.target.value)}
                   required
@@ -247,10 +282,7 @@ function Login() {
       <div className="login-page">
         <div className="login-card">
           <div className="login-header">
-            <picture>
-              <source srcSet={LOGO_WEBP} type="image/webp" />
-              <img src={LOGO_PNG} alt="Cellarion" className="login-logo" width="159" height="128" />
-            </picture>
+            <AuthLogo />
           </div>
           <div className="alert alert-success">
             <strong>{t('auth.checkYourEmail')}</strong>
@@ -281,12 +313,15 @@ function Login() {
     <div className="login-page">
       <div className="login-card">
         <div className="login-header">
-          <picture>
-            <source srcSet={LOGO_WEBP} type="image/webp" />
-            <img src={LOGO_PNG} alt="Cellarion" className="login-logo" />
-          </picture>
+          <AuthLogo />
           <p>{t('auth.tagline')}</p>
         </div>
+
+        {sessionEnded && (
+          <div className="alert alert-info" role="status">
+            {t('auth.sessionEnded', 'Your session ended. Log in again to pick up where you left off.')}
+          </div>
+        )}
 
         <div className="mode-toggle">
           <button
@@ -303,7 +338,15 @@ function Login() {
           </button>
         </div>
 
-        {error && <div className="alert alert-error">{error}</div>}
+        {/* Set by VerifyEmail on the way here: the link worked, and this is
+            the step that remains. */}
+        {location.state?.verified && !error && (
+          <div className="alert alert-success" role="status">
+            {t('auth.verifiedNowLogin', 'Your email is verified. Log in to start your cellar.')}
+          </div>
+        )}
+
+        {error && <div className="alert alert-error" role="alert">{error}</div>}
 
         {pendingVerificationEmail && (
           <div style={{ marginBottom: '1rem', textAlign: 'center' }}>
@@ -370,14 +413,26 @@ function Login() {
         <form onSubmit={handleSubmit}>
           <div className="form-group">
             <label htmlFor={usernameId}>{mode === 'login' ? t('auth.usernameOrEmail') : t('auth.usernameLabel')}</label>
+            {/* Autocomplete hints let password managers fill and save the
+                right fields (Chrome asks for them; support ticket 2026-10-14). */}
             <input
               id={usernameId}
               type="text"
+              autoComplete="username"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
               value={formData.username}
               onChange={(e) => setFormData({ ...formData, username: e.target.value })}
+              aria-describedby={mode === 'register' ? usernameHintId : undefined}
               required
               autoFocus
             />
+            {mode === 'register' && (
+              <small id={usernameHintId} className="form-hint">
+                {t('auth.usernameHint', '3–30 characters: letters, numbers, dots, underscores or hyphens.')}
+              </small>
+            )}
           </div>
           {mode === 'register' && (
             <div className="form-group">
@@ -385,6 +440,7 @@ function Login() {
               <input
                 id={emailId}
                 type="email"
+                autoComplete="email"
                 value={formData.email}
                 onChange={(e) => setFormData({ ...formData, email: e.target.value })}
                 required
@@ -396,10 +452,17 @@ function Login() {
             <input
               id={passwordId}
               type="password"
+              autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
               value={formData.password}
               onChange={(e) => setFormData({ ...formData, password: e.target.value })}
+              aria-describedby={mode === 'register' ? passwordHintId : undefined}
               required
             />
+            {mode === 'register' && (
+              <small id={passwordHintId} className="form-hint">
+                {t('auth.passwordRequirements', 'Must be at least 12 characters with uppercase, lowercase, number, and special character.')}
+              </small>
+            )}
           </div>
           {mode === 'register' && (
             <div className="form-group consent-group">
@@ -416,6 +479,9 @@ function Login() {
                   </Trans>
                 </span>
               </label>
+              <small className="form-hint">
+                {t('auth.drinkWindowEmailNotice', 'When bottles in your cellar reach their best, we email you, at most once a week. You can turn this off in Settings, or with the link in each email.')}
+              </small>
             </div>
           )}
           {mode === 'login' && (

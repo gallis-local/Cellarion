@@ -28,6 +28,7 @@ jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), build
 jest.mock('../services/vectorStore', () => ({ getPoints: jest.fn(), searchSimilar: jest.fn() }));
 jest.mock('../config/aiConfig', () => ({ get: jest.fn(() => ({ vectorIndex: 'v1' })) }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
+jest.mock('../services/indexNow', () => ({ submitUrls: jest.fn() }));
 jest.mock('../services/findOrCreateWine', () => ({ findOrCreateWine: jest.fn() }));
 jest.mock('../services/bottleOps', () => ({
   consumeBottle: jest.fn(), restoreBottle: jest.fn(), removeFromRacks: jest.fn(),
@@ -124,6 +125,19 @@ describe('preview', () => {
     }, CTX);
     expect(parse(res).data.plan[0].status).toBe('invalid');
   });
+
+  // Release audit 2026-10-13: an unsupported currency passed the preview, then
+  // apply created the new wine before addBottle refused the bottle.
+  test('an unsupported currency is flagged at preview', async () => {
+    ownCellar();
+    const res = await tool('bulk_add').handler({
+      cellar_id: oid('c'),
+      items: [{ wine_id: oid('f'), currency: 'PLN' }],
+    }, CTX);
+    const item = parse(res).data.plan[0];
+    expect(item.status).toBe('invalid');
+    expect(JSON.stringify(item)).toMatch(/Unsupported currency/);
+  });
 });
 
 describe('apply', () => {
@@ -158,6 +172,24 @@ describe('apply', () => {
     const ledger = McpActionLog.create.mock.calls.at(-1)[0];
     expect(ledger.action).toBe('bulk_add');
     expect(ledger.detail.bottles).toHaveLength(2);
+  });
+
+  // Like add_bottle and the REST mint: a wine the batch creates announces its
+  // public page to IndexNow (pending rows and drafts excluded — wineCommit).
+  test('a wine the batch creates is announced to IndexNow; the known wine is not', async () => {
+    const { submitUrls } = require('../services/indexNow');
+    McpActionLog.findOne.mockReturnValue(chain(freshPreview()));
+    McpActionLog.findOneAndUpdate.mockResolvedValue(freshPreview());
+    ownCellar();
+    WineDefinition.findById.mockReturnValue(chain({ _id: oid('f'), name: 'Known' }));
+    findOrCreateWine.mockResolvedValue({ wine: { _id: oid('e'), name: 'Fresh Wine', producer: 'P', slug: 'fresh-wine' }, created: true });
+    bottleOps.addBottle
+      .mockResolvedValueOnce({ bottle: { _id: new mongoose.Types.ObjectId(oid('1')) } })
+      .mockResolvedValueOnce({ bottle: { _id: new mongoose.Types.ObjectId(oid('2')) } });
+
+    await tool('bulk_add').handler({ mode: 'apply', preview_id: oid('9') }, CTX);
+    expect(submitUrls).toHaveBeenCalledTimes(1);
+    expect(submitUrls).toHaveBeenCalledWith('/wines/fresh-wine');
   });
 
   test('refuses: exhausted budget, non-applyable plan, used/expired/foreign preview', async () => {

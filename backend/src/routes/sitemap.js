@@ -26,7 +26,7 @@ const { countWinesBy } = require('./taxonomy');
  */
 
 const WINE_TYPES = ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'];
-const MIN_WINES = 3;
+const { MIN_WINES } = require('../config/taxonomyPages');
 
 const SITE_URL = process.env.FRONTEND_URL || 'https://cellarion.app';
 
@@ -89,6 +89,8 @@ async function buildPages() {
     { loc: '/community/discussions', priority: '0.8', changefreq: 'daily' },
     { loc: '/help', priority: '0.6', changefreq: 'monthly' },
     { loc: '/connect-ai', priority: '0.7', changefreq: 'monthly' },
+    { loc: '/connect-ai/claude', priority: '0.7', changefreq: 'monthly' },
+    { loc: '/developers', priority: '0.6', changefreq: 'monthly' },
     { loc: '/privacy', priority: '0.3', changefreq: 'yearly' },
   ];
 

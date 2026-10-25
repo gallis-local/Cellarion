@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef } from 'react';
+import { useBackToClose } from '../utils/useBackToClose';
 import './Modal.css';
 
 /**
@@ -17,15 +18,44 @@ import './Modal.css';
  * `trapFocus` for modals that must hold focus (e.g. a blocking/non-dismissible
  * modal): on open it moves focus into the dialog and keeps Tab inside it.
  */
+// Open dialogs. Escape closes only the newest: a dialog opened from inside
+// another (the beta feedback form inside the rack "Move bottles" dialog) must
+// not take its parent — and the parent's typed input — with it. "Newest" is
+// the order of FIRST RENDER, which runs parent before child; effects run
+// child before parent, so they cannot tell a nested pair apart.
+const openModals = new Set();
+let modalSeq = 0;
+
 function Modal({ title, onClose, children, wide, showClose, boxStyle, trapFocus = false }) {
   const titleId = useId();
   const boxRef = useRef(null);
+  // Where the current press began. A click whose press began INSIDE the box —
+  // selecting text in a field and releasing past the edge — is reported by the
+  // browser on the overlay, and used to close the dialog with whatever had
+  // been typed in it (journal entry, review, support message).
+  const pressTarget = useRef(null);
+  // The phone's Back closes the dialog instead of leaving the page.
+  useBackToClose(onClose);
+  const token = useRef(null);
+  if (token.current === null) token.current = { seq: ++modalSeq };
+
+  useEffect(() => {
+    const me = token.current;
+    openModals.add(me);
+    return () => { openModals.delete(me); };
+  }, []);
 
   // Escape closes the dialog, independent of the optional focus trap — mirrors
   // Drawer.js so every shared-Modal dialog is keyboard-dismissible.
   useEffect(() => {
     if (!onClose) return undefined;
-    const onKey = (e) => { if (e.key === 'Escape') onClose(e); };
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      let newest = null;
+      for (const m of openModals) if (!newest || m.seq > newest.seq) newest = m;
+      if (newest && newest !== token.current) return;
+      onClose(e);
+    };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
@@ -61,7 +91,16 @@ function Modal({ title, onClose, children, wide, showClose, boxStyle, trapFocus 
   }, [trapFocus]);
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    <div
+      className="modal-overlay"
+      onPointerDown={(e) => { pressTarget.current = e.target; }}
+      onClick={(e) => {
+        const startedInside = pressTarget.current && pressTarget.current !== e.currentTarget;
+        pressTarget.current = null;
+        if (startedInside || e.target !== e.currentTarget) return;
+        if (onClose) onClose(e);
+      }}
+    >
       <div
         className={`modal-box${wide ? ' modal-box--wide' : ''}`}
         style={boxStyle}

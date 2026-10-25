@@ -119,6 +119,9 @@ async function placeBottleInRack(rack, position, bottleId, req) {
   // any surface (web slot picker, post-add placing queue, MCP place_bottle).
   // Audit 2026-09-14: bottles added straight into the drinking history were
   // offered for placement and this accepted them.
+  if (bottle.status === 'ordered') {
+    return { error: { status: 400, message: 'This bottle is on order and has not arrived yet — mark it as arrived before placing it in a rack' } };
+  }
   if (bottle.status && bottle.status !== 'active') {
     return { error: { status: 400, message: 'Only a bottle still in the cellar can be placed in a rack — this one is consumed' } };
   }
@@ -189,8 +192,10 @@ async function moveBottleToCellar(bottle, sourceCellar, destCellar, req) {
   if (String(destCellar._id) === String(sourceCellar._id)) {
     return { error: { status: 400, message: 'Bottle is already in that cellar' } };
   }
-  if (bottle.status !== 'active') {
-    return { error: { status: 400, message: 'Only active bottles can be moved' } };
+  // A bottle on order may be moved too: an order booked to the wrong cellar
+  // is redirected before it arrives.
+  if (bottle.status !== 'active' && bottle.status !== 'ordered') {
+    return { error: { status: 400, message: 'Only bottles in the cellar or on order can be moved' } };
   }
   const now = new Date();
   if (bottle.cellarHistory.length === 0) {
@@ -228,6 +233,31 @@ async function moveBottleToCellar(bottle, sourceCellar, destCellar, req) {
     { fromCellarId: sourceCellar._id, fromCellarName: sourceCellar.name, ...meta });
 
   return { bottle, from: { cellarId: String(sourceCellar._id), cellarName: sourceCellar.name } };
+}
+
+/**
+ * What an arrangement reads of each placed bottle — the ONE load for the web
+ * Arrange preview and MCP auto_arrange, so both plan from the same data.
+ * purchaseDate/createdAt anchor relative (NV) profile windows
+ * (maturityUtils.bottleAnchorYear): without them an NV bottle under a curated
+ * window classifies as having no window and sorts last.
+ */
+const ARRANGE_SLOT_POPULATE = {
+  path: 'slots.bottle',
+  select: 'vintage status drinkFrom drinkTo peakFrom peakUntil wineDefinition purchaseDate createdAt',
+  populate: { path: 'wineDefinition', select: 'name producer type' },
+};
+
+/**
+ * How many positions an arrangement can fill: the positions of the fill
+ * order (default 1..maxPosition) that are not disabled. Counted from the
+ * positions themselves, so a disabled entry listed twice or lying beyond the
+ * rack does not shrink it. Shared by both arrange surfaces' overflow guard.
+ */
+function usablePositionCount(rack, positionOrder) {
+  const disabled = new Set(rack.disabledPositions || []);
+  const order = positionOrder || Array.from({ length: getMaxPosition(rack) }, (_, i) => i + 1);
+  return order.filter((p) => !disabled.has(p)).length;
 }
 
 /**
@@ -325,8 +355,136 @@ async function applyArrangement(rack, target, req, meta = {}) {
   return { rack };
 }
 
+const slotBottleId = (s) => String(s.bottle && s.bottle._id ? s.bottle._id : s.bottle);
+
+/**
+ * Move the bottles of one rack into another rack of the same cellar (forum
+ * feedback 2026-10-12: a rack rebuilt as a wine cabinet meant moving every
+ * bottle across by hand, one at a time). Both racks are loaded and
+ * access-checked by the caller.
+ *
+ * Bottles keep their order: sorted by position in the source, they fill the
+ * target's free positions (in range, not disabled, not taken) from the lowest
+ * up. When the target has fewer free positions than the source has bottles,
+ * the first ones by position move and the rest stay where they are.
+ *
+ * Two racks are two documents and a bottle may sit in one slot only (the
+ * unique slots.bottle index), so the bottles leave the source FIRST and then
+ * enter the target, each save under optimistic concurrency. If the target
+ * write is refused, the bottles go back into the source slots they came from
+ * (those still free); a bottle that cannot go back stays in the cellar,
+ * unplaced — never lost and never in two slots.
+ * Returns { error } | { moved, left, moves: [{ bottleId, from, to }] }.
+ */
+async function moveRackBottles(source, target, req) {
+  if (String(source._id) === String(target._id)) {
+    return { error: { status: 400, message: 'Choose a different rack to move the bottles to' } };
+  }
+  if (String(source.cellar) !== String(target.cellar)) {
+    return { error: { status: 400, message: 'Both racks must be in the same cellar' } };
+  }
+  const occupied = (source.slots || []).filter((s) => s.bottle).sort((a, b) => a.position - b.position);
+  if (occupied.length === 0) {
+    return { error: { status: 400, code: 'empty', message: 'This rack has no bottles to move' } };
+  }
+  const maxPos = getMaxPosition(target);
+  const disabled = new Set(target.disabledPositions || []);
+  const taken = new Set((target.slots || []).map((s) => s.position));
+  const free = [];
+  for (let p = 1; p <= maxPos; p++) if (!disabled.has(p) && !taken.has(p)) free.push(p);
+  if (free.length === 0) {
+    return { error: { status: 409, code: 'full', message: 'The other rack has no free slots' } };
+  }
+
+  const moving = occupied.slice(0, free.length);
+  const moves = moving.map((s, i) => ({
+    bottleId: slotBottleId(s), from: s.position, to: free[i],
+    ...(s.rfidTag ? { rfidTag: s.rfidTag } : {}),
+  }));
+  const movingIds = new Set(moves.map((m) => m.bottleId));
+
+  // 1. Out of the source.
+  source.slots = (source.slots || []).filter((s) => !movingIds.has(slotBottleId(s)));
+  try {
+    await source.save();
+  } catch (err) {
+    if (err.name === 'VersionError') {
+      return { error: { status: 409, code: 'conflict', message: 'This rack was changed at the same moment — nothing was moved.' } };
+    }
+    throw err;
+  }
+
+  // 2. Into the target. Slot-level rfidTags follow their bottle.
+  target.slots = [
+    ...(target.slots || []),
+    ...moves.map((m) => ({ position: m.to, bottle: m.bottleId, ...(m.rfidTag ? { rfidTag: m.rfidTag } : {}) })),
+  ];
+  try {
+    await target.save();
+  } catch (err) {
+    const unplaced = await putBackIntoSource(source._id, moves);
+    // The source DID change: bottles left it, and those that could not go
+    // back are now unplaced. Audited either way, so the data version moves
+    // and every cached layout (offline copy, search, MCP) is re-read.
+    logAudit(req, 'rack.move_bottles', { type: 'rack', id: source._id, cellarId: source.cellar },
+      { fromRack: String(source._id), toRack: String(target._id), moved: 0, refused: true, unplaced });
+    if (err.name === 'VersionError' || err.code === 11000) {
+      return {
+        error: unplaced > 0
+          ? { status: 409, code: 'conflict', unplaced, message: `The other rack was changed at the same moment, so nothing moved there — but ${unplaced} bottle(s) could not go back to their slots and are now unplaced in the cellar.` }
+          : { status: 409, code: 'conflict', message: 'The other rack was changed at the same moment — nothing was moved.' },
+      };
+    }
+    throw err;
+  }
+
+  const left = occupied.length - moves.length;
+  logAudit(req, 'rack.move_bottles', { type: 'rack', id: target._id, cellarId: target.cellar },
+    { fromRack: String(source._id), toRack: String(target._id), moved: moves.length, left });
+  return { moved: moves.length, left, moves: moves.map(({ bottleId, from, to }) => ({ bottleId, from, to })) };
+}
+
+// Best effort after a refused target write: each bottle back into its old
+// source slot when that slot is still free and the bottle sits in no rack.
+// Returns how many bottles are left unplaced — not back, and in no rack.
+async function putBackIntoSource(sourceId, moves) {
+  const ids = moves.map((m) => m.bottleId);
+  try {
+    const fresh = await Rack.findOne({ _id: sourceId, deletedAt: null });
+    if (!fresh) return await countUnplaced(ids);
+    const taken = new Set((fresh.slots || []).map((s) => s.position));
+    const placedElsewhere = new Set((await Rack.find({ 'slots.bottle': { $in: ids } }).select('slots.bottle').lean())
+      .flatMap((r) => (r.slots || []).map(slotBottleId)));
+    const back = [];
+    for (const m of moves) {
+      if (taken.has(m.from) || placedElsewhere.has(m.bottleId)) continue;
+      back.push({ position: m.from, bottle: m.bottleId, ...(m.rfidTag ? { rfidTag: m.rfidTag } : {}) });
+    }
+    if (back.length > 0) {
+      fresh.slots = [...fresh.slots, ...back];
+      await fresh.save();
+    }
+    return moves.length - back.length - moves.filter((m) => placedElsewhere.has(m.bottleId)).length;
+  } catch (err) {
+    console.warn('[rackOps] moveRackBottles put-back failed (bottles left unplaced):', err.message);
+    return countUnplaced(ids);
+  }
+}
+
+// How many of these bottles sit in no rack at all.
+async function countUnplaced(ids) {
+  try {
+    const placed = new Set((await Rack.find({ 'slots.bottle': { $in: ids } }).select('slots.bottle').lean())
+      .flatMap((r) => (r.slots || []).map(slotBottleId)));
+    return ids.filter((id) => !placed.has(id)).length;
+  } catch {
+    return ids.length;
+  }
+}
+
 module.exports = {
   normalizeRackGroup,
   createCellar, createGridRack, placeBottleInRack, clearRackSlot, moveBottleToCellar,
-  buildAnnotatedEntries, validateArrangementTarget, applyArrangement,
+  ARRANGE_SLOT_POPULATE, usablePositionCount,
+  buildAnnotatedEntries, validateArrangementTarget, applyArrangement, moveRackBottles,
 };

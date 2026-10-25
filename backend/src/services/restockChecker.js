@@ -1,4 +1,5 @@
 const Bottle = require('../models/Bottle');
+const WineDefinition = require('../models/WineDefinition');
 const RestockAlert = require('../models/RestockAlert');
 const User = require('../models/User');
 const { createNotification } = require('./notifications');
@@ -23,8 +24,14 @@ const TOP_K = 10;
  *  4. Save the alert and send a notification suggesting they restock
  *
  * Fire-and-forget — errors are caught and logged, never thrown.
+ *
+ * storedVectorOnly: compare with the wine's STORED vector and skip the check
+ * when it has none — never a paid embedding call. Set for every consume made
+ * with an API or OAuth token (Home Assistant, a connected AI): nothing a
+ * token can reach may spend AI money (Johan, 2026-10-21). A wine without a
+ * vector simply gets no restock suggestion from that consume.
  */
-async function runCheck(userId, bottleId, cellarId) {
+async function runCheck(userId, bottleId, cellarId, { storedVectorOnly = false } = {}) {
   try {
     // Check if embedding infra is available
     if (!embedding || !vectorStore) return;
@@ -50,6 +57,7 @@ async function runCheck(userId, bottleId, cellarId) {
 
     // The drunk wine's stored vector (free), else embed it (one Voyage call).
     let queryVector = await vectorStore.getVector(wine._id, vintage, { model, indexVersion });
+    if (!queryVector && storedVectorOnly) return;
     if (!queryVector) {
       const searchText = embedding.buildEmbeddingText(wine, vintage);
       queryVector = await embedding.embedSingle(searchText, { model });
@@ -63,6 +71,8 @@ async function runCheck(userId, bottleId, cellarId) {
     // Scope: 'cellar' = only check the cellar the bottle came from;
     //        'all' (default) = check across all user's cellars.
     const scope = user.preferences?.restockScope || 'all';
+    // Bottles on order count here on purpose: a similar wine already bought
+    // and on its way is no reason to suggest restocking.
     const activeQuery = {
       user: userId,
       wineDefinition: { $ne: null },
@@ -85,7 +95,15 @@ async function runCheck(userId, bottleId, cellarId) {
     const hits = await vectorStore.search(queryVector, {
       model, indexVersion, limit: TOP_K, minScore: SIMILARITY_THRESHOLD, distinctWines: true,
     });
-    const similarWineIds = hits.map(h => h.wineDefinitionId);
+    // Only wines the registry shows: a quarantined non-wine, a pending row
+    // or a canary keeps its vectors but must not be named as a similar wine
+    // in the alert (audit 2026-10-14).
+    const hitIds = hits.map(h => h.wineDefinitionId);
+    const similarWineIds = hitIds.length
+      ? (await WineDefinition.distinct('_id', {
+        _id: { $in: hitIds }, nonWine: { $ne: true }, pendingIdentity: { $ne: true }, canary: { $ne: true },
+      })).map(String)
+      : [];
     if (similarWineIds.length === 0) return;
 
     // Check if there's already an active alert for this wine
@@ -165,10 +183,14 @@ const MAX_QUEUED = 500;
 let queue = Promise.resolve();
 let queued = 0;
 
-function checkRestockGap(userId, bottleId, cellarId) {
+/**
+ * Queue a restock-gap check (runCheck). opts.storedVectorOnly: never embed —
+ * see runCheck; consumeBottle sets it for token-authenticated requests.
+ */
+function checkRestockGap(userId, bottleId, cellarId, opts = {}) {
   if (queued >= MAX_QUEUED) return Promise.resolve();
   queued += 1;
-  const run = queue.then(() => runCheck(userId, bottleId, cellarId)).finally(() => { queued -= 1; });
+  const run = queue.then(() => runCheck(userId, bottleId, cellarId, opts)).finally(() => { queued -= 1; });
   queue = run.catch(() => {});
   return run;
 }

@@ -18,7 +18,16 @@ const today = () => {
 // bottle logged after the fact used to be stamped with the logging day, and
 // the only way to say otherwise was the bulk action (support ticket
 // 2026-09-13). Same field and rule as BulkConsumeModal: never in the future.
-export function ConsumeModal({ wineName, defaultRatingScale, reservationText, onConfirm, onCancel }) {
+//
+// `onJustAGlass`: the rack page and the 3D room open this dialog straight
+// from a slot, where the bottle page's own "Open bottle…" button is not at
+// hand. They pass this, and the dialog first offers "Just a glass — keep the
+// bottle" (open it and pour one glass instead of taking it out). Without it
+// — the bottle page, "Drink one" — that choice is not shown. The racks and
+// the room used to carry copies of this dialog for the sake of that one
+// button, and those copies never learned the reservation warning
+// (usability plan 2026-10-14, D2).
+export function ConsumeModal({ wineName, defaultRatingScale, reservationText, onConfirm, onCancel, onJustAGlass }) {
   const { t } = useTranslation();
   const [reason,       setReason]      = useState('drank');
   const [note,         setNote]        = useState('');
@@ -41,7 +50,11 @@ export function ConsumeModal({ wineName, defaultRatingScale, reservationText, on
   };
 
   return (
-    <div className="modal-overlay" onClick={onCancel}>
+    // While the take-out is on its way, a tap beside the dialog does not
+    // close it: a refusal keeps the dialog open with what was typed (the
+    // racks, the room), and a stray tap must not throw that away. Escape and
+    // Back still close it — those are meant.
+    <div className="modal-overlay" onClick={saving ? undefined : onCancel}>
       <div className="modal-box" onClick={e => e.stopPropagation()} ref={boxRef} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
         <h2 id={titleId}>{t('bottleDetail.removeBottleTitle')}</h2>
         {wineName && <p className="modal-wine-name">{wineName}</p>}
@@ -51,10 +64,23 @@ export function ConsumeModal({ wineName, defaultRatingScale, reservationText, on
             {t('bottleDetail.consumeReservedWarning', { reservation: reservationText })}
           </div>
         )}
+        {onJustAGlass && (
+          // Disabled while the take-out is saving: a glass poured from a
+          // bottle the server is taking out at that moment would land on a
+          // drunk bottle.
+          <div className="consume-partial-row">
+            <button type="button" className="btn btn-secondary consume-partial-btn" onClick={onJustAGlass} disabled={saving}>
+              🍷 {t('openBottle.partialOption')}
+            </button>
+            <span className="consume-partial-or">{t('openBottle.partialOr')}</span>
+          </div>
+        )}
         <form onSubmit={handleSubmit}>
           <div className="form-group">
             <label>{t('common.reason')}</label>
-            <select value={reason} onChange={e => setReason(e.target.value)}>
+            {/* The first focus is the form, also when "Just a glass" sits
+                above it: a stray Enter must not pour a glass. */}
+            <select value={reason} onChange={e => setReason(e.target.value)} autoFocus>
               <option value="drank">{t('bottleDetail.drinkReason')}</option>
               <option value="gifted">{t('bottleDetail.giftedReason')}</option>
               <option value="sold">{t('bottleDetail.soldReason')}</option>
@@ -94,7 +120,7 @@ export function ConsumeModal({ wineName, defaultRatingScale, reservationText, on
             />
           </div>
           <div className="modal-actions">
-            <button type="button" className="btn btn-secondary" onClick={onCancel}>{t('common.cancel')}</button>
+            <button type="button" className="btn btn-secondary" onClick={onCancel} disabled={saving}>{t('common.cancel')}</button>
             <button type="submit" className="btn btn-consume" disabled={saving}>
               {saving ? t('common.saving') : t('common.confirm')}
             </button>

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
-import { adminGetRateLimits, adminSaveRateLimits, adminGetContactEmail, adminSaveContactEmail } from '../../api/admin';
+import { adminGetRateLimits, adminSaveRateLimits, adminGetContactEmail, adminSaveContactEmail, adminGetNewMemberEmails, adminSaveNewMemberEmails } from '../../api/admin';
 
 const INPUT_STYLE = {
   width: 90,
@@ -434,11 +434,10 @@ function ChatLimitsPanel({ apiFetch, config, defaults, error }) {
   const [msg,    setMsg]    = useState(null);
 
   useEffect(() => {
-    if (config?.chatBurst && config?.chatConcurrentStreams) {
+    if (config?.chatBurst) {
       setForm({
         burstMax:      String(config.chatBurst.max),
         burstWindowMs: String(config.chatBurst.windowMs),
-        concurrent:    String(config.chatConcurrentStreams.max),
       });
     }
   }, [config]);
@@ -447,8 +446,7 @@ function ChatLimitsPanel({ apiFetch, config, defaults, error }) {
     setSaving(true); setMsg(null);
     try {
       const res = await adminSaveRateLimits(apiFetch, {
-        chatBurst:             { max: Number(form.burstMax), windowMs: Number(form.burstWindowMs) },
-        chatConcurrentStreams: { max: Number(form.concurrent) },
+        chatBurst: { max: Number(form.burstMax), windowMs: Number(form.burstWindowMs) },
       });
       if (!res.ok) { const d = await res.json(); setMsg({ ok: false, text: d.error || 'Save failed' }); }
       else setMsg({ ok: true, text: 'Saved — takes effect immediately' });
@@ -462,7 +460,7 @@ function ChatLimitsPanel({ apiFetch, config, defaults, error }) {
   return (
     <PanelShell
       title="Cellar Chat abuse controls"
-      intro="Per-user throttles on /api/chat — guards Anthropic spend against scripted bursts inside a single user's daily quota. The SSE per-stream timeout is hardcoded at 90s (not editable) as a system safety bound."
+      intro="Per-user throttles on /api/chat — guards Anthropic spend against scripted bursts inside a single user's daily quota."
       saving={saving} onSave={save} msg={msg}
     >
       <NumberField
@@ -481,14 +479,6 @@ function ChatLimitsPanel({ apiFetch, config, defaults, error }) {
         defaultValue={defaults?.chatBurst?.windowMs}
         onChange={v => setForm(f => ({ ...f, burstWindowMs: v }))}
         min={10000} max={3600000}
-      />
-      <NumberField
-        label="Max concurrent SSE streams per user"
-        unit="streams"
-        value={form.concurrent}
-        defaultValue={defaults?.chatConcurrentStreams?.max}
-        onChange={v => setForm(f => ({ ...f, concurrent: v }))}
-        min={1} max={50}
       />
     </PanelShell>
   );
@@ -621,6 +611,82 @@ function ContactEmailPanel({ apiFetch }) {
   );
 }
 
+// The one email a new member gets two days after joining, if they have not
+// come back (backend services/newMemberEmails). Off until turned on here, and
+// then only for accounts created after that moment.
+export function NewMemberEmailsPanel({ apiFetch }) {
+  const [state, setState] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  useEffect(() => {
+    adminGetNewMemberEmails(apiFetch)
+      .then(r => r.json())
+      .then(setState)
+      .catch(() => setMsg({ ok: false, text: 'Failed to load' }));
+  }, [apiFetch]);
+
+  const toggle = async () => {
+    setSaving(true);
+    setMsg(null);
+    try {
+      const res = await adminSaveNewMemberEmails(apiFetch, !state.enabled);
+      const d = await res.json();
+      if (!res.ok) {
+        setMsg({ ok: false, text: d.error || 'Save failed' });
+      } else {
+        setState(prev => ({ ...prev, ...d }));
+        setMsg({ ok: true, text: d.enabled ? 'Turned on' : 'Turned off' });
+      }
+    } catch {
+      setMsg({ ok: false, text: 'Network error' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="sa-panel" style={{ marginTop: 16 }}>
+      <div className="sa-panel-header">
+        <span className="sa-panel-title">New-member emails</span>
+        {state && (
+          <button className="sa-btn" onClick={toggle} disabled={saving}>
+            {saving ? 'Saving...' : state.enabled ? 'Turn off' : 'Turn on'}
+          </button>
+        )}
+      </div>
+      <div className="sa-panel-body">
+        <div style={{ fontSize: 11, color: 'var(--sa-text-dim)', marginBottom: 12 }}>
+          One email, once, two days after someone joins, and only if they have not come back since:
+          "your cellar so far" when they added bottles, "your cellar is still empty" (with a delete-account
+          link) when not. Sent daily at 17:00 UTC, only to accounts created after it was turned on.
+        </div>
+        {state && (
+          <div className="sa-kv">
+            <div className="sa-kv-row">
+              <span className="sa-kv-key">Status</span>
+              <span>{state.enabled
+                ? `On since ${new Date(state.since).toLocaleString()}`
+                : 'Off'}</span>
+            </div>
+            <div className="sa-kv-row">
+              <span className="sa-kv-key">Sent, last 30 days</span>
+              <span>{state.sentLast30Days?.cellar ?? 0} cellar · {state.sentLast30Days?.empty ?? 0} empty</span>
+            </div>
+            {!state.mailConfigured && (
+              <div className="sa-kv-row">
+                <span className="sa-kv-key">Mail</span>
+                <span style={{ color: 'var(--sa-red)' }}>Not configured: nothing is sent</span>
+              </div>
+            )}
+          </div>
+        )}
+        {msg && <div style={{ marginTop: 8, fontSize: 11, color: msg.ok ? 'var(--sa-green)' : 'var(--sa-red)' }}>{msg.text}</div>}
+      </div>
+    </div>
+  );
+}
+
 export default function TabSettings() {
   const { apiFetch } = useAuth();
   // Single /rate-limits fetch shared by the three rate-limit panels below.
@@ -628,6 +694,7 @@ export default function TabSettings() {
   return (
     <>
       <ContactEmailPanel apiFetch={apiFetch} />
+      <NewMemberEmailsPanel apiFetch={apiFetch} />
       <PerIpLimitsPanel apiFetch={apiFetch} {...rateLimits} />
       <McpLimitsPanel apiFetch={apiFetch} {...rateLimits} />
       <RegistryLimitsPanel apiFetch={apiFetch} {...rateLimits} />

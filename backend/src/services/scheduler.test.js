@@ -16,11 +16,13 @@ jest.mock('node-cron', () => {
 });
 // The jobs themselves are not run here — stub every module the scheduler wires.
 jest.mock('./drinkWindowNotifier', () => ({ runDrinkWindowCheck: jest.fn() }));
+jest.mock('./newMemberEmails', () => ({ runNewMemberEmails: jest.fn() }));
 jest.mock('./cellarValueSnapshotJob', () => ({ runCellarValueSnapshots: jest.fn() }));
 jest.mock('./communityPriceJob', () => ({ runCommunityPriceAggregation: jest.fn() }));
 jest.mock('./userDeletionJob', () => ({ runUserDeletionJob: jest.fn() }));
 jest.mock('./cellarRetentionJob', () => ({ runCellarRetentionPurge: jest.fn() }));
 jest.mock('./recommendationRetentionJob', () => ({ runRecommendationEmailScrub: jest.fn() }));
+jest.mock('./mcpSnapshotRetentionJob', () => ({ runMcpSnapshotScrub: jest.fn() }));
 jest.mock('./scanImageRetentionJob', () => ({ runScanImageRetentionSweep: jest.fn() }));
 jest.mock('./wineDraftExpiryJob', () => ({ runWineDraftExpirySweep: jest.fn() }));
 jest.mock('./searchReconcileJob', () => ({ runSearchIndexReconcile: jest.fn() }));

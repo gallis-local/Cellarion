@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef, Suspense } from 'react';
 import { useParams, useSearchParams, Link, useNavigate } from 'react-router-dom';
+import { useBackHere } from '../utils/useBackHere';
 import { useTranslation } from 'react-i18next';
 import { Canvas } from '@react-three/fiber';
 import { useAuth } from '../contexts/AuthContext';
@@ -12,11 +13,18 @@ import RoomScene from '../components/room/RoomScene';
 import { getRackHeight, clampToRoom } from '../utils/roomConstants';
 import WineImage from '../components/WineImage';
 import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
+import { ConsumeModal } from '../components/ConsumeModal';
+import BottleUndoNotice, { bottleNoticeName } from '../components/BottleUndoNotice';
+import { isReserved, reservationSummary } from '../utils/reservation';
 import { LENSES, getLensStyle, getLensLegend, bottleMatchesSearch } from '../utils/rackLens';
 import CellarNav from '../components/CellarNav';
 import CellarPageHeader from '../components/CellarPageHeader';
 import DialogBox from '../components/DialogBox';
 import { swatchType, wineTypeLabel } from '../utils/wineColour';
+import { friendlyError, messageForResponse } from '../utils/friendlyError';
+import ActionNotice from '../components/ActionNotice';
+import { backLabel } from '../utils/backLabel';
+import { suspendBackToClose, pageEntryState } from '../utils/useBackToClose';
 import './CellarRoom.css';
 
 const DEFAULT_DIMENSIONS = { width: 10, depth: 10, height: 3 };
@@ -32,6 +40,8 @@ function isTypingTarget(e) {
 
 export default function CellarRoom() {
   const { t } = useTranslation();
+  // Handed to the bottle page so its back link returns here (BottleDetail).
+  const backHere = useBackHere('room');
   const { id } = useParams();
   const [searchParams] = useSearchParams();
   const { apiFetch, user } = useAuth();
@@ -52,6 +62,12 @@ export default function CellarRoom() {
   const [showSettings, setShowSettings] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(null);
+  // Why the last slot action failed (translated) — shown by ActionNotice
+  // instead of an English browser alert().
+  const [actionError, setActionError] = useState(null);
+  const failed = useCallback((res, body, fallback) => {
+    setActionError(messageForResponse(res, body, fallback, t));
+  }, [t]);
   const [interactionMode, setInteractionMode] = useState(null); // 'stack' | 'link' | null
   const [showAddRackPicker, setShowAddRackPicker] = useState(false);
 
@@ -61,9 +77,18 @@ export default function CellarRoom() {
   const [slotSearch, setSlotSearch] = useState('');
   const [slotResults, setSlotResults] = useState([]);
   const [slotLoading, setSlotLoading] = useState(false);
+  // A failed load shows a retry, not "no unplaced bottles".
+  const [slotLoadFailed, setSlotLoadFailed] = useState(false);
   const slotTimerRef = useRef(null);
+  // Only the latest request may fill the list: an older search can answer last.
+  const slotSeqRef = useRef(0);
+  // Retry gives way to the loading line; focus goes here, not to the page.
+  const slotSearchRef = useRef(null);
   const [consumeModal, setConsumeModal] = useState(null); // { bottleId, bottle }
   const [journalBottle, setJournalBottle] = useState(null); // consumed bottle awaiting journal prompt
+  // The bottle just taken out, said with Undo — as on the racks page
+  // (components/BottleUndoNotice), with its slot for handleUndone.
+  const [drunkNotice, setDrunkNotice] = useState(null);
 
   // "just a glass" partial flow (see CellarRacks.handlePartial)
   const [partialPicker, setPartialPicker] = useState(null); // { bottleId }
@@ -280,11 +305,11 @@ export default function CellarRoom() {
         redoStackRef.current = [];
       } else {
         const errData = await res.json().catch(() => ({}));
-        setSaveError(errData.error || `Save failed (${res.status})`);
+        setSaveError(messageForResponse(res, errData, undefined, t));
         console.error('Save layout failed:', errData.error || res.status);
       }
     } catch (err) {
-      setSaveError(err.message);
+      setSaveError(friendlyError(err, t));
       console.error('Save layout error:', err);
     } finally {
       setSaving(false);
@@ -788,6 +813,9 @@ export default function CellarRoom() {
   // navigate() calls, etc.) and browser back/forward via popstate.
   useEffect(() => {
     if (!hasUnsavedChanges) return;
+    // This guard owns Back while there are unsaved changes: pop-ups (its own
+    // prompt among them) add no history entries meanwhile.
+    const resumeBackToClose = suspendBackToClose();
 
     const currentPath = window.location.pathname + window.location.search;
     // Normalize any URL form (relative path, absolute path, or full href) to
@@ -815,11 +843,16 @@ export default function CellarRoom() {
     // Seed a sentinel history entry via the NATIVE pushState (not the patched
     // one — otherwise it blocks its own seed and pops a spurious dialog). The
     // state tag lets the cleanup below recognise and remove it.
-    const SENTINEL = { __roomUnsavedSentinel: true };
-    origPushState(SENTINEL, '', window.location.href);
+    // It carries the router's own state (usr/key/idx): without it, "Leave"
+    // (a replace) copied an undefined index and every later page counted
+    // from NaN — which switched off Back-to-close (utils/useBackToClose)
+    // everywhere after the room (release audit 2026-10-16). A pop-up's mark
+    // is not carried over: the sentinel is the page's, not the pop-up's.
+    const sentinel = () => pageEntryState({ __roomUnsavedSentinel: true });
+    origPushState(sentinel(), '', window.location.href);
     const handlePopState = () => {
       if (hasUnsavedRef.current) {
-        origPushState(SENTINEL, '', window.location.href);
+        origPushState(sentinel(), '', window.location.href);
         setPendingNavPath('__back__');
       }
     };
@@ -834,7 +867,11 @@ export default function CellarRoom() {
       // cleanup runs because navigation committed (unmount), the current
       // entry is the new route — not the sentinel — so this is skipped.
       if (window.history.state?.__roomUnsavedSentinel) {
+        // That step is the room's own, not a Back for a pop-up to act on.
+        window.addEventListener('popstate', resumeBackToClose, { once: true });
         window.history.go(-1);
+      } else {
+        resumeBackToClose();
       }
     };
   }, [hasUnsavedChanges]);
@@ -908,13 +945,14 @@ export default function CellarRoom() {
       if (res.ok) {
         setRacks(prev => prev.map(r => r._id === rackId ? data.rack : r));
         setEmptySlotTarget(null);
+        setActionError(null);
       } else {
-        alert(data.error || 'Failed to assign');
+        failed(res, data, t('racks.errors.assign', 'The bottle could not be placed.'));
       }
-    } catch {
-      alert('Network error — please try again.');
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     }
-  }, [emptySlotTarget, apiFetch]);
+  }, [emptySlotTarget, apiFetch, failed, t]);
 
   // Remove bottle from rack slot
   const handleRemoveFromRack = useCallback(async () => {
@@ -926,22 +964,36 @@ export default function CellarRoom() {
       if (res.ok) {
         setRacks(prev => prev.map(r => r._id === rackId ? data.rack : r));
         setSelectedBottle(null);
+        setActionError(null);
       } else {
-        alert(data.error || 'Failed to remove bottle');
+        failed(res, data, t('racks.errors.removeFromRack', 'The bottle could not be taken out of the rack.'));
       }
-    } catch {
-      alert('Network error — please try again.');
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     }
-  }, [selectedBottle, apiFetch]);
+  }, [selectedBottle, apiFetch, failed, t]);
 
   // "Just a glass — keep the bottle": escape hatch out of the remove flow
   // (see CellarRacks.handlePartial for the rationale).
+  // "Just a glass": pour one from an open bottle, or open it first, then
+  // show the bottle. A refusal says why and stays here — nothing changed, so
+  // the bottle page would have nothing to show. Opened but the glass refused:
+  // the bottle page shows it open, where a glass is one tap.
   const handlePartial = async (bottle) => {
     setConsumeModal(null);
     setSelectedBottle(null);
     if (bottle.openedAt) {
-      try { await pourBottle(apiFetch, bottle._id); } catch { /* bottle page shows truth */ }
-      navigate(`/cellars/${id}/bottles/${bottle._id}`);
+      try {
+        const res = await pourBottle(apiFetch, bottle._id);
+        if (!res.ok) {
+          failed(res, await res.json().catch(() => ({})), t('racks.errors.pour', 'The glass could not be recorded.'));
+          return;
+        }
+      } catch (err) {
+        setActionError(friendlyError(err, t));
+        return;
+      }
+      navigate(`/cellars/${id}/bottles/${bottle._id}`, { state: backHere });
     } else {
       setPartialPicker({ bottleId: bottle._id });
     }
@@ -952,11 +1004,19 @@ export default function CellarRoom() {
     setPartialBusy(true);
     try {
       const res = await openBottle(apiFetch, bottleId, method);
-      if (res.ok) await pourBottle(apiFetch, bottleId);
-    } catch { /* bottle page shows truth */ }
-    setPartialBusy(false);
-    setPartialPicker(null);
-    navigate(`/cellars/${id}/bottles/${bottleId}`);
+      if (!res.ok) {
+        failed(res, await res.json().catch(() => ({})), t('racks.errors.open', 'The bottle could not be opened.'));
+        return;
+      }
+      await pourBottle(apiFetch, bottleId).catch(() => {});
+    } catch (err) {
+      setActionError(friendlyError(err, t));
+      return;
+    } finally {
+      setPartialBusy(false);
+      setPartialPicker(null);
+    }
+    navigate(`/cellars/${id}/bottles/${bottleId}`, { state: backHere });
   };
 
   // Consume bottle
@@ -977,20 +1037,58 @@ export default function CellarRoom() {
         })));
         setConsumeModal(null);
         setSelectedBottle(null);
+        setDrunkNotice({
+          kind: 'consumed', reason, bottleId: consumeModal.bottleId, slot: consumeModal.slot,
+          name: bottleNoticeName(consumeModal.bottle), at: Date.now(),
+        });
         if (reason === 'drank' && !journalPromptOptedOut()) {
           setJournalBottle(consumeModal.bottle);
         }
+        setActionError(null);
       } else {
-        alert(data.error || 'Failed to remove bottle');
+        failed(res, data, t('racks.errors.consume', 'The bottle could not be taken out.'));
       }
-    } catch {
-      alert('Network error — please try again.');
+    } catch (err) {
+      setActionError(friendlyError(err, t));
     }
-  }, [consumeModal, apiFetch]);
+  }, [consumeModal, apiFetch, failed, t]);
+
+  // After an Undo, as on the racks page (CellarRacks handleUndone): the
+  // journal prompt for that bottle closes, and the bottle goes back into its
+  // slot when that slot is still free (the server checks: expectOccupant
+  // null), else it stays unplaced. Only the racks are read again — the room
+  // layout may hold unsaved edits.
+  const refreshRacks = useCallback(async () => {
+    try {
+      const res = await getRacks(apiFetch, id);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) setRacks(data.racks || []);
+    } catch { /* the room keeps what it shows */ }
+  }, [apiFetch, id]);
+  const handleUndone = async (notice) => {
+    setJournalBottle((prev) => (prev && String(prev._id) === String(notice.bottleId) ? null : prev));
+    const { slot } = notice;
+    const rack = slot && racks.find((r) => r._id === slot.rackId);
+    const free = !!rack && !(rack.disabledPositions || []).includes(slot.position)
+      && !rack.slots.some((s) => s.position === slot.position && s.bottle);
+    if (free) {
+      try {
+        const res = await updateSlot(apiFetch, slot.rackId, slot.position, { bottleId: notice.bottleId, expectOccupant: null });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.rack) {
+          setRacks((prev) => prev.map((r) => (r._id === slot.rackId ? data.rack : r)));
+          return;
+        }
+      } catch { /* it stays unplaced */ }
+    }
+    await refreshRacks();
+  };
 
   // Backend search for slot picker
   const fetchSlotBottles = useCallback(async (term) => {
+    const seq = ++slotSeqRef.current;
     setSlotLoading(true);
+    setSlotLoadFailed(false);
     try {
       const params = new URLSearchParams({ limit: '30' });
       if (term) params.set('search', term);
@@ -999,10 +1097,13 @@ export default function CellarRoom() {
       params.set('excludePlaced', '1');
       const res = await getCellar(apiFetch, id, params.toString());
       const data = await res.json();
-      if (res.ok) {
-        setSlotResults(data.bottles?.items || []);
-      }
-    } catch { /* ignore */ }
+      if (seq !== slotSeqRef.current) return;
+      if (res.ok) setSlotResults(data.bottles?.items || []);
+      else setSlotLoadFailed(true);
+    } catch {
+      if (seq !== slotSeqRef.current) return;
+      setSlotLoadFailed(true);
+    }
     setSlotLoading(false);
   }, [apiFetch, id]);
 
@@ -1025,6 +1126,17 @@ export default function CellarRoom() {
 
   return (
     <div className="cellar-room-page">
+      <ActionNotice message={actionError} onDismiss={() => setActionError(null)} />
+      {drunkNotice && (
+        <BottleUndoNotice
+          key={`${drunkNotice.bottleId}:${drunkNotice.at}`}
+          floating
+          notice={drunkNotice}
+          cellarId={id}
+          onUndone={() => handleUndone(drunkNotice)}
+          onDismiss={() => setDrunkNotice(null)}
+        />
+      )}
       {/* View mode uses the shared header so the nav anchors like every other
           cellar page. Edit mode keeps its own full-bleed working toolbar (and
           the nav is hidden while arranging racks). */}
@@ -1059,7 +1171,7 @@ export default function CellarRoom() {
           <div className="cellar-room-header-left">
             <Link to={`/cellars/${id}/racks`} className="back-link">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
-              {t('room.backToRacks', 'Racks')}
+              {backLabel(t('room.backToRacks', 'Racks'))}
             </Link>
             <h1>{cellar?.name || '...'} — {t('room.title', 'Room View')}</h1>
             <span className="room-mode-badge edit">{t('room.editMode', 'Edit')}</span>
@@ -1334,10 +1446,14 @@ export default function CellarRoom() {
                     <button
                       className="btn btn-consume btn-small"
                       onClick={() => {
-                        setConsumeModal({ bottleId: bottle._id, bottle });
+                        setConsumeModal({
+                          bottleId: bottle._id,
+                          bottle,
+                          slot: { rackId: selectedBottle.rackId, position: selectedBottle.slot.position },
+                        });
                       }}
                     >
-                      {t('racks.remove', 'Remove')}
+                      {t('racks.remove', 'Drink')}
                     </button>
                   </div>
                 )}
@@ -1360,6 +1476,7 @@ export default function CellarRoom() {
                   </p>
                 )}
                 <input
+                  ref={slotSearchRef}
                   type="text"
                   className="room-slot-search"
                   placeholder={t('racks.searchWines', 'Search wines...')}
@@ -1370,6 +1487,13 @@ export default function CellarRoom() {
                 <div className="room-slot-bottle-list">
                   {slotLoading ? (
                     <p className="room-slot-empty">…</p>
+                  ) : slotLoadFailed ? (
+                    <p className="room-slot-empty">
+                      <span role="alert">{t('racks.unplacedLoadFailed', "Couldn't load your bottles.")}</span>{' '}
+                      <button type="button" className="btn btn-secondary btn-small" onClick={() => { slotSearchRef.current?.focus(); fetchSlotBottles(slotSearch); }}>
+                        {t('common.retry', 'Retry')}
+                      </button>
+                    </p>
                   ) : slotResults.length === 0 ? (
                     <p className="room-slot-empty">{t('racks.noUnplacedBottles', 'No available bottles')}</p>
                   ) : (
@@ -1395,24 +1519,18 @@ export default function CellarRoom() {
             );
           })()}
 
-          {/* Consume modal */}
+          {/* The one "take out of the cellar" dialog (components/ConsumeModal),
+              as on the racks page: "Just a glass" on top, the reservation
+              warning when the bottle is spoken for. */}
           {consumeModal && (
-            <div className="room-consume-overlay" onClick={() => setConsumeModal(null)}>
-              <DialogBox
-                className="room-consume-modal"
-                onClick={e => e.stopPropagation()}
-                onClose={() => setConsumeModal(null)}
-                label={t('bottleDetail.removeBottleTitle', 'Remove Bottle')}
-              >
-                <RoomConsumeForm
-                  onSubmit={handleConsumeSubmit}
-                  onCancel={() => setConsumeModal(null)}
-                  onPartial={consumeModal.bottle ? () => handlePartial(consumeModal.bottle) : undefined}
-                  defaultRatingScale={user?.preferences?.ratingScale}
-                  t={t}
-                />
-              </DialogBox>
-            </div>
+            <ConsumeModal
+              wineName={bottleNoticeName(consumeModal.bottle)}
+              defaultRatingScale={user?.preferences?.ratingScale || '5'}
+              reservationText={isReserved(consumeModal.bottle) ? reservationSummary(consumeModal.bottle, t) : undefined}
+              onConfirm={handleConsumeSubmit}
+              onCancel={() => setConsumeModal(null)}
+              onJustAGlass={() => handlePartial(consumeModal.bottle)}
+            />
           )}
 
           {/* Post-consume "add to journal?" prompt */}
@@ -1617,12 +1735,12 @@ export default function CellarRoom() {
                 savedLayoutRef.current = JSON.stringify(layout);
                 setPendingNavPath(null);
                 // Either way the current entry is the sentinel duplicate of
-                // this page. For Back, one step only reaches the identical
-                // room entry — go(-2) skips past it to the real previous
-                // page. For link navigation, replace the sentinel instead of
-                // stacking the target on top of it.
+                // this page. For Back, step back past every entry of this
+                // same page (the sentinel, the room's own, any a pop-up left)
+                // to the real previous page. For link navigation, replace the
+                // sentinel instead of stacking the target on top of it.
                 if (path === '__back__') {
-                  window.history.go(-2);
+                  leaveBackPastThisPage();
                 } else {
                   navigate(path, { replace: true });
                 }
@@ -1638,94 +1756,26 @@ export default function CellarRoom() {
 }
 
 // LOCAL calendar date, YYYY-MM-DD — what <input type="date"> speaks.
-const roomToday = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-};
-
-// onSubmit(reason, note, rating, ratingScale, consumedAt) — the third consume
-// dialog (after components/ConsumeModal and the racks view's own); the day the
-// bottle was actually drunk rides along like on the other two (audit 2026-09-14).
-function RoomConsumeForm({ onSubmit, onCancel, onPartial, defaultRatingScale, t }) {
-  const [reason, setReason] = useState('drank');
-  const [note, setNote] = useState('');
-  const [rating, setRating] = useState('');
-  const [ratingScale, setRatingScale] = useState(defaultRatingScale || '5');
-  const [date, setDate] = useState(roomToday);
-  const [saving, setSaving] = useState(false);
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setSaving(true);
-    try {
-      await onSubmit(reason, note || undefined, rating || undefined, ratingScale, date || undefined);
-    } finally {
-      // Always re-enable the button — a rejected onSubmit must not leave the
-      // form stuck on "Saving...".
-      setSaving(false);
-    }
+// "Leave" after Back with unsaved changes: step back until the page changes.
+// Above the previous page sit the room's own entry, its guard's sentinel and
+// possibly an entry a pop-up left behind — a fixed go(-2) could stop short and
+// leave the user in the room.
+function leaveBackPastThisPage() {
+  const here = window.location.href;
+  let steps = 0;
+  let timer = null;
+  const done = () => {
+    clearTimeout(timer);
+    window.removeEventListener('popstate', onPop);
   };
-
-  return (
-    <form onSubmit={handleSubmit}>
-      <h3>{t('bottleDetail.removeBottleTitle', 'Remove Bottle')}</h3>
-      {onPartial && (
-        <div className="consume-partial-row">
-          <button type="button" className="btn btn-secondary consume-partial-btn" onClick={onPartial}>
-            🍷 {t('openBottle.partialOption', 'Just a glass — keep the bottle')}
-          </button>
-          <span className="consume-partial-or">{t('openBottle.partialOr', 'or remove it completely:')}</span>
-        </div>
-      )}
-      <div className="form-group">
-        <label>{t('common.reason', 'Reason')}</label>
-        <select value={reason} onChange={e => setReason(e.target.value)}>
-          <option value="drank">{t('bottleDetail.drinkReason', 'Drank')}</option>
-          <option value="gifted">{t('bottleDetail.giftedReason', 'Gifted')}</option>
-          <option value="sold">{t('bottleDetail.soldReason', 'Sold')}</option>
-          <option value="other">{t('bottleDetail.otherReason', 'Other')}</option>
-        </select>
-      </div>
-      <label className="form-group">
-        <span>{t('bulk.consumeDate', 'Date')}</span>
-        <input type="date" value={date} max={roomToday()} onChange={e => setDate(e.target.value)} disabled={saving} />
-      </label>
-      {reason === 'drank' && (
-        <div className="form-group">
-          <label>{t('common.rating', 'Rating')}</label>
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-            <input
-              type="number"
-              min={0}
-              max={Number(ratingScale)}
-              step={0.5}
-              value={rating}
-              onChange={e => setRating(e.target.value)}
-              placeholder="—"
-              style={{ width: '70px' }}
-            />
-            <span>/ </span>
-            <select value={ratingScale} onChange={e => setRatingScale(e.target.value)} style={{ width: '60px' }}>
-              <option value="5">5</option>
-              <option value="10">10</option>
-              <option value="20">20</option>
-              <option value="100">100</option>
-            </select>
-          </div>
-        </div>
-      )}
-      <div className="form-group">
-        <label>{t('common.notes', 'Notes')}</label>
-        <textarea value={note} onChange={e => setNote(e.target.value)} rows={2} />
-      </div>
-      <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.75rem' }}>
-        <button type="button" className="btn btn-secondary btn-small" onClick={onCancel}>
-          {t('common.cancel', 'Cancel')}
-        </button>
-        <button type="submit" className="btn btn-consume btn-small" disabled={saving}>
-          {saving ? t('common.saving', 'Saving...') : t('common.confirm', 'Confirm')}
-        </button>
-      </div>
-    </form>
-  );
+  // A Back with nowhere to go fires nothing: stop listening anyway.
+  const arm = () => { clearTimeout(timer); timer = setTimeout(done, 1500); };
+  function onPop() {
+    if (window.location.href !== here || ++steps >= 10) { done(); return; }
+    arm();
+    window.history.back();
+  }
+  window.addEventListener('popstate', onPop);
+  arm();
+  window.history.back();
 }

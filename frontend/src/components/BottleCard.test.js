@@ -142,3 +142,119 @@ describe('BottleCard private-draft badge', () => {
     expect(screen.queryByText('bottleCard.draftWine')).not.toBeInTheDocument();
   });
 });
+
+/**
+ * Support ticket 2026-10-09: a stacked card gets two direct actions. "Info"
+ * opens the vintage page and "Drink one" takes a single bottle out without
+ * expanding the group first; the card's own click still expands. Hidden in
+ * select mode, where a tap means "toggle" and nothing else.
+ */
+describe('BottleCard stacked card actions', () => {
+  test('Drink one calls its handler without expanding the group, in both views', () => {
+    for (const viewMode of ['list', 'card']) {
+      const onClick = vi.fn();
+      const onDrinkOne = vi.fn();
+      const { unmount } = renderCard({ viewMode, groupCount: 4, onClick, onDrinkOne });
+      fireEvent.click(screen.getByText('bottleCard.groupDrinkOne'));
+      expect(onDrinkOne).toHaveBeenCalledTimes(1);
+      expect(onClick).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByText('Barolo Albe'));
+      expect(onClick).toHaveBeenCalledTimes(1);
+      unmount();
+    }
+  });
+
+  test('the caller decides: no handlers, no actions; select mode hides them', () => {
+    const { unmount: u1 } = renderCard({});
+    expect(screen.queryByText('bottleCard.groupDrinkOne')).toBeNull();
+    u1();
+    const { unmount } = renderCard({ groupCount: 3, onClick: vi.fn() });
+    expect(screen.queryByText('bottleCard.groupDrinkOne')).toBeNull();
+    unmount();
+    renderCard({ groupCount: 3, onClick: vi.fn(), onDrinkOne: vi.fn(), selectable: true, onToggleSelect: vi.fn() });
+    expect(screen.queryByText('bottleCard.groupDrinkOne')).toBeNull();
+  });
+});
+
+/**
+ * One page per wine and vintage: a tap on any entry opens the
+ * vintage page, and "Drink one" sits on every card — the last bottle of a
+ * vintage looks and behaves like the ones before it. The stack still expands
+ * from the ⊕ in select mode, through its own handler.
+ */
+describe('BottleCard with one page per wine and vintage', () => {
+  test('a single bottle carries Drink one too, compact and named for screen readers; the card itself opens the page', () => {
+    const onClick = vi.fn(); // navigate to the vintage page
+    const onDrinkOne = vi.fn();
+    const { container } = renderCard({ onClick, onDrinkOne, actionsInline: true });
+    const drink = screen.getByRole('button', { name: 'bottleCard.drinkOneAria' });
+    expect(container.querySelector('.bottle-group-actions--inline')).not.toBeNull();
+    fireEvent.click(drink);
+    expect(onDrinkOne).toHaveBeenCalledTimes(1);
+    expect(onClick).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText('Barolo Albe'));
+    expect(onClick).toHaveBeenCalledTimes(1);
+    // A tap opens a page, so the card shows ›, like a single bottle.
+    expect(container.querySelector('.bottle-chevron').textContent).toBe('›');
+  });
+
+  test('a stack whose tap opens the page shows ›, and in select mode its ⊕ expands through onExpand', () => {
+    const onClick = vi.fn();
+    const onExpand = vi.fn();
+    const { container, unmount } = renderCard({ groupCount: 3, onClick, onExpand, onDrinkOne: vi.fn(), actionsInline: true });
+    expect(container.querySelector('.bottle-chevron').textContent).toBe('›');
+    unmount();
+
+    const onToggleSelect = vi.fn();
+    renderCard({ groupCount: 3, onClick, onExpand, selectable: true, onToggleSelect });
+    fireEvent.click(screen.getByLabelText('bottleCard.expandGroup'));
+    expect(onExpand).toHaveBeenCalledTimes(1);
+    expect(onClick).not.toHaveBeenCalled();
+    expect(onToggleSelect).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Photos per vintage (support ticket 2026-10-09): a public photo of this
+ * wine AND vintage shows before the wine's generic registry image, which may
+ * be another year's label — but never before the owner's own photo.
+ */
+describe('BottleCard same-vintage photo', () => {
+  const WITH_BOTH = {
+    ...BOTTLE,
+    wineDefinition: { ...BOTTLE.wineDefinition, image: '/api/uploads/processed/registry.png', imageCredit: 'registry credit' },
+    vintageImageUrl: '/api/uploads/processed/vintage-2013.webp', vintageImageCredit: 'Anna',
+  };
+
+  test('beats the registry image, with its own credit', () => {
+    const { container } = renderCard({ bottle: WITH_BOTH });
+    expect(container.querySelector('img').getAttribute('src')).toBe('/api/uploads/processed/vintage-2013.webp');
+    expect(screen.getByText('Anna')).toBeInTheDocument();
+    expect(screen.queryByText('registry credit')).toBeNull();
+  });
+
+  test('yields to the owner\'s own photo', () => {
+    const { container } = renderCard({ bottle: { ...WITH_BOTH, pendingImageUrl: '/api/uploads/processed/mine.png' } });
+    expect(container.querySelector('img').getAttribute('src')).toBe('/api/uploads/processed/mine.png');
+    expect(screen.queryByText('Anna')).toBeNull();
+  });
+
+  // Johan, 2026-10-09: "a new vintage without an image should display the
+  // wine's image … so we always show an image". The owner's photo of ANOTHER
+  // vintage never beats the wine's image; it only stands in when there is none.
+  test('a photo of another vintage loses to the wine\'s image, and fills in only when the wine has none', () => {
+    const other = '/api/uploads/processed/mine-2015.webp';
+    const { container, unmount } = renderCard({ bottle: {
+      ...BOTTLE,
+      wineDefinition: { ...BOTTLE.wineDefinition, image: '/api/uploads/processed/registry.png', imageCredit: 'registry credit' },
+      otherVintageImageUrl: other,
+    } });
+    expect(container.querySelector('img').getAttribute('src')).toBe('/api/uploads/processed/registry.png');
+    expect(screen.getByText('registry credit')).toBeInTheDocument();
+    unmount();
+
+    const second = renderCard({ bottle: { ...BOTTLE, otherVintageImageUrl: other } });
+    expect(second.container.querySelector('img').getAttribute('src')).toBe(other);
+    expect(screen.queryByText('registry credit')).toBeNull();
+  });
+});

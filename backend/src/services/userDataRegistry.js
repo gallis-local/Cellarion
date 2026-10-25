@@ -42,6 +42,7 @@ const Bottle = require('../models/Bottle');
 const ClimateDevice = require('../models/ClimateDevice');
 const ClimateReading = require('../models/ClimateReading');
 const BottleImage = require('../models/BottleImage');
+const DeletedBottle = require('../models/DeletedBottle');
 const Cellar = require('../models/Cellar');
 const CellarLayout = require('../models/CellarLayout');
 const CellarValueSnapshot = require('../models/CellarValueSnapshot');
@@ -56,6 +57,7 @@ const DiscussionReport = require('../models/DiscussionReport');
 const Follow = require('../models/Follow');
 const ImportSession = require('../models/ImportSession');
 const ImportArchive = require('../models/ImportArchive');
+const ReceiptScan = require('../models/ReceiptScan');
 const JournalEntry = require('../models/JournalEntry');
 const Notification = require('../models/Notification');
 const PendingShare = require('../models/PendingShare');
@@ -80,6 +82,7 @@ const PersonalDataKey = require('../models/PersonalDataKey');
 const PersonalDataEntry = require('../models/PersonalDataEntry');
 const SavedDashboard = require('../models/SavedDashboard');
 const SavedView = require('../models/SavedView');
+const PickList = require('../models/PickList');
 const RegistryDataKey = require('../models/RegistryDataKey');
 const RegistryDataValue = require('../models/RegistryDataValue');
 const AuditLog = require('../models/AuditLog');
@@ -125,6 +128,27 @@ const EXCLUDED = {
   CommunityWinePrice: 'no user reference (k-anonymised aggregate community prices; never an individual\'s purchase)',
 };
 
+// Audit rows ABOUT an account (resource = the user). Sign-up, e-mail
+// verification and sign-in (and their failures) happen before anyone is
+// signed in: the row has no actor, the account sits in resource.id, and the
+// detail carries { username, email } — the actor scrub never matched them, so
+// a deleted account's name, address and IP stayed in those rows. Admin and
+// other members' actions on the account lose the account's id and name too,
+// but keep THEIR IP and browser: those belong to whoever acted. A pipeline
+// update, so that choice is made per row.
+const actorless = { $eq: [{ $ifNull: ['$actor.userId', null] }, null] };
+const scrubAuditRowsAbout = (userId) => AuditLog.updateMany(
+  { 'resource.type': 'user', 'resource.id': userId },
+  [
+    { $set: {
+      'resource.id': null,
+      'actor.ipAddress': { $cond: [actorless, null, '$actor.ipAddress'] },
+      userAgent: { $cond: [actorless, '$$REMOVE', '$userAgent'] },
+    } },
+    { $unset: ['detail.email', 'detail.username'] },
+  ]
+);
+
 const REGISTRY = [
   // ── The account itself ──────────────────────────────────────────────────
   {
@@ -152,6 +176,10 @@ const REGISTRY = [
           // simply absent from a subject access request — and "we emailed you
           // on this date" is processing history the user is entitled to see.
           supporterThankYouSentAt: u.supporterThankYouSentAt || null,
+          // The one email sent to a new member two days after joining
+          // (services/newMemberEmails) — when, and which of the two.
+          newMemberEmailSentAt: u.newMemberEmailSentAt || null,
+          newMemberEmailKind: u.newMemberEmailKind || null,
           preferences: u.preferences,
           profileVisibility: u.profileVisibility,
           emailVerified: u.emailVerified,
@@ -279,6 +307,26 @@ const REGISTRY = [
     }),
   },
   {
+    // "Recently deleted" (services/bottleTrash): bottles a bulk delete keeps
+    // for 30 days before they go for good. The user's own rows, and every row
+    // in their cellars' trash, are purged with the account — each bottle's own
+    // photos first (purgeTrashRows), which the BottleImage entry above misses
+    // when another member of a shared cellar took them. A row this user
+    // created in SOMEONE ELSE's cellar trash keeps the bottle (it is the
+    // owner's to restore) and only loses the link to who deleted it.
+    model: DeletedBottle, category: 'personal-data', userFields: ['user', 'deletedBy'],
+    purge: async (ctx) => {
+      const { purgeTrashRows } = require('./bottleTrash');
+      await purgeTrashRows({ $or: [{ user: ctx.userId }, { cellar: { $in: ctx.cellarIds } }] });
+      await DeletedBottle.updateMany({ deletedBy: ctx.userId }, { $set: { deletedBy: ctx.deletedUserId } });
+    },
+    exportFragment: async (ctx) => ({
+      // The bottle as it was stored, and when it is deleted for good.
+      recentlyDeletedBottles: markTrunc(ctx, 'recentlyDeletedBottles', await DeletedBottle.find({ user: ctx.userId }).limit(EXPORT_MAX).lean())
+        .map((r) => ({ bottle: r.snapshot ? r.snapshot.bottle : null, deletedAt: r.deletedAt, purgeAt: r.purgeAt })),
+    }),
+  },
+  {
     model: Cellar, category: 'personal-data', userFields: ['user', 'members.user', 'userColors.user'],
     purge: async (ctx) => {
       // GAP FIX: bottles inside the user's cellars that are OWNED BY OTHERS
@@ -380,6 +428,13 @@ const REGISTRY = [
     model: SavedDashboard, category: 'personal-data', userFields: ['user'],
     purge: (ctx) => SavedDashboard.deleteMany({ user: ctx.userId }),
     exportFragment: async (ctx) => ({ analyticsDashboards: await SavedDashboard.find({ user: ctx.userId }).lean() }),
+  },
+  {
+    // Pick lists (forum request 2026-10-13): the user's own named lists of
+    // bottle references — pure personal data, hard delete, full export.
+    model: PickList, category: 'personal-data', userFields: ['user'],
+    purge: (ctx) => PickList.deleteMany({ user: ctx.userId }),
+    exportFragment: async (ctx) => ({ pickLists: markTrunc(ctx, 'pickLists', await PickList.find({ user: ctx.userId }).limit(EXPORT_MAX).lean()) }),
   },
   {
     // Saved analytics views + preset stars (#987 saved-views slice).
@@ -787,6 +842,8 @@ const REGISTRY = [
               myResponse: mine?.response || null,
               respondedAt: mine?.respondedAt || null,
               notifiedAt: mine?.notifiedAt || null,
+              // When the question was also emailed to them (ownerInquiryEmail).
+              emailedAt: mine?.emailedAt || null,
               // Only reaches them if they answered — same rule as the card.
               curatorReply: (mine?.response && i.ownerReply) || null,
               createdAt: i.createdAt,
@@ -822,8 +879,8 @@ const REGISTRY = [
       ),
     ],
     exportFragment: async (ctx) => ({
-      supportTickets: markTrunc(ctx, 'supportTickets', await SupportTicket.find({ user: ctx.userId }).select('category subject message status adminResponse respondedAt replies createdAt').limit(EXPORT_MAX).lean())
-        .map(t => ({ category: t.category, subject: t.subject, message: t.message, status: t.status, adminResponse: t.adminResponse, respondedAt: t.respondedAt, createdAt: t.createdAt,
+      supportTickets: markTrunc(ctx, 'supportTickets', await SupportTicket.find({ user: ctx.userId }).select('category feature subject message status adminResponse respondedAt replies createdAt').limit(EXPORT_MAX).lean())
+        .map(t => ({ category: t.category, ...(t.feature ? { feature: t.feature } : {}), subject: t.subject, message: t.message, status: t.status, adminResponse: t.adminResponse, respondedAt: t.respondedAt, createdAt: t.createdAt,
           // The conversation, without the by refs (an admin's account id is
           // not the exporting user's data — author side + text suffice).
           replies: (t.replies || []).map(r => ({ author: r.author, message: r.message, createdAt: r.createdAt })) })),
@@ -976,6 +1033,18 @@ const REGISTRY = [
     exportFragment: async (ctx) => ({
       importArchives: markTrunc(ctx, 'importArchives', await ImportArchive.find({ user: ctx.userId })
         .select('cellar fileName detectedFormat detectedEncoding importWarnings rows rowCount rowsTruncated summary retainUntil createdAt')
+        .limit(EXPORT_MAX).lean()),
+    }),
+  },
+  {
+    // Receipts kept during the receipt-scan beta (models/ReceiptScan, at most
+    // 5 days). Exported as what was read and when (the image bytes stay out of
+    // the JSON); erased with the account — files first, via receiptArchive.
+    model: ReceiptScan, category: 'personal-data', userFields: ['user'],
+    purge: (ctx) => require('./receiptArchive').purgeUserReceiptScans(ctx.userId),
+    exportFragment: async (ctx) => ({
+      receiptScans: markTrunc(ctx, 'receiptScans', await ReceiptScan.find({ user: ctx.userId })
+        .select('files outcome model result rawReply retainUntil createdAt')
         .limit(EXPORT_MAX).lean()),
     }),
   },
@@ -1281,7 +1350,7 @@ const REGISTRY = [
         { 'actor.userId': ctx.userId },
         {
           $set: { 'actor.userId': null, 'actor.ipAddress': null },
-          $unset: { 'detail.email': '', 'detail.username': '', 'detail.sharedWith': '', 'detail.invitedEmail': '' },
+          $unset: { 'detail.email': '', 'detail.username': '', 'detail.sharedWith': '', 'detail.invitedEmail': '', userAgent: '' },
         }
       ),
       // (b) The departing user as the SUBJECT of ANOTHER actor's event — a
@@ -1292,9 +1361,20 @@ const REGISTRY = [
         { $or: [{ 'detail.sharedWith': ctx.userEmail }, { 'detail.invitedEmail': ctx.userEmail }] },
         { $unset: { 'detail.sharedWith': '', 'detail.invitedEmail': '' } }
       )] : []),
+      // (c) The departing user as the account an event is ABOUT.
+      scrubAuditRowsAbout(ctx.userId),
     ],
+    // Again after the batch: a sign-in logged while the batch ran (logAudit is
+    // fire-and-forget) would otherwise keep its name and IP. Once the account
+    // is gone no new row can be about it.
+    postPurge: (ctx) => scrubAuditRowsAbout(ctx.userId),
+    // The user's own actions, and the rows about the account written before
+    // anyone was signed in (sign-up, sign-ins, failed sign-ins) — theirs too.
     exportFragment: async (ctx) => ({
-      activityLog: markTrunc(ctx, 'activityLog', await AuditLog.find({ 'actor.userId': ctx.userId }).sort({ timestamp: -1 }).limit(AUDIT_MAX).lean(), AUDIT_MAX)
+      activityLog: markTrunc(ctx, 'activityLog', await AuditLog.find({ $or: [
+        { 'actor.userId': ctx.userId },
+        { 'resource.type': 'user', 'resource.id': ctx.userId, 'actor.userId': null },
+      ] }).sort({ timestamp: -1 }).limit(AUDIT_MAX).lean(), AUDIT_MAX)
         .map(a => ({ action: a.action, timestamp: a.timestamp, detail: a.detail })),
     }),
   },

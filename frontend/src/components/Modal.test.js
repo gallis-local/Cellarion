@@ -25,6 +25,25 @@ describe('Modal', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  test('a press that starts inside the box and ends on the overlay does not close it', () => {
+    // Selecting text in a field and releasing past the edge: the browser
+    // reports that click on the overlay, and it used to throw away what had
+    // been typed in the dialog.
+    const onClose = vi.fn();
+    const { container } = render(<Modal onClose={onClose}><textarea defaultValue="a long note" /></Modal>);
+    fireEvent.pointerDown(screen.getByDisplayValue('a long note'));
+    fireEvent.click(container.firstChild);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test('a press that starts and ends on the overlay still closes it', () => {
+    const onClose = vi.fn();
+    const { container } = render(<Modal onClose={onClose}>body</Modal>);
+    fireEvent.pointerDown(container.firstChild);
+    fireEvent.click(container.firstChild);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   test('does not call onClose when modal box is clicked', () => {
     const onClose = vi.fn();
     render(<Modal onClose={onClose}>body</Modal>);
@@ -37,6 +56,22 @@ describe('Modal', () => {
     render(<Modal onClose={onClose}>body</Modal>);
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('Escape closes only the newest of two open dialogs', () => {
+    const outer = vi.fn();
+    const inner = vi.fn();
+    const { rerender } = render(
+      <Modal onClose={outer}>outer<Modal onClose={inner}>inner</Modal></Modal>,
+    );
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(inner).toHaveBeenCalledTimes(1);
+    expect(outer).not.toHaveBeenCalled();
+
+    // With the inner one closed, Escape reaches the outer one again.
+    rerender(<Modal onClose={outer}>outer</Modal>);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(outer).toHaveBeenCalledTimes(1);
   });
 
   test('exposes dialog semantics', () => {

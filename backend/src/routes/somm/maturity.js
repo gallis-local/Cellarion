@@ -77,7 +77,9 @@ router.get('/', requireSommOrAdmin, async (req, res) => {
 /**
  * GET /api/somm/maturity/lookup?wine=:wineId&vintage=:vintage
  * Look up the profile for a specific wine+vintage. Any authenticated user.
- * Used by BottleDetail to display maturity status.
+ * Used by BottleDetail and CellarVintage to display maturity status. Who set
+ * the window (setBy) goes to sommeliers and admins only: the registry never
+ * shows members who contributed its data.
  */
 router.get('/lookup', async (req, res) => {
   try {
@@ -89,10 +91,12 @@ router.get('/lookup', async (req, res) => {
       return res.status(400).json({ error: 'Invalid wine ID' });
     }
 
-    const profile = await WineVintageProfile.findOne({
+    const curator = req.user.roles.includes('somm') || req.user.roles.includes('admin');
+    const query = WineVintageProfile.findOne({
       wineDefinition: String(wine),
       vintage: String(vintage)
-    }).populate({ path: 'setBy', select: 'username' });
+    });
+    const profile = await (curator ? query.populate({ path: 'setBy', select: 'username' }) : query.select('-setBy'));
 
     if (!profile) {
       return res.json({ profile: null });
@@ -258,6 +262,8 @@ router.post('/:id/ai-suggest', requireSommOrAdmin, async (req, res) => {
 /**
  * DELETE /api/somm/maturity/:id/reset
  * Reset a reviewed profile back to pending. Somm/admin only.
+ * A pending row is refused (409): it has no window to withdraw — the same
+ * answer the MCP reset_maturity_row tool gives.
  */
 router.delete('/:id/reset', requireSommOrAdmin, async (req, res) => {
   try {
@@ -265,6 +271,9 @@ router.delete('/:id/reset', requireSommOrAdmin, async (req, res) => {
     const profile = await WineVintageProfile.findById(req.params.id);
     if (!profile) {
       return res.status(404).json({ error: 'Profile not found' });
+    }
+    if (profile.status !== 'reviewed') {
+      return res.status(409).json({ error: 'This vintage is already pending — there is no window to withdraw.' });
     }
 
     for (const field of PHASE_FIELDS) {
@@ -276,6 +285,9 @@ router.delete('/:id/reset', requireSommOrAdmin, async (req, res) => {
     profile.setAt     = null;
 
     await profile.save();
+    // Withdrawing the window changes the owners' maturity statistics just as
+    // setting it does: move their data version so no read cache keeps it.
+    bumpWineOwners([profile.wineDefinition]);
 
     logAudit(req, 'somm.maturity.reset',
       { type: 'wine', id: profile.wineDefinition },

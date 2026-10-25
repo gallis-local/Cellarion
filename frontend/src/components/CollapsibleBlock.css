@@ -1,0 +1,73 @@
+/* Folding blocks (components/CollapsibleBlock): the chevron sits in the
+   card's top-right corner; folded, a card shows only its first row. */
+/* A column, like the section it sits in: a component that renders two cards
+   (the history's drunk + other vintages) keeps the gap between them. */
+.cblock {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+/* The section's gap spaces the blocks; a card's own top margin would sit
+   inside the wrapper and push the card below its fold button. */
+.cblock > .card {
+  margin-top: 0;
+}
+
+.cblock-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.cblock-toggle:hover,
+.cblock-toggle:focus-visible {
+  border-color: var(--color-border);
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.cblock-toggle svg {
+  transition: transform 0.15s ease;
+}
+
+/* Folded: the chevron points right, toward what is hidden. */
+.cblock-toggle--collapsed svg {
+  transform: rotate(-90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cblock-toggle svg { transition: none; }
+}
+
+.cblock > .cblock-toggle {
+  position: absolute;
+  top: 0.85rem;
+  right: 0.75rem;
+  z-index: 1;
+}
+
+/* Room for the button in the card's title row. */
+.cblock:not(.cblock--nested) > .card > :first-child,
+.cblock--nested > .card > :first-child > :first-child {
+  padding-right: 2.3rem;
+}
+
+/* Folded: the title row stays, the rest is hidden — never a dialog the card
+   renders inside itself (release audit 2026-10-13: "+ Add" on a folded card
+   opened an invisible dialog). */
+.cblock--collapsed > .card > :not(:first-child):not(.modal-overlay),
+.cblock--nested.cblock--collapsed > .card > :first-child > :not(:first-child):not(.modal-overlay) {
+  display: none;
+}

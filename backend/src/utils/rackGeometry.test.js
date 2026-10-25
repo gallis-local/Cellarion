@@ -253,7 +253,7 @@ describe('rackGeometry', () => {
 // ── Cabinet (wine fridge) ───────────────────────────────────────────────────
 // Position contract: shelves top to bottom; inside a bay row 1 rests on the
 // plank; position = cols × Σ shelfRows[k<i] + (row − 1) × cols + slot.
-const { cabinetShelfRows, cabinetPosition, validateCabinetConfig, cabinetRowWidth, cabinetBayCapacity, cabinetRows, cabinetBays } = require('./rackGeometry');
+const { cabinetShelfRows, cabinetPosition, validateCabinetConfig, cabinetRowWidth, cabinetBayCapacity, cabinetRows, cabinetBays, cabinetShelfSideways, fitCabinetTypeConfig } = require('./rackGeometry');
 
 describe('cabinet rack geometry', () => {
   test('capacity is cols × Σ shelfRows; missing entries count as 1', () => {
@@ -308,6 +308,18 @@ describe('cabinet rack geometry', () => {
     // Drawing only: capacity is the same either way.
     expect(totalSlots('cabinet', 3, 6, { shelfRows: [1, 3, 2], stagger: true }))
       .toBe(totalSlots('cabinet', 3, 6, { shelfRows: [1, 3, 2], stagger: false }));
+  });
+
+  test('headToTail is a boolean, cabinet-only, one deep only, and never changes capacity', () => {
+    expect(validateCabinetConfig({ shelfRows: [2, 2], twoDeep: false, headToTail: true }, 'cabinet', 2, false)).toBeNull();
+    expect(validateCabinetConfig({ shelfRows: [2, 2], twoDeep: true, headToTail: false }, 'cabinet', 2, false)).toBeNull();
+    expect(validateCabinetConfig({ shelfRows: [2, 2], twoDeep: false, headToTail: 'yes' }, 'cabinet', 2, false)).toMatch(/headToTail must be a boolean/);
+    // Neck to neck and head to tail are two ways of lying: never both (twoDeep defaults on).
+    expect(validateCabinetConfig({ shelfRows: [2, 2], twoDeep: true, headToTail: true }, 'cabinet', 2, false)).toMatch(/needs twoDeep off/);
+    expect(validateCabinetConfig({ shelfRows: [2, 2], headToTail: true }, 'cabinet', 2, false)).toMatch(/needs twoDeep off/);
+    expect(validateCabinetConfig({ headToTail: true }, 'grid', 2, false)).toMatch(/cabinet racks only/);
+    expect(totalSlots('cabinet', 3, 6, { shelfRows: [1, 3, 2], twoDeep: false, headToTail: true }))
+      .toBe(totalSlots('cabinet', 3, 6, { shelfRows: [1, 3, 2], twoDeep: false }));
   });
 
   test('getMaxPosition reads a cabinet document', () => {
@@ -376,8 +388,8 @@ describe('cabinet rack geometry', () => {
     test('per-shelf width and pattern: the GrandCru 5001 loading diagram is one cabinet of 196', () => {
       const tc = { shelfRows: [8, 8, 8, 8, 8], shelfCols: [4, 6, 6, 6, 4], shelfAlternate: [false, true, true, true, false], twoDeep: true };
       expect(cabinetBays(5, 6, tc)).toEqual([
-        { rows: 8, cols: 4, alternate: false }, { rows: 8, cols: 6, alternate: true }, { rows: 8, cols: 6, alternate: true },
-        { rows: 8, cols: 6, alternate: true }, { rows: 8, cols: 4, alternate: false },
+        { rows: 8, cols: 4, alternate: false, sideways: '' }, { rows: 8, cols: 6, alternate: true, sideways: '' }, { rows: 8, cols: 6, alternate: true, sideways: '' },
+        { rows: 8, cols: 6, alternate: true, sideways: '' }, { rows: 8, cols: 4, alternate: false, sideways: '' },
       ]);
       expect(totalSlots('cabinet', 5, 6, tc)).toBe(2 * 32 + 3 * 44);
       // Top bay: 8 rows of 4 → 1..32; the honeycomb bay below starts at 33.
@@ -391,9 +403,88 @@ describe('cabinet rack geometry', () => {
       // Missing entries mean the cabinet's own width / pattern; a width past
       // the cabinet is clamped on read.
       expect(cabinetBays(3, 6, { shelfRows: [1, 1, 1], shelfCols: [4], shelfAlternate: [true], alternate: false }))
-        .toEqual([{ rows: 1, cols: 4, alternate: true }, { rows: 1, cols: 6, alternate: false }, { rows: 1, cols: 6, alternate: false }]);
+        .toEqual([{ rows: 1, cols: 4, alternate: true, sideways: '' }, { rows: 1, cols: 6, alternate: false, sideways: '' }, { rows: 1, cols: 6, alternate: false, sideways: '' }]);
       expect(cabinetBays(1, 6, { shelfRows: [1], shelfCols: [9] })[0].cols).toBe(6);
       expect(totalSlots('cabinet', 2, 6, { shelfRows: [2, 2], shelfCols: [3, 6] })).toBe(6 + 12);
+    });
+
+    // Support forum 2026-10-13: a slim fridge lays one bottle across the front
+    // of each shelf and fills its bottom bin with bottles lying across.
+    test('shelfSideways is drawing only on one-row shelves, in a bin and two deep', () => {
+      const oneRow = { shelfRows: [1, 1, 1, 2], shelfCols: [5, 5, 6, 4], shelfAlternate: [false, false, false, true], twoDeep: false };
+      const lies = ['front', '', 'front', 'all'];
+      expect(cabinetRows(4, 6, { ...oneRow, shelfSideways: lies })).toEqual(cabinetRows(4, 6, oneRow));
+      expect(cabinetBays(4, 6, { ...oneRow, shelfSideways: lies }).map((b) => b.sideways)).toEqual(lies);
+      // Two deep the bottle across lies in front of both rows: nothing is recounted.
+      const deep = { shelfRows: [2, 4], shelfAlternate: [true, false], twoDeep: true };
+      expect(cabinetRows(2, 6, { ...deep, shelfSideways: ['front', 'front'] })).toEqual(cabinetRows(2, 6, deep));
+      // Missing or unknown entries read as front to back.
+      expect(cabinetShelfSideways(3, { shelfSideways: ['all', 'sideways'] })).toEqual(['all', '', '']);
+    });
+
+    // Support forum 2026-10-14: on a stacked shelf of a one-deep fridge the
+    // bottle across the front sits BESIDE the first row's bottles, and the
+    // level above rests on the ones behind it: 1 across + 4, 3 on top. It
+    // used to take one of the row's places and stack 4 on 3.
+    test('one bottle across a stacked one-deep shelf: the levels above count from the bottles behind it', () => {
+      const front = { twoDeep: false, sideways: 'front' };
+      expect([1, 2, 3].map((r) => cabinetRowWidth(r, 5, { ...front, alternate: true }))).toEqual([5, 3, 4]);
+      expect([1, 2, 3].map((r) => cabinetRowWidth(r, 5, { ...front, alternate: false }))).toEqual([5, 4, 4]);
+      expect(cabinetBayCapacity(2, 5, { ...front, alternate: true })).toBe(8);
+      expect(cabinetBayCapacity(2, 5, { ...front, alternate: false })).toBe(9);
+      expect(cabinetRowWidth(2, 1, { ...front, alternate: true })).toBe(1); // never 0 wide
+      // Two deep, and the other lies, are counted as before.
+      expect([1, 2, 3, 4].map((r) => cabinetRowWidth(r, 6, { twoDeep: true, alternate: true, sideways: 'front' }))).toEqual([6, 5, 5, 6]);
+      expect([1, 2].map((r) => cabinetRowWidth(r, 5, { twoDeep: false, alternate: true, sideways: 'all' }))).toEqual([5, 4]);
+
+      // The Kingsbottle Atelier Duo with the maker's top shelf: still 86, and
+      // the numbering runs on through the shorter level.
+      const atelier = {
+        shelfRows: [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+        shelfCols: [5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 4],
+        shelfAlternate: [true, false, false, false, false, false, false, false, false, false, false, false, false, false, true],
+        shelfSideways: ['front', 'front', 'front', 'front', 'front', 'front', 'front', '', 'front', 'front', 'front', 'front', 'front', 'front', 'all'],
+        twoDeep: false,
+      };
+      expect(totalSlots('cabinet', 15, 6, atelier)).toBe(86);
+      expect(cabinetRows(15, 6, atelier).slice(0, 3)).toEqual([
+        { shelfIndex: 0, row: 1, start: 0, width: 5 },
+        { shelfIndex: 0, row: 2, start: 5, width: 3 },
+        { shelfIndex: 1, row: 1, start: 8, width: 5 },
+      ]);
+      expect(cabinetPosition({ shelfIndex: 0, row: 2, slot: 3, cols: 6, ...atelier })).toBe(8);
+      expect(cabinetPosition({ shelfIndex: 0, row: 2, slot: 4, cols: 6, ...atelier })).toBeNull();
+      expect(cabinetPosition({ shelfIndex: 1, row: 1, slot: 1, cols: 6, ...atelier })).toBe(9);
+    });
+
+    // Release audit 2026-10-13: a hand-edited export's non-list value was
+    // stored as a wrong-length list, and every later edit was then refused.
+    test('fitCabinetTypeConfig: what an import stores is always a valid cabinet config', () => {
+      const fitted = fitCabinetTypeConfig(3, 6, {
+        shelfRows: [2, 2], shelfSideways: 'front', shelfCols: 'wide', shelfAlternate: [true],
+        twoDeep: false, headToTail: true, extra: 'kept',
+      });
+      expect(fitted.shelfRows).toEqual([2, 2, 1]);
+      expect(fitted.shelfSideways).toBeUndefined();
+      expect(fitted.shelfCols).toBeUndefined();
+      expect(fitted.shelfAlternate).toEqual([true, false, false]);
+      expect(fitted.headToTail).toBe(true);
+      expect(fitted.extra).toBe('kept');
+      expect(validateCabinetConfig(fitted, 'cabinet', 3, false, 6)).toBeNull();
+      // A list is fitted to the shelf count, unknown entries read as front to back.
+      expect(fitCabinetTypeConfig(2, 6, { shelfRows: [1, 1], shelfSideways: ['all', 'x', 'front'] }).shelfSideways).toEqual(['all', '']);
+      // Two deep never keeps head to tail.
+      expect(fitCabinetTypeConfig(1, 6, { shelfRows: [1], headToTail: true }).headToTail).toBe(false);
+      expect(validateCabinetConfig(fitCabinetTypeConfig(1, 4, null), 'cabinet', 1, false, 4)).toBeNull();
+    });
+
+    test('validateCabinetConfig: shelfSideways one of "", "front", "all" per shelf, cabinet only', () => {
+      expect(validateCabinetConfig({ shelfRows: [1, 2], shelfSideways: ['front', 'all'] }, 'cabinet', 2, false, 6)).toBeNull();
+      expect(validateCabinetConfig({ shelfRows: [1, 2], shelfSideways: ['', ''] }, 'cabinet', 2, false, 6)).toBeNull();
+      expect(validateCabinetConfig({ shelfRows: [1, 2], shelfSideways: ['front'] }, 'cabinet', 2, false, 6)).toMatch(/one entry per shelf/);
+      expect(validateCabinetConfig({ shelfRows: [1, 2], shelfSideways: ['front', 'up'] }, 'cabinet', 2, false, 6)).toMatch(/"front"/);
+      expect(validateCabinetConfig({ shelfRows: [1, 2], shelfSideways: 'front' }, 'cabinet', 2, false, 6)).toMatch(/one entry per shelf/);
+      expect(validateCabinetConfig({ shelfSideways: ['front', ''] }, 'grid', 2, false, 6)).toMatch(/cabinet racks only/);
     });
 
     test('validateCabinetConfig: shelfCols 1..cols and shelfAlternate booleans, one entry per shelf', () => {

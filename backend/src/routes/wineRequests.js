@@ -7,6 +7,7 @@ const WineDefinition = require('../models/WineDefinition');
 const { findVisibleWine } = require('../services/wineVisibility');
 const { createWineRequest } = require('../services/accountOps');
 const { originFrom } = require('../utils/contributionOrigin');
+const { WINE_LIST_SELECT } = require('../config/constants');
 
 const router = express.Router();
 
@@ -18,7 +19,7 @@ router.use(requireAuth);
 // the demo is reaped — queue-spam vector.
 router.post('/', requireNonDemo, async (req, res) => {
   try {
-    const { requestType = 'new_wine', wineName, sourceUrl, image, linkedWineDefinition, suggestedGrapes } = req.body;
+    const { requestType = 'new_wine', wineName, sourceUrl, sourceUrls, image, backImage, linkedWineDefinition, suggestedGrapes } = req.body;
 
     if (requestType === 'grape_suggestion') {
       // ── Grape suggestion for an existing wine ──
@@ -57,12 +58,14 @@ router.post('/', requireNonDemo, async (req, res) => {
 
     // ── New wine request ── (validation + creation shared with the MCP
     // request_wine_addition tool via services/accountOps)
-    const { wineRequest, error } = await createWineRequest(req.user.id, { wineName, sourceUrl, image }, { via: 'web', req });
+    const { wineRequest, error } = await createWineRequest(req.user.id, { wineName, sourceUrl, sourceUrls, image, backImage }, { via: 'web', req });
     if (error) return res.status(error.status).json({ error: error.message });
     logAudit(req, 'wineRequest.create', { type: 'wineRequest', id: wineRequest._id });
     // Registry Bridge (self-hosted installs): a wine nobody here has is worth
-    // asking the shared registry for too. Fire-and-forget.
-    registryBridge.forwardRequest({ wineName, sourceUrl, image }).catch(() => {});
+    // asking the shared registry for too — label photo included — and the id
+    // it gets there is kept, so the answer comes back (hourly request sync).
+    // Fire-and-forget: the request here never waits on the registry.
+    registryBridge.forwardAndTrackRequest(wineRequest).catch(() => {});
     res.status(201).json({ wineRequest });
   } catch (error) {
     console.error('Create wine request error:', error);
@@ -87,8 +90,10 @@ router.get('/', async (req, res) => {
       filter.status = status;
     }
 
+    // The linked wine as a bottle list carries it: no member-hidden field
+    // (who contributed it, the curation internals) and no aiProfile.
     const requests = await WineRequest.find(filter)
-      .populate('linkedWineDefinition')
+      .populate('linkedWineDefinition', WINE_LIST_SELECT)
       .populate('resolvedBy', 'username')
       .sort({ createdAt: -1 });
 

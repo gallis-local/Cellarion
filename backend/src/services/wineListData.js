@@ -1,6 +1,10 @@
 const mongoose = require('mongoose');
 const Bottle = require('../models/Bottle');
+const Cellar = require('../models/Cellar');
 const WineDefinition = require('../models/WineDefinition');
+const { DRAFT_EXCLUDED } = require('./wineVisibility');
+const { getOrCreateDailySnapshot, convertCurrency } = require('../utils/exchangeRates');
+const { normalizeCurrency } = require('../config/currencies');
 
 const WINE_SELECT = 'name producer type appellation country region grapes classification';
 const WINE_POPULATE = [
@@ -23,12 +27,46 @@ function allEntries(wineList) {
 }
 
 /**
+ * Average purchase price of one entry from its per-currency price totals
+ * (Map<currency, { sum, n }>, priced bottles only) — see loadStockMap.
+ */
+function averagePrice(prices, currency, rates) {
+  if (prices.size === 0) return null;
+  if (prices.size === 1) {
+    const [[from, { sum, n }]] = prices;
+    if (!currency || from === normalizeCurrency(currency)) return sum / n;
+  }
+  if (!currency) return null;
+  let total = 0;
+  let count = 0;
+  for (const [from, { sum, n }] of prices) {
+    // convertCurrency reads 0 as nothing to convert; 0 is 0 in any currency.
+    const converted = sum === 0 ? 0 : convertCurrency(sum, from, currency, rates);
+    if (converted == null) return null;
+    total += converted;
+    count += n;
+  }
+  return total / count;
+}
+
+/**
  * Aggregate the cellar's active bottles per wine + vintage + bottle size.
  * Returns Map<entryKey, { stock, avgPrice }>. Stock is scoped to the list's
  * cellar — entry wine IDs reference the shared registry, but counts and
  * purchase prices must never leak from other cellars.
+ *
+ * Each price is in its bottle's own currency. An entry whose priced bottles
+ * are all in `currency` (the list's) gets their plain average. Any other entry
+ * — one foreign currency or several — gets the count-weighted average
+ * converted into `currency` with today's rates, or null when a rate is
+ * missing: no price beats a SEK figure printed as euros, or EUR and SEK added
+ * up as one number. Without a `currency` (the editor's picker) an entry in
+ * one currency keeps its plain average and a mixed one has none.
+ *
+ * @param {any} cellarId
+ * @param {{ currency?: string }} [options]
  */
-async function loadStockMap(cellarId) {
+async function loadStockMap(cellarId, { currency } = {}) {
   const groups = await Bottle.aggregate([
     {
       $match: {
@@ -43,19 +81,92 @@ async function loadStockMap(cellarId) {
           wine: '$wineDefinition',
           vintage: { $ifNull: ['$vintage', 'NV'] },
           bottleSize: { $ifNull: ['$bottleSize', '750ml'] },
+          currency: { $ifNull: ['$currency', 'USD'] },
         },
         stock: { $sum: 1 },
-        avgPrice: { $avg: '$price' },
+        priced: { $sum: { $cond: [{ $isNumber: '$price' }, 1, 0] } },
+        priceSum: { $sum: '$price' },
       },
     },
   ]);
 
-  const map = new Map();
+  // Fold the per-currency groups into one row per entry. A bottle without a
+  // price still carries the default currency, so only priced groups count
+  // towards an entry's currencies.
+  const rows = new Map();
   for (const g of groups) {
     const key = entryKey({ wine: g._id.wine, vintage: g._id.vintage, bottleSize: g._id.bottleSize });
-    map.set(key, { stock: g.stock, avgPrice: g.avgPrice != null ? g.avgPrice : null });
+    const row = rows.get(key) || { stock: 0, prices: new Map() };
+    row.stock += g.stock;
+    if (g.priced > 0) {
+      const cur = normalizeCurrency(g._id.currency);
+      const p = row.prices.get(cur) || { sum: 0, n: 0 };
+      p.sum += g.priceSum;
+      p.n += g.priced;
+      row.prices.set(cur, p);
+    }
+    rows.set(key, row);
+  }
+
+  // Rates are needed as soon as one priced bottle is in another currency than
+  // the list's.
+  const target = currency && normalizeCurrency(currency);
+  let rates = null;
+  if (target && [...rows.values()].some(r => [...r.prices.keys()].some(c => c !== target))) {
+    try {
+      rates = (await getOrCreateDailySnapshot())?.rates || null;
+    } catch (_) { /* entries needing a conversion get no average */ }
+  }
+
+  const map = new Map();
+  for (const [key, row] of rows) {
+    map.set(key, { stock: row.stock, avgPrice: averagePrice(row.prices, currency, rates) });
   }
   return map;
+}
+
+/**
+ * Which of `wineIds` may sit on this owner's wine lists: every published
+ * registry wine, plus the pending-identity rows that are the owner's OWN —
+ * created by them, or held by a bottle in a cellar they own or belong to (a
+ * member's unread label in a shared cellar is still the owner's wine on the
+ * owner's menu). A list is the owner's document about the owner's wines, so a
+ * wine they see on their bottle page belongs on it like any other; the public
+ * page then prints the row the way the bottle page does (name, no producer).
+ *
+ * Nothing else: a published list is served by routes/wineListPublic.js with
+ * NO auth at all, so a stranger's hidden row must stay hidden there too. That
+ * is why this is a QUERY filter rather than a post-filter — `pendingIdentity`
+ * and `createdBy` are deliberately absent from WINE_SELECT, and a post-filter
+ * reading an absent field would pass every row (services/wineVisibility
+ * explains the trap). Shared by the renderer (loadWineMap) and the MCP
+ * add_to_list lookup, so what can be added and what renders is one rule.
+ *
+ * @param {any} ownerId  the list owner (WineList.user)
+ * @param {string[]} wineIds
+ */
+async function ownerWineFilter(ownerId, wineIds) {
+  const ids = [...new Set(wineIds.map(String))];
+  let held = [];
+  if (ids.length) {
+    const cellarIds = await Cellar.find({ $or: [{ user: ownerId }, { 'members.user': ownerId }], deletedAt: null }).distinct('_id');
+    if (cellarIds.length) {
+      held = await Bottle.distinct('wineDefinition', { cellar: { $in: cellarIds }, wineDefinition: { $in: ids } });
+    }
+  }
+  return {
+    _id: { $in: ids },
+    $or: [
+      { pendingIdentity: { $ne: true } },
+      // The owner's own rows, their private drafts included: a draft is the
+      // owner's wine too, and this is the owner's own menu.
+      { pendingIdentity: true, createdBy: ownerId },
+      // Held by a bottle in a cellar of theirs — a member's unread label — but
+      // never another member's private draft: a draft stays creator-only on
+      // every publish surface (services/wineVisibility, decision 2).
+      { pendingIdentity: true, ...DRAFT_EXCLUDED, _id: { $in: held } },
+    ],
+  };
 }
 
 /**
@@ -63,7 +174,8 @@ async function loadStockMap(cellarId) {
  * every entry plus per-entry stock from the list's cellar.
  *
  * Returns Map<entryKey, { wine, stock, avgPrice }> — entries whose wine no
- * longer exists in the registry are simply absent.
+ * longer exists in the registry, or is a hidden row that is not the owner's
+ * own (ownerWineFilter), are simply absent.
  */
 async function loadWineMap(wineList) {
   const wineIds = new Set();
@@ -72,18 +184,13 @@ async function loadWineMap(wineList) {
   }
 
   const [wines, stockMap] = await Promise.all([
-    // pendingIdentity rows are excluded here as well as refused at write time
-    // (routes/wineLists.js, mcp/tools/wineLists.js). Defence in depth with a
-    // reason: a published wine list is served by routes/wineListPublic.js,
-    // which has NO auth at all, and rows attached before the write gate existed
-    // would otherwise still render a stranger's hidden wine to the internet.
-    // An excluded entry simply drops out of the map — the exact same handling
-    // an entry whose wine was deleted already gets.
-    WineDefinition.find({ _id: { $in: [...wineIds] }, pendingIdentity: { $ne: true } })
-      .select(WINE_SELECT)
-      .populate(WINE_POPULATE)
-      .lean(),
-    loadStockMap(wineList.cellar),
+    ownerWineFilter(wineList.user, [...wineIds]).then(filter =>
+      WineDefinition.find(filter)
+        .select(WINE_SELECT)
+        .populate(WINE_POPULATE)
+        .lean()
+    ),
+    loadStockMap(wineList.cellar, { currency: wineList.layout?.currency || 'USD' }),
   ]);
 
   const wineById = new Map(wines.map(w => [w._id.toString(), w]));
@@ -103,6 +210,8 @@ async function loadWineMap(wineList) {
 /**
  * All distinct wines in a cellar (active bottles grouped by wine + vintage +
  * size) with stock and average purchase price — the editor's picker data.
+ * The picker belongs to no list, so it has no currency to convert into: a
+ * wine whose bottles were bought in several currencies has no average here.
  */
 async function loadCellarWines(cellarId) {
   const stockMap = await loadStockMap(cellarId);
@@ -134,4 +243,4 @@ async function loadCellarWines(cellarId) {
   return result;
 }
 
-module.exports = { entryKey, allEntries, loadWineMap, loadCellarWines };
+module.exports = { entryKey, allEntries, ownerWineFilter, loadWineMap, loadCellarWines };

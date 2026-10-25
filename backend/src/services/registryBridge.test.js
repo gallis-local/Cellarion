@@ -38,6 +38,7 @@ jest.mock('./findOrCreateWine', () => ({
   findOrCreateGrapes: jest.fn(async (names) => names.map((n) => `grape:${n}`)),
 }));
 jest.mock('./search', () => ({ indexWine: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('./registryDataOps', () => ({ invalidateVocabCache: jest.fn() }));
 
 const WineDefinition = require('../models/WineDefinition');
 const WineVintageProfile = require('../models/WineVintageProfile');
@@ -73,6 +74,89 @@ beforeEach(() => {
   RegistryDataValue.findOne.mockResolvedValue(null);
   SiteConfig.findOne.mockReturnValue({ lean: () => Promise.resolve(null) });
   delete process.env.REGISTRY_BRIDGE_REFRESH;
+});
+
+describe('adoptWine — registry keys this install only knows as a proposal', () => {
+  const { invalidateVocabCache } = require('./registryDataOps');
+  const LIVE = { nameKey: 'abv', status: { $in: ['proposed', 'accepted'] } };
+  const keyDoc = (over) => ({ _id: 'keyP', name: 'ABV', nameKey: 'abv', type: 'decimal', unit: '%', status: 'proposed', rationale: 'Proposed by a member.', save: jest.fn().mockResolvedValue(undefined), ...over });
+  const publishedKeys = () => RegistryDataValue.findOneAndUpdate.mock.calls.map((c) => c[0].key);
+
+  test('a locally PROPOSED key of the same name is promoted to accepted and used — no second key, no E11000', async () => {
+    const proposed = keyDoc();
+    RegistryDataKey.findOne.mockResolvedValue(proposed);
+    client.fetchWine.mockResolvedValue(registryWine());
+
+    const r = await bridge.adoptWine(RID, USER);
+
+    expect(r.ok).toBe(true);
+    expect(RegistryDataKey.findOne).toHaveBeenCalledWith(LIVE);
+    expect(RegistryDataKey.create).not.toHaveBeenCalled();
+    expect(proposed).toMatchObject({ status: 'accepted', decidedBy: USER });
+    expect(proposed.decidedAt).toBeInstanceOf(Date);
+    expect(proposed.save).toHaveBeenCalled();
+    expect(publishedKeys()).toEqual(['keyP', 'keyP']);
+    expect(invalidateVocabCache).toHaveBeenCalled();
+  });
+
+  test('a promoted key keeps the local type and unit when they differ, and says so in the log', async () => {
+    const proposed = keyDoc({ type: 'text', unit: null });
+    RegistryDataKey.findOne.mockResolvedValue(proposed);
+    client.fetchWine.mockResolvedValue(registryWine());
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await bridge.adoptWine(RID, USER);
+
+    expect(proposed).toMatchObject({ status: 'accepted', type: 'text', unit: null });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ABV'));
+    warn.mockRestore();
+  });
+
+  // Release audit 2026-10-23: proposals allow a 1000-character rationale, and
+  // appending the registry note past that failed validation on save — after the
+  // wine was already saved, so the adoption answered 500 and its values never
+  // landed.
+  test('a rationale near the 1000-character limit stays as written and the promotion still saves', async () => {
+    const long = 'x'.repeat(990);
+    const proposed = keyDoc({ rationale: long });
+    RegistryDataKey.findOne.mockResolvedValue(proposed);
+    client.fetchWine.mockResolvedValue(registryWine());
+
+    const r = await bridge.adoptWine(RID, USER);
+
+    expect(r.ok).toBe(true);
+    expect(proposed.status).toBe('accepted');
+    expect(proposed.rationale.length).toBeLessThanOrEqual(1000);
+    expect(proposed.rationale).toBe(long);
+    expect(proposed.save).toHaveBeenCalled();
+  });
+
+  test('a create that loses the race (E11000) re-reads the key and still publishes the values', async () => {
+    RegistryDataKey.findOne.mockResolvedValueOnce(null).mockResolvedValueOnce(keyDoc({ _id: 'keyR', status: 'accepted' }));
+    RegistryDataKey.create.mockRejectedValueOnce(Object.assign(new Error('dup key'), { code: 11000 }));
+    client.fetchWine.mockResolvedValue(registryWine());
+
+    const r = await bridge.adoptWine(RID, USER);
+
+    expect(r.ok).toBe(true);
+    expect(publishedKeys()).toEqual(['keyR', 'keyR']);
+  });
+
+  test('a key minted here clears the vocabulary cache at once', async () => {
+    client.fetchWine.mockResolvedValue(registryWine());
+    await bridge.adoptWine(RID, USER);
+    expect(RegistryDataKey.create).toHaveBeenCalled();
+    expect(invalidateVocabCache).toHaveBeenCalled();
+  });
+
+  test('an already ACCEPTED key is used as is: nothing saved, the cache left alone', async () => {
+    const accepted = keyDoc({ status: 'accepted' });
+    RegistryDataKey.findOne.mockResolvedValue(accepted);
+    client.fetchWine.mockResolvedValue(registryWine());
+    await bridge.adoptWine(RID, USER);
+    expect(accepted.save).not.toHaveBeenCalled();
+    expect(invalidateVocabCache).not.toHaveBeenCalled();
+  });
 });
 
 describe('adoptWine', () => {
@@ -242,11 +326,47 @@ describe('forwarding', () => {
     expect(await bridge.forwardValueFor('c'.repeat(24), { keyName: 'ABV', value: 1 })).toBeNull();
   });
 
-  test('a wine request is forwarded, an inline image is not', async () => {
-    await bridge.forwardRequest({ wineName: 'X', sourceUrl: 'https://x.example', image: 'data:image/png;base64,AAAA' });
-    expect(client.forwardRequest).toHaveBeenCalledWith({ wineName: 'X', sourceUrl: 'https://x.example' });
+  test('a wine request is forwarded with its photo: a link, or an inline label photo within the cap', async () => {
     await bridge.forwardRequest({ wineName: 'Y', sourceUrl: 'https://y.example', image: 'https://y.example/label.jpg' });
     expect(client.forwardRequest).toHaveBeenLastCalledWith({ wineName: 'Y', sourceUrl: 'https://y.example', image: 'https://y.example/label.jpg' });
+    // Over the cap the registry would refuse it anyway: the request goes without.
+    await bridge.forwardRequest({ wineName: 'Z', sourceUrl: 'https://z.example', image: `data:image/png;base64,${'A'.repeat(500001)}` });
+    expect(client.forwardRequest).toHaveBeenLastCalledWith({ wineName: 'Z', sourceUrl: 'https://z.example' });
+    // Not decodable as an image: the request goes without too.
+    await bridge.forwardRequest({ wineName: 'W', sourceUrl: 'https://w.example', image: 'data:image/webp;base64,AAAA' });
+    expect(client.forwardRequest).toHaveBeenLastCalledWith({ wineName: 'W', sourceUrl: 'https://w.example' });
+  });
+
+  test('a request this install tracks says it follows it (follow: true), so cellarion.app does not notify the key owner too', async () => {
+    await bridge.forwardAndTrackRequest({ _id: 'local-1', wineName: 'Y', sourceUrl: 'https://y.example' });
+    expect(client.forwardRequest).toHaveBeenLastCalledWith({ wineName: 'Y', sourceUrl: 'https://y.example', follow: true });
+  });
+
+  test('an inline photo leaves re-encoded: WebP, transparency kept, camera metadata (EXIF, GPS) dropped', async () => {
+    const sharp = require('sharp');
+    const png = await sharp({ create: { width: 8, height: 12, channels: 4, background: { r: 200, g: 20, b: 40, alpha: 0.5 } } })
+      .withExif({ IFD0: { Make: 'TestCam', Copyright: 'someone' } })
+      .png().toBuffer();
+    expect((await sharp(png).metadata()).exif).toBeTruthy(); // the input really carries EXIF
+    await bridge.forwardRequest({ wineName: 'X', sourceUrl: 'https://x.example', image: `data:image/png;base64,${png.toString('base64')}` });
+    const sent = client.forwardRequest.mock.calls.at(-1)[0];
+    expect(sent.image.startsWith('data:image/webp;base64,')).toBe(true);
+    const meta = await sharp(Buffer.from(sent.image.split(',')[1], 'base64')).metadata();
+    expect(meta.format).toBe('webp');
+    expect(meta.hasAlpha).toBe(true);
+    expect(meta.exif).toBeUndefined();
+  });
+
+  test('a registry that refuses the body as too large still gets the request, without the photo', async () => {
+    const sharp = require('sharp');
+    const png = await sharp({ create: { width: 4, height: 4, channels: 3, background: '#808080' } }).png().toBuffer();
+    client.forwardRequest
+      .mockResolvedValueOnce({ ok: false, status: 413, code: 'too_large' })
+      .mockResolvedValueOnce({ ok: true, status: 201, body: { request: { id: 'e'.repeat(24) } } });
+    const r = await bridge.forwardRequest({ wineName: 'X', sourceUrl: 'https://x.example', image: `data:image/png;base64,${png.toString('base64')}` });
+    expect(client.forwardRequest.mock.calls.at(-2)[0].image).toMatch(/^data:image\/webp;base64,/);
+    expect(client.forwardRequest).toHaveBeenLastCalledWith({ wineName: 'X', sourceUrl: 'https://x.example' });
+    expect(r.ok).toBe(true);
   });
 });
 
@@ -506,5 +626,36 @@ describe('audit 2026-09-08 — refresh keeps its promises', () => {
     client.fetchWine.mockResolvedValue(registryWine({ image: null, imageCredit: null }));
     await bridge.refreshHeld({ now: new Date('2026-09-08') });
     expect(local.image).toBe('/api/uploads/processed/local.png');
+  });
+});
+
+describe('forwarding — links and the back label (#1460)', () => {
+  test('the extra links and the back label travel with the request; a single link rides as sourceUrl only', async () => {
+    await bridge.forwardRequest({ wineName: 'Y', sourceUrl: 'https://y.example', sourceUrls: ['https://y.example'], image: null, backImage: 'https://y.example/back.jpg' });
+    expect(client.forwardRequest).toHaveBeenLastCalledWith({ wineName: 'Y', sourceUrl: 'https://y.example', backImage: 'https://y.example/back.jpg' });
+    await bridge.forwardRequest({ wineName: 'Y', sourceUrl: 'https://y.example', sourceUrls: ['https://y.example', 'https://review.example/y'] });
+    expect(client.forwardRequest).toHaveBeenLastCalledWith({ wineName: 'Y', sourceUrl: 'https://y.example', sourceUrls: ['https://y.example', 'https://review.example/y'] });
+  });
+
+  test('an inline back label leaves re-encoded like the front; one over the cap stays home', async () => {
+    const sharp = require('sharp');
+    const png = await sharp({ create: { width: 4, height: 4, channels: 3, background: '#808080' } }).png().toBuffer();
+    await bridge.forwardRequest({ wineName: 'X', sourceUrl: 'https://x.example', backImage: `data:image/png;base64,${png.toString('base64')}` });
+    expect(client.forwardRequest.mock.calls.at(-1)[0].backImage).toMatch(/^data:image\/webp;base64,/);
+    await bridge.forwardRequest({ wineName: 'X', sourceUrl: 'https://x.example', backImage: `data:image/png;base64,${'A'.repeat(500001)}` });
+    expect(client.forwardRequest).toHaveBeenLastCalledWith({ wineName: 'X', sourceUrl: 'https://x.example' });
+  });
+
+  test('a registry that refuses the body drops the back label first, then the front photo', async () => {
+    client.forwardRequest
+      .mockResolvedValueOnce({ ok: false, status: 413, code: 'too_large' })
+      .mockResolvedValueOnce({ ok: false, status: 413, code: 'too_large' })
+      .mockResolvedValueOnce({ ok: true, status: 201, body: { request: { id: 'e'.repeat(24) } } });
+    const r = await bridge.forwardRequest({ wineName: 'X', sourceUrl: 'https://x.example', image: 'https://x.example/front.jpg', backImage: 'https://x.example/back.jpg' });
+    const sent = client.forwardRequest.mock.calls.slice(-3).map((c) => c[0]);
+    expect(sent[0]).toEqual({ wineName: 'X', sourceUrl: 'https://x.example', image: 'https://x.example/front.jpg', backImage: 'https://x.example/back.jpg' });
+    expect(sent[1]).toEqual({ wineName: 'X', sourceUrl: 'https://x.example', image: 'https://x.example/front.jpg' });
+    expect(sent[2]).toEqual({ wineName: 'X', sourceUrl: 'https://x.example' });
+    expect(r.ok).toBe(true);
   });
 });

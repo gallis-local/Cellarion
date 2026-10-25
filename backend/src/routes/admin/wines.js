@@ -24,6 +24,7 @@ const {
 const WineDefinition = require('../../models/WineDefinition');
 const Bottle = require('../../models/Bottle');
 const BottleImage = require('../../models/BottleImage');
+const DeletedBottle = require('../../models/DeletedBottle');
 const WineVintageProfile = require('../../models/WineVintageProfile');
 const WineVintagePrice = require('../../models/WineVintagePrice');
 const WineReport = require('../../models/WineReport');
@@ -33,6 +34,7 @@ const DiscussionReply = require('../../models/DiscussionReply');
 const WineEmbedding = require('../../models/WineEmbedding');
 const WineNotDuplicate = require('../../models/WineNotDuplicate');
 const { bumpDataVersion } = require('../../services/dataVersion');
+const { ensurePendingVintageProfile } = require('../../utils/vintageProfile');
 // Pending correction proposals close with their wine THROUGH this service, so
 // a user who filed one is told what happened (it owns the model access).
 const { closePendingForWine } = require('../../services/wineCorrectionNotify');
@@ -46,12 +48,14 @@ const JournalEntry = require('../../models/JournalEntry');
 const Recommendation = require('../../models/Recommendation');
 const RestockAlert = require('../../models/RestockAlert');
 const WineRequest = require('../../models/WineRequest');
+const PersonalDataEntry = require('../../models/PersonalDataEntry');
+const RegistryDataValue = require('../../models/RegistryDataValue');
 const { unlinkImageFiles } = require('../../services/imageProcessor');
-const { embedSinglePair } = require('../../services/embeddingJob');
+const { embedSinglePair, reembedActiveVintages } = require('../../services/embeddingJob');
 const searchService = require('../../services/search');
 const { logAudit } = require('../../services/audit');
 const { submitUrls } = require('../../services/indexNow');
-const { isValidId } = require('../../utils/validation');
+const { isValidId, coerceStringQuery } = require('../../utils/validation');
 const { escapeRegex } = require('../../utils/sanitize');
 const { parsePagination } = require('../../utils/pagination');
 const { stripProducerName, stripProducerKeyPrefix, canonicalizeWineName } = require('../../utils/producerPrefix');
@@ -689,13 +693,41 @@ router.post('/:id/non-wine', async (req, res) => {
     // A user's private draft is not registry content, not even to an admin.
     if (!wine || wine.draft === true) return res.status(404).json({ error: 'Wine not found' });
 
+    const wasNonWine = wine.nonWine === true;
     wine.nonWine = req.body.value;
     await wine.save();
     // Self-healing index sync: indexWine removes flagged rows, re-adds restored ones.
     searchService.indexWine(wine._id);
+    // The vectors too: a quarantined row's embeddings would keep it in
+    // semantic search and the similar-wines graph (audit 2026-10-14). A
+    // restore re-embeds the vintages in cellars, as a promotion does.
+    if (req.body.value === true) await purgeSourceVectors(wine._id);
+    else if (wasNonWine) reembedActiveVintages(wine._id).catch(() => {});
+
+    // Completes the quarantine for the somm queue, the same rule as the
+    // proposal path's non_wine apply: PENDING maturity rows go (auto-seeded
+    // stubs); REVIEWED windows are curated data and stay with the record.
+    let pendingRemoved = 0;
+    if (req.body.value === true && !wasNonWine) {
+      const del = await WineVintageProfile.deleteMany({ wineDefinition: wine._id, status: 'pending' });
+      pendingRemoved = del.deletedCount || 0;
+    }
+
+    // A restore gives back the maturity-queue rows the quarantine removed
+    // (both quarantine paths delete the PENDING ones), seeded from
+    // the bottles in cellars — the same re-seed a pending wine gets when it
+    // is promoted. Bottles on order are queued when they arrive.
+    if (wasNonWine && req.body.value === false) {
+      try {
+        const vintages = await Bottle.distinct('vintage', { wineDefinition: wine._id, status: 'active' });
+        for (const v of vintages) await ensurePendingVintageProfile(wine._id, v);
+      } catch (err) {
+        console.warn('Maturity re-seed after a non-wine restore failed (non-fatal):', err.message);
+      }
+    }
 
     logAudit(req, 'admin.wine.nonWine', { type: 'wine', id: wine._id },
-      { value: req.body.value, name: wine.name, producer: wine.producer });
+      { value: req.body.value, name: wine.name, producer: wine.producer, ...(req.body.value === true ? { pendingRemoved } : {}) });
     res.json({ message: req.body.value ? 'Quarantined as non-wine' : 'Restored as wine', nonWine: wine.nonWine });
   } catch (error) {
     console.error('Non-wine toggle error:', error);
@@ -887,7 +919,13 @@ router.get('/low-confidence', async (req, res) => {
 
 router.get('/duplicates', async (req, res) => {
   try {
-    const { name, producer, appellation, threshold = 0.75 } = req.query;
+    // A repeated query param arrives as an array: coerced to '' it hits the 400
+    // below instead of a .split() TypeError (500).
+    const name = coerceStringQuery(req.query.name);
+    const producer = coerceStringQuery(req.query.producer);
+    const appellation = coerceStringQuery(req.query.appellation) || undefined;
+    const parsedThreshold = parseFloat(coerceStringQuery(req.query.threshold));
+    const threshold = Number.isFinite(parsedThreshold) ? parsedThreshold : 0.75;
 
     if (!name || !producer) {
       return res.status(400).json({ error: 'Name and producer are required' });
@@ -951,11 +989,10 @@ router.get('/duplicates', async (req, res) => {
           appellationSimilarity = 0.5;
         }
 
-        // Overall similarity: name and producer weighted heavily
-        const overallSimilarity =
-          nameCombined * 0.45 +
-          producerCombined * 0.45 +
-          appellationSimilarity * 0.1;
+        // Overall: the shared scorer every add flow uses (producer keys,
+        // star grades, label abbreviations). The breakdown above stays as
+        // the per-algorithm detail.
+        const overallSimilarity = scoreWineMatch(wine, { name, producer, appellation }, { redistribute: false });
 
         return {
           wine,
@@ -978,12 +1015,12 @@ router.get('/duplicates', async (req, res) => {
           }
         };
       })
-      .filter(item => item.similarity >= parseFloat(threshold))
+      .filter(item => item.similarity >= threshold)
       .sort((a, b) => b.similarity - a.similarity);
 
     res.json({
       count: candidates.length,
-      threshold: parseFloat(threshold),
+      threshold,
       query: { name, producer, appellation },
       candidates
     });
@@ -1475,6 +1512,57 @@ router.put('/:id', async (req, res) => {
       const colourErr = colourTypeConflict(type || wine.type, colour);
       if (colourErr) return res.status(400).json({ error: colourErr });
     }
+    // The create route's input checks, before anything is changed: a bad id or
+    // a non-string field is a 400, not a cast error turned into a 500.
+    if ((name != null && typeof name !== 'string') || (producer != null && typeof producer !== 'string')) {
+      return res.status(400).json({ error: 'Name and producer must be strings' });
+    }
+    if (appellation != null && typeof appellation !== 'string') {
+      return res.status(400).json({ error: 'Appellation must be a string' });
+    }
+    if (country && !isValidId(String(country))) {
+      return res.status(400).json({ error: 'Invalid country' });
+    }
+    if (region && !isValidId(String(region))) {
+      return res.status(400).json({ error: 'Invalid region' });
+    }
+    if (grapes !== undefined && (!Array.isArray(grapes) || !grapes.every((g) => isValidId(String(g))))) {
+      return res.status(400).json({ error: 'Invalid grapes' });
+    }
+    // A bare Prädikat is not a place. Create (built for scans) moves it into
+    // the classification; an edit is a person at a form, so it is refused
+    // rather than moved behind their back. Only when the appellation CHANGES:
+    // the form re-sends every field, and an older row stored with one must
+    // stay editable (and mergeable from the cluster modal).
+    if (appellation && appellation.trim() && appellation.trim() !== (wine.appellation || '')
+      && splitPradikatFromAppellation(appellation, null, '').appellation === null) {
+      return res.status(400).json({
+        error: `"${appellation.trim()}" is a Prädikat (ripeness level), not an appellation — a bare Prädikat is never stored as the appellation`,
+      });
+    }
+    const nextAppellation = appellation !== undefined
+      ? await resolveCanonicalAppellation(normalizeAppellation(appellation?.trim()))
+      : wine.appellation;
+
+    // Name and producer: the same step-0 canon and producer gate as create,
+    // each run only when its own field really changes (the edit form re-sends
+    // every field on save, so an unrelated save never renames or blocks an old
+    // row): the canon on a name change, the producer gate on a producer change.
+    // No producer-spelling resolve: that would undo a curator's deliberate rename.
+    const typedName = name && name.trim() ? name.trim() : wine.name;
+    const nextProducer = producer && producer.trim() ? producer.trim() : wine.producer;
+    const nextName = typedName !== wine.name
+      ? (canonicalizeWineName(typedName, nextProducer) || typedName)
+      : wine.name;
+    if (nextProducer !== wine.producer) {
+      const { detectBlockingProducerIssue } = require('../../services/crossFieldScan');
+      const blocked = await detectBlockingProducerIssue({ name: nextName, producer: nextProducer, appellation: nextAppellation || '' });
+      if (blocked) {
+        return res.status(400).json({
+          error: `"${nextProducer}" is not a usable producer name — cross-field rule ${blocked.check} matched "${blocked.detail}", which belongs in a different field`,
+        });
+      }
+    }
 
     // Snapshot the profile-feeding fields BEFORE any mutation — the re-enrich
     // decision below compares against this, so only a REAL change (not the
@@ -1483,13 +1571,11 @@ router.put('/:id', async (req, res) => {
     const beforeProfileInputs = profileInputsSnapshot(wine);
 
     // Update fields
-    if (name) wine.name = name.trim();
-    if (producer) wine.producer = producer.trim();
+    wine.name = nextName;
+    wine.producer = nextProducer;
     if (country) wine.country = country;
     if (region !== undefined) wine.region = region || null;
-    if (appellation !== undefined) {
-      wine.appellation = await resolveCanonicalAppellation(normalizeAppellation(appellation?.trim()));
-    }
+    if (appellation !== undefined) wine.appellation = nextAppellation;
     if (grapes !== undefined) wine.grapes = grapes;
     if (type) wine.type = type;
     // Absent = leave alone; '' or null = clear. The model hook drops it again
@@ -1589,11 +1675,13 @@ router.put('/:id', async (req, res) => {
 //
 // Refuses while USER-AUTHORED content references the wine (bottles, wishlist
 // items, reviews, discussions/replies, journal pairings, wine-list entries,
-// recommendations) — deleting under those would orphan or silently vanish
-// other people's data; merge re-points references and is the right tool.
+// recommendations, members' wine-level personal data entries) — deleting
+// under those would orphan or silently vanish other people's data; merge
+// re-points references and is the right tool.
 // Registry-side/derived data that only exists FOR the wine (maturity
 // profiles, price snapshots/opt-ins, community prices, embeddings with their
-// vectors, restock alerts, reports) is cascade-deleted with it.
+// vectors, restock alerts, reports, registry data values) is cascade-deleted
+// with it.
 router.delete('/:id', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
@@ -1604,8 +1692,11 @@ router.delete('/:id', async (req, res) => {
     }
     const id = wine._id;
 
-    const [bottles, wishlistItems, reviews, discussions, discussionReplies, journalEntries, wineLists, recommendations] = await Promise.all([
+    const [bottles, recentlyDeletedBottles, wishlistItems, reviews, discussions, discussionReplies, journalEntries, wineLists, recommendations, personalDataEntries] = await Promise.all([
       Bottle.countDocuments({ wineDefinition: id }),
+      // Bottles in a "Recently deleted" (services/bottleTrash) can still be
+      // restored onto this wine; a merge re-points them, a delete would strand them.
+      DeletedBottle.countDocuments({ wineDefinition: id }),
       WishlistItem.countDocuments({ wineDefinition: id }),
       Review.countDocuments({ wineDefinition: id }),
       Discussion.countDocuments({ wineDefinition: id }),
@@ -1613,8 +1704,11 @@ router.delete('/:id', async (req, res) => {
       JournalEntry.countDocuments({ 'pairings.wine': id }),
       WineList.countDocuments({ $or: [{ 'sections.entries.wine': id }, { 'autoGroupEntries.wine': id }] }),
       Recommendation.countDocuments({ wine: id }),
+      // A member's own typed entries on the wine (bottle-level entries carry
+      // no wine ref and follow their bottle).
+      PersonalDataEntry.countDocuments({ wineDefinition: id }),
     ]);
-    const references = { bottles, wishlistItems, reviews, discussions, discussionReplies, journalEntries, wineLists, recommendations };
+    const references = { bottles, recentlyDeletedBottles, wishlistItems, reviews, discussions, discussionReplies, journalEntries, wineLists, recommendations, personalDataEntries };
     const blocking = Object.entries(references).filter(([, n]) => n > 0);
     if (blocking.length > 0) {
       return res.status(400).json({
@@ -1639,6 +1733,9 @@ router.delete('/:id', async (req, res) => {
       WineReport.updateMany({ duplicateOf: id }, { $unset: { duplicateOf: '' } }),
       WineRequest.updateMany({ linkedWineDefinition: id }, { $unset: { linkedWineDefinition: '' } }),
       WineNotDuplicate.deleteMany({ $or: [{ wineA: id }, { wineB: id }] }),
+      // Registry data values (suggested, published, rejected) describe only
+      // this wine; nothing can read or review them once it is gone.
+      RegistryDataValue.deleteMany({ wineDefinition: id }),
       // Pending correction proposals on (or targeting) a deleted wine would
       // dangle in the review queue forever — same closure as performWineMerge.
       // Through the shared closer, so a user who filed one is told (the wine is
@@ -1760,10 +1857,12 @@ router.post('/:id/merge', async (req, res) => {
     const { targetId } = req.body;
     const sourceId = req.params.id;
 
-    if (!targetId || !mongoose.Types.ObjectId.isValid(targetId)) {
+    if (!isValidId(targetId)) {
       return res.status(400).json({ error: 'A valid targetId is required' });
     }
-    if (sourceId === targetId) {
+    // Compare canonical forms: an id in another letter case names the same
+    // wine (MongoDB casts both to one ObjectId).
+    if (sourceId.toLowerCase() === targetId.toLowerCase()) {
       return res.status(400).json({ error: 'Cannot merge a wine into itself' });
     }
 
@@ -1783,8 +1882,9 @@ router.post('/:id/merge', async (req, res) => {
 
 // The single-pair merge body, extracted so the correction-proposal approve
 // (routes/admin/wineProposals.js) runs EXACTLY the machinery the route above
-// runs — one implementation, two callers. Ids must be pre-validated (24-hex,
-// source ≠ target) by the caller. `req` is for audit attribution only.
+// runs — one implementation, two callers. Ids must be pre-validated (24-hex)
+// by the caller; a source that IS the target is refused here, for every
+// caller. `req` is for audit attribution only.
 // Returns { error: { status, message } } or { bottlesMoved, imageAction,
 // source, target }.
 async function performWineMerge(sourceId, targetId, req) {
@@ -1798,6 +1898,12 @@ async function performWineMerge(sourceId, targetId, req) {
   if (target && target.draft === true) target = null;
   if (!source) return { error: { status: 404, message: 'Source wine not found' } };
   if (!target) return { error: { status: 404, message: 'Target wine not found' } };
+  // Merging a wine into itself would drop its profiles, price-tracking rows
+  // and vectors as "collisions" and then delete it under its own bottles.
+  // Compared on the loaded ids, so no spelling of the request ids gets past.
+  if (String(source._id) === String(target._id)) {
+    return { error: { status: 400, message: 'Cannot merge a wine into itself' } };
+  }
 
   // Capture the source's primary BottleImage (the one whose URL backs
   // WineDefinition.image) BEFORE the bulk reassign below. After reassign
@@ -1828,6 +1934,8 @@ async function performWineMerge(sourceId, targetId, req) {
       await WineDefinition.findByIdAndUpdate(targetId, {
         image: sourceUrl,
         imageCredit: source.imageCredit || null,
+        // Atomic writes skip the save hook; the Bridge's change check reads updatedAt.
+        updatedAt: new Date(),
       });
       imageAction = 'adopted_from_source';
     } else {
@@ -1959,7 +2067,8 @@ async function inheritAiProfile(keeper, sources) {
   }
   keeper.aiProfile = profile;
   if ('profileReviewedAt' in set) keeper.profileReviewedAt = set.profileReviewedAt;
-  await WineDefinition.updateOne({ _id: keeper._id }, { $set: set });
+  // updatedAt: the keeper's profile changed, and the Bridge sends it.
+  await WineDefinition.updateOne({ _id: keeper._id }, { $set: { ...set, updatedAt: new Date() } });
 }
 
 // Re-embed every active vintage the keeper now owns so the vector store reflects
@@ -2020,13 +2129,15 @@ async function reassignVintageProfiles(sourceId, keeperId) {
 
   for (const sp of sourceProfiles) {
     const kp = keeperByVintage.get(sp.vintage);
+    // updatedAt: a window moving onto the keeper is a change to the keeper
+    // for the Registry Bridge change check (routes/bridgeV1), which reads it.
     if (!kp) {
-      await WineVintageProfile.updateOne({ _id: sp._id }, { $set: { wineDefinition: keeperId } });
+      await WineVintageProfile.updateOne({ _id: sp._id }, { $set: { wineDefinition: keeperId, updatedAt: new Date() } });
       // Track it so a second source with the same vintage reconciles against this one.
       keeperByVintage.set(sp.vintage, { vintage: sp.vintage, status: sp.status });
     } else if (kp.status !== 'reviewed' && sp.status === 'reviewed') {
       await WineVintageProfile.deleteOne({ wineDefinition: keeperId, vintage: sp.vintage });
-      await WineVintageProfile.updateOne({ _id: sp._id }, { $set: { wineDefinition: keeperId } });
+      await WineVintageProfile.updateOne({ _id: sp._id }, { $set: { wineDefinition: keeperId, updatedAt: new Date() } });
       keeperByVintage.set(sp.vintage, { vintage: sp.vintage, status: 'reviewed' });
     } else {
       await WineVintageProfile.deleteOne({ _id: sp._id });
@@ -2101,6 +2212,9 @@ async function reassignWineRefs(sourceId, keeperId) {
   owners.forEach(bumpDataVersion);
   await Promise.all([
     reassignWineListEntries(sourceId, keeperId),
+    // Bottles in a "Recently deleted" follow the merge, so a restore lands on
+    // the kept wine instead of failing on the merged-away one.
+    DeletedBottle.updateMany({ wineDefinition: sourceId }, { $set: { wineDefinition: keeperId } }),
     BottleImage.updateMany({ wineDefinition: sourceId }, { $set: { wineDefinition: keeperId } }),
     // Maturity profiles need collision reconciliation (unique wineDefinition+vintage).
     reassignVintageProfiles(sourceId, keeperId),
@@ -2144,6 +2258,25 @@ async function reassignWineRefs(sourceId, keeperId) {
     reassignRestockSimilar(sourceId, keeperId),
     WineReport.updateMany({ duplicateOf: sourceId }, { $set: { duplicateOf: keeperId } }),
     WineRequest.updateMany({ linkedWineDefinition: sourceId }, { $set: { linkedWineDefinition: keeperId } }),
+    // Members' wine-level personal data entries follow their bottles (they are
+    // read through the bottle's wine). No unique index on (author, wine), so a
+    // plain re-point cannot collide: a member with entries on both wines may
+    // see a key twice, a removable duplicate over silent loss (same policy as
+    // wishlist items). The authors' data version moves like the bottle
+    // owners' — analyze_cellar reads personal keys behind that cache.
+    (async () => {
+      const authors = await PersonalDataEntry.distinct('author', { wineDefinition: sourceId });
+      await PersonalDataEntry.updateMany({ wineDefinition: sourceId }, { $set: { wineDefinition: keeperId } });
+      authors.forEach(bumpDataVersion);
+    })(),
+    // Registry data values. Rejected rows sit outside the unique
+    // (wine, key, vintage, status) index and move plainly; a suggested or
+    // published row moves unless the keeper already holds one for that slot,
+    // which wins (the source's row is dropped).
+    (async () => {
+      await RegistryDataValue.updateMany({ wineDefinition: sourceId, status: 'rejected' }, { $set: { wineDefinition: keeperId } });
+      await reassignKeyedRefs(RegistryDataValue, sourceId, keeperId, ['key', 'vintage', 'status']);
+    })(),
   ]);
   return bottleRes.modifiedCount || 0;
 }
@@ -2166,7 +2299,11 @@ router.post('/merge', async (req, res) => {
     if (!Array.isArray(sourceIds) || sourceIds.length === 0) {
       return res.status(400).json({ error: 'sourceIds must be a non-empty array' });
     }
-    const ids = [...new Set(sourceIds.filter(id => isValidId(id) && id !== keeperId))];
+    // Canonical (lower-case) ids, so a source spelled in another letter case
+    // dedupes and the keeper is left out whatever its spelling.
+    const keeperCanon = keeperId.toLowerCase();
+    const ids = [...new Set(sourceIds.filter(id => isValidId(id)).map(id => id.toLowerCase()))]
+      .filter(id => id !== keeperCanon);
     if (ids.length === 0) {
       return res.status(400).json({ error: 'No valid source ids (distinct from the keeper) provided' });
     }
@@ -2182,9 +2319,12 @@ router.post('/merge', async (req, res) => {
     const sourceOids = ids.map(id => new mongoose.Types.ObjectId(id));
     const imageOid = imageFromWineId ? new mongoose.Types.ObjectId(imageFromWineId) : null;
 
+    // A private draft takes no part in a merge, as in performWineMerge: a
+    // draft keeper answers like a missing one, and a draft among the sources
+    // is left out while the rest of the cluster merges.
     const keeper = await WineDefinition.findById(keeperOid);
-    if (!keeper) return res.status(404).json({ error: 'Keeper wine not found' });
-    const sources = await WineDefinition.find({ _id: { $in: sourceOids } });
+    if (!keeper || keeper.draft === true) return res.status(404).json({ error: 'Keeper wine not found' });
+    const sources = await WineDefinition.find({ _id: { $in: sourceOids }, draft: { $ne: true } });
     if (sources.length === 0) return res.status(404).json({ error: 'No source wines found' });
 
     // Capture the admin's chosen surviving image BEFORE the reassign — after it,

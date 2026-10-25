@@ -17,36 +17,51 @@
  * generateWineSlug uses name+producer only, so the public /wines/:slug URL is
  * unaffected; bottles carry no denormalized appellation.
  *
- * Dry-run by default. On --apply: writes a JSON backup of affected rows first.
+ * Dry-run by default. On --apply: appends each row's old values to an NDJSON
+ * backup before writing it (scripts/lib/backupLog: --backup-dir=<dir> or
+ * SCRIPT_BACKUP_DIR, default the OS temp dir).
  * Run the admin embedding job afterwards (appellation feeds the embed text).
  *
  * Usage:
  *   node src/scripts/normalize-appellation-tiers.js            # dry run
  *   node src/scripts/normalize-appellation-tiers.js --apply    # execute
+ *   node src/scripts/normalize-appellation-tiers.js --apply --backup-dir=<dir>
  */
 
 require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
 const mongoose = require('mongoose');
 const WineDefinition = require('../models/WineDefinition');
 const { normalizeAppellation, generateWineKey } = require('../utils/normalize');
+const searchService = require('../services/search');
+const { initSearch } = require('./lib/scriptSearch');
+const { createBackupLog } = require('./lib/backupLog');
 
 const APPLY = process.argv.includes('--apply');
 const tag = APPLY ? '✔' : '[dry]';
 
+// Rows whose normalizedKey is a generateWineKey key. A pending-identity row
+// keys as `pending~<creator>` and a draft as `draft~<creator>`: re-keyed here
+// they would enter the public key space while still private. A canary keeps
+// the fields it was seeded with.
+const CANDIDATES = {
+  appellation: { $nin: [null, ''] },
+  pendingIdentity: { $ne: true },
+  draft: { $ne: true },
+  canary: { $ne: true },
+};
+
 async function run() {
   await mongoose.connect(process.env.MONGO_URI || 'mongodb://mongo:27017/winecellar');
   console.log(`Connected. Mode: ${APPLY ? 'APPLY' : 'DRY RUN (pass --apply to execute)'}\n`);
+  const searchOk = APPLY ? await initSearch({ label: 'normalize-appellation-tiers' }) : false;
 
   const wines = await WineDefinition
-    .find({ appellation: { $nin: [null, ''] } })
+    .find(CANDIDATES)
     .select('name producer appellation normalizedKey')
     .lean();
 
   const stats = { scanned: 0, changed: 0, same: 0, collisions: 0 };
-  const backup = [];
+  const backup = createBackupLog('appellation-tiers');
   let shown = 0;
 
   for (const w of wines) {
@@ -68,23 +83,23 @@ async function run() {
       console.log(`${tag} "${w.name}" — ${w.producer}:  "${w.appellation}"  →  "${canonical}"`);
       shown += 1;
     }
-    backup.push({ _id: String(w._id), appellation: w.appellation, normalizedKey: w.normalizedKey });
 
     if (APPLY) {
+      backup.append({ _id: String(w._id), appellation: w.appellation, normalizedKey: w.normalizedKey });
       await WineDefinition.updateOne({ _id: w._id }, { $set: { appellation: canonical || null, normalizedKey: newKey } });
-      try { await require('../services/search').indexWine(w._id); } catch { /* best-effort */ }
+      if (searchOk) await searchService.indexWine(w._id);
     }
   }
 
-  if (APPLY && backup.length) {
-    const file = path.join(os.tmpdir(), `appellation-tiers-backup-${Date.now()}.json`);
-    fs.writeFileSync(file, JSON.stringify(backup, null, 2));
-    console.log(`\nBackup of ${backup.length} rows → ${file}`);
-  }
+  if (APPLY) backup.report();
 
   console.log(`\nSummary: ${stats.scanned} wines with an appellation, ${stats.changed} ${APPLY ? 'canonicalized' : 'would change'}, ${stats.same} already canonical, ${stats.collisions} collisions left for manual merge.`);
   if (APPLY) console.log('Next: run the admin embedding job (appellation feeds the embed text); the appellation field + grouping update now.');
   await mongoose.disconnect();
 }
 
-run().catch((err) => { console.error('Appellation cleanup failed:', err); process.exit(1); });
+if (require.main === module) {
+  run().catch((err) => { console.error('Appellation cleanup failed:', err); process.exit(1); });
+}
+
+module.exports = { CANDIDATES };

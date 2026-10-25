@@ -5,6 +5,8 @@ import { useAuth } from '../contexts/AuthContext';
 import { searchWines, getWine, resolveWine, identifyWineByText } from '../api/wines';
 import { adoptRegistryWine } from '../api/bridge';
 import useLabelScanner from '../hooks/useLabelScanner';
+import useTapToFocus from '../hooks/useTapToFocus';
+import CameraFocusRing from '../components/CameraFocusRing';
 import { addToWishlist } from '../api/wishlist';
 import '../components/ImageUpload.css';
 import './AddBottle.css';
@@ -13,6 +15,7 @@ import SimilarWinesModal from '../components/SimilarWinesModal';
 import { WINE_TYPES } from '../config/wineTypes';
 import { swatchType, wineTypeLabel, isStyleType, colourLabel, WINE_COLOURS } from '../utils/wineColour';
 import './AddToWishlist.css';
+import { backLabel } from '../utils/backLabel';
 
 function AddToWishlist() {
   const { t } = useTranslation();
@@ -32,6 +35,8 @@ function AddToWishlist() {
   const [registryWines, setRegistryWines] = useState([]);
   const [adoptingId, setAdoptingId] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [searchFailed, setSearchFailed] = useState(false);
+  const searchSeq = useRef(0);
   const [aiSearching, setAiSearching] = useState(false);
   const [aiSearchError, setAiSearchError] = useState(null);
   // identify-text is read-only — see api/wines.js. `aiIdentified` is UNSAVED
@@ -217,6 +222,9 @@ function AddToWishlist() {
    */
   const handleBackScanSuccess = useCallback((data) => {
     const merged = data.merged || {};
+    // Read now: the form updater runs at render time, after this handler has
+    // already replaced the ref with the merge's verdict.
+    const suspectValue = suspectProducerValueRef.current;
     setBackScanImageId(data.backScanImageId || null);
     setScanConflicts(Array.isArray(data.conflicts) ? data.conflicts : []);
     setBackOffer(false);
@@ -245,8 +253,8 @@ function AddToWishlist() {
       }
       // A SUSPECT front producer may be REPLACED by the back label's — only
       // while the box still holds the exact prefilled string (audit M-1).
-      if (suspectProducerValueRef.current
-          && next.producer === suspectProducerValueRef.current
+      if (suspectValue
+          && next.producer === suspectValue
           && fromMerged.producer
           && fromMerged.producer !== next.producer) {
         next.producer = fromMerged.producer;
@@ -270,6 +278,8 @@ function AddToWishlist() {
     onScanError: handleScanError,
     onBackScanSuccess: handleBackScanSuccess,
   });
+  // Tap the preview to focus there, as in a camera app.
+  const tapFocus = useTapToFocus(labelVideoRef);
 
   const startBackScan = useCallback(() => {
     startBackLabelCamera({
@@ -388,16 +398,29 @@ function AddToWishlist() {
     const query = search.trim();
     setLoading(true);
     setAiSearchError(null);
+    setSearchFailed(false);
     clearAi();
 
+    // Only the latest search may set the list: an earlier one that answers
+    // last is not the answer to what is in the box.
+    const seq = ++searchSeq.current;
     searchWines(apiFetch, `search=${encodeURIComponent(query)}&limit=10`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.wines) setWines(data.wines);
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`search ${res.status}`);
+        const data = await res.json();
+        if (seq !== searchSeq.current) return;
+        setWines(Array.isArray(data.wines) ? data.wines : []);
         setRegistryWines(Array.isArray(data.registryWines) ? data.registryWines : []);
       })
-      .catch(() => {})
-      .finally(() => setLoading(false));
+      // Said, not just swallowed: a failed search that keeps the previous
+      // list reads as the answer to this one.
+      .catch(() => {
+        if (seq !== searchSeq.current) return;
+        setWines([]);
+        setRegistryWines([]);
+        setSearchFailed(true);
+      })
+      .finally(() => { if (seq === searchSeq.current) setLoading(false); });
   }, [search, apiFetch, clearAi]);
 
   const handleSearchKeyDown = (e) => {
@@ -613,7 +636,7 @@ function AddToWishlist() {
       {/* Label-scan camera modal */}
       {labelCam.open && (
         <div className="camera-modal">
-          <div className="camera-container">
+          <div className="camera-container" onPointerDown={tapFocus.onPointerDown}>
             {labelCam.error ? (
               <div className="camera-error-overlay">
                 <p>{labelCam.error}</p>
@@ -622,6 +645,7 @@ function AddToWishlist() {
             ) : (
               <>
                 <video ref={labelVideoRef} autoPlay playsInline muted className="camera-video" />
+                <CameraFocusRing ring={tapFocus.ring} />
                 {labelScanning ? (
                   <div className="label-scan-overlay">
                     <div className="label-scan-spinner" />
@@ -652,7 +676,7 @@ function AddToWishlist() {
       <div className="add-wishlist-header">
         <Link to="/wishlist" className="back-link">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
-          {t('addToWishlist.backToWishlist')}
+          {backLabel(t('addToWishlist.backToWishlist'))}
         </Link>
         <h1>{t('addToWishlist.title')}</h1>
       </div>
@@ -863,7 +887,7 @@ function AddToWishlist() {
             <>
               <div className="wine-select-manual-header">
                 <h2>{t('addToWishlist.searchForWine')}</h2>
-                <button type="button" className="btn-link-muted" onClick={() => { setShowTextSearch(false); setSearch(''); setWines([]); setAiSearchError(null); }}>
+                <button type="button" className="btn-link-muted" onClick={() => { searchSeq.current += 1; setLoading(false); setShowTextSearch(false); setSearch(''); setWines([]); setSearchFailed(false); setAiSearchError(null); }}>
                   {t('addToWishlist.useCameraInstead')}
                 </button>
               </div>
@@ -876,7 +900,7 @@ function AddToWishlist() {
                     type="text"
                     placeholder={t('addToWishlist.searchPlaceholder')}
                     value={search}
-                    onChange={(e) => { setSearch(e.target.value); setWines([]); setAiSearchError(null); setError(null); clearAi(); }}
+                    onChange={(e) => { searchSeq.current += 1; setLoading(false); setSearch(e.target.value); setWines([]); setSearchFailed(false); setAiSearchError(null); setError(null); clearAi(); }}
                     onKeyDown={handleSearchKeyDown}
                     className="search-input-large"
                     autoFocus
@@ -888,6 +912,12 @@ function AddToWishlist() {
               </div>
 
               {loading && <p>{t('addToWishlist.searching')}</p>}
+
+              {searchFailed && !loading && (
+                <p className="error-text" role="alert">
+                  {t('addToWishlist.searchFailed', 'The search didn’t go through. Check your connection and try again.')}
+                </p>
+              )}
 
               {/* AI result card — shape-aware: `card` is either a saved
                   registry wine (populated refs) or the AI's unsaved suggestion

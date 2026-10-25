@@ -437,3 +437,70 @@
   flex-wrap: wrap;
   margin-top: 1.25rem;
 }
+
+/* Shared by dialogs that open on several pages (release audit 2026-10-13: the
+   pick list opened them before CellarDetail.css / BottleDetail.css loaded). */
+/* The bulk modals' forms (purchase details, consume, reserve, add to list). */
+.bulk-form .form-group { display: flex; flex-direction: column; gap: 0.25rem; margin-bottom: 0.75rem; }
+.bulk-form .form-group > span { font-size: 0.85rem; color: var(--color-text-secondary); }
+.bulk-form input[type="text"], .bulk-form input[type="url"], .bulk-form input[type="date"],
+.bulk-form input[type="number"], .bulk-form select, .bulk-form textarea { width: 100%; }
+.bulk-form small { color: var(--color-text-muted); font-size: 0.75rem; }
+.bulk-price-row { display: grid; grid-template-columns: 1fr 120px; gap: 0.5rem; }
+.bulk-price-row label { display: flex; flex-direction: column; gap: 0.25rem; }
+.bulk-mode-row { display: flex; flex-direction: row; gap: 1rem; }
+.move-bottle-skipped { color: var(--color-text-secondary); }
+
+/* Consume button */
+.btn-consume {
+  background: #6a3d8a;
+  color: white;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0.75rem 1.5rem;
+  cursor: pointer;
+  font-size: 1rem;
+  font-weight: 500;
+  transition: background 0.15s;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.btn-consume:hover {
+  background: #7d3c98;
+}
+
+/* A member's own drink that is not wine: hidden from the shared registry and
+   found only by that member's own search (backend services/ownHiddenWines). */
+.own-hidden-pill {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+/* Touch screens: small controls answer taps further than they are drawn — an
+   invisible overlay, nothing changes on screen (small icons and "×"s were hard
+   to hit with a thumb; usability pass 2026-10). Each control sets how far with
+   --tap-reach beside its own rule, and is positioned there. */
+@media (pointer: coarse) {
+  .active-filter-chip-remove::after,
+  .view-toggle-btn::after,
+  .bulk-bar-close::after,
+  .rack-lens-search-clear::after,
+  .rack-icon-btn::after,
+  .zones-remove::after,
+  .bd-contribute__dismiss::after,
+  .cellar-vintage-notice-close::after,
+  .install-prompt-dismiss::after {
+    content: '';
+    position: absolute;
+    inset: var(--tap-reach, -10px);
+  }
+}

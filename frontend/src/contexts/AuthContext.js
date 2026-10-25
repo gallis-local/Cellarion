@@ -18,7 +18,11 @@ const notifyApiMutation = (url) => {
 };
 import i18n, { hasLanguagePreview } from '../i18n';
 import { getSignupSource } from '../utils/signupSource';
+import { markSessionExpired, clearSessionExpired } from '../utils/sessionExpired';
+import { removeStored } from '../utils/safeStorage';
 import { track } from '../utils/track';
+import { guessCurrency } from '../utils/localeDefaults';
+import { saveLocaleDefaults } from '../api/auth';
 
 const AuthContext = createContext();
 
@@ -133,9 +137,9 @@ export const AuthProvider = ({ children }) => {
 
   const clearToken = () => {
     // Clean up any legacy stored tokens from previous versions
-    localStorage.removeItem('token');
-    sessionStorage.removeItem('token');
-    sessionStorage.removeItem('sessionOnly');
+    removeStored('token');
+    removeStored('token', 'session');
+    removeStored('sessionOnly', 'session');
     setToken(null);
     tokenRef.current = null;
   };
@@ -154,6 +158,8 @@ export const AuthProvider = ({ children }) => {
     // cookie is gone, and the next start would post that logout with THIS
     // account's cookie, ending the new session (release audit 2026-09-27, L).
     markPendingLogout(false);
+    // A session again: the login page's "Your session ended" has done its job.
+    clearSessionExpired();
     storeToken(token);
     setUser(userData);
     setOfflineSession(false); // a session applied from the server is a live one
@@ -171,6 +177,10 @@ export const AuthProvider = ({ children }) => {
     // preview TRANSLATING.md promises "on any page" would work only while
     // signed out, which is precisely backwards for a translator.
     if (hasLanguagePreview()) return;
+    // A brand-new account's stored language is only the server default ('en'),
+    // not a choice: keep the language the visitor signed up in. The effect
+    // below saves it as their preference on this first sign-in.
+    if (userData?.localeDefaultsPending) return;
     const preferred = userData?.preferences?.language;
     if (preferred && findLanguage(preferred)) {
       i18n.changeLanguage(preferred);
@@ -264,7 +274,7 @@ export const AuthProvider = ({ children }) => {
   // unsent offline changes, so they still go out once the same user signs
   // back in. A user-initiated logout deletes everything (Layout confirms first
   // when changes are waiting).
-  const logout = useCallback(async ({ keepQueue = false } = {}) => {
+  const logout = useCallback(async ({ keepQueue = false, sessionExpired = false } = {}) => {
     // Tell the server to end this device's session and clear its cookie. With
     // no network (offline mode) that can't happen now — remember it, and the
     // next start finishes it before anything else (restoreSession).
@@ -274,6 +284,9 @@ export const AuthProvider = ({ children }) => {
     // Wipe per-tab user state so chat history etc. don't bleed across logins.
     // Only sessionStorage — localStorage holds theme / language / persisted token.
     try { sessionStorage.clear(); } catch { /* noop */ }
+    // After the clear, or the clear takes it: the login page this leads to
+    // says why (utils/sessionExpired).
+    if (sessionExpired) markSessionExpired();
     // …and the service worker's cached API responses (cellars, bottles, wines),
     // and the profile kept for an offline start.
     await clearApiCaches();
@@ -291,7 +304,7 @@ export const AuthProvider = ({ children }) => {
   // logs out; the caller's request fails and the next one tries again.
   const onRefreshFailed = useCallback(() => {
     if (refreshOutcomeRef.current !== 'rejected') return;
-    logout({ keepQueue: true });
+    logout({ keepQueue: true, sessionExpired: true });
   }, [logout]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -314,9 +327,9 @@ export const AuthProvider = ({ children }) => {
 
   useEffect(() => {
     // Migrate: clear any legacy stored tokens from previous versions
-    localStorage.removeItem('token');
-    sessionStorage.removeItem('token');
-    sessionStorage.removeItem('sessionOnly');
+    removeStored('token');
+    removeStored('token', 'session');
+    removeStored('sessionOnly', 'session');
 
     // On mount, attempt to restore session via httpOnly refresh cookie
     const restoreSession = async () => {
@@ -471,7 +484,7 @@ export const AuthProvider = ({ children }) => {
       if (cancelled) return;
       if (!newToken) {
         // Still no network: stay. The server rejected the session: end it.
-        if (refreshOutcomeRef.current === 'rejected') logout({ keepQueue: true });
+        if (refreshOutcomeRef.current === 'rejected') logout({ keepQueue: true, sessionExpired: true });
         return;
       }
       let res = null;
@@ -488,7 +501,7 @@ export const AuthProvider = ({ children }) => {
         applySession(newToken, data.user);
         setOfflineSession(false);
       } else if (res.status === 401 || res.status === 404) {
-        logout({ keepQueue: true });
+        logout({ keepQueue: true, sessionExpired: true });
       }
     };
     const onVisible = () => { if (document.visibilityState === 'visible') reconnect(); };
@@ -524,7 +537,11 @@ export const AuthProvider = ({ children }) => {
       });
 
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Registration failed');
+      if (!response.ok) {
+        const err = new Error(data.error || 'Registration failed');
+        err.code = data.code;
+        throw err;
+      }
       track('signup-completed', { method: 'password' });
 
       if (data.token) {
@@ -539,7 +556,7 @@ export const AuthProvider = ({ children }) => {
       // Verification enabled — user must confirm email before logging in
       return { success: true, email: data.email, requiresVerification: true };
     } catch (error) {
-      return { success: false, error: error.message };
+      return { success: false, error: error.message, code: error.code };
     }
   };
 
@@ -624,6 +641,41 @@ export const AuthProvider = ({ children }) => {
       ? { ...next, isSuperAdmin: prev.isSuperAdmin }
       : next
   ));
+
+  // ------------------------------------------------------------------
+  // First sign-in of a new account: save the language it is being shown in
+  // and its region's currency as its preferences (utils/localeDefaults.js).
+  // Only accounts the server marked at creation (localeDefaultsPending) — an
+  // older account's settings are never touched — and the server clears the
+  // mark in the same update, so another tab racing this changes nothing. A
+  // failed attempt is simply tried again at the next sign-in.
+  // ------------------------------------------------------------------
+
+  // The account it was sent for — per account, so a second new account made
+  // in the same tab (sign out, register again) still gets its own.
+  const localeDefaultsSentForRef = useRef(null);
+  const localeDefaultsPending = user?.localeDefaultsPending === true;
+  const localeUserId = user ? String(user.id || user._id || '') : '';
+  useEffect(() => {
+    if (!localeDefaultsPending || !token || offlineSession) return;
+    if (localeDefaultsSentForRef.current === localeUserId) return;
+    // A translator's ?lng= preview is not the visitor's own language.
+    if (hasLanguagePreview()) return;
+    localeDefaultsSentForRef.current = localeUserId;
+    const generation = sessionGenRef.current;
+    const language = i18n.resolvedLanguage || i18n.language;
+    const currency = guessCurrency();
+    saveLocaleDefaults(apiFetch, { language, ...(currency ? { currency } : {}) })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        // Signed out (or into another account) while this was in flight: the
+        // answer belongs to a session that is gone and must not bring it back.
+        if (sessionGenRef.current !== generation || userIdRef.current !== localeUserId) return;
+        if (data?.user) replaceUser(data.user);
+      })
+      .catch(() => { /* kept pending server-side — the next sign-in retries */ });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localeDefaultsPending, token, offlineSession, localeUserId]);
 
   // ------------------------------------------------------------------
   // updatePreferences (uses apiFetch for auto-refresh)

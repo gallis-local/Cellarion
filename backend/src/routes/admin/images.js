@@ -4,12 +4,15 @@ const BottleImage = require('../../models/BottleImage');
 const WineDefinition = require('../../models/WineDefinition');
 const Bottle = require('../../models/Bottle');
 const searchService = require('../../services/search');
-const { unlinkImageFiles, discardOriginal, processImage } = require('../../services/imageProcessor');
+const { unlinkImageFiles, discardOriginal } = require('../../services/imageProcessor');
 const { logAudit } = require('../../services/audit');
-const { createNotification } = require('../../services/notifications');
 const { incrementCred } = require('../../utils/cellarCred');
+const {
+  linkWineViaBottle, approveImage, rejectImage, setOfficialImage, setImageVisibility,
+} = require('../../services/imageModerationOps');
 const { parsePagination } = require('../../utils/pagination');
 const { isValidId } = require('../../utils/validation');
+const { photoVintage, vintageKey, pickVintageOfficials } = require('../../utils/imageVintage');
 
 const router = express.Router();
 
@@ -112,7 +115,7 @@ router.get('/by-wine', async (req, res) => {
     // Bottles for these wines: their ids link bottle-only images, and their
     // count is shown per wine.
     const bottles = await Bottle.find({ wineDefinition: { $in: wineIds } })
-      .select('_id wineDefinition').lean();
+      .select('_id wineDefinition vintage').lean();
     const bottleToWine = new Map(bottles.map(b => [b._id.toString(), b.wineDefinition.toString()]));
     const bottleCount = {};
     for (const b of bottles) {
@@ -139,6 +142,23 @@ router.get('/by-wine', async (req, res) => {
       if (!wid || !wineMap.has(wid)) continue;
       if (!imagesByWine.has(wid)) imagesByWine.set(wid, []);
       imagesByWine.get(wid).push(img);
+    }
+
+    // Each image's vintage (its tag, else its bottle's) and whether it is the
+    // photo its vintage shows (support ticket 2026-10-09), so the curator sees
+    // which photo stands for which year and can choose another.
+    const bottleVintage = new Map(bottles.map(b => [b._id.toString(), photoVintage(b.vintage)]));
+    for (const imgs of imagesByWine.values()) {
+      for (const img of imgs) {
+        img.vintage = photoVintage(img.vintage) || (img.bottle ? bottleVintage.get(img.bottle.toString()) : null) || null;
+      }
+    }
+    const eligible = [...imagesByWine.entries()].flatMap(([wid, imgs]) => imgs
+      .filter(img => img.status === 'approved' && img.visibility === 'public' && img.vintage)
+      .map(img => ({ ...img, wineDefinition: wid })));
+    const officialIds = new Set([...pickVintageOfficials(eligible).values()].map(img => String(img._id)));
+    for (const imgs of imagesByWine.values()) {
+      for (const img of imgs) img.vintageOfficial = officialIds.has(String(img._id));
     }
 
     const items = groups
@@ -169,116 +189,32 @@ router.get('/by-wine', async (req, res) => {
 // both URLs were set — including a keepBackground row, whose "original" IS the
 // kept file — and left processedUrl pointing at nothing.
 
-// A photo uploaded on a bottle carries no wine of its own — the bottle does.
-// Publishing it (approved + public) makes it a photo OF THE WINE: every owner
-// of that wine sees it in their gallery and can pick it as their bottle's
-// picture, and it can become the wine's registry image. Until 2026-09-27 the
-// approve and visibility routes left the wine reference empty, so a published
-// bottle photo was visible on that one bottle only, never reached the wine,
-// and approving from the queue needed a second "assign to wine" click.
-// Resolves the wine through the bottle when the row has none; a photo that
-// already carries a wine (a wine-level upload) keeps it. Returns the wine id.
-async function linkWineViaBottle(image) {
-  if (image.wineDefinition || !image.bottle) return image.wineDefinition || null;
-  const bottle = await Bottle.findById(image.bottle).select('wineDefinition').lean();
-  if (bottle && bottle.wineDefinition) image.wineDefinition = bottle.wineDefinition;
-  return image.wineDefinition || null;
-}
+// Approve, reject, set-official and visibility are services/imageModerationOps
+// — the same code the sommelier's MCP image tools run (mcp/tools/sommImages.js),
+// so the two surfaces cannot drift. linkWineViaBottle lives there too.
+const sendFailure = (res, result) =>
+  res.status(result.code === 'not_found' ? 404 : 400).json({ error: result.message });
 
 // PUT /api/admin/images/:id/approve
-// Body: { visibility: 'private' | 'public' } — defaults to 'public'
+// Body: { visibility: 'private' | 'public' } — defaults to 'public'. A public
+// photo becomes the wine's picture when the wine has none yet.
 router.put('/:id/approve', async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
-    const image = await BottleImage.findById(req.params.id);
-    if (!image) {
-      return res.status(404).json({ error: 'Image not found' });
-    }
-    if (!['processed', 'uploaded'].includes(image.status)) {
-      return res.status(400).json({ error: 'Image cannot be approved in current state' });
-    }
-    // Never a label scan (audit L-6): it is a private frame kept only so a
-    // curator can read an unreadable label. Promoting one to a wine's official
-    // image makes it public AND sets assignedToWine, which moves it out of the
-    // delete branch of account deletion into the anonymise branch, so the
-    // uploader's own photo would outlive their account, reattributed.
-    if (image.kind === 'label-scan') {
-      return res.status(400).json({ error: 'A label scan is private curation evidence, not a wine image' });
-    }
+    const result = await approveImage({
+      imageId: req.params.id,
+      actorId: req.user.id,
+      visibility: req.body.visibility || 'public',
+      official: 'auto',
+      req,
+    });
+    if (!result.ok) return sendFailure(res, result);
 
-    const visibility = req.body.visibility || 'public';
-    if (!['private', 'public'].includes(visibility)) {
-      return res.status(400).json({ error: 'visibility must be "private" or "public"' });
-    }
-
-    image.status = 'approved';
-    image.visibility = visibility;
-    image.reviewedBy = req.user.id;
-    image.reviewedAt = new Date();
-    // An admin approving a REPORTED photo is the answer to that report: clear
-    // the needs-a-look flag, but keep the reports themselves so a photo raised
-    // repeatedly still shows its history (ticket 6a865f60).
-    image.reportedAt = null;
-    // Published: the photo belongs to the wine from here on (linkWineViaBottle).
-    // A private approval stays the uploader's own bottle photo.
-    if (visibility === 'public') await linkWineViaBottle(image);
-    await discardOriginal(image);
-    await image.save();
-
-    // Approved before rembg got to it (a failed run, or rembg down at upload):
-    // kick the processor now — it accepts an approved row with no processed
-    // file — rather than leave the raw frame as the image for good.
-    if (!image.processedUrl && !image.keepBackground) {
-      processImage(image._id).catch((err) => console.error('Post-approval processing error:', err.message));
-    }
-
-    // Award Cellar Cred to the uploader
-    incrementCred(image.uploadedBy, 'image_approved').catch(() => {});
-
-    // Resolve the wine for the notification label regardless of visibility —
-    // private approvals should still name the wine (the reject path does).
-    // For a published bottle photo this is the wine linked above.
-    const wineDefId = image.wineDefinition;
-    const approvedWine = wineDefId ? await WineDefinition.findById(wineDefId) : null;
-
-    // Auto-assign as wine image if public and the wine doesn't already have one
-    if (visibility === 'public' && wineDefId) {
-      if (approvedWine && !approvedWine.image) {
-        await BottleImage.updateMany(
-          { wineDefinition: wineDefId, assignedToWine: true },
-          { assignedToWine: false }
-        );
-        image.assignedToWine = true;
-        await image.save();
-
-        const imageUrl = image.processedUrl || image.originalUrl;
-        await WineDefinition.findByIdAndUpdate(wineDefId, { image: imageUrl, imageCredit: image.credit || null });
-        searchService.indexWine(wineDefId);
-      }
-    }
-
-    const wineLabel = approvedWine
-      ? `"${approvedWine.name}" by ${approvedWine.producer}`
-      : 'a wine';
-    createNotification(
-      image.uploadedBy,
-      'image_approved',
-      'Image approved',
-      `Your image for ${wineLabel} has been approved.`,
-      null
-    );
-
+    const { image } = result;
     await image.populate([
       { path: 'uploadedBy', select: 'username' },
       { path: 'reviewedBy', select: 'username' },
       { path: 'wineDefinition', select: 'name producer type' }
     ]);
-
-    logAudit(req, 'admin.image.approve',
-      { type: 'image', id: image._id },
-      { wineDefinitionId: image.wineDefinition, visibility }
-    );
-
     res.json({ image });
   } catch (error) {
     console.error('Approve image error:', error);
@@ -291,71 +227,14 @@ router.put('/:id/approve', async (req, res) => {
 // removing redundant duplicates, use DELETE /:id below instead.
 router.put('/:id/reject', async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
-    const image = await BottleImage.findById(req.params.id);
-    if (!image) {
-      return res.status(404).json({ error: 'Image not found' });
-    }
+    const result = await rejectImage({ imageId: req.params.id, actorId: req.user.id, req });
+    if (!result.ok) return sendFailure(res, result);
 
-    // If image was assigned to a wine, remove the assignment BEFORE the file
-    // URLs are nulled below — otherwise WineDefinition.image keeps pointing
-    // at the deleted file (same block as the unapprove route).
-    if (image.assignedToWine && image.wineDefinition) {
-      const wineDefId = image.wineDefinition;
-      image.assignedToWine = false;
-
-      // Clear the wine definition's image if it matches this image
-      const imageUrl = image.processedUrl || image.originalUrl;
-      const wine = await WineDefinition.findById(wineDefId);
-      if (wine && wine.image === imageUrl) {
-        wine.image = null;
-        wine.imageCredit = null;
-        await wine.save();
-        searchService.indexWine(wineDefId);
-      }
-    }
-
-    // A rejected photo shouldn't stay starred on any bottle — clear the refs so
-    // they fall back to the wine image instead of dangling.
-    await Bottle.updateMany({ defaultImage: image._id }, { $set: { defaultImage: null } });
-
-    image.status = 'rejected';
-    image.reviewedBy = req.user.id;
-    image.reviewedAt = new Date();
-    image.reportedAt = null;   // resolved — the photo is coming down
-
-    // Delete the files from disk — reference-safe: import dedup can point two
-    // records at the same file, and a shared file must survive for the record
-    // that remains.
-    await unlinkImageFiles(image);
-    image.originalUrl = null;
-    image.processedUrl = null;
-    await image.save();
-
-    const rejectedWine = image.wineDefinition
-      ? await WineDefinition.findById(image.wineDefinition).select('name producer').lean()
-      : null;
-    const rejectedWineLabel = rejectedWine
-      ? `"${rejectedWine.name}" by ${rejectedWine.producer}`
-      : 'a wine';
-    createNotification(
-      image.uploadedBy,
-      'image_rejected',
-      'Image rejected',
-      `Your image for ${rejectedWineLabel} was rejected by an admin.`,
-      null
-    );
-
+    const { image } = result;
     await image.populate([
       { path: 'uploadedBy', select: 'username' },
       { path: 'reviewedBy', select: 'username' }
     ]);
-
-    logAudit(req, 'admin.image.reject',
-      { type: 'image', id: image._id },
-      {}
-    );
-
     res.json({ image });
   } catch (error) {
     console.error('Reject image error:', error);
@@ -403,9 +282,12 @@ router.delete('/:id', async (req, res) => {
     // deleted file.
     if (image.assignedToWine && image.wineDefinition) {
       const wineDefId = image.wineDefinition;
-      const imageUrl = image.processedUrl || image.originalUrl;
+      // Either file of the record can be the wine's picture (an original kept
+      // beside its processed file, or a picture set before processing ran), and
+      // unlinkImageFiles below removes both — so match against both.
+      const imageUrls = [image.processedUrl, image.originalUrl].filter(Boolean);
       const wine = await WineDefinition.findById(wineDefId);
-      if (wine && wine.image === imageUrl) {
+      if (wine && wine.image && imageUrls.includes(wine.image)) {
         if (survivor) {
           // Mirrors the set-official promotion.
           await BottleImage.updateOne(
@@ -556,7 +438,7 @@ router.put('/:id/assign-to-wine', async (req, res) => {
 
     // Update WineDefinition.image to the processed URL (or original if not processed)
     const imageUrl = image.processedUrl || image.originalUrl;
-    await WineDefinition.findByIdAndUpdate(wineDefId, { image: imageUrl, imageCredit: image.credit || null });
+    await WineDefinition.findByIdAndUpdate(wineDefId, { image: imageUrl, imageCredit: image.credit || null, updatedAt: new Date() });
 
     // Update search index
     searchService.indexWine(wineDefId);
@@ -585,58 +467,8 @@ router.put('/:id/assign-to-wine', async (req, res) => {
 // by-wine view without a separate approval pass.
 router.put('/:id/set-official', async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
-    const image = await BottleImage.findById(req.params.id).populate('bottle', 'wineDefinition');
-    if (!image) return res.status(404).json({ error: 'Image not found' });
-    if (image.status === 'rejected') {
-      return res.status(400).json({ error: 'Rejected images cannot be set as official' });
-    }
-    // Never a label scan (audit L-6): it is a private frame kept only so a
-    // curator can read an unreadable label. Promoting one to a wine's official
-    // image makes it public AND sets assignedToWine, which moves it out of the
-    // delete branch of account deletion into the anonymise branch, so the
-    // uploader's own photo would outlive their account, reattributed.
-    if (image.kind === 'label-scan') {
-      return res.status(400).json({ error: 'A label scan is private curation evidence, not a wine image' });
-    }
-
-    const imageUrl = image.processedUrl || image.originalUrl;
-    if (!imageUrl) return res.status(400).json({ error: 'Image has no file to use' });
-
-    const wineDefId = image.wineDefinition || image.bottle?.wineDefinition;
-    if (!wineDefId) return res.status(400).json({ error: 'Image is not linked to a wine' });
-
-    // Demote the wine's current official image, if any (and not this one).
-    await BottleImage.updateMany(
-      { wineDefinition: wineDefId, assignedToWine: true, _id: { $ne: image._id } },
-      { assignedToWine: false }
-    );
-
-    const wasOfficial = image.assignedToWine;
-    image.wineDefinition = wineDefId;
-    image.assignedToWine = true;
-    image.status = 'approved';
-    image.visibility = 'public';
-    if (!image.reviewedBy) {
-      image.reviewedBy = req.user.id;
-      image.reviewedAt = new Date();
-    }
-    // Drop a retained original once a processed version exists, same as the
-    // approve path — imageUrl was resolved above before this nulls it.
-    await discardOriginal(image);
-    await image.save();
-
-    await WineDefinition.findByIdAndUpdate(wineDefId, { image: imageUrl, imageCredit: image.credit || null });
-    searchService.indexWine(wineDefId);
-
-    // Reward the uploader the first time their image becomes official.
-    if (!wasOfficial) incrementCred(image.uploadedBy, 'image_assigned_official').catch(() => {});
-
-    logAudit(req, 'admin.image.setOfficial',
-      { type: 'image', id: image._id },
-      { wineDefinitionId: wineDefId }
-    );
-
+    const result = await setOfficialImage({ imageId: req.params.id, actorId: req.user.id, req });
+    if (!result.ok) return sendFailure(res, result);
     res.json({ ok: true });
   } catch (error) {
     console.error('Set official image error:', error);
@@ -644,53 +476,80 @@ router.put('/:id/set-official', async (req, res) => {
   }
 });
 
+// PUT /api/admin/images/:id/set-vintage-official — "this is THE photo of this
+// wine's <vintage>" (support ticket 2026-10-09). Without a choice a vintage
+// shows the wine's official image when it is of that vintage, else the first
+// photo of it approved (utils/imageVintage.pickVintageOfficials); this is the
+// override. Like set-official it promotes any non-rejected photo — approving
+// and publishing it in the same step — but it never touches the wine's own
+// official image.
+router.put('/:id/set-vintage-official', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
+    const image = await BottleImage.findById(req.params.id).populate('bottle', 'wineDefinition vintage');
+    if (!image) return res.status(404).json({ error: 'Image not found' });
+    if (image.status === 'rejected') {
+      return res.status(400).json({ error: 'Rejected images cannot be a vintage\'s photo' });
+    }
+    // Never a label scan (audit L-6): private curation evidence, never published.
+    if (image.kind === 'label-scan') {
+      return res.status(400).json({ error: 'A label scan is private curation evidence, not a wine image' });
+    }
+    if (!(image.processedUrl || image.originalUrl)) return res.status(400).json({ error: 'Image has no file to use' });
+
+    const wineDefId = image.wineDefinition || image.bottle?.wineDefinition;
+    if (!wineDefId) return res.status(400).json({ error: 'Image is not linked to a wine' });
+    // Its own tag, else its bottle's vintage (a row older than the tag).
+    const vintage = photoVintage(image.vintage) || photoVintage(image.bottle?.vintage);
+    if (!vintage) return res.status(400).json({ error: 'This photo is not of a known vintage' });
+
+    // One choice per wine + vintage.
+    await BottleImage.updateMany(
+      { wineDefinition: wineDefId, vintage, assignedToVintage: true, _id: { $ne: image._id } },
+      { $set: { assignedToVintage: false } }
+    );
+
+    image.wineDefinition = wineDefId;
+    image.vintage = vintage;
+    image.assignedToVintage = true;
+    image.status = 'approved';
+    image.visibility = 'public';
+    if (!image.reviewedBy) {
+      image.reviewedBy = req.user.id;
+      image.reviewedAt = new Date();
+    }
+    await discardOriginal(image);
+    await image.save();
+
+    logAudit(req, 'admin.image.setVintageOfficial',
+      { type: 'image', id: image._id },
+      { wineDefinitionId: wineDefId, vintage }
+    );
+
+    res.json({ ok: true, vintage });
+  } catch (error) {
+    console.error('Set vintage official image error:', error);
+    res.status(500).json({ error: 'Failed to set the vintage\'s photo' });
+  }
+});
+
 // PUT /api/admin/images/:id/visibility - Change visibility of an approved image
 router.put('/:id/visibility', async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
-    const image = await BottleImage.findById(req.params.id);
-    if (!image) {
-      return res.status(404).json({ error: 'Image not found' });
-    }
-    if (image.status !== 'approved') {
-      return res.status(400).json({ error: 'Only approved images can change visibility' });
-    }
+    const result = await setImageVisibility({
+      imageId: req.params.id,
+      actorId: req.user.id,
+      visibility: req.body.visibility,
+      req,
+    });
+    if (!result.ok) return sendFailure(res, result);
 
-    const { visibility } = req.body;
-    if (!['private', 'public'].includes(visibility)) {
-      return res.status(400).json({ error: 'visibility must be "private" or "public"' });
-    }
-
-    // Made public: the photo belongs to the wine from here on (linkWineViaBottle).
-    if (visibility === 'public') await linkWineViaBottle(image);
-
-    // If changing to private, unassign from wine
-    if (visibility === 'private' && image.assignedToWine && image.wineDefinition) {
-      const imageUrl = image.processedUrl || image.originalUrl;
-      const wine = await WineDefinition.findById(image.wineDefinition);
-      if (wine && wine.image === imageUrl) {
-        wine.image = null;
-        wine.imageCredit = null;
-        await wine.save();
-        searchService.indexWine(image.wineDefinition);
-      }
-      image.assignedToWine = false;
-    }
-
-    image.visibility = visibility;
-    await image.save();
-
+    const { image } = result;
     await image.populate([
       { path: 'uploadedBy', select: 'username' },
       { path: 'reviewedBy', select: 'username' },
       { path: 'wineDefinition', select: 'name producer type' }
     ]);
-
-    logAudit(req, 'admin.image.visibility',
-      { type: 'image', id: image._id },
-      { visibility }
-    );
-
     res.json({ image });
   } catch (error) {
     console.error('Change visibility error:', error);

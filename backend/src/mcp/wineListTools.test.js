@@ -17,6 +17,9 @@ jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../services/wineListData', () => ({
   entryKey: (e) => `${e.wine}|${e.vintage || 'NV'}|${e.bottleSize || '750ml'}`,
   loadWineMap: jest.fn(async () => new Map()),
+  // add_to_list looks the wine up through the renderer's owner rule; the
+  // filter itself is pinned in services/wineListData.pendingIdentity.test.js.
+  ownerWineFilter: jest.fn(async (ownerId, ids) => ({ _id: { $in: ids }, owner: ownerId })),
 }));
 // revert.js and tools/write.js top-require bottleOps (which pulls the search/
 // meili chain) — mock the full surface they read at load, same as
@@ -70,8 +73,8 @@ beforeEach(() => {
   jest.clearAllMocks();
   McpActionLog.create.mockResolvedValue({});
   McpActionLog.findOne.mockReturnValue({ lean: () => Promise.resolve(null) });
-  // findOne with an absolute pendingIdentity exclusion: a wine list can be
-  // PUBLISHED and routes/wineListPublic.js has no auth (security audit H-5).
+  // findOne through the owner rule (ownerWineFilter above): the caller's own
+  // pending rows resolve, a stranger's hidden row reads as not_found.
   WineDefinition.findOne.mockReturnValue({ populate: jest.fn(() => Promise.resolve({ _id: WINE, name: 'Barolo Riserva', producer: 'Rinaldi' })) });
 });
 
@@ -255,6 +258,29 @@ describe('update_list_pricing', () => {
       action: 'winelist_price',
       prev: { listPrice: 80, byGlass: false, glassPrice: null, glassPriceManual: false },
     }));
+  });
+});
+
+describe('audit rows', () => {
+  test('add_to_list and update_list_pricing audit the list and its cellar, as the REST routes do, in a row the model can store', async () => {
+    WineList.findOne.mockResolvedValue(makeList());
+    await tool('add_to_list').handler({ list_id: LIST, wine_id: WINE, vintage: '2019', list_price: 100 }, CTX);
+    WineList.findOne.mockResolvedValue(makeList({
+      autoGroupEntries: [{ wine: WINE, vintage: '2019', bottleSize: '750ml', listPrice: 80, byGlass: false }],
+    }));
+    await tool('update_list_pricing').handler({ list_id: LIST, wine_id: WINE, list_price: 90 }, CTX);
+
+    const rows = logAudit.mock.calls.filter(([, action]) => action.startsWith('winelist.entry.'));
+    expect(rows.map(([, action]) => action)).toEqual(['winelist.entry.add', 'winelist.entry.update']);
+    const AuditLog = require('../models/AuditLog');
+    for (const [, action, resource, detail] of rows) {
+      expect(resource).toEqual({ type: 'winelist', id: LIST, cellarId: oid('c') });
+      // The model's resource is a strict typed sub-document: a key it does
+      // not know is dropped without an error, so compare what it keeps.
+      const row = new AuditLog({ action, resource, detail });
+      expect(row.validateSync()).toBeUndefined();
+      expect(JSON.parse(JSON.stringify(row.toObject().resource))).toEqual({ type: 'winelist', id: LIST, cellarId: oid('c') });
+    }
   });
 });
 

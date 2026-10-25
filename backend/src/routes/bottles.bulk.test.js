@@ -31,7 +31,7 @@ jest.mock('../services/rackOps', () => ({ moveBottleToCellar: jest.fn() }));
 jest.mock('../services/bottleOps', () => ({
   addBottle: jest.fn(), validateBottleCommitFields: jest.fn(), updateBottleFields: jest.fn(), consumeBottle: jest.fn(),
   restoreBottle: jest.fn(), removeFromRacks: jest.fn(), removeBottleCascade: jest.fn(),
-  openBottle: jest.fn(), pourFromBottle: jest.fn(), closeBottle: jest.fn(),
+  openBottle: jest.fn(), pourFromBottle: jest.fn(), closeBottle: jest.fn(), markArrived: jest.fn(),
 }));
 jest.mock('../utils/exchangeRates', () => ({ getSnapshotForDate: jest.fn().mockResolvedValue(null) }));
 jest.mock('../utils/vintageProfile', () => ({ ensurePendingVintageProfile: jest.fn() }));
@@ -48,10 +48,12 @@ jest.mock('../models/PriceTrackingSkip', () => ({}));
 jest.mock('../models/BottleImage', () => ({ findOne: jest.fn(), findById: jest.fn() }));
 jest.mock('../models/WineRequest', () => ({}));
 jest.mock('../models/Bottle', () => ({ findById: jest.fn(), find: jest.fn() }));
+// The auth middleware checks a demo token's account still exists.
+jest.mock('../models/User', () => ({ exists: jest.fn().mockResolvedValue(true) }));
 
 const Bottle = require('../models/Bottle');
 const Cellar = require('../models/Cellar');
-const { updateBottleFields, consumeBottle } = require('../services/bottleOps');
+const { updateBottleFields, consumeBottle, markArrived } = require('../services/bottleOps');
 const { logAudit } = require('../services/audit');
 const { checkRestockGap } = require('../services/restockChecker');
 const bottlesRouter = require('./bottles');
@@ -80,8 +82,8 @@ function app() {
   return a;
 }
 
-function postJson(a, path, body) {
-  const token = jwt.sign({ id: USER, roles: ['user'] }, process.env.JWT_SECRET, { expiresIn: '1h' });
+function postJson(a, path, body, { isDemo = false } = {}) {
+  const token = jwt.sign({ id: USER, roles: ['user'], ...(isDemo ? { isDemo: true } : {}) }, process.env.JWT_SECRET, { expiresIn: '1h' });
   const payload = JSON.stringify(body);
   return new Promise((resolve, reject) => {
     const server = http.createServer(a);
@@ -119,18 +121,65 @@ describe('POST /api/bottles/bulk', () => {
     const { status, body } = await postJson(app(), '/api/bottles/bulk', {
       action: 'update',
       bottleIds: [B(1), B(2), B(3), B(4)],
-      fields: { purchaseDate: '2026-09-01', price: 120, currency: 'SEK', notes: 'must not pass', vintage: '1999' },
+      fields: { purchaseDate: '2026-09-01', price: 120, currency: 'SEK', vintage: '1999', rating: 5 },
     });
 
     expect(status).toBe(200);
     expect(body).toEqual({ done: 2, doneIds: [B(1), B(2)], skipped: [{ id: B(3), reason: 'not_found' }, { id: B(4), reason: 'not_found' }] });
     expect(updateBottleFields).toHaveBeenCalledTimes(2);
-    // Only the bulk whitelist reaches the shared update — notes/vintage are per bottle.
+    // Only the bulk whitelist reaches the shared update — vintage and rating are per bottle.
     expect(updateBottleFields).toHaveBeenNthCalledWith(1,
       expect.objectContaining({ _id: B(1) }), { purchaseDate: '2026-09-01', price: 120, currency: 'SEK' }, expect.anything());
     expect(logAudit).toHaveBeenCalledWith(
       expect.anything(), 'bottle.bulk_update', expect.objectContaining({ type: 'cellar', id: OWNED }),
       { requested: 4, done: 2, skipped: 2, fields: ['price', 'currency', 'purchaseDate'] },
+    );
+  });
+
+  test('update: a barcode reaches every bottle — the vintage page\'s "Add barcode" (the shared update checks and normalises it)', async () => {
+    Bottle.find.mockResolvedValue([
+      { _id: B(1), cellar: OWNED, status: 'active' },
+      { _id: B(2), cellar: OWNED, status: 'active' },
+    ]);
+    const { status, body } = await postJson(app(), '/api/bottles/bulk', {
+      action: 'update', bottleIds: [B(1), B(2)], fields: { barcode: '7310070000002' },
+    });
+    expect(status).toBe(200);
+    expect(body.done).toBe(2);
+    expect(updateBottleFields).toHaveBeenNthCalledWith(1, expect.objectContaining({ _id: B(1) }), { barcode: '7310070000002' }, expect.anything());
+  });
+
+  test('update: a demo account cannot add a barcode to many bottles either (the single-bottle edit refuses it too)', async () => {
+    Bottle.find.mockResolvedValue([
+      { _id: B(1), cellar: OWNED, status: 'active' },
+      { _id: B(2), cellar: OWNED, status: 'active' },
+    ]);
+    const { status, body } = await postJson(app(), '/api/bottles/bulk', {
+      action: 'update', bottleIds: [B(1), B(2)], fields: { barcode: '7310070000002' },
+    }, { isDemo: true });
+    expect(status).toBe(403);
+    expect(body.error).toMatch(/barcode/i);
+    expect(updateBottleFields).not.toHaveBeenCalled();
+  });
+
+  test('update: a note sent on purpose reaches every bottle — the vintage page\'s "Edit vintage" writes one note for the vintage', async () => {
+    // Notes stay per bottle by default (the bulk bar never sends one); a
+    // caller that sends a note asks for it on all of them, as the lot rule
+    // in services/bottleLot has it (LOT_FIELDS_ON_REQUEST).
+    Bottle.find.mockResolvedValue([
+      { _id: B(1), cellar: OWNED, status: 'active' },
+      { _id: B(2), cellar: OWNED, status: 'active' },
+    ]);
+    const { status, body } = await postJson(app(), '/api/bottles/bulk', {
+      action: 'update', bottleIds: [B(1), B(2)], fields: { notes: 'Bought as a case of six', drinkFrom: 2028 },
+    });
+    expect(status).toBe(200);
+    expect(body.done).toBe(2);
+    expect(updateBottleFields).toHaveBeenNthCalledWith(2,
+      expect.objectContaining({ _id: B(2) }), { notes: 'Bought as a case of six', drinkFrom: 2028 }, expect.anything());
+    expect(logAudit).toHaveBeenCalledWith(
+      expect.anything(), 'bottle.bulk_update', expect.anything(),
+      expect.objectContaining({ fields: ['drinkFrom', 'notes'] }),
     );
   });
 
@@ -176,7 +225,7 @@ describe('POST /api/bottles/bulk', () => {
     let res = await postJson(app(), '/api/bottles/bulk', { action: 'delete', bottleIds: [B(1)] });
     expect(res.status).toBe(400);
 
-    res = await postJson(app(), '/api/bottles/bulk', { action: 'update', bottleIds: [B(1)], fields: { notes: 'x' } });
+    res = await postJson(app(), '/api/bottles/bulk', { action: 'update', bottleIds: [B(1)], fields: { vintage: '1999' } });
     expect(res.status).toBe(400);
 
     res = await postJson(app(), '/api/bottles/bulk', { action: 'update', bottleIds: [], fields: { price: 1 } });
@@ -276,5 +325,188 @@ describe('POST /api/bottles/bulk — per-bottle window conflicts (audit 2026-09-
     updateBottleFields.mockResolvedValueOnce({ error: { status: 400, message: 'purchaseDate must be a valid date' } });
     const { status } = await postJson(app(), '/api/bottles/bulk', { action: 'update', bottleIds: [B(1)], fields: { purchaseDate: 'nope' } });
     expect(status).toBe(400);
+  });
+});
+
+describe('POST /api/bottles/bulk — arrive (bottles on order)', () => {
+  test('marks every bottle on order as arrived with one day; anything else is skipped as not_on_order', async () => {
+    markArrived.mockResolvedValue({ bottle: {} });
+    Bottle.find.mockResolvedValue([
+      { _id: B(1), cellar: OWNED, status: 'ordered' },
+      { _id: B(2), cellar: OWNED, status: 'ordered' },
+      { _id: B(3), cellar: OWNED, status: 'active' },
+    ]);
+
+    const { status, body } = await postJson(app(), '/api/bottles/bulk', {
+      action: 'arrive', bottleIds: [B(1), B(2), B(3)], arrivedAt: '2026-10-02',
+    });
+
+    expect(status).toBe(200);
+    expect(body).toEqual({ done: 2, doneIds: [B(1), B(2)], skipped: [{ id: B(3), reason: 'not_on_order' }] });
+    expect(markArrived).toHaveBeenCalledTimes(2);
+    expect(markArrived).toHaveBeenCalledWith(expect.objectContaining({ _id: B(1) }), { arrivedAt: '2026-10-02' }, expect.anything());
+    expect(consumeBottle).not.toHaveBeenCalled();
+    expect(logAudit).toHaveBeenCalledWith(
+      expect.anything(), 'bottle.bulk_arrive', expect.objectContaining({ type: 'cellar', id: OWNED }),
+      { requested: 3, done: 2, skipped: 1 },
+    );
+  });
+
+  test('update: a bad expected month is refused up front, whatever the order of the bottles', async () => {
+    Bottle.find.mockResolvedValue([
+      { _id: B(1), cellar: OWNED, status: 'active' },
+      { _id: B(2), cellar: OWNED, status: 'ordered' },
+    ]);
+    const { status, body } = await postJson(app(), '/api/bottles/bulk', {
+      action: 'update', bottleIds: [B(1), B(2)], fields: { expectedArrival: '3/27' },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/YYYY-MM/);
+    expect(updateBottleFields).not.toHaveBeenCalled();
+  });
+
+  // 2026-10-13: Chrome's page translation sent "EURO" for "EUR".
+  test('update: an unsupported currency is refused up front; an alias reaches every bottle as its code', async () => {
+    Bottle.find.mockResolvedValue([{ _id: B(1), cellar: OWNED, status: 'active' }]);
+    let res = await postJson(app(), '/api/bottles/bulk', {
+      action: 'update', bottleIds: [B(1)], fields: { price: 9, currency: 'XYZ' },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Unsupported currency/);
+    expect(updateBottleFields).not.toHaveBeenCalled();
+
+    res = await postJson(app(), '/api/bottles/bulk', {
+      action: 'update', bottleIds: [B(1)], fields: { price: 9, currency: 'EURO' },
+    });
+    expect(res.status).toBe(200);
+    expect(updateBottleFields).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: B(1) }), { price: 9, currency: 'EUR' }, expect.anything());
+  });
+
+  // Release audit 2026-10-13: a lot edit of a bottle with an older import's
+  // code carries that code; it must not be refused up front.
+  test('update: an unsupported code that is a selected bottle\'s own reaches the shared update', async () => {
+    Bottle.find.mockResolvedValue([{ _id: B(1), cellar: OWNED, status: 'active', currency: 'ILS' }]);
+    const res = await postJson(app(), '/api/bottles/bulk', {
+      action: 'update', bottleIds: [B(1)], fields: { price: 90, currency: 'ils' },
+    });
+    expect(res.status).toBe(200);
+    expect(updateBottleFields).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: B(1) }), { price: 90, currency: 'ILS' }, expect.anything());
+  });
+
+  test('update: a currency that is not a string is refused up front', async () => {
+    Bottle.find.mockResolvedValue([{ _id: B(1), cellar: OWNED, status: 'active' }]);
+    const res = await postJson(app(), '/api/bottles/bulk', {
+      action: 'update', bottleIds: [B(1)], fields: { price: 9, currency: 7 },
+    });
+    expect(res.status).toBe(400);
+    expect(updateBottleFields).not.toHaveBeenCalled();
+  });
+
+  test('a bad arrival date fails the whole request before anything is touched', async () => {
+    markArrived.mockResolvedValue({ error: { status: 400, message: 'arrivedAt must be a valid date and not in the future' } });
+    Bottle.find.mockResolvedValue([{ _id: B(1), cellar: OWNED, status: 'ordered' }]);
+    const { status, body } = await postJson(app(), '/api/bottles/bulk', { action: 'arrive', bottleIds: [B(1)], arrivedAt: 'later' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/arrivedAt/);
+  });
+});
+
+// Undo of a bulk "mark as drunk" (the cellar list's and the pick list's) in
+// ONE request: one restore call per bottle ate the member's write budget and
+// could not undo a batch larger than the write limit. The real per-bottle
+// restore runs here (services/bottleOps.restoreBottle), with its two-day rule.
+describe('POST /api/bottles/bulk — restore (Undo of a bulk take-out)', () => {
+  const { restoreBottle } = require('../services/bottleOps');
+  const hoursAgo = (h) => new Date(Date.now() - h * 60 * 60 * 1000);
+  const consumed = (n, cellar, over = {}) => ({
+    _id: B(n), cellar, status: 'drank', consumedReason: 'drank',
+    consumedAt: hoursAgo(1), consumedLoggedAt: hoursAgo(1), save: jest.fn().mockResolvedValue(undefined), ...over,
+  });
+  beforeEach(() => {
+    restoreBottle.mockImplementation(jest.requireActual('../services/bottleOps').restoreBottle);
+  });
+
+  test('puts every bottle the batch took out back to active, in owned and editable cellars, with one summary row', async () => {
+    const rows = [consumed(1, OWNED), consumed(2, EDITABLE, { status: 'gifted', consumedReason: 'gifted' })];
+    Bottle.find.mockResolvedValue(rows);
+
+    const { status, body } = await postJson(app(), '/api/bottles/bulk', { action: 'restore', bottleIds: [B(1), B(2)] });
+
+    expect(status).toBe(200);
+    expect(body).toEqual({ done: 2, doneIds: [B(1), B(2)], skipped: [] });
+    for (const b of rows) {
+      expect(b.status).toBe('active');
+      expect(b.consumedAt).toBeUndefined();
+      expect(b.consumedReason).toBeUndefined();
+      expect(b.save).toHaveBeenCalledTimes(1);
+    }
+    // The per-bottle rows the single restore writes, and the bulk summary.
+    expect(logAudit).toHaveBeenCalledWith(expect.anything(), 'bottle.restore', expect.objectContaining({ id: B(1) }), { from: 'drank' });
+    expect(logAudit).toHaveBeenCalledWith(expect.anything(), 'bottle.restore', expect.objectContaining({ id: B(2) }), { from: 'gifted' });
+    expect(logAudit).toHaveBeenCalledWith(
+      expect.anything(), 'bottle.bulk_restore', expect.objectContaining({ type: 'cellar', id: OWNED }),
+      { requested: 2, done: 2, skipped: 0 },
+    );
+  });
+
+  test('refusals are per bottle, with the reason: not taken out, past the two days, not found', async () => {
+    const back = consumed(1, OWNED);
+    const active = { _id: B(2), cellar: OWNED, status: 'active', save: jest.fn() };
+    const old = consumed(3, OWNED, { consumedAt: hoursAgo(72), consumedLoggedAt: hoursAgo(72) });
+    Bottle.find.mockResolvedValue([back, active, old]);
+
+    const { status, body } = await postJson(app(), '/api/bottles/bulk', { action: 'restore', bottleIds: [B(3), B(1), B(2), B(4)] });
+
+    // The first bottle's refusal does not fail the request: it is about that bottle.
+    expect(status).toBe(200);
+    expect(body).toEqual({
+      done: 1,
+      doneIds: [B(1)],
+      skipped: [
+        { id: B(3), reason: 'restore_window_expired' },
+        { id: B(2), reason: 'not_consumed' },
+        { id: B(4), reason: 'not_found' },
+      ],
+    });
+    expect(old.status).toBe('drank');
+    expect(old.save).not.toHaveBeenCalled();
+    expect(active.save).not.toHaveBeenCalled();
+    expect(logAudit).toHaveBeenCalledWith(
+      expect.anything(), 'bottle.bulk_restore', expect.anything(), { requested: 4, done: 1, skipped: 3 },
+    );
+  });
+
+  test('a bottle logged today with a backdated date is still within its two days (the window counts from the log)', async () => {
+    const backdated = consumed(1, OWNED, { consumedAt: hoursAgo(24 * 9), consumedLoggedAt: hoursAgo(1) });
+    Bottle.find.mockResolvedValue([backdated]);
+    const { body } = await postJson(app(), '/api/bottles/bulk', { action: 'restore', bottleIds: [B(1)] });
+    expect(body).toEqual({ done: 1, doneIds: [B(1)], skipped: [] });
+  });
+
+  test('a viewer may not move bottles back: they read as not_found and nothing changes', async () => {
+    const theirs = consumed(1, VIEWONLY);
+    Bottle.find.mockResolvedValue([theirs]);
+
+    const { status, body } = await postJson(app(), '/api/bottles/bulk', { action: 'restore', bottleIds: [B(1)] });
+
+    expect(status).toBe(200);
+    expect(body).toEqual({ done: 0, doneIds: [], skipped: [{ id: B(1), reason: 'not_found' }] });
+    expect(theirs.status).toBe('drank');
+    expect(theirs.save).not.toHaveBeenCalled();
+    // No cellar was touched: no summary row either.
+    expect(logAudit).not.toHaveBeenCalled();
+  });
+
+  test('the id list rules of every bulk action apply (empty, malformed, over the cap)', async () => {
+    let res = await postJson(app(), '/api/bottles/bulk', { action: 'restore', bottleIds: [] });
+    expect(res.status).toBe(400);
+    res = await postJson(app(), '/api/bottles/bulk', { action: 'restore', bottleIds: ['nope'] });
+    expect(res.status).toBe(400);
+    res = await postJson(app(), '/api/bottles/bulk', { action: 'restore', bottleIds: Array.from({ length: 501 }, (_, i) => `64b0000000000000000${String(i).padStart(5, '0')}`) });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/At most 500/);
+    expect(restoreBottle).not.toHaveBeenCalled();
   });
 });

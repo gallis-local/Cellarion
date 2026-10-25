@@ -5,6 +5,7 @@ const router = express.Router();
 
 const WineDefinition = require('../models/WineDefinition');
 const WineVintageProfile = require('../models/WineVintageProfile');
+const RegistryDataValue = require('../models/RegistryDataValue');
 const User = require('../models/User');
 const searchService = require('../services/search');
 const { findVisibleWine } = require('../services/wineVisibility');
@@ -27,7 +28,8 @@ const { CURRENT_REGISTRY_TERMS_VERSION } = require('../config/legal');
 //   GET  /search?q=          up to 10 identities (no profiles)
 //   GET  /wines/:id          one wine in full: identity, profile, windows, values
 //   POST /wines/changes      which of the ids the install HOLDS changed since a time
-//   POST /requests           a wine request into the hosted intake
+//   POST /requests           a wine request into the hosted intake (a label photo may ride along)
+//   GET  /requests?ids=      what became of the requests this install filed
 //   POST /corrections        a field-correction proposal into the admin queue
 //   POST /values             a public-value suggestion into the review queue
 //   GET  /me                 the key, its quotas and today's spend
@@ -320,8 +322,59 @@ router.get('/wines/:id', quota('fetches'), async (req, res) => {
   }
 });
 
+/**
+ * The latest change to what a fetch carries BESIDES the wine record: its
+ * reviewed drink windows and its published values. Neither touches the wine's
+ * own updatedAt, so a change check on that alone never reported a window a
+ * sommelier reviewed after an install copied the wine (support ticket
+ * 2026-10-13: the install kept "awaiting staff review" while the hosted wine
+ * had its window). A row's setAt / decidedAt counts as well as its updatedAt:
+ * updates written with $set skip the pre-save hook that stamps updatedAt.
+ *
+ * A window withdrawn back to pending, or a value taken down, leaves nothing
+ * here to report, and the install keeps what it copied: a fetch only adds and
+ * replaces (services/registryBridge applyWindows / applyValues).
+ *
+ * @param {Array} wineIds
+ * @returns {Promise<Map<string, Date>>}
+ */
+// Windows and values count from this release on. An install whose watermark
+// is older was never told about the ones reviewed between its copy and its
+// last check, and comparing them to that watermark would leave them missing
+// for good. So until its watermark passes this date it is told about every
+// window/value change. Its own "already have this version" skip
+// (registrySyncedAt >= updatedAt) fetches only the copies actually behind,
+// and a run cut short by the fetch quota keeps its watermark, so the
+// catch-up resumes next week.
+const ATTACHED_COUNTED_FROM = new Date('2026-10-14T00:00:00Z');
+
+async function latestAttachedChange(wineIds) {
+  const latest = new Map();
+  if (!wineIds.length) return latest;
+  const lastOf = (stamps) => ({ $max: { $max: stamps } });
+  const [windows, values] = await Promise.all([
+    WineVintageProfile.aggregate([
+      { $match: { wineDefinition: { $in: wineIds }, status: 'reviewed' } },
+      { $group: { _id: '$wineDefinition', at: lastOf(['$updatedAt', '$setAt']) } },
+    ]),
+    RegistryDataValue.aggregate([
+      { $match: { wineDefinition: { $in: wineIds }, status: 'published' } },
+      { $group: { _id: '$wineDefinition', at: lastOf(['$updatedAt', '$decidedAt']) } },
+    ]),
+  ]);
+  for (const row of [...windows, ...values]) {
+    if (!row.at) continue;
+    const id = String(row._id);
+    const prev = latest.get(id);
+    if (!prev || row.at > prev) latest.set(id, row.at);
+  }
+  return latest;
+}
+
 // POST /v1/wines/changes — { ids: [...], since: ISO } → which of THOSE changed.
 // Never a global feed: an install can only ask about wines it already holds.
+// "Changed" covers the wine record, its reviewed windows and its published
+// values: everything GET /wines/:id carries that an install copies.
 router.post('/wines/changes', validChanges, quota('changeChecks'), async (req, res) => {
   const ids = req.bridgeIds;
   const since = req.bridgeSince;
@@ -333,12 +386,24 @@ router.post('/wines/changes', validChanges, quota('changeChecks'), async (req, r
     const found = await WineDefinition.find({ _id: { $in: ids }, ...VISIBLE, canary: { $ne: true } })
       .select('_id updatedAt nonWine').lean();
     const present = new Map(found.map((w) => [String(w._id), w]));
+    const latest = await latestAttachedChange(found.filter((w) => !w.nonWine).map((w) => w._id));
+    // Before the cutover every window/value change counts (see
+    // ATTACHED_COUNTED_FROM); the wine record itself always compares to since.
+    const attachedSince = since < ATTACHED_COUNTED_FROM ? new Date(0) : since;
     const changed = [];
     const removed = [];
     for (const id of ids) {
       const w = present.get(String(id));
       if (!w || w.nonWine) { removed.push(String(id)); continue; }
-      if (w.updatedAt && new Date(w.updatedAt).getTime() > since.getTime()) changed.push({ id: String(id), updatedAt: w.updatedAt });
+      const recordAt = w.updatedAt ? new Date(w.updatedAt) : null;
+      const attachedAt = latest.get(String(id)) || null;
+      const recordChanged = !!recordAt && recordAt > since;
+      const attachedChanged = !!attachedAt && attachedAt > attachedSince;
+      if (!recordChanged && !attachedChanged) continue;
+      // The latest of the two: what the install compares its own sync stamp
+      // to, so a copy already newer than every change is not fetched again.
+      const updatedAt = !attachedAt || (recordAt && recordAt > attachedAt) ? recordAt : attachedAt;
+      changed.push({ id: String(id), updatedAt });
     }
     res.json({ since, checkedAt, checked: ids.length, changed, removed });
   } catch (error) {
@@ -347,19 +412,79 @@ router.post('/wines/changes', validChanges, quota('changeChecks'), async (req, r
   }
 });
 
-// POST /v1/requests — { wineName, sourceUrl, image? } → the hosted wine-request queue.
+// POST /v1/requests — { wineName, sourceUrl, sourceUrls?, image?, backImage?, follow? }
+// → the hosted wine-request queue. sourceUrls (up to three links, sourceUrl
+// first) and backImage arrived with #1460; an older install sends neither.
 router.post('/requests', quota('contributions'), async (req, res) => {
   try {
     const r = await createWineRequest(req.user.id, {
-      wineName: req.body?.wineName, sourceUrl: req.body?.sourceUrl, image: req.body?.image,
+      wineName: req.body?.wineName, sourceUrl: req.body?.sourceUrl, sourceUrls: req.body?.sourceUrls,
+      image: req.body?.image, backImage: req.body?.backImage,
     }, { via: 'bridge', req });
     if (r.error) return res.status(r.error.status || 400).json({ error: r.error.message, code: 'invalid' });
+    // An install from v1.264.0 says it will follow the request (follow: true):
+    // it asks for the outcome and tells its own requester, so the decision
+    // here stays silent for the key owner (models/WineRequest installFollowsAt).
+    // An older one sends nothing and is marked on its first GET /requests.
+    if (req.body?.follow === true) {
+      const WineRequest = require('../models/WineRequest');
+      await WineRequest.updateOne({ _id: r.wineRequest._id }, { $set: { installFollowsAt: new Date() } })
+        .catch((err) => console.warn('[bridge] request follow mark failed:', err.message));
+    }
     logAudit(req, 'bridge.request.forwarded', { type: 'wineRequest', id: r.wineRequest._id },
       { key: req.bridge.key.id, instanceHost: req.bridge.key.instanceHost });
     res.status(201).json({ request: { id: r.wineRequest._id, status: r.wineRequest.status, wineName: r.wineRequest.wineName } });
   } catch (error) {
     console.error('Bridge request error:', error);
     res.status(500).json({ error: 'Failed to file the request' });
+  }
+});
+
+// GET /v1/requests?ids=a,b,… — what became of requests this install filed.
+// Before this existed a request answered here stayed "pending" on the install
+// for good. Only the key owner's own bridge-filed requests answer (any of
+// their keys, so a rotated key still learns the outcome); any other id is
+// simply absent from the answer, never confirmed to exist. A resolved
+// request carries its wine's identity when that wine is visible — what the
+// install then copies (adopt) and links its waiting bottles to.
+const REQUEST_STATUS_MAX = 50;
+router.get('/requests', async (req, res) => {
+  try {
+    const ids = [...new Set(String(req.query.ids || '').split(',').map((s) => s.trim()).filter(isValidId))].slice(0, REQUEST_STATUS_MAX);
+    if (!ids.length) {
+      return res.status(400).json({ error: `ids must be up to ${REQUEST_STATUS_MAX} comma-separated request ids`, code: 'invalid' });
+    }
+    const WineRequest = require('../models/WineRequest');
+    const rows = await WineRequest.find({ _id: { $in: ids }, user: req.user.id, via: 'bridge' })
+      .select('status linkedWineDefinition adminNotes resolvedAt installFollowsAt').lean();
+    // Asking about a pending request shows this install follows it: it will
+    // finish the request and tell its own requester (installFollowsAt).
+    const nowFollowed = rows.filter((r) => r.status === 'pending' && !r.installFollowsAt).map((r) => r._id);
+    if (nowFollowed.length) {
+      await WineRequest.updateMany({ _id: { $in: nowFollowed }, installFollowsAt: null }, { $set: { installFollowsAt: new Date() } })
+        .catch((err) => console.warn('[bridge] request follow mark failed:', err.message));
+    }
+    const wineIds = rows.filter((r) => r.status === 'resolved' && r.linkedWineDefinition).map((r) => r.linkedWineDefinition);
+    const wines = wineIds.length
+      ? await WineDefinition.find({ _id: { $in: wineIds }, ...VISIBLE }).select(IDENTITY_SELECT).populate('country region grapes', 'name').lean()
+      : [];
+    const byId = new Map(wines.map((w) => [String(w._id), w]));
+    res.json({
+      requests: rows.map((r) => {
+        const wine = r.linkedWineDefinition ? byId.get(String(r.linkedWineDefinition)) : null;
+        return {
+          id: String(r._id),
+          status: r.status,
+          resolvedAt: r.resolvedAt || null,
+          // The admin's note to the requester — the reason, for a decline.
+          notes: r.adminNotes || null,
+          wine: wine ? identity(wine) : null,
+        };
+      }),
+    });
+  } catch (error) {
+    console.error('Bridge request status error:', error);
+    res.status(500).json({ error: 'Failed to read the requests' });
   }
 });
 

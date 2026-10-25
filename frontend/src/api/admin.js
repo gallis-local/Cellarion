@@ -99,6 +99,15 @@ export const adminApproveWineProposal = (apiFetch, id, spelling) =>
     ? { method: 'POST', headers: J, body: JSON.stringify(spelling) }
     : { method: 'POST' });
 
+// Lifts (value false) or sets the non-wine quarantine on a registry wine. The
+// proposals list uses it to restore a wine a non_wine proposal quarantined.
+export const adminSetWineNonWine = (apiFetch, wineId, value) =>
+  apiFetch(`/api/admin/wines/${wineId}/non-wine`, {
+    method: 'POST',
+    headers: J,
+    body: JSON.stringify({ value }),
+  });
+
 export const adminRejectWineProposal = (apiFetch, id, reason) =>
   apiFetch(`/api/admin/wine-proposals/${id}/reject`, {
     method: 'POST',
@@ -359,6 +368,18 @@ export const superadminSaveAnnouncement = (apiFetch, data) =>
     body: JSON.stringify(data),
   });
 
+// ── Feature flags / early access (SuperAdmin) ─────────────────────────────────
+export const superadminGetFeatures = (apiFetch) =>
+  apiFetch('/api/superadmin/features');
+
+// `data` is { state } and/or { forumPath }.
+export const superadminSaveFeature = (apiFetch, key, data) =>
+  apiFetch(`/api/superadmin/features/${encodeURIComponent(key)}`, {
+    method: 'PATCH',
+    headers: J,
+    body: JSON.stringify(data),
+  });
+
 // ── AI spend (SuperAdmin → AI) ────────────────────────────────────────────────
 // Estimated AI spend per feature over the last `days` UTC days.
 export const superadminAiCostsPath = (days = 30) => `/api/superadmin/ai/costs?days=${days}`;
@@ -475,6 +496,20 @@ export const adminSaveContactEmail = (apiFetch, contactEmail) =>
     body: JSON.stringify({ contactEmail }),
   });
 
+// ── Settings (new-member emails) ──────────────────────────────────────────────
+// The one email a new member gets two days after joining (backend
+// services/newMemberEmails). GET → { enabled, since, mailConfigured,
+// sentLast30Days: { cellar, empty } }; PATCH { enabled } → { enabled, since }.
+export const adminGetNewMemberEmails = (apiFetch) =>
+  apiFetch('/api/admin/settings/new-member-emails');
+
+export const adminSaveNewMemberEmails = (apiFetch, enabled) =>
+  apiFetch('/api/admin/settings/new-member-emails', {
+    method: 'PATCH',
+    headers: J,
+    body: JSON.stringify({ enabled }),
+  });
+
 // ── Registry Bridge (keys, readers, admin revocation) ────────────────────────
 export const adminGetBridgeKeys = (apiFetch, days = 7) =>
   apiFetch(`/api/admin/bridge/keys?days=${days}`);
@@ -489,3 +524,7 @@ export const adminRevokeBridgeKey = (apiFetch, id, reason) =>
     headers: J,
     body: JSON.stringify({ reason }),
   });
+
+// "This is THE photo of this wine's vintage" (support ticket 2026-10-09).
+export const adminSetVintageOfficialImage = (apiFetch, id) =>
+  apiFetch(`/api/admin/images/${id}/set-vintage-official`, { method: 'PUT' });

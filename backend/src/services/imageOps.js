@@ -24,6 +24,7 @@ const { sanitizeImageBuffer, detectImageFormat } = require('./imageSanitizer');
 const { processImage, hashImageBytes } = require('./imageProcessor');
 const { encodeKeptPhoto, KEPT_EXTENSION } = require('./photoFormat');
 const { stripHtml } = require('../utils/sanitize');
+const { photoVintage } = require('../utils/imageVintage');
 
 const MAX_IMAGES_PER_BOTTLE = 20;
 const EXT_FOR = { jpeg: 'jpg', png: 'png', webp: 'webp' };
@@ -65,10 +66,16 @@ function sanitizeCredit(credit, userRoles) {
  * @param {object}  [opts.bottle]          access-checked bottle doc (editor+)
  * @param {string}  [opts.wineDefinitionId] pre-validated registry wine id
  * @param {string}  [opts.credit]          RAW credit — gated + sanitised here (admin-only)
+ * @param {{ side?: 'front'|'back' }} [opts.publish]  an ADMIN-approved photo: the row is born
+ *   approved + public, reviewed by the uploader, BEFORE background removal is
+ *   kicked off. The worker keeps an already-approved row approved; a row
+ *   approved after the hand-off raced it and usually ended 'processed' —
+ *   invisible in every gallery (release audit 2026-10-09, H1).
+ * @param {'web'|'mcp'} [opts.via='web']   the surface, named in the audit row
  * @param {object}  req                    for downstream audit attribution
  * @returns {{ image }} | {{ error: { status, message } }}
  */
-async function ingestBottleImage({ buffer, userId, userRoles = [], bottle = null, wineDefinitionId = null, credit = null, keepBackground = false }, req) {
+async function ingestBottleImage({ buffer, userId, userRoles = [], bottle = null, wineDefinitionId = null, credit = null, keepBackground = false, publish = null, via = 'web' }, req) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     return { error: { status: 400, message: 'No image data provided' } };
   }
@@ -136,6 +143,8 @@ async function ingestBottleImage({ buffer, userId, userRoles = [], bottle = null
   const image = new BottleImage({
     bottle: bottle ? bottle._id : null,
     wineDefinition: wineDefinitionId || null,
+    // A photo is of one bottle, so it is of that bottle's vintage.
+    vintage: bottle ? photoVintage(bottle.vintage) : null,
     uploadedBy: userId,
     originalUrl,
     processedUrl: keep ? originalUrl : null,
@@ -143,8 +152,26 @@ async function ingestBottleImage({ buffer, userId, userRoles = [], bottle = null
     keepBackground: keep,
     credit: sanitizeCredit(credit, userRoles),
     contentHash,
+    // Published at birth (see `publish` above): approved before the worker
+    // can read the row, so its settled status stays 'approved'.
+    ...(publish ? {
+      status: 'approved',
+      visibility: 'public',
+      side: publish.side === 'back' ? 'back' : 'front',
+      reviewedBy: userId,
+      reviewedAt: new Date(),
+    } : {}),
   });
   await image.save();
+
+  // One attach row for both surfaces, and only for a photo put on a bottle:
+  // the admin flows that publish a registry picture write their own row, and
+  // a photo uploaded before its bottle exists is audited when it is linked.
+  if (bottle) {
+    const { logAudit } = require('./audit');
+    logAudit(req, 'image.attach', { type: 'bottle', id: bottle._id, cellarId: bottle.cellar },
+      { via, imageId: String(image._id) });
+  }
 
   // Fire-and-forget background removal (rembg) — same hand-off as the route.
   if (!keep) {
@@ -188,6 +215,9 @@ async function attachOfficialWineImage({ buffer, wineDefinitionId, credit = null
     image: image.processedUrl || image.originalUrl,
     // The GATED credit from the shared pipeline — never the raw caller input.
     imageCredit: image.credit,
+    // Atomic writes skip the save hook that stamps updatedAt, and the Bridge's
+    // change check reads only updatedAt.
+    updatedAt: new Date(),
   });
   require('./search').indexWine(wineDefinitionId);
 
@@ -248,4 +278,106 @@ async function persistLabelScan({ buffer, userId, side = 'front' }) {
   }
 }
 
-module.exports = { ingestBottleImage, attachOfficialWineImage, persistLabelScan, decodeInlineImage, MAX_IMAGES_PER_BOTTLE };
+/**
+ * Choose which photo a bottle shows by default — ONE implementation for
+ * PUT /api/bottles/:id/default-image and the MCP set_bottle_default_image
+ * tool. `imageId` null/'' clears the choice. A photo qualifies when it belongs
+ * to this bottle, or is a published picture of the bottle's wine (the same
+ * candidates the web picker offers). `bottle` is an access-checked document.
+ * A change is audited here ('image.default'), once for both surfaces; `req`
+ * names the actor. Choosing the photo that already is the default writes no row.
+ * Returns { error } | { bottle, prev } (prev = the previous default image id).
+ */
+async function setBottleDefaultImage(bottle, imageId, req) {
+  const mongoose = require('mongoose');
+  const { logAudit } = require('./audit');
+  const prev = bottle.defaultImage ? String(bottle.defaultImage) : null;
+  const audit = (now) => {
+    if (now === prev) return;
+    logAudit(req, 'image.default', { type: 'bottle', id: bottle._id, cellarId: bottle.cellar },
+      { imageId: now, prev });
+  };
+  if (!imageId) {
+    bottle.defaultImage = null;
+    await bottle.save();
+    audit(null);
+    return { bottle, prev };
+  }
+  // Cast the caller's id before it touches the query (a junk string would
+  // throw a CastError; the cast also clears user-input-in-query taint).
+  if (!mongoose.isValidObjectId(imageId)) {
+    return { error: { status: 400, message: 'Invalid image ID' } };
+  }
+  const imageOid = new mongoose.Types.ObjectId(String(imageId));
+  // The wine clause only when the bottle HAS a wine: BottleImage.wineDefinition
+  // defaults to null, so for a bottle waiting on a request it would match ANY
+  // approved unattached image.
+  const orClauses = [{ bottle: bottle._id }];
+  if (bottle.wineDefinition) {
+    const wineId = bottle.wineDefinition._id || bottle.wineDefinition;
+    orClauses.push({ wineDefinition: wineId, status: 'approved', visibility: 'public' });
+  }
+  const image = await BottleImage.findOne({ _id: imageOid, $or: orClauses });
+  if (!image) {
+    return { error: { status: 404, message: 'Image not found or not associated with this bottle' } };
+  }
+  bottle.defaultImage = image._id;
+  await bottle.save();
+  audit(String(image._id));
+  return { bottle, prev };
+}
+
+/**
+ * The uploader deletes their own, still-personal photo — ONE implementation
+ * for DELETE /api/images/:id and the MCP delete_bottle_image tool. Someone
+ * else's photo is reported as not found (its existence is not confirmed); a
+ * photo that has become the wine's registry picture is refused, because other
+ * people's pages show it (report it instead). Every reference is cleared
+ * before the files go, so nothing renders a hole. Not reversible.
+ * Returns { error } | { image } (the deleted row, lean-ish, for audit/answers).
+ */
+async function deleteOwnImage(imageId, userId, req) {
+  const Bottle = require('../models/Bottle');
+  const { logAudit } = require('./audit');
+  const image = await BottleImage.findById(imageId);
+  if (!image || String(image.uploadedBy) !== String(userId)) {
+    return { error: { status: 404, message: 'Image not found' } };
+  }
+  if (image.assignedToWine) {
+    return {
+      error: {
+        status: 409,
+        code: 'assigned_to_wine',
+        message: 'This photo is being used as the wine\'s picture in the shared registry, so removing it would change the wine page for everyone. Report it instead and an admin will take it down.',
+      },
+    };
+  }
+
+  await Bottle.updateMany({ defaultImage: image._id }, { $set: { defaultImage: null } });
+  if (image.wineDefinition) {
+    const WineDefinition = require('../models/WineDefinition');
+    await WineDefinition.updateOne(
+      { _id: image.wineDefinition, scanImage: image._id }, { $set: { scanImage: null } }
+    );
+    await WineDefinition.updateOne(
+      { _id: image.wineDefinition, scanImageBack: image._id }, { $set: { scanImageBack: null } }
+    );
+  }
+
+  const { unlinkImageFiles } = require('./imageProcessor');
+  try { await unlinkImageFiles(image); } catch (err) {
+    // The row is what makes the photo reachable; a stranded file is a
+    // janitorial problem, not a reason to tell the user it is still there.
+    console.warn('[images] unlink failed during user delete (continuing):', err.message);
+  }
+  await BottleImage.deleteOne({ _id: image._id });
+
+  logAudit(req, 'image.delete', { type: 'image', id: image._id },
+    { kind: image.kind, visibility: image.visibility, status: image.status, byOwner: true });
+  return { image };
+}
+
+module.exports = {
+  ingestBottleImage, attachOfficialWineImage, persistLabelScan, decodeInlineImage, MAX_IMAGES_PER_BOTTLE,
+  setBottleDefaultImage, deleteOwnImage,
+};

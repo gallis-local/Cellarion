@@ -130,6 +130,9 @@ function classifyMaturity(bottle, profileMap) {
   if (peakUntil && currentYear <= peakUntil) return 'peak';
   if (lateFrom && currentYear < lateFrom) return 'peak';
   if (lateUntil && currentYear <= lateUntil) return 'late';
+  // A late phase with no end stays late once it has begun (release audit
+  // 2026-10-13: it fell through to 'peak'). Mirrors frontend drinkStatus.
+  if (lateFrom && !lateUntil && currentYear >= lateFrom) return 'late';
   if ((lateUntil && currentYear > lateUntil) ||
       (peakUntil && currentYear > peakUntil && !lateFrom)) return 'declining';
   if (peakFrom && currentYear >= peakFrom) return 'peak';
@@ -178,6 +181,85 @@ function resolveEffectiveWindow(bottle, profileMap) {
     peakFrom,
     peakUntil,
   };
+}
+
+// "Maturity (Drink Soon→Later)": the stage first — declining, late, peak,
+// early, not ready, then bottles without data — and inside a stage the year
+// that stage ends, so a peak ending this year comes before a peak running
+// another decade (support ticket 2026-10-19: the stage alone left a long peak
+// above one ending now). Then the end of the whole window.
+const MATURITY_SORT_RANK = { declining: 0, late: 1, peak: 2, early: 3, 'not-ready': 4 };
+const NO_MATURITY_SORT_RANK = 5;
+const STAGE_ENDS = {
+  'not-ready': (w) => w.drinkFrom ?? w.peakFrom, // becomes drinkable
+  early: (w) => w.peakFrom ?? w.drinkTo,         // its peak begins
+  peak: (w) => w.peakUntil ?? w.drinkTo,         // its peak ends
+  late: (w) => w.drinkTo,                        // its window closes
+  declining: (w) => w.drinkTo ?? w.peakUntil,    // its window closed
+};
+
+/**
+ * The sort key of one bottle: { rank, due, end }. `due` is the year its
+ * current stage ends and `end` the year its window ends, null when unknown.
+ * `window` is resolveEffectiveWindow's answer for the bottle.
+ */
+function maturitySortKey(status, window) {
+  const rank = MATURITY_SORT_RANK[status] ?? NO_MATURITY_SORT_RANK;
+  const w = window || {};
+  const due = STAGE_ENDS[status] ? STAGE_ENDS[status](w) : null;
+  return { rank, due: Number.isFinite(due) ? due : null, end: Number.isFinite(w.drinkTo) ? w.drinkTo : null };
+}
+
+/**
+ * The sort key of a bottle whose status comes from a curated profile. The
+ * profile has boundaries the effective window folds away, and classifyMaturity
+ * uses them: a late stage with no end (lateFrom alone), a peak that runs on
+ * until lateFrom, an early stage that ends at earlyUntil. `w` is the profile
+ * resolved for the bottle (resolveWindowForBottle).
+ */
+function curatedSortKey(status, w) {
+  const n = (v) => (Number.isFinite(v) ? v : null);
+  const earlyFrom = n(w.earlyFrom), earlyUntil = n(w.earlyUntil), peakFrom = n(w.peakFrom);
+  const peakUntil = n(w.peakUntil), lateFrom = n(w.lateFrom), lateUntil = n(w.lateUntil);
+  let peakEnd = peakUntil;
+  if (lateFrom !== null && (peakEnd === null || lateFrom - 1 > peakEnd)) peakEnd = lateFrom - 1;
+  const due = {
+    'not-ready': earlyFrom ?? peakFrom,
+    early: peakFrom ?? earlyUntil,
+    peak: peakEnd ?? lateUntil,
+    late: lateUntil,
+    declining: lateUntil ?? peakUntil,
+  }[status] ?? null;
+  return {
+    rank: MATURITY_SORT_RANK[status] ?? NO_MATURITY_SORT_RANK,
+    due,
+    end: lateUntil ?? (lateFrom !== null ? null : peakUntil),
+  };
+}
+
+/** Bottle id → sort key; `statusMap` (id → classifyMaturity) saves classifying twice. */
+function buildMaturitySortKeys(bottles, profileMap, statusMap = null) {
+  const keys = new Map();
+  for (const b of bottles) {
+    const id = b._id.toString();
+    const status = statusMap ? statusMap.get(id) : classifyMaturity(b, profileMap);
+    const window = status ? resolveEffectiveWindow(b, profileMap) : null;
+    if (window?.source === 'profile') {
+      const wdId = b.wineDefinition?._id?.toString() || b.wineDefinition?.toString();
+      keys.set(id, curatedSortKey(status, resolveWindowForBottle(profileMap.get(`${wdId}:${b.vintage}`), b)));
+    } else {
+      keys.set(id, maturitySortKey(status, window));
+    }
+  }
+  return keys;
+}
+
+// An unknown year sorts after every known one in the same stage.
+const compareYears = (x, y) => (x === y ? 0 : x == null ? 1 : y == null ? -1 : x - y);
+
+/** Ascending comparator over two maturitySortKey results ("drink soon" first). */
+function compareMaturitySortKeys(a, b) {
+  return a.rank - b.rank || compareYears(a.due, b.due) || compareYears(a.end, b.end);
 }
 
 /** Build and return a WineVintageProfile lookup map for a set of active bottles. */
@@ -247,15 +329,15 @@ function maturityLabel(status, profile, bottle = null) {
     // the shared profile's late-phase end (support ticket 2026-09-10).
     switch (status) {
       case 'not-ready':
-        return `Not ready yet — drinking from ${from ?? '?'}`;
+        return `Not ready — drinking from ${from ?? '?'}`;
       case 'early':
-        return peakFrom ? `Early drinking — peak from ${peakFrom}` : 'Early drinking window';
+        return peakFrom ? `Early — peak from ${peakFrom}` : 'Early — in its drinking window';
       case 'peak':
-        return to ? `At peak — drink now through ${to}` : 'At peak maturity — drink now';
+        return to ? `Peak — drink now through ${to}` : 'Peak — drink now';
       case 'late':
-        return to ? `Late maturity — drink soon, until ${to}` : 'Late maturity — drink soon';
+        return to ? `Late — drink soon, until ${to}` : 'Late — drink soon';
       case 'declining':
-        return 'Past peak — declining, drink immediately if at all';
+        return 'Declining — past its peak, drink now if at all';
       default:
         return null;
     }
@@ -268,21 +350,21 @@ function maturityLabel(status, profile, bottle = null) {
 
   switch (status) {
     case 'not-ready':
-      return `Not ready yet — drinking from ${w.earlyFrom || w.peakFrom || '?'}`;
+      return `Not ready — drinking from ${w.earlyFrom || w.peakFrom || '?'}`;
     case 'early':
       return w.peakFrom
-        ? `Early drinking — peak from ${w.peakFrom}`
-        : 'Early drinking window';
+        ? `Early — peak from ${w.peakFrom}`
+        : 'Early — in its drinking window';
     case 'peak':
       return w.peakUntil
-        ? `At peak — drink now through ${w.peakUntil}`
-        : 'At peak maturity — drink now';
+        ? `Peak — drink now through ${w.peakUntil}`
+        : 'Peak — drink now';
     case 'late':
       return w.lateUntil
-        ? `Late maturity — drink soon, until ${w.lateUntil}`
-        : 'Late maturity — drink soon';
+        ? `Late — drink soon, until ${w.lateUntil}`
+        : 'Late — drink soon';
     case 'declining':
-      return 'Past peak — declining, drink immediately if at all';
+      return 'Declining — past its peak, drink now if at all';
     default:
       return null;
   }
@@ -320,4 +402,5 @@ module.exports = {
   classifyMaturity, classifyPersonalWindow, buildProfileMap, maturityLabel,
   bottleAnchorYear, resolveWindow, resolveWindowForBottle, resolveEffectiveWindow,
   MATURITY_FILTER_VALUES, parseMaturityFilter, matchesMaturityFilter,
+  maturitySortKey, buildMaturitySortKeys, compareMaturitySortKeys,
 };

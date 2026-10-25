@@ -4,10 +4,12 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { getRecommendations, getSentRecommendations, updateRecommendationStatus, deleteRecommendation } from '../api/recommendations';
 import { addToWishlist } from '../api/wishlist';
+import { friendlyError, httpError, responseError } from '../utils/friendlyError';
 import './Recommendations.css';
 
 import WineImage from '../components/WineImage';
 import ConfirmModal from '../components/ConfirmModal';
+import LoadError from '../components/LoadError';
 import timeAgo from '../utils/timeAgo';
 
 const PAGE_SIZE = 50; // backend caps recommendation pages at 50
@@ -19,6 +21,8 @@ export default function Recommendations() {
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
+  // The list could not be loaded: shown instead of the empty-tab message.
+  const [loadFailed, setLoadFailed] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [message, setMessage] = useState(null); // { type: 'info' | 'error', text }
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
@@ -33,7 +37,7 @@ export default function Recommendations() {
 
   const fetchItems = async (loadMore = false) => {
     const seq = ++fetchSeq.current;
-    if (loadMore) setLoadingMore(true); else setLoading(true);
+    if (loadMore) setLoadingMore(true); else { setLoading(true); setLoadFailed(false); }
     try {
       const fetcher = tab === 'received' ? getRecommendations : getSentRecommendations;
       // Request pages explicitly — without a limit the backend serves its
@@ -46,8 +50,12 @@ export default function Recommendations() {
         const data = await res.json();
         setItems(prev => loadMore ? [...prev, ...(data.items || [])] : (data.items || []));
         setTotal(data.total || 0);
+      } else if (!res.ok && !loadMore && seq === fetchSeq.current) {
+        setLoadFailed(true);
       }
-    } catch { /* ignore */ }
+    } catch {
+      if (!loadMore && seq === fetchSeq.current) setLoadFailed(true);
+    }
     if (seq === fetchSeq.current) {
       setLoading(false);
       setLoadingMore(false);
@@ -55,20 +63,25 @@ export default function Recommendations() {
   };
 
   const handleMarkSeen = async (id) => {
-    const res = await updateRecommendationStatus(apiFetch, id, 'seen');
-    if (res.ok) {
-      setItems((prev) => prev.map((r) => r._id === id ? { ...r, status: 'seen' } : r));
+    try {
+      const res = await updateRecommendationStatus(apiFetch, id, 'seen');
+      if (res.ok) {
+        setItems((prev) => prev.map((r) => r._id === id ? { ...r, status: 'seen' } : r));
+      } else {
+        setMessage({ type: 'error', text: await responseError(res, t) });
+      }
+    } catch (err) {
+      setMessage({ type: 'error', text: friendlyError(err, t) });
     }
   };
 
+  // A refused or failed delete throws, so the confirm dialog stays open and
+  // says why — it used to close as if the recommendation had gone.
   const handleDelete = async (id) => {
-    try {
-      const res = await deleteRecommendation(apiFetch, id);
-      if (res.ok) {
-        setItems(prev => prev.filter(r => r._id !== id));
-        setTotal(prev => prev - 1);
-      }
-    } catch { /* ignore */ }
+    const res = await deleteRecommendation(apiFetch, id);
+    if (!res.ok) throw httpError(res, await res.json().catch(() => null));
+    setItems(prev => prev.filter(r => r._id !== id));
+    setTotal(prev => prev - 1);
     setConfirmDeleteId(null);
   };
 
@@ -115,6 +128,8 @@ export default function Recommendations() {
 
       {loading ? (
         <p className="rec-loading">{t('recommendations.loading')}</p>
+      ) : loadFailed && items.length === 0 ? (
+        <LoadError onRetry={() => fetchItems()} />
       ) : items.length === 0 ? (
         <div className="rec-empty">
           <p>

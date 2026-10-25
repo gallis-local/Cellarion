@@ -1,6 +1,25 @@
 const { getOrCreateDailySnapshot, convertCurrency } = require('../utils/exchangeRates');
-const { toNormalized } = require('../utils/ratingUtils');
+const { toNormalized, bottleRating, RATING_BANDS, emptyBands, ratingBand } = require('../utils/ratingUtils');
 const { classifyMaturity, classifyPersonalWindow, buildProfileMap, resolveWindowForBottle } = require('../utils/maturityUtils');
+
+const avgOf = (sum, count) => (count > 0 ? Math.round((sum / count) * 10) / 10 : null);
+
+/**
+ * The rating distribution three ways (support ticket 2026-10-11: someone who
+ * rates only when drinking saw an empty "Rating distribution"): the bottles
+ * in the cellar, the history — bottles drunk, gifted or sold, each with the
+ * rating given when drinking, else the one on the bottle
+ * (utils/ratingUtils.bottleRating) — and all of them, each bottle once.
+ */
+function ratingViews(cellar, history) {
+  const all = emptyBands();
+  for (const k of RATING_BANDS) all[k] = cellar.byRating[k] + history.byRating[k];
+  return {
+    all: { byRating: all, avg: avgOf(cellar.sum + history.sum, cellar.count + history.count), count: cellar.count + history.count },
+    cellar: { byRating: cellar.byRating, avg: avgOf(cellar.sum, cellar.count), count: cellar.count },
+    history: { byRating: history.byRating, avg: avgOf(history.sum, history.count), count: history.count },
+  };
+}
 
 // ── Main export ───────────────────────────────────────────────────────────────
 
@@ -45,7 +64,7 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
   const byRegion      = {};
   const byGrape       = {};
   const byVintage     = {};
-  const byRating      = { '0-20': 0, '21-40': 0, '41-60': 0, '61-80': 0, '81-100': 0 };
+  const byRating      = emptyBands();
   const byBottleSize  = {};
   const byPurchaseYear = {};
   const byProducer    = {};
@@ -70,11 +89,10 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
       if (v != null) { totalValue += v; priceCount++; }
     }
 
-    if (b.rating) {
-      const normRating = toNormalized(b.rating, b.ratingScale || '5');
-      ratingSum += normRating; ratingCount++;
-      const band = normRating <= 20 ? '0-20' : normRating <= 40 ? '21-40' : normRating <= 60 ? '41-60' : normRating <= 80 ? '61-80' : '81-100';
-      byRating[band] = (byRating[band] || 0) + 1;
+    const ownRating = bottleRating(b);
+    if (ownRating != null) {
+      ratingSum += ownRating; ratingCount++;
+      byRating[ratingBand(ownRating)]++;
     }
 
     const type = wd?.type || 'unknown';
@@ -224,6 +242,8 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
   const consumedByGrape     = {};
   const consumedByProducer  = {};
   let cRatingSum = 0, cRatingCount = 0;
+  // Every history bottle's own rating (drunk, gifted, sold), for the distribution.
+  const historyRatings = { byRating: emptyBands(), sum: 0, count: 0 };
   const outputByYear = {};
 
   const HOLD_BUCKETS = ['<1yr', '1–2yr', '2–5yr', '5–10yr', '10+yr'];
@@ -258,6 +278,11 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
     if (b.consumedRating) {
       const normCR = toNormalized(b.consumedRating, b.consumedRatingScale || '5');
       cRatingSum += normCR; cRatingCount++;
+    }
+    const own = bottleRating(b);
+    if (own != null) {
+      historyRatings.byRating[ratingBand(own)]++;
+      historyRatings.sum += own; historyRatings.count++;
     }
 
     const anchor = b.purchaseDate || b.createdAt;
@@ -383,6 +408,7 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
       ...(byVintage['NV'] ? [{ year: 'NV', count: byVintage['NV'] }] : []),
     ],
     byRating,
+    ratingViews: ratingViews({ byRating, sum: ratingSum, count: ratingCount }, historyRatings),
     byBottleSize,
     byPurchaseYear: Object.entries(byPurchaseYear).sort((a, b) => parseInt(a[0], 10) - parseInt(b[0], 10)).map(([year, count]) => ({ year, count })),
     maturity,
@@ -413,18 +439,19 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
   };
 }
 
-function buildEmptyStats(currency) {
+function buildEmptyStats(currency, targetRatingScale) {
   return {
     overview: {
       totalBottles: 0, totalConsumed: 0, uniqueWines: 0, totalCellars: 0,
       totalCountries: 0, totalGrapes: 0, totalValue: 0, currency,
-      avgPrice: 0, avgRating: null, avgConsumedRating: null,
+      avgPrice: 0, avgRating: null, avgConsumedRating: null, targetRatingScale,
       oldestVintage: null, newestVintage: null, avgVintageAge: null,
       bottlesDrunk: 0, bottlesGifted: 0, bottlesSold: 0,
       healthScore: null, healthGrade: null, regretIndex: 0,
     },
     byType: {}, byCountry: [], byRegion: [], byGrape: [],
-    byVintage: [], byRating: { '0-20': 0, '21-40': 0, '41-60': 0, '61-80': 0, '81-100': 0 },
+    byVintage: [], byRating: emptyBands(),
+    ratingViews: ratingViews({ byRating: emptyBands(), sum: 0, count: 0 }, { byRating: emptyBands(), sum: 0, count: 0 }),
     byBottleSize: {}, byPurchaseYear: [],
     maturity:   { declining: 0, late: 0, peak: 0, early: 0, notReady: 0, noProfile: 0 },
     maturityCoverage: { sommSet: 0, none: 0 },

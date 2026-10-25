@@ -17,17 +17,21 @@ const { getSnapshotsForDates, getOrCreateDailySnapshot, convertCurrency } = requ
 const { createNotification } = require('../services/notifications');
 const { transferCellarOwnership } = require('../services/cellarTransfer');
 const { sendCellarInviteEmail } = require('../services/mailgun');
-const { toNormalized } = require('../utils/ratingUtils');
-const { classifyMaturity, buildProfileMap, parseMaturityFilter, matchesMaturityFilter } = require('../utils/maturityUtils');
+const { toNormalized, ratingBand, filterByRating } = require('../utils/ratingUtils');
+const {
+  classifyMaturity, buildProfileMap, parseMaturityFilter, matchesMaturityFilter,
+  buildMaturitySortKeys, compareMaturitySortKeys,
+} = require('../utils/maturityUtils');
 const { isReserved } = require('../utils/reservationUtils');
 const {
   normalizeTaxonomyQuery, parseExtraBottleFilters, applyExtraBottleFilters, groupIdenticalBottles,
 } = require('../utils/bottleListFilters');
-const { CONSUMED_STATUSES, WINE_POPULATE_LIST, WINE_POPULATE_CARDS } = require('../config/constants');
+const { CONSUMED_STATUSES, NOT_IN_CELLAR_STATUSES, ORDERED_STATUS, WINE_POPULATE_LIST, WINE_POPULATE_CARDS } = require('../config/constants');
 const mongoose = require('mongoose');
 const { parsePagination } = require('../utils/pagination');
 const bottleSearch = require('../services/bottleSearch');
-const { getDataVersion } = require('../services/dataVersion');
+const { getDataVersion, bumpDataVersion } = require('../services/dataVersion');
+const { createTokenReadCache } = require('../services/tokenReadCache');
 
 // The data version of a search scope's owners (services/dataVersion): the
 // search keeps the scope's documents while it holds (services/bottleSearch),
@@ -37,6 +41,8 @@ const scopeVersion = (ownerIds) => [...new Set(ownerIds.map((id) => String(id &&
   .map((id) => `${id}:${getDataVersion(id)}`)
   .join(',');
 const { isValidId, coerceStringQuery } = require('../utils/validation');
+const { photoVintage, vintageKey } = require('../utils/imageVintage');
+const { findVintageOfficials } = require('../services/vintageImages');
 
 const router = express.Router();
 
@@ -44,6 +50,23 @@ const router = express.Router();
 function getUserColor(cellar, userId) {
   const entry = cellar.userColors?.find(uc => uc.user.toString() === userId.toString());
   return entry?.color || null;
+}
+
+// Machine polling (usage check 2026-10-09): the Home Assistant integration
+// asks for the cellar list every few minutes per install, about 2,200 reads a
+// day from some thirty installs, and it runs on about one active user in
+// four. API-token requests are answered from memory while the user's data
+// version (services/dataVersion) is unchanged — every audited cellar.* change
+// moves the actor's and the owner's, and the membership routes move the
+// member's, whose list changes without them acting. Browser reads are never
+// cached.
+const tokenListCache = createTokenReadCache();
+
+// The people whose cellar list changes when this cellar changes hands, name
+// or existence without them acting: its members. The actor and the owner are
+// moved by the audit entry; these are the others.
+function bumpMembers(cellar) {
+  for (const m of cellar?.members || []) bumpDataVersion(m.user);
 }
 
 // Group key parts default like the JS grouping path: missing/empty vintage →
@@ -55,6 +78,23 @@ function groupPartExpr(field, fallback) {
       in: { $cond: [{ $eq: ['$$v', ''] }, fallback, '$$v'] },
     },
   };
+}
+
+// Sort by quantity (forum request 2026-10-15): the grouped list's cards by
+// how many identical bottles each holds — sortDir -1 most first; cards holding
+// as many stay A to Z. Lists that are not grouped keep name order.
+const QUANTITY_SORT = 'quantity';
+// A bottle's wine name for sorting, case-insensitive: the registry wine's, a
+// pending request's, or — with neither — after every named wine.
+const wineSortName = (b) => (b.wineDefinition?.name || b.pendingWineRequest?.wineName || '\uffff').toLowerCase();
+const byWineName = (a, b) => {
+  const av = wineSortName(a);
+  const bv = wineSortName(b);
+  return av < bv ? -1 : av > bv ? 1 : 0;
+};
+// Stable: groups holding as many keep the order their bottles came in.
+function sortGroupsByQuantity(groups, sortDir) {
+  return groups.sort((a, b) => sortDir * (a.bottles.length - b.bottles.length));
 }
 
 /**
@@ -71,7 +111,7 @@ async function loadGroupedBottlePage({ cellarId, excludeSet, onlyIds = null, sor
   const { ObjectId } = mongoose.Types;
   const match = {
     cellar: new ObjectId(String(cellarId)),
-    status: { $nin: CONSUMED_STATUSES },
+    status: { $nin: NOT_IN_CELLAR_STATUSES },
   };
   if (excludeSet.size > 0) {
     match._id = { $nin: [...excludeSet].map(id => new ObjectId(id)) };
@@ -85,7 +125,29 @@ async function loadGroupedBottlePage({ cellarId, excludeSet, onlyIds = null, sor
     size: groupPartExpr('bottleSize', '750ml'),
   };
 
-  const [pageGroups, countResult] = await Promise.all([
+  let pageGroups;
+  let countResult;
+  if (sortField === QUANTITY_SORT) {
+    // Every group's size (ids only — nothing populated), the wines' names
+    // once for the ties, then only the page's members are loaded below.
+    const all = await Bottle.aggregate([
+      { $match: match },
+      { $sort: { createdAt: -1 } },
+      { $group: { _id: groupId, n: { $sum: 1 }, wineRef: { $first: '$wineDefinition' }, memberIds: { $push: '$_id' } } },
+    ]).allowDiskUse(true);
+    const wineIds = [...new Set(all.map((g) => g.wineRef).filter(Boolean).map(String))];
+    const names = new Map((wineIds.length
+      ? await WineDefinition.find({ _id: { $in: wineIds } }).select('name').lean()
+      : []).map((w) => [String(w._id), (w.name || '').toLowerCase()]));
+    const nameOf = (g) => (g.wineRef && names.get(String(g.wineRef))) || '\uffff';
+    all.sort((a, b) => sortDir * (a.n - b.n)
+      || (nameOf(a) < nameOf(b) ? -1 : nameOf(a) > nameOf(b) ? 1 : 0)
+      || (String(a._id.wine) < String(b._id.wine) ? -1 : String(a._id.wine) > String(b._id.wine) ? 1 : 0)
+      || (String(a._id.vintage) < String(b._id.vintage) ? -1 : String(a._id.vintage) > String(b._id.vintage) ? 1 : 0)
+      || (String(a._id.size) < String(b._id.size) ? -1 : String(a._id.size) > String(b._id.size) ? 1 : 0));
+    pageGroups = all.slice(skip, skip + limit);
+    countResult = [{ total: all.length, bottles: all.reduce((sum, g) => sum + g.n, 0) }];
+  } else [pageGroups, countResult] = await Promise.all([
     Bottle.aggregate([
       { $match: match },
       { $sort: { [sortField]: sortDir } },
@@ -111,8 +173,8 @@ async function loadGroupedBottlePage({ cellarId, excludeSet, onlyIds = null, sor
     ]).allowDiskUse(true),
     Bottle.aggregate([
       { $match: match },
-      { $group: { _id: groupId } },
-      { $count: 'total' },
+      { $group: { _id: groupId, n: { $sum: 1 } } },
+      { $group: { _id: null, total: { $sum: 1 }, bottles: { $sum: '$n' } } },
     ]).allowDiskUse(true),
   ]);
 
@@ -141,6 +203,7 @@ async function loadGroupedBottlePage({ cellarId, excludeSet, onlyIds = null, sor
     groupsForPage,
     bottles: groupsForPage.flatMap(g => g.bottles),
     totalCount: countResult[0]?.total || 0,
+    bottleTotal: countResult[0]?.bottles || 0,
   };
 }
 
@@ -252,8 +315,6 @@ async function resolveAccessibleCellars(userId) {
   }).lean();
 }
 
-const MATURITY_RANK_MULTI = { declining: 0, late: 1, peak: 2, early: 3, 'not-ready': 4 };
-
 // `history` (historyPaging's answer) pages a history instead of `paginate`.
 async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginate = true, history = null, version }) {
   // Coerce every query param to a string up front: Express turns repeated
@@ -268,6 +329,7 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
   const appellation = coerceStringQuery(req.query.appellation);
   const minRating = coerceStringQuery(req.query.minRating);
   const maxRating = coerceStringQuery(req.query.maxRating);
+  const ratingBandParam = coerceStringQuery(req.query.ratingBand);
   // null when absent; a Set of statuses otherwise (multi-select, OR-combined).
   const maturityFilter = parseMaturityFilter(coerceStringQuery(req.query.maturity));
   const sort = coerceStringQuery(req.query.sort) || '-createdAt';
@@ -284,7 +346,7 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
   const needsMaturity = statusFilter !== 'consumed' && !!(maturityFilter || sortField === 'maturity');
   const statusMongo = statusFilter === 'consumed'
     ? { $in: CONSUMED_STATUSES }
-    : { $nin: CONSUMED_STATUSES };
+    : { $nin: NOT_IN_CELLAR_STATUSES };
   const objectIds = cellarIds.map(id => new mongoose.Types.ObjectId(id));
 
   // ── HOT PATH: default view (no search/filters, DB-sortable) ──
@@ -293,7 +355,7 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
   // trivially correct here since the cross-cellar view never groups.
   const canPaginateInDb = paginate
     && !hasSearchFilters
-    && !minRating && !maxRating && !maturityFilter && !extraFilters
+    && !minRating && !maxRating && !ratingBandParam && !maturityFilter && !extraFilters
     && ['createdAt', 'vintage', 'price', 'rating'].includes(sortField);
   if (canPaginateInDb) {
     const filter = { cellar: { $in: objectIds }, status: statusMongo };
@@ -326,8 +388,8 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
     // The search has ranked and sorted every hit. With nothing left to filter
     // or re-sort in memory, load only the page instead of every hit.
     const pageOnly = paginate && statusFilter !== 'consumed'
-      && !minRating && !maxRating && !maturityFilter && !extraFilters
-      && sortField !== 'name' && sortField !== 'maturity';
+      && !minRating && !maxRating && !ratingBandParam && !maturityFilter && !extraFilters
+      && sortField !== 'name' && sortField !== 'maturity' && sortField !== QUANTITY_SORT;
     if (pageOnly) {
       const items = await loadBottlesInOrder(found.ids.slice(skip, skip + limit));
       return { items, total: found.ids.length, limit, skip, maturityStatusMap: null, found };
@@ -338,7 +400,7 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
   // and reason (four fields), then only the page in full. The rating and
   // chart filters (not offered on the history page) read whole bottles, so
   // they take the path below.
-  if (history && !minRating && !maxRating && !extraFilters) {
+  if (history && !minRating && !maxRating && !ratingBandParam && !extraFilters) {
     const page = await pageHistory(found
       ? { _id: { $in: found.ids } }
       : { cellar: { $in: objectIds }, status: statusMongo }, history);
@@ -360,19 +422,16 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
 
   // ── Shared post-filters (extra + rating + maturity), applied to both paths ──
   bottles = applyExtraBottleFilters(bottles, extraFilters);
-  if (minRating) {
-    const min = parseFloat(minRating);
-    bottles = bottles.filter(b => b.rating && toNormalized(b.rating, b.ratingScale || '5') >= min);
-  }
-  if (maxRating) {
-    const max = parseFloat(maxRating);
-    bottles = bottles.filter(b => b.rating && toNormalized(b.rating, b.ratingScale || '5') <= max);
-  }
+  // A drunk bottle counts with the rating given when drinking (the history
+  // list), and a band is exactly the statistics' band (utils/ratingUtils).
+  bottles = filterByRating(bottles, { minRating, maxRating, ratingBand: ratingBandParam });
   let maturityStatusMap;
+  let maturitySortKeys;
   if (needsMaturity) {
     const profileMap = await buildProfileMap(bottles);
     maturityStatusMap = new Map();
     for (const b of bottles) maturityStatusMap.set(b._id.toString(), classifyMaturity(b, profileMap));
+    if (sortField === 'maturity') maturitySortKeys = buildMaturitySortKeys(bottles, profileMap, maturityStatusMap);
   }
   if (maturityFilter && maturityStatusMap) {
     bottles = bottles.filter(b => matchesMaturityFilter(maturityStatusMap.get(b._id.toString()), maturityFilter));
@@ -383,17 +442,12 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
     // History is a chronological view — newest-consumed first, always.
     bottles.sort(historyOrder);
   } else if (sortField === 'name') {
-    bottles.sort((a, b) => {
-      const av = (a.wineDefinition?.name || '').toLowerCase();
-      const bv = (b.wineDefinition?.name || '').toLowerCase();
-      return av < bv ? -sortDir : av > bv ? sortDir : 0;
-    });
-  } else if (sortField === 'maturity' && maturityStatusMap) {
-    bottles.sort((a, b) => {
-      const av = maturityStatusMap.get(a._id.toString());
-      const bv = maturityStatusMap.get(b._id.toString());
-      return ((av != null ? MATURITY_RANK_MULTI[av] : 5) - (bv != null ? MATURITY_RANK_MULTI[bv] : 5)) * sortDir;
-    });
+    bottles.sort((a, b) => sortDir * byWineName(a, b));
+  } else if (sortField === QUANTITY_SORT) {
+    bottles.sort(byWineName);
+  } else if (sortField === 'maturity' && maturitySortKeys) {
+    bottles.sort((a, b) => sortDir * compareMaturitySortKeys(
+      maturitySortKeys.get(a._id.toString()), maturitySortKeys.get(b._id.toString())));
   } else if (!found) {
     // The search ranked its hits (relevance, then the sort); a list sorts here.
     bottles.sort((a, b) => {
@@ -410,7 +464,7 @@ async function queryBottlesAcrossCellars(req, { cellarIds, statusFilter, paginat
   let remaining;
   if (history) ({ page: items, remaining } = sliceHistory(bottles, history));
   // `found` carries the search's facet counts, so the caller needs no second pass.
-  return { items, total, limit, skip, maturityStatusMap, found, reasonCounts, remaining };
+  return { items, total, limit, skip, maturityStatusMap, found, reasonCounts, remaining, sortField, sortDir };
 }
 
 // Attach the same per-bottle image fields the single-cellar /:id route adds, so
@@ -437,11 +491,22 @@ async function attachBottleImageUrls(bottles, userId) {
   // not), so the by-wine arm never sees it — the photo's bottle is the only
   // way to learn its wine.
   const wineOfBottle = {};
-  for (const b of bottles) { const w = wineIdOf(b); if (w) wineOfBottle[b._id.toString()] = w.toString(); }
+  // …and each bottle's vintage, so a photo pinned to a sibling counts as a
+  // photo of THAT bottle's vintage even before the row carries its own tag
+  // (rows written before BottleImage.vintage existed, until the boot backfill).
+  const vintageOfBottle = {};
+  for (const b of bottles) {
+    const w = wineIdOf(b);
+    if (w) wineOfBottle[b._id.toString()] = w.toString();
+    vintageOfBottle[b._id.toString()] = photoVintage(b.vintage);
+  }
   if (wineIds.length) {
     try {
-      const siblings = await Bottle.find({ user: userId, wineDefinition: { $in: wineIds } }).select('_id wineDefinition').lean();
-      for (const s of siblings) if (s.wineDefinition) wineOfBottle[s._id.toString()] = s.wineDefinition.toString();
+      const siblings = await Bottle.find({ user: userId, wineDefinition: { $in: wineIds } }).select('_id wineDefinition vintage').lean();
+      for (const s of siblings) {
+        if (s.wineDefinition) wineOfBottle[s._id.toString()] = s.wineDefinition.toString();
+        vintageOfBottle[s._id.toString()] = photoVintage(s.vintage);
+      }
     } catch (err) {
       // A photo nicety must never take the cellar list down.
       console.error('Sibling photo lookup failed:', err.message);
@@ -472,10 +537,22 @@ async function attachBottleImageUrls(bottles, userId) {
     kind: { $ne: 'label-scan' },
   }).sort({ createdAt: -1 }).lean();
 
-  // Two maps, consulted bottle-first: a photo pinned to this exact bottle must
-  // always beat one that merely matches the wine, or choosing a per-bottle
-  // photo would appear to do nothing.
+  // Which picture a card shows (support ticket 2026-10-09; Johan: "a new
+  // vintage without an image should display the wine's image … so we always
+  // show an image"). In order:
+  //   1. the bottle's starred photo (defaultImageUrl, below)
+  //   2. the viewer's own photo of THIS bottle — choosing a per-bottle photo
+  //      must never appear to do nothing
+  //   3. the viewer's own photo of the same vintage (a sibling bottle's)
+  //   4. the vintage's official photo (vintageImageUrl)
+  //   5. the wine's registry image (wineDefinition.image, on the client)
+  //   6. the viewer's own photo of another vintage (otherVintageImageUrl) —
+  //      only reached when the wine has no registry image, so a card with any
+  //      photo of the wine is never blank
+  // 2–3 go out as pendingImageUrl, as before. A photo of the 2015 label no
+  // longer stands in for the 2016 bottles while the wine has an image.
   const pendingByBottle = {};
+  const pendingByWineVintage = {};
   const pendingByWine = {};
   for (const img of pendingImages) {
     const url = img.processedUrl || img.originalUrl;
@@ -483,11 +560,28 @@ async function attachBottleImageUrls(bottles, userId) {
     if (img.bottle && !pendingByBottle[img.bottle.toString()]) {
       pendingByBottle[img.bottle.toString()] = url;
     }
-    // The wine the photo belongs to: its own reference, else its bottle's.
+    // The wine the photo belongs to: its own reference, else its bottle's;
+    // its vintage: its own tag, else its bottle's.
     const imgWine = (img.wineDefinition && img.wineDefinition.toString()) || (img.bottle && wineOfBottle[img.bottle.toString()]) || null;
+    const imgVintage = photoVintage(img.vintage) || (img.bottle ? vintageOfBottle[img.bottle.toString()] : null) || null;
+    if (imgWine && imgVintage && !pendingByWineVintage[vintageKey(imgWine, imgVintage)]) {
+      pendingByWineVintage[vintageKey(imgWine, imgVintage)] = url;
+    }
     if (imgWine && !pendingByWine[imgWine]) {
       pendingByWine[imgWine] = url;
     }
+  }
+
+  // The vintage official of each (wine, vintage) on this page: the photo of
+  // that vintage an admin approved first (or chose), by anyone, with its
+  // credit. One query for the page.
+  let officials = new Map();
+  const vintagesWanted = [...new Set(bottles.map(b => photoVintage(b.vintage)).filter(Boolean))];
+  try {
+    officials = await findVintageOfficials(wineIds, vintagesWanted);
+  } catch (err) {
+    // A photo nicety must never take the cellar list down.
+    console.error('Vintage photo lookup failed:', err.message);
   }
 
   const defaultImageIds = bottles.filter(b => b.defaultImage).map(b => b.defaultImage);
@@ -501,13 +595,17 @@ async function attachBottleImageUrls(bottles, userId) {
 
   return bottles.map(b => {
     const wineId = wineIdOf(b);
+    const vintage = photoVintage(b.vintage);
+    const vkey = wineId && vintage ? vintageKey(wineId.toString(), vintage) : null;
+    const official = vkey ? officials.get(vkey) : null;
+    const own = pendingByBottle[b._id.toString()] || (vkey ? pendingByWineVintage[vkey] : null) || null;
     return {
       ...b,
-      pendingImageUrl:
-        pendingByBottle[b._id.toString()]
-        || (wineId ? pendingByWine[wineId.toString()] : null)
-        || null,
+      pendingImageUrl: own,
       defaultImageUrl: b.defaultImage ? (defaultImageMap[b.defaultImage.toString()] || null) : null,
+      vintageImageUrl: official ? official.url : null,
+      vintageImageCredit: official ? official.credit : null,
+      otherVintageImageUrl: !own && wineId ? (pendingByWine[wineId.toString()] || null) : null,
     };
   });
 }
@@ -530,6 +628,14 @@ router.use(requireAuth);
 // GET /api/cellars - List user's cellars (owned + shared)
 router.get('/', async (req, res) => {
   try {
+    // Read the version BEFORE loading: a change landing during the load moves
+    // it on, so the entry stored below can never outlive that change.
+    const version = req.apiToken ? getDataVersion(req.user.id) : null;
+    if (req.apiToken) {
+      const hit = tokenListCache.get(req.user.id, 'list', version);
+      if (hit) return res.json(hit);
+    }
+
     const cellars = await Cellar.find({
       $or: [{ user: req.user.id }, { 'members.user': req.user.id }],
       deletedAt: null
@@ -543,7 +649,9 @@ router.get('/', async (req, res) => {
       return obj;
     });
 
-    res.json({ count: cellarsWithRole.length, cellars: cellarsWithRole });
+    const body = { count: cellarsWithRole.length, cellars: cellarsWithRole };
+    if (req.apiToken) tokenListCache.set(req.user.id, 'list', version, body);
+    res.json(body);
   } catch (error) {
     console.error('Get cellars error:', error);
     res.status(500).json({ error: 'Failed to get cellars' });
@@ -608,12 +716,17 @@ router.get('/multi/bottles', async (req, res) => {
       cellarIds, statusFilter: 'active', paginate: !grouped,
       version: scopeVersion(cellarIds.map(id => accessibleMap.get(id).user)),
     });
-    const { limit, skip, maturityStatusMap, found } = result;
+    const { limit, skip, maturityStatusMap, found, sortField, sortDir } = result;
     let { total } = result;
     let items = result.items;
     let groupsForPage = null;
+    // Grouped, `total` counts cards; the filter's "Show n bottles" needs the
+    // bottles behind them.
+    let bottleTotal = null;
     if (grouped) {
+      bottleTotal = items.length;
       const allGroups = groupIdenticalBottles(items, { byCellar: true });
+      if (sortField === QUANTITY_SORT) sortGroupsByQuantity(allGroups, sortDir);
       total = allGroups.length;
       groupsForPage = allGroups.slice(skip, skip + limit);
       items = groupsForPage.flatMap(g => g.bottles);
@@ -648,7 +761,7 @@ router.get('/multi/bottles', async (req, res) => {
         const c = accessibleMap.get(id);
         return { _id: id, name: c.name, userColor: getUserColor(c, req.user.id) };
       }),
-      bottles: { count: items.length, total, limit, skip, grouped, items },
+      bottles: { count: items.length, total, limit, skip, grouped, items, ...(grouped ? { bottleTotal } : {}) },
       facets, baseFacets, facetMeta,
     });
   } catch (error) {
@@ -704,6 +817,65 @@ router.get('/multi/history', async (req, res) => {
 });
 
 // GET /api/cellars/:id/statistics - Get cellar statistics (active bottles only)
+// GET /api/cellars/:id/maturity-counts — how many bottles are at each stage,
+// for the counts on the filter's maturity buttons (#1291: they were never
+// sent, so the buttons showed none). The filter asks as it opens; this groups
+// only what the classification reads — not the cellar's other statistics. The
+// same classification the list's maturity filter uses, so a button's count is
+// what choosing it shows (without the other filters).
+router.get('/:id/maturity-counts', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
+    const cellar = await Cellar.findById(req.params.id);
+    const role = getCellarRole(cellar, req.user.id);
+    if (!role || cellar.deletedAt) {
+      return res.status(404).json({ error: 'Cellar not found' });
+    }
+    // One grouping query, like the statistics: bottles that share what the
+    // classification reads — wine, vintage, their own window, and the year
+    // an NV window counts from (bottleAnchorYear: bought, else added) — are
+    // classified once and weighed by their number.
+    const anchorDate = { $convert: { input: { $ifNull: ['$purchaseDate', '$createdAt'] }, to: 'date', onError: null, onNull: null } };
+    const groups = await Bottle.aggregate([
+      { $match: { cellar: cellar._id, status: { $nin: NOT_IN_CELLAR_STATUSES } } },
+      {
+        $group: {
+          _id: {
+            wineDefinition: '$wineDefinition',
+            vintage: '$vintage',
+            drinkFrom: '$drinkFrom',
+            drinkTo: '$drinkTo',
+            peakFrom: '$peakFrom',
+            peakUntil: '$peakUntil',
+            anchorYear: { $year: anchorDate },
+          },
+          count: { $sum: 1 },
+        },
+      },
+    ]).allowDiskUse(true);
+    const rows = groups.map((g) => ({
+      ...g._id,
+      // Mid-year, so the UTC year read back is the year grouped on.
+      purchaseDate: g._id.anchorYear != null ? new Date(Date.UTC(g._id.anchorYear, 6, 1)) : null,
+      count: g.count,
+    }));
+    const profileMap = await buildProfileMap(rows);
+    const maturity = { declining: 0, late: 0, peak: 0, early: 0, notReady: 0, noProfile: 0 };
+    let total = 0;
+    for (const b of rows) {
+      total += b.count;
+      const status = classifyMaturity(b, profileMap);
+      if (!status) maturity.noProfile += b.count;
+      else if (status === 'not-ready') maturity.notReady += b.count;
+      else if (Object.hasOwn(maturity, status)) maturity[status] += b.count;
+    }
+    res.json({ maturity, total });
+  } catch (error) {
+    console.error('Get maturity counts error:', error);
+    res.status(500).json({ error: 'Failed to get maturity counts' });
+  }
+});
+
 router.get('/:id/statistics', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
@@ -725,7 +897,7 @@ router.get('/:id/statistics', async (req, res) => {
     // so the maps list their keys in a stable order.
     const priced = { $ne: [{ $ifNull: ['$price', 0] }, 0] };
     const groups = await Bottle.aggregate([
-      { $match: { cellar: cellar._id, status: { $nin: CONSUMED_STATUSES } } },
+      { $match: { cellar: cellar._id, status: { $nin: NOT_IN_CELLAR_STATUSES } } },
       {
         $group: {
           _id: {
@@ -853,7 +1025,7 @@ router.get('/:id/statistics', async (req, res) => {
       // By rating — normalize to 0-100 and bucket into 5 bands
       if (g._id.rating) {
         const norm = toNormalized(g._id.rating, g._id.ratingScale || '5');
-        const band = norm <= 20 ? '0-20' : norm <= 40 ? '21-40' : norm <= 60 ? '41-60' : norm <= 80 ? '61-80' : '81-100';
+        const band = ratingBand(norm);
         stats.byRating[band] = (stats.byRating[band] || 0) + g.count;
       }
     }
@@ -967,6 +1139,187 @@ router.get('/:id/history', async (req, res) => {
   }
 });
 
+// GET /api/cellars/:id/on-order — the bottles bought for this cellar that
+// have not arrived yet (status 'ordered'): soonest expected first, undated
+// orders last. Any member may look; arriving / editing needs editor, which
+// those endpoints enforce. Capped like the other list paths.
+// GET /api/cellars/:id/vintages/:wineId/:vintage — one wine and vintage in
+// this cellar: the page behind a grouped "n identical bottles" entry
+// (support ticket 2026-10-09). A VIEW over data that already exists, not a
+// third storage level: the bottles with their rack slots and photos, what
+// they share (a note or drink window identical on every one), how many are
+// on order or already drunk, and a bottle id the page hands to the lot
+// history and personal-data cards, which are keyed by bottle. Any member
+// may look; drinking one needs editor, which the consume route enforces.
+// The sommelier window and the registry's per-vintage values come from
+// their own routes, as on the bottle page.
+const VINTAGE_PAGE_LIMIT = 500;
+const VINTAGE_SHARED_FIELDS = ['notes', 'drinkFrom', 'drinkTo', 'peakFrom', 'peakUntil'];
+const VINTAGE_PROFILE_SELECT = ['description', 'body', 'tannin', 'acidity', 'sweetness', 'flavors', 'foodPairings', 'source']
+  .map((f) => `aiProfile.${f}`).join(' ');
+router.get('/:id/vintages/:wineId/:vintage', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id) || !isValidId(req.params.wineId)) return res.status(400).json({ error: 'Invalid ID' });
+    // Up to the 20 characters a bottle's vintage may hold: an imported
+    // "Non-Vintage" is its own group, and its page link must find it.
+    const vintageParam = String(req.params.vintage || '').trim().slice(0, 20);
+    if (!vintageParam) return res.status(400).json({ error: 'Invalid vintage' });
+    const cellar = await Cellar.findById(req.params.id).populate('user', 'username').lean();
+    const role = getCellarRole(cellar, req.user.id);
+    if (!role || cellar.deletedAt) return res.status(404).json({ error: 'Cellar not found' });
+
+    // '' and null vintages read as NV in the grouped cellar view; match that
+    // set (same rule as services/bottleLot).
+    const vintageFilter = vintageParam === 'NV' ? { $in: ['NV', '', null] } : vintageParam;
+    const base = { cellar: cellar._id, wineDefinition: req.params.wineId, vintage: vintageFilter };
+    let bottles = await Bottle.find({ ...base, status: { $nin: NOT_IN_CELLAR_STATUSES } })
+      .populate(WINE_POPULATE_CARDS)
+      .sort({ addedToCellarAt: 1, createdAt: 1 })
+      .limit(VINTAGE_PAGE_LIMIT)
+      .lean();
+    const [onOrderCount, consumedCount] = await Promise.all([
+      Bottle.countDocuments({ ...base, status: ORDERED_STATUS }),
+      Bottle.countDocuments({ ...base, status: { $in: CONSUMED_STATUSES } }),
+    ]);
+    // The wine as the cards carry it; from the last drunk bottle when nothing
+    // is left (else one on order), so a vintage that is all history still has
+    // a page.
+    // The page reads the vintage's history and own data through one bottle:
+    // one whose vintage is written out when there is one — an NV group also
+    // holds imported bottles with an empty vintage, and "this vintage" own
+    // data can only be scoped through a bottle that has one. The page is told
+    // that bottle's vintage, so it offers the scope only when it can work.
+    let wine = bottles[0]?.wineDefinition || null;
+    const written = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+    const historyBottle = bottles.find((b) => written(b.vintage)) || bottles[0] || null;
+    let historyBottleId = historyBottle?._id || null;
+    let historyBottleVintage = written(historyBottle?.vintage);
+    if (!wine) {
+      const any = await Bottle.findOne({ ...base, status: { $in: CONSUMED_STATUSES } }).populate(WINE_POPULATE_CARDS).sort({ consumedAt: -1 }).lean()
+        || await Bottle.findOne(base).populate(WINE_POPULATE_CARDS).sort({ createdAt: -1 }).lean();
+      if (!any || !any.wineDefinition) return res.status(404).json({ error: 'No bottles of this wine and vintage here' });
+      wine = any.wineDefinition;
+      historyBottleId = any._id;
+      historyBottleVintage = written(any.vintage);
+    }
+
+    // The tasting profile for the page's wine section. The cards leave the
+    // prose out (WINE_LIST_SELECT), so it is read once here: the display
+    // fields only, as the bottle page shows them. A held profile stores no
+    // description and no descriptors, so it stays silent here too.
+    try {
+      const profiled = await WineDefinition.findById(wine._id).select(VINTAGE_PROFILE_SELECT).lean();
+      wine = { ...wine, aiProfile: profiled?.aiProfile || null };
+    } catch (err) {
+      // Auxiliary, like the rack slots below: never 500 the page over it.
+      console.error('Vintage page profile lookup failed:', err.message);
+    }
+
+    // Rack slots, answered here like the bottle page does: the page must not
+    // download every rack to place a few bottles.
+    const slotOf = {};
+    // Said in the answer: when the lookup fails every bottle reads "not in a
+    // rack", and the page must not take them for identical (DrinkOneModal).
+    let placesKnown = true;
+    if (bottles.length) {
+      try {
+        const ids = bottles.map((b) => b._id);
+        const racks = await Rack.find({ cellar: cellar._id, deletedAt: null, 'slots.bottle': { $in: ids } })
+          .select('name group slots').lean();
+        const wanted = new Set(ids.map(String));
+        let inRoomRacks = null;
+        for (const rack of racks) {
+          for (const slot of rack.slots || []) {
+            const bid = slot.bottle && String(slot.bottle);
+            if (!bid || !wanted.has(bid)) continue;
+            if (inRoomRacks === null) {
+              const CellarLayout = require('../models/CellarLayout');
+              const layout = await CellarLayout.findOne({ cellar: cellar._id }).select('rackPlacements.rack').lean();
+              inRoomRacks = new Set((layout?.rackPlacements || []).map((rp) => String(rp.rack?._id || rp.rack)));
+            }
+            slotOf[bid] = { rackId: rack._id, rackName: rack.name, rackGroup: rack.group || null, position: slot.position, inRoom: inRoomRacks.has(String(rack._id)) };
+          }
+        }
+      } catch (err) {
+        // Placement is auxiliary: never 500 the page over it.
+        placesKnown = false;
+        console.error('Vintage page rack lookup failed:', err.message);
+      }
+    }
+
+    // Maturity as the cards show it (personal window over the shared profile).
+    const profileMap = await buildProfileMap(bottles);
+    bottles = await attachBottleImageUrls(bottles, req.user.id);
+    bottles = bottles.map((b) => ({
+      ...b,
+      maturityStatus: classifyMaturity(b, profileMap),
+      rackInfo: slotOf[String(b._id)] || null,
+    }));
+
+    // What every bottle in the cellar shares. A note identical on all of them
+    // is shown once on the page; one that differs stays with its bottle.
+    const shared = {};
+    for (const field of VINTAGE_SHARED_FIELDS) {
+      const values = new Set(bottles.map((b) => (b[field] == null || b[field] === '' ? null : b[field])));
+      const only = values.size === 1 ? [...values][0] : undefined;
+      shared[field] = bottles.length > 0 && only != null ? only : null;
+    }
+
+    res.json({
+      cellar: { _id: cellar._id, name: cellar.name, userRole: role, userColor: getUserColor(cellar, req.user.id) },
+      wine,
+      vintage: vintageParam,
+      bottles,
+      total: bottles.length,
+      onOrderCount,
+      consumedCount,
+      historyBottleId,
+      historyBottleVintage,
+      shared,
+      placesKnown,
+    });
+  } catch (error) {
+    console.error('Get vintage page error:', error);
+    res.status(500).json({ error: 'Failed to get this vintage' });
+  }
+});
+
+const ON_ORDER_LIMIT = 2000;
+router.get('/:id/on-order', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
+    const cellar = await Cellar.findById(req.params.id).populate('user', 'username').lean();
+    const role = getCellarRole(cellar, req.user.id);
+    if (!role || cellar.deletedAt) return res.status(404).json({ error: 'Cellar not found' });
+
+    // Dated orders first (soonest first), then undated ones. Two queries,
+    // because an ascending sort puts a missing date FIRST — and with the cap
+    // that would cut dated orders rather than undated ones.
+    const dated = await Bottle.find({ cellar: req.params.id, status: ORDERED_STATUS, expectedArrival: { $ne: null } })
+      .populate(WINE_POPULATE_CARDS)
+      .sort({ expectedArrival: 1, createdAt: 1 })
+      .limit(ON_ORDER_LIMIT)
+      .lean();
+    const undated = dated.length < ON_ORDER_LIMIT
+      ? await Bottle.find({ cellar: req.params.id, status: ORDERED_STATUS, expectedArrival: null })
+        .populate(WINE_POPULATE_CARDS)
+        .sort({ createdAt: 1 })
+        .limit(ON_ORDER_LIMIT - dated.length)
+        .lean()
+      : [];
+    const bottles = await attachBottleImageUrls([...dated, ...undated], req.user.id);
+
+    res.json({
+      cellar: { ...cellar, userRole: role, userColor: getUserColor(cellar, req.user.id) },
+      bottles,
+      total: bottles.length,
+    });
+  } catch (error) {
+    console.error('Get on-order bottles error:', error);
+    res.status(500).json({ error: 'Failed to get the bottles on order' });
+  }
+});
+
 // GET /api/cellars/:id/members - List members (owner only)
 router.get('/:id/members', async (req, res) => {
   try {
@@ -1008,6 +1361,7 @@ router.get('/:id', async (req, res) => {
       appellation,
       minRating,
       maxRating,
+      ratingBand: ratingBandParam,
       search,
       maturity: maturityRaw,
       sort = '-createdAt',
@@ -1082,13 +1436,14 @@ router.get('/:id', async (req, res) => {
 
     // Whether we need in-memory post-processing that neither the search nor MongoDB can do
     const needsMaturity = !!(maturityFilter || sortField === 'maturity');
-    const MATURITY_RANK = { declining: 0, late: 1, peak: 2, early: 3, 'not-ready': 4 };
 
     // ── Search: free text or a wine filter (type, country, region, appellation, grapes, vintage) ──
     const hasSearchFilters = !!(search || type || country || region || grapes || vintage || appellation);
     let found = null;
     let bottles;
     let totalCount;
+    // Grouped: the bottles behind the `totalCount` cards.
+    let bottleTotal = null;
     let canPaginateInDb;
     let groupsForPage = null;
 
@@ -1096,10 +1451,10 @@ router.get('/:id', async (req, res) => {
     // Group + paginate inside MongoDB instead of hydrating the whole cellar.
     const groupedInDb = grouped
       && !hasSearchFilters
-      && !minRating && !maxRating && !maturityFilter && !reservedOnly && !extraFilters
-      && ['createdAt', 'vintage', 'price', 'rating'].includes(sortField);
+      && !minRating && !maxRating && !ratingBandParam && !maturityFilter && !reservedOnly && !extraFilters
+      && ['createdAt', 'vintage', 'price', 'rating', QUANTITY_SORT].includes(sortField);
     if (groupedInDb) {
-      ({ groupsForPage, bottles, totalCount } = await loadGroupedBottlePage({
+      ({ groupsForPage, bottles, totalCount, bottleTotal } = await loadGroupedBottlePage({
         cellarId: req.params.id, excludeSet, onlyIds, sortField, sortDir, skip, limit,
         populate: WINE_POPULATE_CARDS,
       }));
@@ -1116,8 +1471,8 @@ router.get('/:id', async (req, res) => {
       // reserved, chart filters), the ranked hits are the final order: page
       // over them, grouped or not, and load only the page's bottles. Loading
       // every hit to show 30 cost a big cellar ~4 MB and most of the request.
-      const pageOnly = !minRating && !maxRating && !maturityFilter && !reservedOnly && !extraFilters
-        && sortField !== 'maturity';
+      const pageOnly = !minRating && !maxRating && !ratingBandParam && !maturityFilter && !reservedOnly && !extraFilters
+        && sortField !== 'maturity' && (sortField !== QUANTITY_SORT || grouped);
       found = await bottleSearch.searchBottles(search || '', {
         cellarId: req.params.id,
         type,
@@ -1143,7 +1498,10 @@ router.get('/:id', async (req, res) => {
           const allGroups = groupIdenticalBottles(hits.map(h => ({
             _id: h.id, wineDefinition: h.wineDefinition, vintage: h.vintage, bottleSize: h.bottleSize,
           })));
+          // Cards holding as many keep the search's ranking.
+          if (sortField === QUANTITY_SORT) sortGroupsByQuantity(allGroups, sortDir);
           totalCount = allGroups.length;
+          bottleTotal = hits.length;
           const pageGroups = allGroups.slice(skip, skip + limit);
           const docs = await loadBottlesInOrder(pageGroups.flatMap(g => g.bottles.map(b => b._id)), WINE_POPULATE_CARDS);
           const byId = new Map(docs.map(d => [d._id.toString(), d]));
@@ -1170,7 +1528,7 @@ router.get('/:id', async (req, res) => {
       // ── LIST PATH: no search — rating / maturity / reserved / chart filters or an in-memory sort ──
       const filter = {
         cellar: req.params.id,
-        status: { $nin: CONSUMED_STATUSES }
+        status: { $nin: NOT_IN_CELLAR_STATUSES }
       };
 
       if (excludeSet.size > 0) {
@@ -1180,7 +1538,7 @@ router.get('/:id', async (req, res) => {
 
       const directSortFields = ['createdAt', 'vintage', 'price', 'rating'];
       const canSortInDb_ = directSortFields.includes(sortField);
-      const needsInMemoryFilter = !!(minRating || maxRating || maturityFilter || reservedOnly || extraFilters);
+      const needsInMemoryFilter = !!(minRating || maxRating || ratingBandParam || maturityFilter || reservedOnly || extraFilters);
       const needsInMemorySort = !canSortInDb_;
       // Grouping needs every matching bottle in memory before it can collapse
       // duplicates, so it disables DB-level pagination.
@@ -1203,30 +1561,14 @@ router.get('/:id', async (req, res) => {
         totalCount = await Bottle.countDocuments(filter);
       }
 
-      // In-memory sort for fields that require populated data
-      if (needsInMemorySort) {
-        let maturityStatusMap_;
-        if (sortField === 'maturity') {
-          const profileMap = await buildProfileMap(bottles);
-          maturityStatusMap_ = new Map();
-          for (const b of bottles) {
-            maturityStatusMap_.set(b._id.toString(), classifyMaturity(b, profileMap));
-          }
-        }
+      // In-memory sort for fields that require populated data. Maturity sorts
+      // after the shared post-filters below, on both paths.
+      if (needsInMemorySort && sortField !== 'maturity') {
         bottles.sort((a, b) => {
-          let aVal, bVal;
-          if (sortField === 'name') {
-            aVal = a.wineDefinition?.name || '';
-            bVal = b.wineDefinition?.name || '';
-          } else if (sortField === 'maturity' && maturityStatusMap_) {
-            const aStatus = maturityStatusMap_.get(a._id.toString());
-            const bStatus = maturityStatusMap_.get(b._id.toString());
-            aVal = aStatus != null ? MATURITY_RANK[aStatus] : 5;
-            bVal = bStatus != null ? MATURITY_RANK[bStatus] : 5;
-          } else {
-            aVal = a.createdAt;
-            bVal = b.createdAt;
-          }
+          if (sortField === QUANTITY_SORT) return byWineName(a, b);
+          if (sortField === 'name') return sortDir * byWineName(a, b);
+          const aVal = a.createdAt;
+          const bVal = b.createdAt;
           if (aVal < bVal) return -sortDir;
           if (aVal > bVal) return sortDir;
           return 0;
@@ -1242,46 +1584,30 @@ router.get('/:id', async (req, res) => {
 
     bottles = applyExtraBottleFilters(bottles, extraFilters);
 
-    if (minRating) {
-      const min = parseFloat(minRating);
-      bottles = bottles.filter(b => {
-        if (!b.rating) return false;
-        return toNormalized(b.rating, b.ratingScale || '5') >= min;
-      });
-    }
-
-    if (maxRating) {
-      const max = parseFloat(maxRating);
-      bottles = bottles.filter(b => {
-        if (!b.rating) return false;
-        return toNormalized(b.rating, b.ratingScale || '5') <= max;
-      });
-    }
+    // A drunk bottle counts with the rating given when drinking (the history
+    // list), and a band is exactly the statistics' band (utils/ratingUtils).
+    bottles = filterByRating(bottles, { minRating, maxRating, ratingBand: ratingBandParam });
 
     let maturityStatusMap;
+    let maturitySortKeys;
     if (needsMaturity) {
       const profileMap = await buildProfileMap(bottles);
       maturityStatusMap = new Map();
       for (const b of bottles) {
         maturityStatusMap.set(b._id.toString(), classifyMaturity(b, profileMap));
       }
+      if (sortField === 'maturity') maturitySortKeys = buildMaturitySortKeys(bottles, profileMap, maturityStatusMap);
     }
 
     if (maturityFilter && maturityStatusMap) {
       bottles = bottles.filter(b => matchesMaturityFilter(maturityStatusMap.get(b._id.toString()), maturityFilter));
     }
 
-    // The search ranks by relevance and a stored field; maturity needs vintage
-    // profiles, so a maturity sort on the search path is applied here, mirroring
-    // the list path's comparator.
-    if (sortField === 'maturity' && found && maturityStatusMap) {
-      bottles.sort((a, b) => {
-        const aStatus = maturityStatusMap.get(a._id.toString());
-        const bStatus = maturityStatusMap.get(b._id.toString());
-        const aVal = aStatus != null ? MATURITY_RANK[aStatus] : 5;
-        const bVal = bStatus != null ? MATURITY_RANK[bStatus] : 5;
-        return (aVal - bVal) * sortDir;
-      });
+    // Maturity needs the vintage profiles, so neither the search nor MongoDB
+    // can order by it: both paths sort here (stage, then the year it ends).
+    if (maturitySortKeys) {
+      bottles.sort((a, b) => sortDir * compareMaturitySortKeys(
+        maturitySortKeys.get(a._id.toString()), maturitySortKeys.get(b._id.toString())));
     }
 
     // Group identical bottles (same wine + vintage), or paginate normally.
@@ -1289,8 +1615,11 @@ router.get('/:id', async (req, res) => {
     // (Skipped when the DB-grouped hot path already produced groupsForPage.)
     if (grouped && !groupsForPage && !pageReady) {
       // Wine + vintage + bottle size, so a magnum and a 750ml stay apart.
+      if (sortField === QUANTITY_SORT) bottles.sort(byWineName); // ties A to Z, also after a search
       const allGroups = groupIdenticalBottles(bottles);
+      if (sortField === QUANTITY_SORT) sortGroupsByQuantity(allGroups, sortDir);
       totalCount = allGroups.length;                  // total = number of groups
+      bottleTotal = bottles.length;                   // …and the bottles in them
       groupsForPage = allGroups.slice(skip, skip + limit);
       bottles = groupsForPage.flatMap(g => g.bottles); // flatten so image attach below works
     } else if (!canPaginateInDb && !groupsForPage && !pageReady) {
@@ -1331,14 +1660,35 @@ router.get('/:id', async (req, res) => {
     const facets = onlyIds ? null : facetSource.facetDistribution;
     const facetMeta = facetSource.facetMeta;
 
+    // Bottles bought for this cellar that have not arrived yet: the page
+    // shows a link to them (GET /:id/on-order) instead of mixing them into
+    // the list. One indexed count; the next date only when there are any.
+    // Auxiliary: a failed lookup degrades to "no link", never a 500 page.
+    let onOrderCount = 0;
+    let nextExpected = null;
+    try {
+      onOrderCount = await Bottle.countDocuments({ cellar: req.params.id, status: ORDERED_STATUS });
+      if (onOrderCount > 0) {
+        const next = await Bottle.findOne({ cellar: req.params.id, status: ORDERED_STATUS, expectedArrival: { $ne: null } })
+          .sort({ expectedArrival: 1 }).select('expectedArrival').lean();
+        nextExpected = next?.expectedArrival || null;
+      }
+    } catch (err) {
+      console.warn('On-order summary failed (non-fatal):', err.message);
+    }
+
     res.json({
       cellar: { ...cellar, userRole: role, userColor: getUserColor(cellar, req.user.id) },
+      onOrder: { count: onOrderCount, nextExpected },
       bottles: {
         total: totalCount,
         count: responseItems.length,
         limit,
         skip,
         grouped,
+        // Grouped, `total` counts cards; the filter's "Show n bottles" needs
+        // the bottles behind them (support ticket 2026-10-14).
+        ...(grouped ? { bottleTotal } : {}),
         items: responseItems
       },
       ...(facets ? { facets, baseFacets, facetMeta } : {})
@@ -1369,6 +1719,7 @@ router.put('/:id', async (req, res) => {
     if (description !== undefined) cellar.description = description?.trim() || '';
 
     await cellar.save();
+    bumpMembers(cellar);
 
     logAudit(req, 'cellar.update', { type: 'cellar', id: cellar._id, cellarId: cellar._id }, { name: cellar.name });
 
@@ -1410,6 +1761,9 @@ router.patch('/:id/color', async (req, res) => {
     }
 
     await cellar.save();
+    // Not audited (a personal preference), but userColor rides in the cached
+    // token list of this user (release audit 2026-10-09, L).
+    bumpDataVersion(req.user.id);
     res.json({ userColor: color || null });
   } catch (error) {
     console.error('Set cellar color error:', error);
@@ -1434,6 +1788,7 @@ router.delete('/:id', async (req, res) => {
     const now = new Date();
     cellar.deletedAt = now;
     await cellar.save();
+    bumpMembers(cellar);
 
     // Cascade soft-delete to the LIVE racks only ({ deletedAt: null }). Racks
     // the user already soft-deleted individually keep their own (earlier)
@@ -1587,6 +1942,7 @@ router.post('/:id/members', requireNonDemo, async (req, res) => {
 
     cellar.members.push({ user: userToAdd._id, role });
     await cellar.save();
+    bumpDataVersion(userToAdd._id);
 
     const sharingUser = await User.findById(req.user.id).select('username').lean();
     createNotification(
@@ -1629,6 +1985,7 @@ router.put('/:id/members/:userId', async (req, res) => {
     const previousRole = member.role;
     member.role = role;
     await cellar.save();
+    bumpDataVersion(req.params.userId);
 
     // Assigning a climate device to a cellar requires owner/editor. If this
     // member is downgraded to viewer, detach any device they had assigned here
@@ -1674,6 +2031,7 @@ router.delete('/:id/members/:userId', async (req, res) => {
 
     cellar.members.splice(memberIndex, 1);
     await cellar.save();
+    bumpDataVersion(req.params.userId);
 
     // Detach any climate devices the removed member had assigned to this
     // cellar — otherwise their token keeps posting readings into a cellar they
@@ -1752,6 +2110,8 @@ router.post('/:id/transfer-ownership', requireNonDemo, async (req, res) => {
     }
 
     const result = await transferCellarOwnership(req.params.id, newOwnerId, req.user.id);
+    bumpDataVersion(newOwnerId);
+    bumpMembers(result.cellar);
 
     logAudit(
       req,

@@ -1,17 +1,28 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, Suspense } from 'react';
+import { lazy } from '../utils/lazyWithReload';
 import { useParams, Link } from 'react-router-dom';
+import { useCameBack } from '../utils/useBackHere';
+import { validScope, keepKnownCellars } from '../utils/savedScope';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import RatingDisplay from '../components/RatingDisplay';
 import WineImage from '../components/WineImage';
 import BottleFilterModal from '../components/BottleFilterModal';
 import { addToWishlist } from '../api/wishlist';
+import { restoreBottle } from '../api/bottles';
 import { listCellars, getCellarHistory, getMultiCellarHistory } from '../api/cellars';
+import { withinRestoreWindow } from '../utils/restoreWindow';
+import { messageForResponse, friendlyError } from '../utils/friendlyError';
+import { bottleNoticeName } from '../components/BottleUndoNotice';
 import CellarScopePicker from '../components/CellarScopePicker';
 import CellarNav from '../components/CellarNav';
 import CellarPageHeader from '../components/CellarPageHeader';
+import SearchInput from '../components/SearchInput';
 import './CellarDetail.css';
 import './CellarHistory.css';
+import '../components/BottleUndoNotice.css';
+
+const AddMoreBottlesModal = lazy(() => import('../components/AddMoreBottlesModal'));
 
 // Bottles per page. The first page is the newest bottles of every section; a
 // section's "Load more" continues after the last bottle it shows.
@@ -32,10 +43,30 @@ const reasonOf = (bottle) => {
 // Where a section's next page starts: after this bottle (?before).
 const cursorOf = (bottle) => `${bottle.consumedAt || ''}|${bottle._id}`;
 
+// What the history view was showing — search, filters and scope — kept per
+// cellar for this tab, so Back from a bottle finds the same list (it used to
+// start over: everything in component state only). Only Back/Forward (or a
+// reload) restores it — a link to the history opens it fresh.
+const HISTORY_VIEW_PREFIX = 'cellarion.historyView.';
+const DEFAULT_HISTORY_FILTERS = {
+  search: '',
+  type: [], country: [], region: [], appellation: [], grapes: [], vintage: [],
+  minRating: '', maxRating: '', maturity: []
+};
+const readSavedHistoryView = (cellarId) => {
+  try {
+    const v = JSON.parse(sessionStorage.getItem(HISTORY_VIEW_PREFIX + cellarId) || 'null');
+    if (!v || typeof v !== 'object') return null;
+    return { filters: { ...DEFAULT_HISTORY_FILTERS, ...(v.filters || {}) }, scope: validScope(v.scope, cellarId) };
+  } catch {
+    return null;
+  }
+};
+
 function CellarHistory() {
   const { t } = useTranslation();
   const { id } = useParams();
-  const { apiFetch } = useAuth();
+  const { apiFetch, user } = useAuth();
   const [cellar, setCellar] = useState(null);
   // The pages loaded so far, and the server's totals for the whole history.
   const [bottles, setBottles] = useState([]);
@@ -50,33 +81,60 @@ function CellarHistory() {
   const [sections, setSections] = useState({});
   const [error, setError] = useState(null);
   const [total, setTotal] = useState(0);
+  // Whether the list on screen was asked for with a search or a filter: an
+  // empty answer then means "nothing matches", not "nothing taken out yet".
+  // Kept with the answer, not read off the search box, so the empty state
+  // never flashes the wrong message while a new answer is on its way.
+  const [shownNarrowed, setShownNarrowed] = useState(false);
   const [reasonCounts, setReasonCounts] = useState(null);
-  const [filters, setFilters] = useState({
-    search: '',
-    type: [], country: [], region: [], grapes: [], vintage: [],
-    minRating: '', maxRating: '', maturity: []
-  });
+  const cameBack = useCameBack();
+  const [savedView] = useState(() => (cameBack ? readSavedHistoryView(id) : null));
+  const [filters, setFilters] = useState(() => savedView?.filters || DEFAULT_HISTORY_FILTERS);
   const [facets, setFacets] = useState(null);
   const [baseFacets, setBaseFacets] = useState(null);
   const [facetMeta, setFacetMeta] = useState(null);
   const [showFilterModal, setShowFilterModal] = useState(false);
+  // What a card's "Move back to cellar" or "Add again" just did, said in the
+  // floating line (the card may be far down a long history).
+  const [notice, setNotice] = useState(null);
+  // The bottle "Add again" copies (components/AddMoreBottlesModal).
+  const [addTemplate, setAddTemplate] = useState(null);
 
   // ── Cross-cellar scope: which cellars this history view spans (default: this one) ──
   const [allCellars, setAllCellars] = useState([]);
-  const [scopeIds, setScopeIds] = useState([id]);
+  const [scopeIds, setScopeIds] = useState(() => savedView?.scope || [id]);
   const scopeKey = scopeIds.join(',');
   const isMulti = !(scopeIds.length === 1 && scopeIds[0] === id);
 
   useEffect(() => {
     listCellars(apiFetch)
       .then(r => r.json())
-      .then(d => setAllCellars(d.cellars || []))
+      .then(d => {
+        const list = d.cellars || [];
+        setAllCellars(list);
+        // A remembered scope may name a cellar since deleted or unshared —
+        // judged only on a real answer (an error must not wipe the scope).
+        if (Array.isArray(d.cellars)) setScopeIds((prev) => keepKnownCellars(prev, id, list));
+      })
       .catch(() => {});
-  }, [apiFetch]);
+  }, [apiFetch]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reset the scope to just this cellar whenever the user navigates to a
-  // different cellar's history.
-  useEffect(() => { setScopeIds([id]); }, [id]);
+  // different cellar's history (the filters carry over) — unless coming back
+  // to it, when its own remembered view returns.
+  const historyFirstRun = useRef(true);
+  useEffect(() => {
+    if (historyFirstRun.current) { historyFirstRun.current = false; return; }
+    const view = cameBack ? readSavedHistoryView(id) : null;
+    setScopeIds(view?.scope || [id]);
+    if (view) setFilters(view.filters);
+  }, [id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(HISTORY_VIEW_PREFIX + id, JSON.stringify({ filters, scope: scopeIds }));
+    } catch { /* best-effort */ }
+  }, [id, filters, scopeKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Monotonic fetch token — only the most-recent fetch commits its result, so an
   // out-of-order response from a superseded scope/filter can't overwrite newer data.
@@ -86,7 +144,7 @@ function CellarHistory() {
   const listQuery = useRef(null);
 
   // Debounce search
-  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState(() => filters.search || '');
   const searchTimer = useRef(null);
   useEffect(() => {
     if (searchTimer.current) clearTimeout(searchTimer.current);
@@ -98,7 +156,7 @@ function CellarHistory() {
   const filterKey = [
     debouncedSearch,
     filters.type.join(','), filters.country.join(','), filters.region.join(','),
-    filters.grapes.join(','), filters.vintage.join(',')
+    (filters.appellation || []).join(','), filters.grapes.join(','), filters.vintage.join(',')
   ].join('|');
 
   // `id` is included so navigating to another cellar whose scope key matches the
@@ -125,6 +183,7 @@ function CellarHistory() {
         if (key === 'search') return;
         if (Array.isArray(val) && val.length > 0) filterParams.append(key, val.join(','));
       });
+      const asked = [...filterParams.keys()].length > 0;
       const multi = !(scopeIds.length === 1 && scopeIds[0] === id);
       if (multi) filterParams.append('cellars', scopeIds.join(','));
       const query = { multi, cellarId: id, filters: filterParams.toString() };
@@ -141,13 +200,14 @@ function CellarHistory() {
       listQuery.current = query;
       // A server from before paging sends the whole history and no total.
       setTotal(typeof data.total === 'number' ? data.total : page.length);
+      setShownNarrowed(asked);
       setReasonCounts(data.reasonCounts || null);
       setBottles(page);
       const next = {};
       for (const bottle of page) next[reasonOf(bottle)] = { cursor: cursorOf(bottle) };
       setSections(next);
       setHasLoaded(true);
-      if (data.facets) setFacets(data.facets);
+      setFacets(data.facets ?? null); // none sent: no counts, not stale ones
       if (data.baseFacets) setBaseFacets(data.baseFacets);
       if (data.facetMeta) setFacetMeta(data.facetMeta);
     } catch {
@@ -216,6 +276,22 @@ function CellarHistory() {
   };
   const busy = refreshing || loadingMore !== null;
 
+  // Owners and editors of a bottle's own cellar may move it back or add it
+  // again, as on the bottle page — the cross-cellar view spans several.
+  const roleIn = (cellarId) => (String(cellarId) === String(id) && cellar?.userRole)
+    || allCellars.find((c) => String(c._id) === String(cellarId))?.userRole;
+  const canEditIn = (cellarId) => ['owner', 'editor'].includes(roleIn(cellarId || id));
+  // A bottle moved back leaves the list where it is — the pages "Load more"
+  // brought stay, and the totals drop by one — rather than the history
+  // starting over from its first page.
+  const handleRestored = (bottle) => {
+    setNotice(t('bottleNotice.restored', '“{{name}}” is back in the cellar.', { name: bottleNoticeName(bottle) || t('bottleNotice.thisBottle', 'The bottle') }));
+    const reason = reasonOf(bottle);
+    setBottles((prev) => prev.filter((b) => b._id !== bottle._id));
+    setTotal((n) => Math.max(0, n - 1));
+    setReasonCounts((prev) => (prev ? { ...prev, [reason]: Math.max(0, (prev[reason] || 0) - 1) } : prev));
+  };
+
   // Only replace the whole page when nothing has loaded yet; after a successful
   // load, transient fetch failures render as an inline banner instead.
   const hasLoadedContent = hasLoaded;
@@ -242,8 +318,14 @@ function CellarHistory() {
   (filters.type || []).forEach(v => activeChips.push({ key: 'type', value: v, label: v.charAt(0).toUpperCase() + v.slice(1) }));
   (filters.country || []).forEach(v => activeChips.push({ key: 'country', value: v, label: countryNames[v] || v }));
   (filters.region || []).forEach(v => activeChips.push({ key: 'region', value: v, label: regionNames[v] || v }));
+  (filters.appellation || []).forEach(v => activeChips.push({ key: 'appellation', value: v, label: v }));
   (filters.grapes || []).forEach(v => activeChips.push({ key: 'grapes', value: v, label: grapeNames[v] || v }));
   (filters.vintage || []).forEach(v => activeChips.push({ key: 'vintage', value: v, label: v }));
+
+  // Something narrows the list — a filter chip or the search box (which has
+  // no chip, so a search that found nothing used to show the empty-history
+  // note). Read from the answer on screen (shownNarrowed).
+  const narrowed = shownNarrowed;
 
   const removeChip = (chip) => {
     setFilters(prev => {
@@ -254,7 +336,7 @@ function CellarHistory() {
   };
 
   const clearAll = () => setFilters(prev => ({
-    ...prev, type: [], country: [], region: [], grapes: [], vintage: [],
+    ...prev, type: [], country: [], region: [], appellation: [], grapes: [], vintage: [],
     minRating: '', maxRating: '', maturity: []
   }));
 
@@ -273,13 +355,26 @@ function CellarHistory() {
           </button>
         </div>
       )}
+      {notice && (
+        <div className="alert alert-success bottle-undo-notice bottle-undo-notice--floating" role="status">
+          <span className="bottle-undo-notice__text">{notice}</span>
+          <button
+            type="button"
+            className="btn btn-small btn-secondary bottle-undo-notice__close"
+            onClick={() => setNotice(null)}
+            aria-label={t('common.close', 'Close')}
+          >
+            ✕
+          </button>
+        </div>
+      )}
       <CellarPageHeader
         backTo={`/cellars/${id}`}
         backLabel={t('history.backTo', { cellarName: cellar?.name || '…' })}
         title={t('history.title')}
         loading={loading}
         userColor={cellar?.userColor}
-        subtitle={total === 0 && !activeChips.length ? t('history.noHistory') : t('history.bottleCount', { count: total })}
+        subtitle={total === 0 && !narrowed ? t('history.noHistory') : t('history.bottleCount', { count: total })}
       />
 
       <CellarNav cellarId={id} active="history" />
@@ -289,7 +384,7 @@ function CellarHistory() {
       ) : <>
 
       {/* Summary row */}
-      {total > 0 && !activeChips.length && (
+      {total > 0 && !narrowed && (
         <div className="history-summary-row">
           {Object.entries(REASON_CONFIG).map(([key, cfg]) => {
             const count = countOf(key);
@@ -306,13 +401,10 @@ function CellarHistory() {
 
       {/* Search + filter bar — same layout as cellar bottles tab */}
       <div className="search-row history-search-row">
-        <input
-          type="text"
-          className="search-input"
+        <SearchInput
           placeholder={t('cellarDetail.searchPlaceholder')}
           value={filters.search}
-          onChange={e => setFilters({ ...filters, search: e.target.value })}
-          aria-label={t('cellarDetail.searchPlaceholder')}
+          onChange={search => setFilters({ ...filters, search })}
         />
         <button
           type="button"
@@ -365,14 +457,14 @@ function CellarHistory() {
         />
       )}
 
-      {total === 0 && !activeChips.length && (
+      {total === 0 && !narrowed && (
         <div className="empty-state">
           <p>{t('history.emptyHistoryHint')}</p>
           <Link to={`/cellars/${id}`} className="btn btn-primary">{t('history.backToCellarBtn')}</Link>
         </div>
       )}
 
-      {total === 0 && activeChips.length > 0 && (
+      {total === 0 && narrowed && (
         <div className="empty-state">
           <p>{t('cellarDetail.noSearchResults')}</p>
         </div>
@@ -393,9 +485,20 @@ function CellarHistory() {
               </div>
               {items.length > 0 && (
                 <div className="history-bottles">
-                  {items.map(bottle => (
-                    <HistoryBottleCard key={bottle._id} bottle={bottle} cellarId={id} showCellarBadge={isMulti} />
-                  ))}
+                  {items.map(bottle => {
+                    const canEdit = canEditIn(bottle.cellar);
+                    return (
+                      <HistoryBottleCard
+                        key={bottle._id}
+                        bottle={bottle}
+                        cellarId={id}
+                        showCellarBadge={isMulti}
+                        canEdit={canEdit}
+                        onRestored={handleRestored}
+                        onAddAgain={canEdit && bottle.wineDefinition?._id && !user?.isDemo ? setAddTemplate : undefined}
+                      />
+                    );
+                  })}
                 </div>
               )}
               {hasMoreIn(key) && (
@@ -416,11 +519,28 @@ function CellarHistory() {
       })()}
 
       </>}
+
+      <Suspense fallback={null}>
+        {addTemplate && (
+          <AddMoreBottlesModal
+            bottle={addTemplate}
+            copyDetailsDefault={false}
+            onClose={() => setAddTemplate(null)}
+            onAdded={(count) => {
+              const name = bottleNoticeName(addTemplate);
+              setAddTemplate(null);
+              setNotice(name
+                ? t('bottleNotice.added', { count, name })
+                : t('bottleNotice.addedUnnamed', { count }));
+            }}
+          />
+        )}
+      </Suspense>
     </div>
   );
 }
 
-function HistoryBottleCard({ bottle, cellarId, showCellarBadge = false }) {
+function HistoryBottleCard({ bottle, cellarId, showCellarBadge = false, canEdit = false, onRestored, onAddAgain }) {
   const { t } = useTranslation();
   const { apiFetch, user } = useAuth();
   const wine = bottle.wineDefinition;
@@ -434,6 +554,33 @@ function HistoryBottleCard({ bottle, cellarId, showCellarBadge = false }) {
 
   // One-tap add-to-wishlist: 'idle' → 'saving' → 'added' | 'error'.
   const [wishState, setWishState] = useState('idle');
+
+  // "Move back to cellar" — the bottle page's restore, here too: a drink
+  // logged by mistake was only undoable from the bottle's own page. Same
+  // two-day window (utils/restoreWindow) and the same refusal from the server.
+  const canRestore = canEdit && withinRestoreWindow(bottle);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [restoreError, setRestoreError] = useState(null);
+  const handleRestore = async () => {
+    if (restoreBusy) return;
+    setRestoreBusy(true);
+    setRestoreError(null);
+    try {
+      const res = await restoreBottle(apiFetch, bottle._id);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // The server's reason ("removed too long ago…"), or for a rate limit
+        // or an outage words with the wait — utils/friendlyError.
+        setRestoreError(messageForResponse(res, data, t('bottleDetail.restoreError', 'Could not move it back — try again'), t));
+        return;
+      }
+      onRestored?.(bottle);
+    } catch (err) {
+      setRestoreError(friendlyError(err, t));
+    } finally {
+      setRestoreBusy(false);
+    }
+  };
 
   const handleAddToWishlist = async (e) => {
     // The button is a sibling of the stretched-link overlay (not nested), but
@@ -495,6 +642,33 @@ function HistoryBottleCard({ bottle, cellarId, showCellarBadge = false }) {
           )}
         </div>
         <div className="history-bottle-main-right">
+          {/* The vintage page stays reachable after the last bottle is drunk
+              (support ticket 2026-10-09): from here, not only from the cellar
+              list's group, which is gone by then. */}
+          {wine?._id && (
+            <Link
+              to={`/cellars/${linkCellarId}/vintages/${wine._id}/${encodeURIComponent(bottle.vintage || 'NV')}`}
+              className="history-vintage-link"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {t('history.vintagePage', 'Vintage page')}
+            </Link>
+          )}
+          {/* "Add again": new bottles of this wine and vintage, copied from
+              this one, straight into the cellar — the visible way back used to
+              be the wishlist, which never adds a bottle. */}
+          {onAddAgain && (
+            <button
+              type="button"
+              className="history-card-btn"
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); onAddAgain(bottle); }}
+              title={t('bottleDetail.addAgainHint', 'Bought it again? Add new bottles of this wine and vintage to the cellar.')}
+              aria-label={t('bottleDetail.addAgain', 'Add again')}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              <span className="history-card-btn-label">{t('bottleDetail.addAgain', 'Add again')}</span>
+            </button>
+          )}
           {wine?._id && (
             <button
               type="button"
@@ -527,6 +701,19 @@ function HistoryBottleCard({ bottle, cellarId, showCellarBadge = false }) {
           <p className="history-note">"{bottle.consumedNote}"</p>
         )}
       </div>
+
+      {canRestore && (
+        <div className="history-restore-row">
+          <button type="button" className="history-card-btn" onClick={handleRestore} disabled={restoreBusy}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><polyline points="3 3 3 8 8 8"/>
+            </svg>
+            {restoreBusy ? t('bottleDetail.restoring', 'Moving back…') : t('bottleDetail.restore', 'Move back to cellar')}
+          </button>
+          <span className="history-restore-hint">{t('bottleDetail.restoreHint', 'Removed by mistake? Put it back as active (within 2 days).')}</span>
+          {restoreError && <span className="history-restore-error" role="alert">{restoreError}</span>}
+        </div>
+      )}
     </div>
   );
 }

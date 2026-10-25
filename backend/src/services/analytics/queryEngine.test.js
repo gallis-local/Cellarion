@@ -86,6 +86,7 @@ function evalExpr(expr, doc) {
     case '$cond': return evalExpr(a[0], doc) ? evalExpr(a[1], doc) : evalExpr(a[2], doc);
     case '$or': return a.some((x) => evalExpr(x, doc));
     case '$eq': return evalExpr(a[0], doc) === evalExpr(a[1], doc);
+    case '$in': { const v = evalExpr(a[0], doc); return a[1].map((x) => evalExpr(x, doc)).includes(v); }
     case '$lte': return evalExpr(a[0], doc) <= evalExpr(a[1], doc);
     case '$type': { const v = evalExpr(a, doc); return v === null ? 'null' : v === undefined ? 'missing' : typeof v; }
     case '$add': return a.reduce((s, x) => s + evalExpr(x, doc), 0);
@@ -129,6 +130,13 @@ describe('AUDIT F3: the star-conversion expression matches the JS composition', 
     expect(evalExpr(starExpr, { rating: v, ratingScale: scale }))
       .toBeCloseTo(fromNorm(toNorm(v, scale), '5'), 6);
   });
+  test('a rating already in the target scale passes through unclamped, as the rows show it', () => {
+    const davis = ratingConversionExpr('rating', 'ratingScale', '20');
+    expect(evalExpr(davis, { rating: 5, ratingScale: '20' })).toBe(5); // below the 8/20 anchor
+    expect(evalExpr(ratingConversionExpr('rating', 'ratingScale', '100'), { rating: 55, ratingScale: '100' })).toBe(55);
+    expect(evalExpr(davis, { rating: null, ratingScale: '20' })).toBeNull();
+  });
+
   test('a 60-point Parker bottle no longer outranks a 5-star one', () => {
     const parker60 = evalExpr(starExpr, { rating: 60, ratingScale: '100' });
     const fiveStar = evalExpr(starExpr, { rating: 5, ratingScale: '5' });
@@ -147,6 +155,12 @@ describe('convertedPriceExpr parity with convertCurrency', () => {
   });
   test('an unknown currency yields null (counted, not silently zeroed)', () => {
     expect(evalExpr(expr, { price: 100, currency: 'XXX' })).toBeNull();
+  });
+  // 2026-10-13: browser translation stored "EURO" for "EUR" on some bottles.
+  test('a row stored under an alias converts as its code', () => {
+    const asEuro = evalExpr(expr, { price: 100, currency: 'EURO' });
+    expect(asEuro).toBeCloseTo(evalExpr(expr, { price: 100, currency: 'EUR' }), 6);
+    expect(asEuro).toBeCloseTo(convertCurrency(100, 'EURO', 'SEK', rates), 6);
   });
   test('a missing price yields null', () => {
     expect(evalExpr(expr, { currency: 'EUR' })).toBeNull();
@@ -577,6 +591,25 @@ describe('rows mode hydration', () => {
     }]));
     const out = await runQuery(USER, { columns: ['rating.current'] });
     expect(out.rows[0].values['rating.current']).toBeCloseTo(4.1, 5);
+    expect(out.ratingScale).toBe('5');
+  });
+
+  test('ratingScale: a rating hydrates in the viewer scale — exactly as entered when it is already in it', async () => {
+    const B2 = 'f'.repeat(24);
+    aggReturning([{ ids: [{ _id: B1 }, { _id: B2 }], total: [{ n: 2 }] }]);
+    Bottle.find.mockReturnValue(chainLean([
+      { _id: B1, cellar: CELLAR_A, wineDefinition: null, rating: 92, ratingScale: '100' },
+      { _id: B2, cellar: CELLAR_A, wineDefinition: null, rating: 5, ratingScale: '5' },
+    ]));
+    const out = await runQuery(USER, { columns: ['rating.current'], ratingScale: '100' });
+    expect(out.ratingScale).toBe('100');
+    const byId = Object.fromEntries(out.rows.map((r) => [String(r.id), r.values['rating.current']]));
+    expect(byId[String(B1)]).toBe(92); // no round trip through stars
+    expect(byId[String(B2)]).toBe(100); // 5 stars on the 100-point scale
+  });
+
+  test('ratingScale must be 5, 20 or 100', async () => {
+    await expect(runQuery(USER, { columns: ['rating.current'], ratingScale: '10' })).rejects.toThrow(/ratingScale must be/);
   });
 });
 
@@ -619,6 +652,17 @@ describe('AUDIT fixes 2026-08-19 — the rest of the confirmed nine', () => {
   test('F3: a rating filter value outside 0–5 stars is rejected', async () => {
     await expect(compileFilters([{ field: 'rating.current', op: 'gte', value: 92 }], USER))
       .rejects.toThrow(/stars run 0–5/);
+  });
+
+  test('a rating filter in its own scale compares against the expression for that scale', async () => {
+    const { exprFilters } = await compileFilters([{ field: 'rating.current', op: 'gte', value: 90, scale: '100' }], USER);
+    expect(exprFilters[0].pred).toEqual({ $gte: 90 });
+    // Rounded to the scale's step, as the rows show it (release audit 2026-10-12).
+    expect(exprFilters[0].expr).toEqual({ $round: [ratingConversionExpr('rating', 'ratingScale', '100'), 0] });
+    await expect(compileFilters([{ field: 'rating.current', op: 'gte', value: 101, scale: '100' }], USER))
+      .rejects.toThrow(/100-point scale runs 0–100/);
+    await expect(compileFilters([{ field: 'rating.current', op: 'gte', value: 9, scale: '10' }], USER))
+      .rejects.toThrow(/scale must be 5, 20 or 100/);
   });
 
   test('F3: sorting by rating orders by the star expression with the tiebreaker', async () => {

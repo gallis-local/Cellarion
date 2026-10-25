@@ -9,6 +9,12 @@ const { sendSupportReplyEmail, EMAIL_VERIFICATION_ENABLED } = require('../../ser
 const { stripHtml } = require('../../utils/sanitize');
 const { parsePagination } = require('../../utils/pagination');
 const { isValidId } = require('../../utils/validation');
+// A row written straight to the model bypasses services/notifications, which
+// is what moves the recipient's notifications version for the cached token
+// polls (release audit 2026-10-09, L).
+const { bumpNotificationsVersion } = require('../../services/dataVersion');
+const { SUPPORT_CATEGORIES } = require('../../config/constants');
+const featureFlags = require('../../config/featureFlags');
 
 const TICKET_STATUSES = ['open', 'in_progress', 'closed'];
 const REPLY_EMAIL_TIMEOUT_MS = 10000;
@@ -50,18 +56,23 @@ async function emailSupportReply(ticket, replyText) {
 
 router.use(requireAuth, requireRole('admin'));
 
-// GET /api/admin/support-tickets — list all tickets with optional status filter
+// GET /api/admin/support-tickets — list all tickets, optionally filtered by
+// status, by category, and for beta feedback by the feature it is about.
 router.get('/', async (req, res) => {
   try {
-    const { status } = req.query;
+    const { status, category, feature } = req.query;
     const { limit, offset, page } = parsePagination(req.query, { limit: 20, maxLimit: 200 });
 
-    // Retrieve from static array so the value in the filter is never user-tainted
+    // Retrieve from static arrays so the values in the filter are never user-tainted
     const statusIdx = TICKET_STATUSES.indexOf(String(status || ''));
+    const categoryIdx = SUPPORT_CATEGORIES.indexOf(String(category || ''));
+    const featureIdx = featureFlags.FEATURE_KEYS.indexOf(String(feature || ''));
     const filter = {};
     if (statusIdx !== -1) filter.status = TICKET_STATUSES[statusIdx];
+    if (categoryIdx !== -1) filter.category = SUPPORT_CATEGORIES[categoryIdx];
+    if (featureIdx !== -1) filter.feature = featureFlags.FEATURE_KEYS[featureIdx];
 
-    const [tickets, total] = await Promise.all([
+    const [rows, total] = await Promise.all([
       SupportTicket.find(filter)
         .sort({ createdAt: -1 })
         .skip(offset)
@@ -71,6 +82,11 @@ router.get('/', async (req, res) => {
         .lean(),
       SupportTicket.countDocuments(filter)
     ]);
+    // Beta feedback carries the feature's English title for the badge; a
+    // flag already deleted from the code shows its key.
+    const tickets = rows.map((t) => (t.feature
+      ? { ...t, featureTitle: featureFlags.get(t.feature)?.title || t.feature }
+      : t));
 
     res.json({ tickets, total, page, limit });
   } catch (err) {
@@ -106,14 +122,20 @@ router.put('/:id/respond', async (req, res) => {
     ticket.status = newStatus;
     await ticket.save();
 
-    // Notify the user
-    await Notification.create({
-      user: ticket.user,
-      type: 'support_ticket_response',
-      title: 'Support ticket update',
-      message: `Your support ticket "${ticket.subject}" has received a response.`,
-      link: '/support'
-    });
+    // The reply is stored. Nothing after this line may answer 500: a retry of
+    // a stored reply appends the same answer to replies[] a second time.
+    try {
+      await Notification.create({
+        user: ticket.user,
+        type: 'support_ticket_response',
+        title: 'Support ticket update',
+        message: `Your support ticket "${ticket.subject}" has received a response.`,
+        link: '/support'
+      });
+      bumpNotificationsVersion(ticket.user);
+    } catch (err) {
+      console.error('[support] bell notification failed after the reply was saved:', err.message);
+    }
     const emailed = await emailSupportReply(ticket, cleaned);
 
     logAudit(req, 'support.ticket.responded', { type: 'SupportTicket', id: ticket._id }, {
@@ -121,8 +143,12 @@ router.put('/:id/respond', async (req, res) => {
       emailed
     });
 
-    await ticket.populate('user', 'username email');
-    await ticket.populate('respondedBy', 'username');
+    try {
+      await ticket.populate('user', 'username email');
+      await ticket.populate('respondedBy', 'username');
+    } catch (err) {
+      console.error('[support] populate failed after the reply was saved:', err.message);
+    }
     res.json({ ticket, emailed });
   } catch (err) {
     console.error('Admin respond to support ticket error:', err);

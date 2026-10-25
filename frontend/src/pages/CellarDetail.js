@@ -1,9 +1,12 @@
 import { useState, useEffect, useRef, Suspense, Fragment } from 'react';
 import { lazy } from '../utils/lazyWithReload';
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { useCameBack } from '../utils/useBackHere';
+import { validScope, keepKnownCellars } from '../utils/savedScope';
+import useHandedOverState from '../hooks/useHandedOverState';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
-import { getCellar, getCellarStatistics, listCellars, getMultiCellarBottles } from '../api/cellars';
+import { getCellar, getCellarStatistics, getCellarMaturityCounts, listCellars, getMultiCellarBottles } from '../api/cellars';
 import { getRacks } from '../api/racks';
 import { getCellarLayout } from '../api/cellarLayout';
 import BottleCard from '../components/BottleCard';
@@ -12,9 +15,18 @@ import CellarScopePicker from '../components/CellarScopePicker';
 import ClimateCard from '../components/ClimateCard';
 import CellarNav from '../components/CellarNav';
 import CellarPageHeader from '../components/CellarPageHeader';
+import SearchInput from '../components/SearchInput';
 import { readBottleViewMode, storeBottleViewMode } from '../utils/bottleViewMode';
-import { ratingRangeLabel, toMaturityArray, MATURITY_I18N_KEY } from '../utils/filterLabels';
+import { ratingRangeLabel, ratingBandName, toMaturityArray, MATURITY_I18N_KEY } from '../utils/filterLabels';
 import { CELLAR_SORTS, DEFAULT_CELLAR_SORT, preferredCellarSort } from '../utils/cellarSort';
+import { formatArrivalMonth, isArrivalLate } from '../utils/onOrder';
+import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
+import { useFeature } from '../utils/featureFlags';
+import BottleUndoNotice, { bottleNoticeName } from '../components/BottleUndoNotice';
+import BottleAddedNotice from '../components/BottleAddedNotice';
+import { CARD_FIELDS, cardDetails, readCardFields, storeCardFields } from '../utils/cardDetails';
+import { summarizeSelection } from '../utils/bulkSelection';
+import LoadError from '../components/LoadError';
 import './CellarDetail.css';
 
 // Stable empty rack map for the cross-cellar view (rack placement is per-cellar,
@@ -32,20 +44,45 @@ const BulkConsumeModal = lazy(() => import('../components/BulkConsumeModal'));
 const BulkReserveModal = lazy(() => import('../components/BulkReserveModal'));
 const BulkDrinkWindowModal = lazy(() => import('../components/BulkDrinkWindowModal'));
 const BulkAddToListModal = lazy(() => import('../components/BulkAddToListModal'));
+const AddToPickListModal = lazy(() => import('../components/AddToPickListModal'));
+const BulkDeleteModal = lazy(() => import('../components/BulkDeleteModal'));
+const RecentlyDeletedModal = lazy(() => import('../components/RecentlyDeletedModal'));
+const DrinkOneModal = lazy(() => import('../components/DrinkOneModal'));
 
 // The select-mode bar's actions, in display order. Each opens one modal; all
 // of them reuse the single-bottle operations server-side and report skipped
-// bottles instead of failing the batch.
+// bottles instead of failing the batch. Delete sits last, set apart: it moves
+// the bottles to "Recently deleted" for 30 days behind its own confirm step.
 const BULK_ACTIONS = [
   { key: 'move',     icon: '📦', label: 'bulk.moveAction' },
   { key: 'purchase', icon: '🧾', label: 'bulk.purchaseAction' },
   { key: 'consume',  icon: '🍷', label: 'bulk.consumeAction' },
   { key: 'reserve',  icon: '🔖', label: 'bulk.reserveAction' },
   { key: 'window',   icon: '⏳', label: 'bulk.windowAction' },
+  // Early access (flag pickLists): the bottles go on a pick list that shows
+  // where each one sits. Shown only to members with the feature on.
+  { key: 'pick',     icon: '📍', label: 'bulk.pickAction', feature: 'pickLists' },
   { key: 'list',     icon: '📋', label: 'bulk.listAction' },
+  { key: 'delete',   icon: '🗑️', label: 'bulk.deleteAction', danger: true },
 ];
 
 const BOTTLES_PER_PAGE = 30;
+// Coming back to the list (Back from a bottle) should find it as it was left:
+// the "all my cellars" scope, how many bottles were loaded, and where the page
+// was scrolled. Per cellar, this tab only (sessionStorage), like the filters.
+// Only Back/Forward (or a reload) restores them — a link to the cellar opens
+// it fresh.
+const SCOPE_STORAGE_PREFIX = 'cellarion.cellarScope.';
+const PLACE_STORAGE_PREFIX = 'cellarion.cellarPlace.';
+// The server's page cap (routes/cellars.js maxLimit): a place deeper than this
+// comes back with its first 200 bottles and the rest behind "Load more".
+const MAX_RESTORE = 200;
+// A place older than this is a different visit, not a Back.
+const PLACE_TTL_MS = 30 * 60 * 1000;
+const readStored = (key) => {
+  try { return JSON.parse(sessionStorage.getItem(key) || 'null'); } catch { return null; }
+};
+const readSavedScope = (cellarId) => validScope(readStored(SCOPE_STORAGE_PREFIX + cellarId), cellarId);
 
 // Persist the per-cellar filter/sort selection for the tab session so that
 // opening a bottle and hitting browser-back doesn't wipe it (the bottle page is
@@ -57,7 +94,7 @@ const buildDefaultFilters = (sort = DEFAULT_CELLAR_SORT) => ({
   grapes: [], vintage: [], minRating: '', maxRating: '', maturity: [], unplaced: '', reserved: '', storage: '',
   // Only set by Statistics chart deep links (no control in the filter modal);
   // shown as removable chips.
-  producer: '', bottleSize: '', purchaseYear: '',
+  producer: '', bottleSize: '', purchaseYear: '', ratingBand: '',
   sort
 });
 // Every URL param the page reads on arrival (and then clears from the URL).
@@ -65,7 +102,7 @@ const buildDefaultFilters = (sort = DEFAULT_CELLAR_SORT) => ({
 // Statistics page's chart segments land here (support ticket 2026-09-19).
 const URL_FILTER_KEYS = ['search', 'type', 'country', 'region', 'appellation',
   'grapes', 'vintage', 'minRating', 'maxRating', 'maturity', 'unplaced', 'reserved', 'storage',
-  'producer', 'bottleSize', 'purchaseYear', 'sort'];
+  'producer', 'bottleSize', 'purchaseYear', 'ratingBand', 'sort'];
 const readSavedFilters = (cellarId) => {
   try {
     const raw = sessionStorage.getItem(FILTERS_STORAGE_PREFIX + cellarId);
@@ -80,16 +117,32 @@ const readSavedFilters = (cellarId) => {
 };
 
 function CellarDetail() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { id } = useParams();
   const { apiFetch, user, updatePreferences } = useAuth();
   const ratingScale = user?.preferences?.ratingScale || '5';
   const userCurrency = user?.preferences?.currency || 'USD';
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  // A bottle the bottle page just took away (drunk, or "Added by mistake"),
+  // said here with Undo — handed over once (hooks/useHandedOverState).
+  const [bottleNotice, setBottleNotice] = useHandedOverState('bottleNotice');
+  // "“X” added — Add another bottle", handed over by the add page. It gives
+  // way to the next notice (a drink from a card): one line at a time.
+  const [addedNotice, setAddedNotice] = useHandedOverState('addedNotice');
+  useEffect(() => { if (bottleNotice) setAddedNotice(null); }, [bottleNotice]); // eslint-disable-line react-hooks/exhaustive-deps
   const [cellar, setCellar] = useState(null);
   const [bottles, setBottles] = useState([]);
   const [bottlesTotal, setBottlesTotal] = useState(0);
+  // Bottles behind the cards: identical bottles share a card, so `bottlesTotal`
+  // (cards, for paging) can be 1 where the filter's button means 2 bottles.
+  const [bottleCount, setBottleCount] = useState(0);
+  // Bottles per maturity stage, for the filter's maturity buttons — asked for
+  // each time the filter opens (#1291), kept with the cellar they are for:
+  // { id, counts }.
+  const [maturity, setMaturity] = useState(null);
+  // { count, nextExpected } — bottles bought for this cellar, not arrived yet.
+  const [onOrder, setOnOrder] = useState(null);
   const [statistics, setStatistics] = useState(null);
   const [rackMap, setRackMap] = useState(new Map());
   // null = rack layout not yet loaded. Gates the "Unplaced" badge: only badge
@@ -101,10 +154,14 @@ function CellarDetail() {
   const [loading, setLoading] = useState(true);
   const [bottlesLoading, setBottlesLoading] = useState(false);
   const [error, setError] = useState(null);
+  // Whether trying the load again can help: a network failure or a 5xx can; a
+  // 404/403 ("Cellar not found") cannot, so it gets no Retry button.
+  const [errorRetryable, setErrorRetryable] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showColorPicker, setShowColorPicker] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [showTrash, setShowTrash] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   // True while the bottle list is in select mode — hides the add-bottle FAB,
   // which otherwise sits on top of the cards being selected.
@@ -141,6 +198,8 @@ function CellarDetail() {
       producer: searchParams.get('producer') || '',
       bottleSize: searchParams.get('bottleSize') || '',
       purchaseYear: searchParams.get('purchaseYear') || '',
+      // A statistics rating band ('61-80'): exactly the bottles counted in it.
+      ratingBand: searchParams.get('ratingBand') || '',
       sort: searchParams.get('sort') || preferredSort
     };
   });
@@ -156,8 +215,14 @@ function CellarDetail() {
 
   // ── Cross-cellar scope: which cellars this view spans (default: this one) ──
   const [allCellars, setAllCellars] = useState([]);
-  const [scopeIds, setScopeIds] = useState([id]);
+  const cameBack = useCameBack();
+  const [scopeIds, setScopeIds] = useState(() => (cameBack ? readSavedScope(id) : [id]));
   const scopeKey = scopeIds.join(',');
+  const scopeNow = useRef(scopeIds);
+  scopeNow.current = scopeIds;
+  // The place restored on arrival (kept for a scope trimmed after it).
+  const restoredPlace = useRef(null);
+  const restoring = useRef(null);
   const multiScope = !(scopeIds.length === 1 && scopeIds[0] === id);
   // Shape of the bottles CURRENTLY in state (grouped vs flat). Tracked separately
   // from the live scope selection so a scope change never renders the just-loaded
@@ -175,6 +240,16 @@ function CellarDetail() {
       .then(d => {
         const list = d.cellars || [];
         setAllCellars(list);
+        // A remembered scope may name a cellar since deleted or unshared —
+        // judged only on a real answer (an error must not wipe the scope).
+        // Trimmed while its place was being restored: restore it again.
+        if (Array.isArray(d.cellars)) {
+          const kept = keepKnownCellars(scopeNow.current, id, list);
+          if (kept !== scopeNow.current) {
+            if (restoredPlace.current) restoring.current = { ...restoredPlace.current, scopeKey: kept.join(',') };
+            setScopeIds(kept);
+          }
+        }
         // Mount-time value: this effect runs once, on arrival.
         if (pendingOwnedScope) {
           // This cellar first, then the rest the user owns — the same set the
@@ -199,8 +274,13 @@ function CellarDetail() {
     // Skip the mount run: the initial state already is [id], and resetting
     // here would race the ?scope=owned widening above.
     if (scopeResetFirstRun.current) { scopeResetFirstRun.current = false; return; }
-    setScopeIds([id]);
-  }, [id]);
+    setScopeIds(cameBack ? readSavedScope(id) : [id]);
+  }, [id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Remember the scope per cellar, like the filters.
+  useEffect(() => {
+    try { sessionStorage.setItem(SCOPE_STORAGE_PREFIX + id, JSON.stringify(scopeIds)); } catch { /* best-effort */ }
+  }, [id, scopeKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // The unplaced filter is single-cellar only (placement is per-cellar; the
   // cross-cellar endpoint doesn't resolve rack slots) — drop it when the scope
@@ -261,17 +341,70 @@ function CellarDetail() {
     filters.appellation.join(','), filters.grapes.join(','), filters.vintage.join(','),
     filters.minRating, filters.maxRating, toMaturityArray(filters.maturity).join(','),
     filters.unplaced, filters.reserved, filters.storage,
-    filters.producer, filters.bottleSize, filters.purchaseYear, filters.sort
+    filters.producer, filters.bottleSize, filters.purchaseYear, filters.ratingBand, filters.sort
   ].join('|');
 
   // Refetch on cellar id, filters, or scope change. `id` is included so an
   // in-place navigation to another cellar whose scope key happens to match the
   // current one still refetches; the fetch-seq guard drops the transient
   // stale-scope response that the id→scope-reset produces.
+  // Where this list was left (read once, on arrival): restored when the
+  // filters and scope are the same as then — i.e. this is coming back.
+  const placeToRestore = useRef(cameBack ? readStored(PLACE_STORAGE_PREFIX + id) : null);
+  // The place being restored (restoring, until its list is on screen): a
+  // remembered scope trimmed meanwhile (a cellar since gone) asks again with
+  // the same count.
+  const pendingScroll = useRef(null);
   useEffect(() => {
     if (pendingOwnedScope) return;
-    fetchCellarData(0);
+    const place = placeToRestore.current;
+    placeToRestore.current = null;
+    if (place && place.filterKey === filterKey && place.scopeKey === scopeKey
+      && Date.now() - (place.at || 0) < PLACE_TTL_MS) {
+      restoring.current = place;
+      restoredPlace.current = place;
+    }
+    const restore = restoring.current && restoring.current.filterKey === filterKey ? restoring.current : null;
+    restoring.current = restore;
+    if (restore) {
+      pendingScroll.current = restore.scrollY || 0;
+      fetchCellarData(0, Math.min(Math.max(restore.count || 0, BOTTLES_PER_PAGE), MAX_RESTORE));
+    } else {
+      pendingScroll.current = null;
+      fetchCellarData(0);
+    }
   }, [id, filterKey, scopeKey, pendingOwnedScope]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Scroll back once the restored page is on screen — or forget it, when the
+  // list came back empty, so a later filter does not jump down the page.
+  useEffect(() => {
+    if (pendingScroll.current == null || loading) return;
+    const y = pendingScroll.current;
+    pendingScroll.current = null;
+    restoring.current = null;
+    if (bottles.length > 0) requestAnimationFrame(() => window.scrollTo(0, y));
+  }, [bottles, loading]);
+
+  // Save the place when leaving (Back, a bottle, another page). The scroll
+  // position is tracked as it changes: by the time a leaving page cleans up,
+  // the next one may already have moved the window.
+  // Kept after each commit (not during render), so leaving for another
+  // cellar saves the one being left, not the one arriving.
+  const placeNow = useRef({});
+  useEffect(() => {
+    placeNow.current = { count: bottles.length, filterKey, scopeKey };
+  });
+  useEffect(() => {
+    let scrollY = window.scrollY;
+    const onScroll = () => { scrollY = window.scrollY; };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      try {
+        sessionStorage.setItem(PLACE_STORAGE_PREFIX + id, JSON.stringify({ ...placeNow.current, scrollY, at: Date.now() }));
+      } catch { /* best-effort */ }
+    };
+  }, [id]);
 
   useEffect(() => {
     fetchStatistics();
@@ -279,7 +412,7 @@ function CellarDetail() {
   }, [id]); // eslint-disable-line react-hooks/exhaustive-deps
 
 
-  const fetchCellarData = async (skip) => {
+  const fetchCellarData = async (skip, limit = BOTTLES_PER_PAGE) => {
     const seq = ++fetchSeq.current;
     setError(null);
     try {
@@ -303,7 +436,7 @@ function CellarDetail() {
           params.append(key, val);
         }
       });
-      params.set('limit', BOTTLES_PER_PAGE);
+      params.set('limit', limit);
       params.set('skip', skip);
       const multi = !(scopeIds.length === 1 && scopeIds[0] === id);
       let res;
@@ -329,14 +462,21 @@ function CellarDetail() {
       if (seq !== fetchSeq.current) return;
       if (res.ok) {
         if (data.cellar) setCellar(data.cellar);
+        // Single-cellar responses only; the cross-cellar view has no on-order
+        // link. Reset when absent (an offline copy carries none), so another
+        // cellar's count never lingers.
+        if (!multi) setOnOrder(data.onOrder || null);
         setBottlesTotal(data.bottles.total);
+        setBottleCount(data.bottles.bottleTotal ?? data.bottles.total);
         if (skip === 0) {
           // Set the data + its shape together so BottlesList never sees a
           // shape/flag mismatch (grouped items rendered as flat, or vice-versa).
           setBottles(data.bottles.items);
           setDataIsMulti(multi);
-          // Update facets on every fetch so cascading filters work
-          if (data.facets) setFacets(data.facets);
+          // Update facets on every fetch so cascading filters work. An
+          // answer with none (a rack / storage filter: the search cannot
+          // count it) clears them — never the previous request's numbers.
+          setFacets(data.facets ?? null);
           if (data.baseFacets) setBaseFacets(data.baseFacets);
           if (data.facetMeta) setFacetMeta(data.facetMeta);
         } else {
@@ -344,9 +484,14 @@ function CellarDetail() {
         }
       } else {
         setError(data.error || 'Failed to load cellar');
+        setErrorRetryable(res.status >= 500);
       }
     } catch {
-      if (seq === fetchSeq.current) setError('Network error');
+      // Network failure, or a proxy's HTML error page during a deploy.
+      if (seq === fetchSeq.current) {
+        setError(t('common.couldNotLoad', 'This could not be loaded. Check your connection and try again.'));
+        setErrorRetryable(true);
+      }
     } finally {
       if (seq === fetchSeq.current) {
         setLoading(false);
@@ -356,6 +501,20 @@ function CellarDetail() {
   };
 
   const loadMore = () => fetchCellarData(bottles.length);
+
+  // The maturity buttons' counts, fresh each time the filter opens on this
+  // cellar alone (the all-cellars view has none): any change — a bottle
+  // drunk, a drink window edited — may have moved bottles between stages.
+  // The last counts for this cellar show meanwhile; another cellar's never.
+  useEffect(() => {
+    if (!showFilterModal || multiScope) return undefined;
+    let live = true;
+    getCellarMaturityCounts(apiFetch, id)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => { if (live && data?.maturity) setMaturity({ id, counts: data.maturity }); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [showFilterModal, multiScope, id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const fetchStatistics = async () => {
     try {
@@ -408,11 +567,23 @@ function CellarDetail() {
 
   // Only replace the whole page when we have nothing to show yet; once the
   // cellar is loaded, transient fetch failures render as an inline banner.
-  if (error && !cellar) return <div className="alert alert-error">{error}</div>;
+  // Load again after a failure. `loading` first, or the moment between the
+  // tap and the answer shows "No bottles in this cellar yet" again.
+  const retryCellar = () => {
+    setError(null);
+    setLoading(true);
+    fetchCellarData(0);
+  };
+  const retryProps = errorRetryable ? { onRetry: retryCellar } : {};
+  // An empty list with a load error says so in the list's own place (below);
+  // the banner at the top is for failures over a list that is on screen.
+  const errorInList = !!error && bottles.length === 0;
+
+  if (error && !cellar) return <LoadError message={error} {...retryProps} />;
 
   return (
     <div className="cellar-detail-page">
-      {error && (
+      {error && !errorInList && (
         <div className="alert alert-error" role="alert">
           {error}
           <button
@@ -424,6 +595,23 @@ function CellarDetail() {
             ✕
           </button>
         </div>
+      )}
+      {bottleNotice && (
+        <BottleUndoNotice
+          key={`${bottleNotice.bottleId}:${bottleNotice.at || ''}`}
+          floating={!!bottleNotice.floating}
+          notice={bottleNotice}
+          cellarId={id}
+          onUndone={() => { fetchCellarData(0); fetchStatistics(); fetchRacks(); }}
+          onDismiss={() => setBottleNotice(null)}
+        />
+      )}
+      {addedNotice && (
+        <BottleAddedNotice
+          notice={addedNotice}
+          cellarId={id}
+          onDismiss={() => setAddedNotice(null)}
+        />
       )}
       {/* ── Header — shared shape so the nav anchors at the same Y everywhere ── */}
       <CellarPageHeader
@@ -441,7 +629,7 @@ function CellarDetail() {
         actions={!loading && (
           <>
             {canEdit && !user?.isDemo && (
-              <Link to={`/cellars/${id}/add-bottle`} className="btn btn-primary btn-small cph-desktop-only">
+              <Link to={`/cellars/${id}/add-bottle`} state={{ cameFrom: `/cellars/${id}` }} className="btn btn-primary btn-small cph-desktop-only">
                 + {t('cellarDetail.addBottle')}
               </Link>
             )}
@@ -519,6 +707,14 @@ function CellarDetail() {
                       >
                         <span aria-hidden="true">🧾</span> {t('cellarDetail.auditLog')}
                       </Link>
+                    )}
+                    {canEdit && (
+                      <button
+                        className="more-menu-item"
+                        onClick={() => { setShowTrash(true); setMoreOpen(false); }}
+                      >
+                        <span aria-hidden="true">♻️</span> {t('trash.menuItem')}
+                      </button>
                     )}
                     {cellar.userRole === 'owner' && (
                       <>
@@ -656,6 +852,7 @@ function CellarDetail() {
             // One chip for the rating range (either bound or both), in the user's scale.
             const ratingLabel = ratingRangeLabel(t, filters.minRating, filters.maxRating, ratingScale);
             if (ratingLabel) activeChips.push({ key: 'rating', value: '', label: ratingLabel });
+            if (filters.ratingBand) activeChips.push({ key: 'ratingBand', value: filters.ratingBand, label: t('bottles.chipRatingRange', 'Rating: {{value}}', { value: ratingBandName(filters.ratingBand, t) }) });
             toMaturityArray(filters.maturity).forEach(v => activeChips.push({ key: 'maturity', value: v, label: t(MATURITY_I18N_KEY[v] || v, v) }));
             if (filters.unplaced) activeChips.push({ key: 'unplaced', value: '1', label: t('cellarDetail.unplacedOnly', 'Unplaced only') });
             if (filters.reserved) activeChips.push({ key: 'reserved', value: '1', label: t('cellarDetail.reservedOnly', 'Reserved only') });
@@ -684,19 +881,16 @@ function CellarDetail() {
               ...prev,
               type: [], country: [], region: [], appellation: [], grapes: [], vintage: [],
               minRating: '', maxRating: '', maturity: [], unplaced: '', reserved: '', storage: '',
-              producer: '', bottleSize: '', purchaseYear: ''
+              producer: '', bottleSize: '', purchaseYear: '', ratingBand: ''
             }));
 
             return (
               <>
                 <div className="search-row">
-                  <input
-                    type="text"
+                  <SearchInput
                     placeholder={t('cellarDetail.searchPlaceholder')}
                     value={filters.search}
-                    onChange={e => setFilters({ ...filters, search: e.target.value })}
-                    className="search-input"
-                    aria-label={t('cellarDetail.searchPlaceholder')}
+                    onChange={search => setFilters({ ...filters, search })}
                   />
                   <button
                     type="button"
@@ -726,6 +920,8 @@ function CellarDetail() {
                     <option value="-vintage">{t('cellarDetail.sortVintageNew')}</option>
                     <option value="price">{t('cellarDetail.sortPriceLow')}</option>
                     <option value="-price">{t('cellarDetail.sortPriceHigh')}</option>
+                    <option value="-quantity">{t('cellarDetail.sortQuantityMost', 'Most bottles first')}</option>
+                    <option value="quantity">{t('cellarDetail.sortQuantityFewest', 'Fewest bottles first')}</option>
                     <option value="maturity">{t('cellarDetail.sortMaturity')}</option>
                   </select>
                   {allCellars.length > 1 && (
@@ -757,6 +953,22 @@ function CellarDetail() {
                   </div>
                 )}
 
+                {/* Bottles bought for this cellar that have not arrived yet —
+                    kept out of the list below, one tap away. */}
+                {!dataIsMulti && onOrder?.count > 0 && (
+                  <Link to={`/cellars/${id}/on-order`} className="on-order-link-bar">
+                    <span aria-hidden="true">🚚</span>
+                    <span>{t('onOrder.linkCount', { count: onOrder.count })}</span>
+                    {onOrder.nextExpected && (
+                      <span className={`on-order-link-next${isArrivalLate(onOrder.nextExpected) ? ' is-late' : ''}`}>
+                        · {t(isArrivalLate(onOrder.nextExpected) ? 'onOrder.linkLate' : 'onOrder.linkNext',
+                          { month: formatArrivalMonth(onOrder.nextExpected, i18n.language) })}
+                      </span>
+                    )}
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+                  </Link>
+                )}
+
                 {showFilterModal && (
                   <Suspense fallback={null}>
                     <BottleFilterModal
@@ -766,12 +978,12 @@ function CellarDetail() {
                       facets={facets}
                       baseFacets={baseFacets}
                       facetMeta={facetMeta}
-                      bottlesTotal={bottlesTotal}
+                      bottlesTotal={bottleCount}
                       showUnplaced={!multiScope && hasRacks === true}
                       showReserved={!multiScope}
                       storage={!multiScope ? storageRacks : null}
                       ratingScale={ratingScale}
-                      maturityCounts={!multiScope ? (statistics?.maturity || null) : null}
+                      maturityCounts={!multiScope && maturity?.id === id ? maturity.counts : null}
                     />
                   </Suspense>
                 )}
@@ -781,8 +993,12 @@ function CellarDetail() {
 
           {loading ? (
             <div className="loading">{t('cellarDetail.loadingCellar')}</div>
+          ) : error && bottles.length === 0 ? (
+            // A failed load is not an empty cellar — "No bottles in this
+            // cellar yet" here reads as "my bottles are gone".
+            <LoadError message={error} {...retryProps} />
           ) : bottles.length === 0 && !bottlesLoading ? (
-            (filters.search || filters.vintage?.length || filters.minRating || filters.maxRating || toMaturityArray(filters.maturity).length || filters.unplaced || filters.reserved || filters.storage || filters.producer || filters.bottleSize || filters.purchaseYear || filters.type?.length || filters.country?.length || filters.region?.length || filters.appellation?.length || filters.grapes?.length) ? (
+            (filters.search || filters.vintage?.length || filters.minRating || filters.maxRating || toMaturityArray(filters.maturity).length || filters.unplaced || filters.reserved || filters.storage || filters.producer || filters.bottleSize || filters.purchaseYear || filters.ratingBand || filters.type?.length || filters.country?.length || filters.region?.length || filters.appellation?.length || filters.grapes?.length) ? (
               <div className="empty-state">
                 <p>{t('cellarDetail.noSearchResults')}</p>
               </div>
@@ -790,9 +1006,19 @@ function CellarDetail() {
               <div className="empty-state">
                 <p>{t('cellarDetail.noBottles')}</p>
                 {canEdit && (
-                  <Link to={`/cellars/${id}/add-bottle`} className="btn btn-primary">
+                  <Link to={`/cellars/${id}/add-bottle`} state={{ cameFrom: `/cellars/${id}` }} className="btn btn-primary">
                     {t('cellarDetail.addFirstBottle')}
                   </Link>
+                )}
+                {/* Import is how big collections arrive (and who loads one
+                    stays), but it lived only in the ⋯ menu — say it here,
+                    where someone with a collection elsewhere actually is. */}
+                {canEdit && (
+                  <p className="empty-state-import">
+                    <Link to={`/cellars/${id}/import`}>
+                      {t('cellarDetail.importInstead', 'Or import your collection from CellarTracker, Vivino or a spreadsheet')}
+                    </Link>
+                  </p>
                 )}
               </div>
             )
@@ -807,8 +1033,11 @@ function CellarDetail() {
               multi={dataIsMulti}
               rackKnown={!dataIsMulti && hasRacks === true}
               canBulkMove={!dataIsMulti && cellar?.userRole === 'owner'}
+              canConsume={!dataIsMulti && canEdit}
               onBulkDone={() => { fetchCellarData(0); fetchStatistics(); fetchRacks(); }}
               onSelectModeChange={setSelecting}
+              onTakenOut={setBottleNotice}
+              placesKnown={!dataIsMulti && hasRacks !== null}
             />
           )}
         </div>
@@ -817,7 +1046,7 @@ function CellarDetail() {
       {/* ── FAB: Add Bottle (mobile only) — hidden while selecting bottles ── */}
       {!loading && canEdit && !selecting && (
         <Link
-          to={`/cellars/${id}/add-bottle`}
+          to={`/cellars/${id}/add-bottle`} state={{ cameFrom: `/cellars/${id}` }}
           className="fab"
           aria-label={t('cellarDetail.addBottle')}
         >
@@ -858,6 +1087,16 @@ function CellarDetail() {
             onClose={() => setShowDeleteModal(false)}
           />
         )}
+
+        {showTrash && (
+          <RecentlyDeletedModal
+            cellarId={id}
+            onClose={(restoredAny) => {
+              setShowTrash(false);
+              if (restoredAny) { fetchCellarData(0); fetchStatistics(); fetchRacks(); }
+            }}
+          />
+        )}
       </Suspense>
     </div>
   );
@@ -871,8 +1110,45 @@ function CellarDetail() {
 // `canBulkMove` (owner of this one cellar) enables select mode and its bulk
 // actions; `onBulkDone` refreshes the parent's list, stats and racks after
 // one; `onSelectModeChange` tells the parent to hide the FAB meanwhile.
-function BottlesList({ bottles, rackMap, cellarId, hasMore, loadingMore, onLoadMore, multi = false, rackKnown = false, canBulkMove = false, onBulkDone, onSelectModeChange }) {
-  const { t } = useTranslation();
+function BottlesList({ bottles, rackMap, cellarId, hasMore, loadingMore, onLoadMore, multi = false, rackKnown = false, placesKnown = false, canBulkMove = false, canConsume = false, onBulkDone, onSelectModeChange, onTakenOut }) {
+  const { t, i18n } = useTranslation();
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  // "Show on cards" (forum feedback 2026-10-12): extra details the user picks
+  // for every card — rating, price, size, region, purchase date — per device.
+  const [cardFields, setCardFields] = useState(readCardFields);
+  const [fieldsOpen, setFieldsOpen] = useState(false);
+  const toggleCardField = (field) => {
+    setCardFields(prev => {
+      const next = prev.includes(field) ? prev.filter(f => f !== field) : CARD_FIELDS.filter(f => f === field || prev.includes(f));
+      storeCardFields(next);
+      return next;
+    });
+  };
+  // "Drink one" on a stacked card (support ticket 2026-10-09): the group
+  // whose bottle is being picked, then — after the server logged it — the
+  // journal prompt the bottle page offers for a bottle drunk, unless the
+  // user opted out of it. The list refreshes through onBulkDone either way.
+  const [drinkGroup, setDrinkGroup] = useState(null);
+  const [journalBottle, setJournalBottle] = useState(null);
+  // One page per wine and vintage: a tap on ANY entry — one bottle or a
+  // stack — opens the vintage page, so the last bottle of a vintage looks and
+  // behaves like the ones before it, and "Drink one" sits on every entry. A
+  // stack still expands from the ⊕ in select mode. An entry still waiting on
+  // a wine request has no registry wine: a tap opens the bottle (one) or
+  // expands the stack.
+  const pickListsOn = useFeature('pickLists');
+  const vintageHref = (rep, inCellar) => (rep?.wineDefinition?._id
+    ? `/cellars/${inCellar}/vintages/${rep.wineDefinition._id}/${encodeURIComponent(rep.vintage || 'NV')}`
+    : null);
+  const handleDrunk = (bottle, reason) => {
+    setDrinkGroup(null);
+    // Said at the top of the list, with Undo — drinking from a card used to
+    // change the count and say nothing (live walkthrough 2026-10-15).
+    onTakenOut?.({ kind: 'consumed', reason, bottleId: bottle._id, name: bottleNoticeName(bottle), at: Date.now(), floating: true });
+    if (reason === 'drank' && !journalPromptOptedOut()) setJournalBottle(bottle);
+    else onBulkDone?.();
+  };
   const [viewMode, setViewMode] = useState(readBottleViewMode);
   const [density, setDensity] = useState(() => {
     try { return localStorage.getItem('cellarion_bottle_density') || 'comfortable'; } catch { return 'comfortable'; }
@@ -939,6 +1215,13 @@ function BottlesList({ bottles, rackMap, cellarId, hasMore, loadingMore, onLoadM
   const compact = viewMode === 'list' && density === 'compact';
   // Notes preview likewise: the grid tiles have no room for a text line.
   const notesOn = viewMode === 'list' && showNotes;
+  // One line of the picked details for a card's bottles (one, or a stack).
+  // A string, so the memoized BottleCard compares it by value. The grid card
+  // already shows the region (a wine with only a country still gets it here).
+  const ratingScale = user?.preferences?.ratingScale || '5';
+  const detailsOf = (list) => cardDetails(list, cardFields, { ratingScale, locale: i18n.language, cardShowsRegion: viewMode !== 'list' })
+    .map(d => (d.field === 'purchased' ? t('cellarDetail.cardPurchased', { date: d.text, defaultValue: 'Bought {{date}}' }) : d.text))
+    .join(' · ');
 
   const toggleGroup = (key) => {
     setExpandedGroups(prev => {
@@ -963,6 +1246,33 @@ function BottlesList({ bottles, rackMap, cellarId, hasMore, loadingMore, onLoadM
             {t('cellarDetail.selectBottles')}
           </button>
         )}
+        <div className="more-menu-wrap card-fields-wrap">
+          <button
+            type="button"
+            className={`view-toggle-btn card-fields-btn ${cardFields.length ? 'active' : ''}`}
+            onClick={() => setFieldsOpen(o => !o)}
+            aria-haspopup="true"
+            aria-expanded={fieldsOpen}
+            aria-label={t('cellarDetail.cardFields', 'Show on cards')}
+            title={t('cellarDetail.cardFields', 'Show on cards')}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="9" cy="6" r="2" fill="currentColor"/><circle cx="15" cy="12" r="2" fill="currentColor"/><circle cx="7" cy="18" r="2" fill="currentColor"/></svg>
+          </button>
+          {fieldsOpen && (
+            <>
+              <div className="more-menu-backdrop" onClick={() => setFieldsOpen(false)} aria-hidden="true" />
+              <div className="more-menu-dropdown card-fields-menu" role="group" aria-label={t('cellarDetail.cardFields', 'Show on cards')}>
+                <div className="card-fields-title">{t('cellarDetail.cardFields', 'Show on cards')}</div>
+                {CARD_FIELDS.map(field => (
+                  <label key={field} className="more-menu-item card-fields-item">
+                    <input type="checkbox" checked={cardFields.includes(field)} onChange={() => toggleCardField(field)} />
+                    {t(`cellarDetail.cardField.${field}`)}
+                  </label>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
         {viewMode === 'list' && (
           <button
             className={`view-toggle-btn notes-toggle-btn ${showNotes ? 'active' : ''}`}
@@ -1034,11 +1344,11 @@ function BottlesList({ bottles, rackMap, cellarId, hasMore, loadingMore, onLoadM
             </button>
           </div>
           <div className="bulk-bar-actions">
-            {BULK_ACTIONS.map(a => (
+            {BULK_ACTIONS.filter(a => !a.feature || (a.feature === 'pickLists' && pickListsOn)).map(a => (
               <button
                 key={a.key}
                 type="button"
-                className="bulk-action-btn"
+                className={`bulk-action-btn${a.danger ? ' bulk-action-btn--danger' : ''}`}
                 onClick={() => setBulkAction(a.key)}
                 disabled={selectedIds.size === 0}
               >
@@ -1058,6 +1368,7 @@ function BottlesList({ bottles, rackMap, cellarId, hasMore, loadingMore, onLoadM
               <BottleCard
                 key={item._id}
                 bottle={item}
+                details={detailsOf([item])}
                 rackMap={rackMap}
                 cellarId={item.cellar || cellarId}
                 viewMode={viewMode}
@@ -1073,9 +1384,17 @@ function BottlesList({ bottles, rackMap, cellarId, hasMore, loadingMore, onLoadM
             const rep = item.bottles[0];
             // Cross-cellar groups live in one cellar: link + badge with it.
             const groupCellarId = multi ? (rep.cellar || cellarId) : cellarId;
+            // The vintage page every entry opens (null while the entry has
+            // no registry wine yet).
+            const pageHref = vintageHref(rep, groupCellarId);
             if (item.count === 1) {
               return (
-                <BottleCard key={rep._id} bottle={rep} rackMap={rackMap} cellarId={groupCellarId} showCellarBadge={multi} viewMode={viewMode} compact={compact} rackKnown={rackKnown} showNotes={notesOn} selectable={selectableNow} selected={isSelected(idsOf(item))} onToggleSelect={() => toggleIds(idsOf(item))} onLongPress={canBulkMove ? () => enterSelectWith(idsOf(item)) : undefined} />
+                <BottleCard
+                  key={rep._id} bottle={rep} details={detailsOf([rep])} rackMap={rackMap} cellarId={groupCellarId} showCellarBadge={multi} viewMode={viewMode} compact={compact} rackKnown={rackKnown} showNotes={notesOn} selectable={selectableNow} selected={isSelected(idsOf(item))} onToggleSelect={() => toggleIds(idsOf(item))} onLongPress={canBulkMove ? () => enterSelectWith(idsOf(item)) : undefined}
+                  onClick={pageHref ? () => navigate(pageHref) : undefined}
+                  onDrinkOne={canConsume ? () => setDrinkGroup(item) : undefined}
+                  actionsInline
+                />
               );
             }
             if (!expandedGroups.has(item.key)) {
@@ -1088,7 +1407,11 @@ function BottlesList({ bottles, rackMap, cellarId, hasMore, loadingMore, onLoadM
                   showCellarBadge={multi}
                   viewMode={viewMode}
                   groupCount={item.count}
-                  onClick={() => toggleGroup(item.key)}
+                  details={detailsOf(item.bottles)}
+                  onClick={pageHref ? () => navigate(pageHref) : () => toggleGroup(item.key)}
+                  onExpand={pageHref ? () => toggleGroup(item.key) : undefined}
+                  actionsInline
+                  onDrinkOne={canConsume ? () => setDrinkGroup(item) : undefined}
                   selectable={selectableNow}
                   selected={isSelected(idsOf(item))}
                   onToggleSelect={() => toggleIds(idsOf(item))}
@@ -1109,14 +1432,14 @@ function BottlesList({ bottles, rackMap, cellarId, hasMore, loadingMore, onLoadM
                   </button>
                 </div>
                 {item.bottles.map(b => (
-                  <BottleCard key={b._id} bottle={b} rackMap={rackMap} cellarId={groupCellarId} showCellarBadge={multi} viewMode={viewMode} compact={compact} rackKnown={rackKnown} showNotes={notesOn} selectable={selectableNow} selected={isSelected([b._id])} onToggleSelect={() => toggleIds([b._id])} onLongPress={canBulkMove ? () => enterSelectWith([b._id]) : undefined} />
+                  <BottleCard key={b._id} bottle={b} details={detailsOf([b])} rackMap={rackMap} cellarId={groupCellarId} showCellarBadge={multi} viewMode={viewMode} compact={compact} rackKnown={rackKnown} showNotes={notesOn} selectable={selectableNow} selected={isSelected([b._id])} onToggleSelect={() => toggleIds([b._id])} onLongPress={canBulkMove ? () => enterSelectWith([b._id]) : undefined} />
                 ))}
               </Fragment>
             );
           }
           // Defensive fallback: a plain bottle item (responses are always grouped)
           return (
-            <BottleCard key={item._id} bottle={item} rackMap={rackMap} cellarId={cellarId} viewMode={viewMode} compact={compact} rackKnown={rackKnown} showNotes={notesOn} selectable={selectableNow} selected={isSelected([item._id])} onToggleSelect={() => toggleIds([item._id])} onLongPress={canBulkMove ? () => enterSelectWith([item._id]) : undefined} />
+            <BottleCard key={item._id} bottle={item} details={detailsOf([item])} rackMap={rackMap} cellarId={cellarId} viewMode={viewMode} compact={compact} rackKnown={rackKnown} showNotes={notesOn} selectable={selectableNow} selected={isSelected([item._id])} onToggleSelect={() => toggleIds([item._id])} onLongPress={canBulkMove ? () => enterSelectWith([item._id]) : undefined} />
           );
         })}
       </div>
@@ -1149,10 +1472,36 @@ function BottlesList({ bottles, rackMap, cellarId, hasMore, loadingMore, onLoadM
         {bulkAction === 'window' && (
           <BulkDrinkWindowModal bottleIds={[...selectedIds]} onClose={closeAction} onDone={finishAction} />
         )}
+        {bulkAction === 'pick' && (
+          <AddToPickListModal bottleIds={[...selectedIds]} onClose={closeAction} onDone={finishAction} />
+        )}
         {bulkAction === 'list' && (
           <BulkAddToListModal bottleIds={[...selectedIds]} cellarId={cellarId} onClose={closeAction} onDone={finishAction} />
         )}
+        {bulkAction === 'delete' && (
+          <BulkDeleteModal
+            bottleIds={[...selectedIds]}
+            cellarId={cellarId}
+            summary={summarizeSelection(bottles, selectedIds, t('common.unknownWine'))}
+            rackedCount={[...selectedIds].filter(x => rackMap.has(String(x))).length}
+            onClose={closeAction}
+            onDone={finishAction}
+          />
+        )}
+        {drinkGroup && (
+          <DrinkOneModal
+            bottles={drinkGroup.bottles}
+            rackMap={rackMap}
+            wineName={bottleNoticeName(drinkGroup.bottles[0])}
+            placesKnown={placesKnown}
+            onClose={() => setDrinkGroup(null)}
+            onDone={handleDrunk}
+          />
+        )}
       </Suspense>
+      {journalBottle && (
+        <JournalPrompt bottle={journalBottle} onDone={() => { setJournalBottle(null); onBulkDone?.(); }} />
+      )}
     </>
   );
 }

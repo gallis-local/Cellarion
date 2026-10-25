@@ -172,7 +172,7 @@ export default function LandingPage() {
               </Link>
             ) : (
               <>
-                <Link to="/login" className="btn-landing-primary btn-landing-large">
+                <Link to="/login?mode=register" className="btn-landing-primary btn-landing-large">
                   {t('landing.getStarted')}
                 </Link>
                 <button
@@ -265,7 +265,7 @@ export default function LandingPage() {
               {t('landing.openCellar')}
             </Link>
           ) : (
-            <Link to="/login" className="btn-landing-primary btn-landing-large">
+            <Link to="/login?mode=register" className="btn-landing-primary btn-landing-large">
               {t('landing.createAccount')}
             </Link>
           )}
@@ -283,6 +283,10 @@ export default function LandingPage() {
           </span>
           <div className="landing-footer-links">
             <Link to="/connect-ai">{t('landing.footerConnectAi')}</Link>
+            <Link to="/developers">{t('landing.footerDevelopers', 'Developers')}</Link>
+            {/* Help is public: the one way in for a visitor deciding whether
+                to sign up (the menus that link it are for members). */}
+            <Link to="/help">{t('landing.footerHelp', 'Help')}</Link>
             <Link to="/privacy">Privacy</Link>
             <Link to="/terms">Registry terms</Link>
             {contactEmail && (

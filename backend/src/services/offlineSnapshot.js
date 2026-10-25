@@ -13,15 +13,15 @@
  * and the client joins them back (six bottles of a wine used to mean six copies
  * of its registry record). Bottles carry exactly what the cellar list gives
  * them: the list-weight wine populate, their resolved card image, and their
- * maturity status.
+ * maturity status, plus the two years the maturity sort orders a stage by.
  */
 const crypto = require('crypto');
 const Cellar = require('../models/Cellar');
 const Bottle = require('../models/Bottle');
 const Rack = require('../models/Rack');
 const { getCellarRole } = require('../utils/cellarAccess');
-const { classifyMaturity, buildProfileMap } = require('../utils/maturityUtils');
-const { CONSUMED_STATUSES, WINE_POPULATE_CARDS } = require('../config/constants');
+const { classifyMaturity, buildProfileMap, buildMaturitySortKeys } = require('../utils/maturityUtils');
+const { NOT_IN_CELLAR_STATUSES, WINE_POPULATE_CARDS } = require('../config/constants');
 const { getDataVersion } = require('./dataVersion');
 
 const SNAPSHOT_SCHEMA = 1;
@@ -41,11 +41,16 @@ const TAG_MAX_AGE_MS = 30 * 60 * 1000;
  * every TAG_MAX_AGE_MS. One small query instead of the ~13 a snapshot takes.
  * Read BEFORE building the snapshot: a change landing mid-build moves it on,
  * so the next check rebuilds instead of keeping a copy that misses it.
+ *
+ * `salt` gives another document built from the same data its own tag space
+ * (GET /api/inventory passes 'inventory:1'): a tag from one can then never
+ * be answered 304 by the other. Without it the tag is exactly as before.
  */
-async function snapshotTag(userId, now = Date.now()) {
+async function snapshotTag(userId, now = Date.now(), { salt = null } = {}) {
   const shared = await Cellar.find({ 'members.user': userId, deletedAt: null }).select('user').lean();
   const owners = [...new Set(shared.map((c) => String(c.user)))].sort();
   const parts = [
+    ...(salt ? [salt] : []),
     SNAPSHOT_SCHEMA,
     BOOT_ID,
     Math.floor(now / TAG_MAX_AGE_MS),
@@ -81,9 +86,10 @@ function userColorOf(cellar, userId) {
 /**
  * Pure: shape loaded documents into the snapshot. Exported for tests.
  * `bottles` are populated (wineDefinition as an object) and already carry
- * their image URLs; `maturity` maps bottle id → status.
+ * their image URLs; `maturity` maps bottle id → status and `maturitySort`
+ * bottle id → maturitySortKey.
  */
-function assembleSnapshot({ userId, cellars, bottles, racks, maturity = new Map(), now = new Date() }) {
+function assembleSnapshot({ userId, cellars, bottles, racks, maturity = new Map(), maturitySort = new Map(), now = new Date() }) {
   const cellarIds = new Set(cellars.map((c) => String(c._id)));
   const wines = {};
   const outBottles = [];
@@ -95,6 +101,10 @@ function assembleSnapshot({ userId, cellars, bottles, racks, maturity = new Map(
       ...b,
       wineDefinition: wine ? String(wine._id) : idOf(b.wineDefinition),
       maturityStatus: maturity.get(String(b._id)) || null,
+      // "Drink Soon→Later" inside a stage, offline as online: the year the
+      // stage ends, then the year the window ends (utils/maturityUtils).
+      maturityDue: maturitySort.get(String(b._id))?.due ?? null,
+      maturityEnd: maturitySort.get(String(b._id))?.end ?? null,
     });
   }
   const bottleIds = new Set(outBottles.map((b) => String(b._id)));
@@ -136,7 +146,7 @@ async function buildOfflineSnapshot(userId, { attachBottleImageUrls }) {
   const ids = cellars.map((c) => c._id);
 
   const bottles = ids.length
-    ? await Bottle.find({ cellar: { $in: ids }, status: { $nin: CONSUMED_STATUSES } })
+    ? await Bottle.find({ cellar: { $in: ids }, status: { $nin: NOT_IN_CELLAR_STATUSES } })
       .populate(SNAPSHOT_WINE_POPULATE)
       .lean()
     : [];
@@ -146,9 +156,10 @@ async function buildOfflineSnapshot(userId, { attachBottleImageUrls }) {
 
   const profileMap = await buildProfileMap(bottles);
   const maturity = new Map(bottles.map((b) => [String(b._id), classifyMaturity(b, profileMap) || null]));
+  const maturitySort = buildMaturitySortKeys(bottles, profileMap, maturity);
   const withImages = await attachBottleImageUrls(bottles, userId);
 
-  return assembleSnapshot({ userId, cellars, bottles: withImages, racks, maturity });
+  return assembleSnapshot({ userId, cellars, bottles: withImages, racks, maturity, maturitySort });
 }
 
 module.exports = { buildOfflineSnapshot, assembleSnapshot, snapshotTag, SNAPSHOT_SCHEMA, SNAPSHOT_WINE_POPULATE, TAG_MAX_AGE_MS };

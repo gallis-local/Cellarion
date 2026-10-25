@@ -16,7 +16,10 @@ process.env.JWT_SECRET = 'test-secret';
 
 jest.mock('../models/WineDefinition', () => ({ findById: jest.fn(), findOne: jest.fn(), find: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../models/Discussion', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
-jest.mock('../services/search', () => ({ getIsAvailable: () => false, search: jest.fn(), indexWine: jest.fn() }));
+jest.mock('../services/search', () => ({ getIsAvailable: () => false, search: jest.fn(), indexWine: jest.fn() }));
+// The page around the wine has its own tests; here it would query models
+// this suite does not mock.
+jest.mock('../services/winePageContext', () => ({ buildWinePageContext: jest.fn(async () => null) }));
 jest.mock('../services/labelScan', () => ({ scanLabelFull: jest.fn(), identifyWineFromQuery: jest.fn() }));
 jest.mock('../services/imageSanitizer', () => ({
   sanitizeImageBuffer: jest.fn(async (b) => b),
@@ -104,6 +107,30 @@ describe('GET /api/wines/:id — pending rows are visible to their creator and t
       _id: W1, name: 'Kaefferkopf', producer: 'Cave', grapes: [], createdBy: CREATOR,
     }));
     expect((await getWine(tokenFor(STRANGER))).status).toBe(200);
+  });
+});
+
+describe('GET /api/wines/:id — a member never receives who contributed the row', () => {
+  const PUBLISHED = { _id: W1, name: 'Kaefferkopf', producer: 'Cave', grapes: [], createdBy: CREATOR };
+
+  test('the member select drops contribution, createdVia and the curation internals, and keeps createdBy for the gate', async () => {
+    const query = populateChain(PUBLISHED);
+    WineDefinition.findById.mockReturnValue(query);
+    const res = await getWine(tokenFor(STRANGER));
+    expect(res.status).toBe(200);
+    const fields = query.select.mock.calls[0][0].split(/\s+/);
+    expect(fields).toEqual(expect.arrayContaining([
+      '-contribution', '-createdVia', '-canary', '-identityProvenance', '-normalizedKey', '-scanImage',
+    ]));
+    expect(fields).not.toContain('-createdBy');
+    expect(await res.json()).not.toHaveProperty('wine.createdBy');
+  });
+
+  test.each([['somm'], ['admin']])('%s still reads the whole row: the select drops only the scan evidence', async (role) => {
+    const query = populateChain(PUBLISHED);
+    WineDefinition.findById.mockReturnValue(query);
+    expect((await getWine(tokenFor(STRANGER, [role]))).status).toBe(200);
+    expect(query.select.mock.calls[0][0]).toBe('-scanImage -scanImageBack -scanFieldConflicts');
   });
 });
 

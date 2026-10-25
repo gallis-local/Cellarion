@@ -1,4 +1,4 @@
-import { memo, useRef } from 'react';
+import { memo, useRef, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { buildRackUrl } from '../utils/rackNavigation';
@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 import AuthImage from './AuthImage';
 import { glassesLeft, daysLeft, freshnessStatus } from '../utils/openBottle';
 import { isReserved, reservationSummary } from '../utils/reservation';
-import { swatchType } from '../utils/wineColour';
+import BottlePlaceholder from './BottlePlaceholder';
 import './BottleCard.css';
 
 const MATURITY_LABELS = {
@@ -21,7 +21,7 @@ const MATURITY_LABELS = {
  * Renders a single bottle in either list or card (grid) view.
  * Props: bottle, rackMap, cellarId, viewMode ('list' | 'card')
  */
-function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onClick, showCellarBadge = false, compact = false, rackKnown = false, showNotes = false, selectable = false, selected = false, onToggleSelect, onLongPress }) {
+function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onClick, showCellarBadge = false, compact = false, rackKnown = false, showNotes = false, selectable = false, selected = false, onToggleSelect, onLongPress, onDrinkOne, onExpand, actionsInline = false, details = '', linkState }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { user } = useAuth();
@@ -31,20 +31,38 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
   const cellarBadgeColor = bottle.cellarColor || null;
   // A collapsed group spans multiple bottles (possibly in different racks), so a
   // single rack badge would be misleading — suppress it until the group expands.
+  // The badge names the slot too ("Fridge · slot 12"; forum request 2026-10-13:
+  // finding a bottle should not mean opening it).
   const rackInfo = isGroup ? null : rackMap?.get(bottle._id);
+  // "slot" is the bottle page's already-translated word (release audit
+  // 2026-10-13: drinkOne.slot is English-only in the other locales).
+  const rackBadgeText = rackInfo && (rackInfo.position != null
+    ? `${rackInfo.rackName} · ${t('bottleDetail.rackSlot', 'slot')} ${rackInfo.position}`
+    : rackInfo.rackName);
   // "Unplaced" = the caller knows this cellar's rack layout (single-cellar view
   // of a cellar that has racks) and this active bottle isn't in any slot — i.e.
   // it's been added but not shelved. Suppressed for groups (members may differ)
   // and whenever placement is unknown (cross-cellar view, or no racks exist).
   const isUnplaced = rackKnown && !isGroup && !rackInfo && bottle.status === 'active';
   const rackNavPref = user?.preferences?.rackNavigation || 'auto';
-  // Chosen default → the owner's own photo (pending or approved) → the
-  // registry image. Same order as the bottle page hero: a photo you took of
-  // YOUR bottle beats a generic registry image, and it must not disappear
-  // from the card when an admin approves it (ticket 2026-09-05, #1227).
+  // Chosen default → the owner's own photo of this bottle or this vintage
+  // (pending or approved) → the vintage's official photo → the wine's
+  // registry image → the owner's photo of another vintage. Same order as the
+  // bottle page hero. A photo you took of YOUR bottle beats a generic registry
+  // image and must not disappear when an admin approves it (ticket 2026-09-05,
+  // #1227); a photo of ANOTHER vintage only stands in when the wine has no
+  // image at all, so a 2016 bottle never wears the 2015 label while the wine
+  // has a picture, and a card with any photo is never blank (ticket 2026-10-09).
   const ownImage = bottle.defaultImageUrl || bottle.pendingImageUrl;
-  const imgSrc = ownImage || bottle.wineDefinition?.image;
-  const credit = ownImage ? null : bottle.wineDefinition?.imageCredit;
+  const registryImage = bottle.vintageImageUrl || bottle.wineDefinition?.image;
+  // A photo that fails to load shows the drawn bottle instead of a blank;
+  // remembered by address, so a new photo is tried again.
+  const [failedSrc, setFailedSrc] = useState(null);
+  const photoSrc = ownImage || registryImage || bottle.otherVintageImageUrl;
+  const imgSrc = photoSrc && photoSrc !== failedSrc ? photoSrc : null;
+  const credit = ownImage || !registryImage
+    ? null
+    : (bottle.vintageImageUrl ? bottle.vintageImageCredit : bottle.wineDefinition?.imageCredit);
   const isPending = !bottle.wineDefinition && !!bottle.pendingWineRequest;
   const displayName = bottle.wineDefinition?.name || bottle.pendingWineRequest?.wineName || t('common.unknownWine');
   const displayProducer = bottle.wineDefinition?.producer || bottle.pendingWineRequest?.producer;
@@ -65,7 +83,7 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
   // collapsed group instead.
   const handleClick = selectable
     ? () => onToggleSelect?.()
-    : (onClick || (() => navigate(`/cellars/${cellarId}/bottles/${bottle._id}`)));
+    : (onClick || (() => navigate(`/cellars/${cellarId}/bottles/${bottle._id}`, linkState ? { state: linkState } : undefined)));
   const handleKey = e => {
     if (e.key === 'Enter') handleClick();
     else if (selectable && e.key === ' ') { e.preventDefault(); handleClick(); }
@@ -112,10 +130,34 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
   // real button that expands the group instead — the only way to pick one
   // bottle out of five (Johan, 2026-09-03, from the phone). It stops
   // propagation so the card's own click / keydown handlers don't also flip
-  // the selection.
-  const canExpandInSelect = selectable && isGroup && typeof onClick === 'function';
-  const expandGroup = (e) => { e.stopPropagation(); onClick(); };
+  // the selection. `onExpand` is the expand handler when the card's own
+  // click does something else (opens the vintage page).
+  const expandHandler = onExpand || onClick;
+  const canExpandInSelect = selectable && isGroup && typeof expandHandler === 'function';
+  const expandGroup = (e) => { e.stopPropagation(); expandHandler(); };
   const stopKeys = (e) => e.stopPropagation();
+  // A card's direct action (support ticket 2026-10-09): "Drink one" takes a
+  // single bottle out without expanding the group first. The cellar list
+  // offers it on every card, one bottle or many (the card itself opens the
+  // vintage page), compact (`actionsInline`) so it never adds a line on a
+  // phone. Hidden in select mode, where a tap means "toggle" and nothing
+  // else. It stops propagation so the card does not also open or expand.
+  const groupActions = !selectable && onDrinkOne ? (
+    <div className={`bottle-group-actions${actionsInline ? ' bottle-group-actions--inline' : ''}`}>
+      {onDrinkOne && (
+        <button
+          type="button"
+          className="bottle-group-btn bottle-group-btn--drink"
+          onClick={(e) => { e.stopPropagation(); onDrinkOne(); }}
+          onKeyDown={stopKeys}
+          aria-label={actionsInline ? t('bottleCard.drinkOneAria', 'Drink a bottle of this') : undefined}
+          title={actionsInline ? t('bottleCard.drinkOneAria', 'Drink a bottle of this') : undefined}
+        >
+          <span aria-hidden="true">🍷</span> <span className="bottle-group-btn-label">{t('bottleCard.groupDrinkOne', 'Drink one')}</span>
+        </button>
+      )}
+    </div>
+  ) : null;
   const pressHandlers = onLongPress ? {
     onPointerDown: startPress,
     onPointerMove: movePress,
@@ -173,12 +215,14 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
                 className="bottle-grid-image"
                 thumb
                 loading="lazy"
-                onError={e => { e.target.style.display = 'none'; }}
+                onError={() => setFailedSrc(photoSrc)}
               />
               {credit && <span className="img-credit-tooltip">{credit}</span>}
             </>
           ) : (
-            <div className={`bottle-grid-placeholder ${swatchType(bottle.wineDefinition, '')}`} />
+            <div className="bottle-grid-placeholder bottle-grid-placeholder--drawn">
+              <BottlePlaceholder wine={bottle.wineDefinition} compact />
+            </div>
           )}
         </div>
         <div className="bottle-grid-info">
@@ -190,6 +234,7 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
               <span className="bottle-grid-region">{bottle.wineDefinition.region.name}</span>
             )}
           </div>
+          {details && <div className="bottle-details">{details}</div>}
           <div className="bottle-badges">
             {cellarBadge && (
               <span className="cellar-badge" style={cellarBadgeColor ? { '--cellar-badge-color': cellarBadgeColor } : undefined}>
@@ -242,10 +287,11 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
                 className="rack-badge"
                 onClick={e => e.stopPropagation()}
               >
-                <span aria-hidden="true">📍</span> {rackInfo.rackName}
+                <span aria-hidden="true">📍</span> {rackBadgeText}
               </Link>
             )}
           </div>
+          {groupActions}
         </div>
       </div>
     );
@@ -272,23 +318,29 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
             className="bottle-wine-image"
             thumb
             loading="lazy"
-            onError={e => { e.target.style.display = 'none'; }}
+            onError={() => setFailedSrc(photoSrc)}
           />
           {credit && <span className="img-credit-tooltip">{credit}</span>}
         </div>
       ) : (
-        <div className={`bottle-wine-placeholder ${swatchType(bottle.wineDefinition, '')}`} />
+        <div className="bottle-wine-placeholder bottle-wine-placeholder--drawn">
+          <BottlePlaceholder wine={bottle.wineDefinition} compact />
+        </div>
       )}
 
       <div className="bottle-info">
+        {/* The name truncates, the ×n pill never does — a long name on a
+            narrow row used to take the count with it. */}
         <div className="bottle-name">
-          {displayName}
+          <span className="bottle-name-text">{displayName}</span>
           {isGroup && <span className="bottle-count-pill">×{groupCount}</span>}
         </div>
         <div className="bottle-meta">
           <span className="bottle-producer">{displayProducer}</span>
           {bottle.vintage && <span className="bottle-vintage">{bottle.vintage}</span>}
         </div>
+        {/* The details picked under "Show on cards" (rating, price, …). */}
+        {details && <div className="bottle-details">{details}</div>}
         {notePreview && (
           <div className="bottle-note-preview" title={noteTitle}>{notePreview}</div>
         )}
@@ -336,11 +388,13 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
               className="rack-badge"
               onClick={e => e.stopPropagation()}
             >
-              📍 {rackInfo.rackName}
+              📍 {rackBadgeText}
             </Link>
           )}
         </div>
       </div>
+
+      {groupActions}
 
       {canExpandInSelect ? (
         <button
@@ -352,7 +406,8 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
           onKeyDown={stopKeys}
         >⊕</button>
       ) : (
-        <span className="bottle-chevron" aria-hidden="true">{isGroup ? '⊕' : '›'}</span>
+        // ⊕ where a tap expands the stack; › where it opens a page.
+        <span className="bottle-chevron" aria-hidden="true">{isGroup && !onExpand ? '⊕' : '›'}</span>
       )}
     </div>
   );
@@ -362,14 +417,23 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
 // search keystroke re-renders the page — without memo, hundreds of cards
 // re-render per keystroke even though their props are unchanged.
 //
-// onClick, onToggleSelect and onLongPress are excluded from the comparison: callers pass
-// inline arrows (`onClick={() => toggleGroup(item.key)}`), whose identity
-// changes every parent render and would defeat the memo for exactly the
-// grouped cards it exists for. This is safe because every current handler
-// closes only over values derived from the OTHER compared props (the
+// onClick, onToggleSelect, onLongPress and onDrinkOne are excluded from
+// the comparison: callers pass inline arrows (`onClick={() => toggleGroup(item.key)}`),
+// whose identity changes every parent render and would defeat the memo for
+// exactly the grouped cards it exists for. This is safe because every current
+// handler closes only over values derived from the OTHER compared props (the
 // bottle/group item) plus functional setState — if a future caller closes over
 // unrelated state, that handler must be stabilized with useCallback instead.
-const COMPARED_PROPS = ['bottle', 'rackMap', 'cellarId', 'viewMode', 'groupCount', 'showCellarBadge', 'compact', 'rackKnown', 'showNotes', 'selectable', 'selected'];
+// Whether the group button SHOWS is compared (hasGroupActions), so a card
+// re-renders when a caller starts or stops offering it — and so is whether
+// a separate expand handler exists, which decides what the card's tap means.
+// linkState (where the bottle page's back link leads) is compared by value:
+// callers build it inline.
+const COMPARED_PROPS = ['bottle', 'rackMap', 'cellarId', 'viewMode', 'groupCount', 'showCellarBadge', 'compact', 'rackKnown', 'showNotes', 'selectable', 'selected', 'actionsInline', 'details'];
+const hasGroupActions = (p) => `${!!p.onDrinkOne}/${!!p.onExpand}`;
+const linkStateKey = (p) => (p.linkState ? `${p.linkState.backTo}|${p.linkState.backFrom}` : '');
 export default memo(BottleCard, (prev, next) =>
   COMPARED_PROPS.every(key => prev[key] === next[key])
+  && hasGroupActions(prev) === hasGroupActions(next)
+  && linkStateKey(prev) === linkStateKey(next)
 );

@@ -125,6 +125,8 @@
 }
 
 .rack-icon-btn {
+  position: relative;
+  --tap-reach: -7px -2px; /* touch tap area, styles/common.css */
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -199,25 +201,6 @@
   max-height: 90vh;
   overflow-y: auto;
   overflow: hidden;
-}
-
-.consume-modal-box {
-  max-width: 380px;
-}
-
-.consume-modal-form {
-  padding: 1rem 1rem 0.5rem;
-}
-
-.consume-modal-form .form-group {
-  margin-bottom: 0.75rem;
-}
-
-.consume-modal-actions {
-  display: flex;
-  gap: 0.75rem;
-  justify-content: flex-end;
-  padding: 0.75rem 0 0.25rem;
 }
 
 /* ---- Slot popup content ---- */
@@ -574,6 +557,7 @@
 }
 
 .rack-lens-search-clear {
+  --tap-reach: -8px -4px; /* touch tap area (styles/common.css) — never into the typed text */
   position: absolute;
   right: 7px;
   width: 20px;
@@ -738,6 +722,47 @@
 .rack-tools-menu button:hover {
   background: var(--color-primary-light);
 }
+
+/* The ⋮ tools on their own row where the lens toolbar is hidden (the 3D view
+   of shelves and wine cabinets), pinned right so the menu opens on-screen. */
+.rack-tools-row {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 0.5rem;
+}
+
+/* Move bottles to another rack (early access). */
+.move-rack-choices {
+  border: none;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.move-rack-choices legend {
+  font-size: 0.85rem;
+  color: var(--color-text-secondary);
+  margin-bottom: 0.35rem;
+}
+.move-rack-choice {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.move-rack-choice:has(input:checked) {
+  border-color: var(--color-primary);
+  background: var(--color-primary-light);
+}
+.move-rack-choice.is-full { cursor: default; opacity: 0.55; }
+.move-rack-choice-name { min-width: 0; overflow-wrap: anywhere; }
+.move-rack-choice-free { color: var(--color-text-secondary); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+.move-rack-short { color: var(--color-text-secondary); }
 
 /* Mobile: keep the lens toolbar tidy. Search + the ⋮ tools button share the
    top row (tools pinned to the RIGHT so its dropdown opens on-screen), and the
@@ -964,6 +989,8 @@
 }
 
 .zones-remove {
+  position: relative;
+  --tap-reach: -10px -6px; /* touch tap area, styles/common.css */
   border: none;
   background: none;
   color: var(--color-text-muted);
@@ -1207,7 +1234,17 @@
 .edit-rack-form .form-group { display: flex; flex-direction: column; gap: 0.25rem; margin-bottom: 0.75rem; }
 .edit-rack-form .form-group > span { font-size: 0.85rem; color: var(--color-text-secondary); }
 .edit-rack-form input { width: 100%; }
+/* A checkbox keeps its own size, beside its label (not stretched onto a line of its own). */
+.edit-rack-form input[type="checkbox"] { width: auto; margin: 0; }
+.edit-rack-form .edit-rack-option-help { display: block; margin: -0.5rem 0 0.75rem; }
 .edit-rack-form .help-text { font-size: 0.78rem; color: var(--color-text-muted); }
+/* How each shelf's bottles lie (early access 'cabinetSideways'): one compact
+   line per shelf, two columns where the dialog is wide enough. */
+.edit-rack-form .edit-rack-sideways { border: 0; padding: 0; margin: 0 0 0.75rem; }
+.edit-rack-form .edit-rack-sideways legend { font-size: 0.85rem; color: var(--color-text-secondary); padding: 0; margin-bottom: 0.35rem; }
+.edit-rack-form .edit-rack-sideways-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.82rem; padding: 0.15rem 0; }
+.edit-rack-form .edit-rack-sideways-row select { width: auto; min-width: 11rem; }
+.edit-rack-form .edit-rack-sideways .edit-rack-option-help { margin: 0.35rem 0 0; }
 
 /* Post-add placing mode bar (issue #1055): progress on the left, actions on
    the right; wraps to two rows on phones. Colours come from .alert-info /

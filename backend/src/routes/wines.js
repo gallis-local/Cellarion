@@ -8,6 +8,7 @@ const rateLimit = require('express-rate-limit');
 const rateLimitsConfig = require('../config/rateLimits');
 const { rateLimitKey } = require('../utils/clientIp');
 const { tierWinePayload } = require('../services/registryTiering');
+const { buildWinePageContext } = require('../services/winePageContext');
 const registryBridge = require('../services/registryBridge');
 const { gateAnonymousRead, CAP_MESSAGE } = require('../services/registryReadTracker');
 const { logAudit } = require('../services/audit');
@@ -20,10 +21,15 @@ const { findBestMatch } = require('../services/wineMatching');
 const { conflictingStyleTerms } = require('../utils/styleTerms');
 const { parsePagination } = require('../utils/pagination');
 const { isValidId } = require('../utils/validation');
+const { MEMBER_WINE_HIDDEN_FIELDS, MEMBER_WINE_EXCLUDE_KEEP_CREATOR } = require('../config/constants');
 // Read-surface decoration: each populated grape gains `displayName` — the
 // regionally correct label for THIS wine (Tinta Roriz on a Douro Port) —
 // while `name` stays canonical. Storage/filters/stats are untouched.
 const { decorateGrapes } = require('../utils/grapeDisplay');
+const { wineVisibilityFilter, isCurator: isCuratorRole } = require('../services/wineVisibility');
+const { normalizeBarcode } = require('../utils/barcode');
+const { lookupBarcode } = require('../services/barcodeLookup');
+const { findOwnHiddenWineIds } = require('../services/ownHiddenWines');
 const { getReleaseCurve } = require('../services/communityPrice');
 const aiBurstLimiter = require('../middleware/aiBurstLimiter');
 const asyncHandler = require('../utils/asyncHandler');
@@ -199,15 +205,21 @@ function sendAiBudgetExhausted(res, debit) {
  *
  * @returns {Promise<{wine, confidence}|null>}
  */
-async function matchScannedIdentity({ name, producer, appellation }) {
+async function matchScannedIdentity({ name, producer, appellation }, viewer) {
   // Both fields are needed before the registry is consulted at all: with one of
   // them missing the exact key cannot be generated and the fuzzy query degrades
   // to a single token, which matches everything and therefore nothing useful.
   if (!name || !producer) return null;
 
+  // What registry search hides, a scan must not match either: quarantined
+  // non-wines, canaries, and pending rows (drafts included) that are not this
+  // viewer's — the shared visibility rule. The Meili branch below is clean at
+  // index time; the two MongoDB lookups get it here.
+  const visible = { nonWine: { $ne: true }, canary: { $ne: true }, ...wineVisibilityFilter(viewer) };
+
   // 1. Exact normalizedKey match
   const normalizedKey = generateWineKey(name, producer, appellation);
-  const wine = await WineDefinition.findOne({ normalizedKey })
+  const wine = await WineDefinition.findOne({ normalizedKey, ...visible })
     .populate(['country', 'region', 'grapes']);
   if (wine) return { wine, confidence: 1.0 };
 
@@ -219,7 +231,9 @@ async function matchScannedIdentity({ name, producer, appellation }) {
     try {
       const { ids } = await searchService.search(searchQuery, { limit: 20 });
       if (ids.length > 0) {
-        candidates = await WineDefinition.find({ _id: { $in: ids } })
+        // The index excludes hidden rows when it is built, but a row hidden
+        // while the index was down keeps its stale entry: filter here too.
+        candidates = await WineDefinition.find({ _id: { $in: ids }, ...visible })
           .populate(['country', 'region', 'grapes']);
       }
     } catch (err) {
@@ -229,7 +243,7 @@ async function matchScannedIdentity({ name, producer, appellation }) {
 
   if (candidates.length === 0) {
     try {
-      candidates = await WineDefinition.find({ $text: { $search: searchQuery } })
+      candidates = await WineDefinition.find({ $text: { $search: searchQuery }, ...visible })
         .populate(['country', 'region', 'grapes'])
         .limit(20);
     } catch {
@@ -313,6 +327,23 @@ async function mongoSearch(filter, sort, limit, offset, search) {
 // GET /api/wines - Search/list wines (auth required)
 // Regular users: search term mandatory, results capped at USER_SEARCH_LIMIT.
 // Admin / somm: full browse and unlimited results.
+// Curation internals a member's search result never needs: the shared member
+// list (config/constants), createdBy and contribution included — the search
+// path answers with whole documents, so without it every result names the
+// member who contributed the row. Curators keep the full document.
+const MEMBER_HIDDEN_FIELDS = MEMBER_WINE_HIDDEN_FIELDS;
+const forMember = (isCurator) => (wine) => {
+  if (isCurator || !wine) return wine;
+  for (const f of MEMBER_HIDDEN_FIELDS) delete wine[f];
+  return wine;
+};
+
+// A scan's matched wine leaves the route like a search result does: grape
+// display names on, curation internals off for a member.
+const scanMatchPayload = (match, roles) => (match
+  ? { ...match, wine: forMember(isCuratorRole(roles))(decorateGrapes(match.wine)) }
+  : match);
+
 router.get('/', requireAuth, async (req, res) => {
   try {
     const isPrivileged = req.user.roles.includes('admin') || req.user.roles.includes('somm');
@@ -362,6 +393,26 @@ router.get('/', requireAuth, async (req, res) => {
       ? await registryBridge.registrySearch(searchTerm).catch(() => [])
       : [];
 
+    // The caller's OWN quarantined drinks (services/ownHiddenWines): first
+    // page only, ahead of the registry's results, carrying nonWine so the
+    // picker can say they are not in the shared registry. Only for pickers
+    // that put a bottle on the wine (?ownHidden=1) — a forum wine tag or a
+    // wine-request link must not point at a row with no public page. Nobody
+    // else's search returns them; a failure here never costs the search.
+    const isCurator = req.user.roles.includes('admin') || req.user.roles.includes('somm');
+    let ownHidden = [];
+    if (searchTerm && parsedOffset === 0 && req.query.ownHidden === '1') {
+      try {
+        const ids = await findOwnHiddenWineIds(req.user.id, searchTerm);
+        if (ids.length) {
+          ownHidden = await WineDefinition.find({ _id: { $in: ids }, nonWine: true })
+            .populate(['country', 'region', 'grapes']);
+        }
+      } catch (err) {
+        console.warn('Own hidden-wine lookup failed (search continues without it):', err.message);
+      }
+    }
+
     // Try Meilisearch for text queries
     if (searchTerm && searchService.getIsAvailable()) {
       try {
@@ -384,11 +435,11 @@ router.get('/', requireAuth, async (req, res) => {
         wines.sort((a, b) => idOrder.get(a._id.toString()) - idOrder.get(b._id.toString()));
 
         return res.json({
-          count: wines.length,
-          total: estimatedTotalHits,
+          count: ownHidden.length + wines.length,
+          total: ownHidden.length + estimatedTotalHits,
           offset: parsedOffset,
           limit: parsedLimit,
-          wines: wines.map(decorateGrapes),
+          wines: [...ownHidden, ...wines].map(decorateGrapes).map(forMember(isCurator)),
           registryWines
         });
       } catch (err) {
@@ -400,11 +451,11 @@ router.get('/', requireAuth, async (req, res) => {
     const { wines, total } = await mongoSearch(filter, sort, parsedLimit, parsedOffset, searchTerm);
 
     res.json({
-      count: wines.length,
-      total,
+      count: ownHidden.length + wines.length,
+      total: ownHidden.length + total,
       offset: parsedOffset,
       limit: parsedLimit,
-      wines: wines.map(decorateGrapes),
+      wines: [...ownHidden, ...wines].map(decorateGrapes).map(forMember(isCurator)),
       registryWines
     });
   } catch (error) {
@@ -552,7 +603,7 @@ router.post('/scan-label', requireAuth, aiBurstLimiter, asyncHandler(async (req,
     // Run the match on whatever the extraction produced: the shared helper is
     // the one place that decides what a half-read identity can and cannot
     // match (see matchScannedIdentity).
-    const match = await matchScannedIdentity(extracted);
+    const match = await matchScannedIdentity(extracted, { userId: req.user.id, roles: req.user.roles });
 
     // A producer the cross-field rules say is not a producer makes this a
     // HALF-READ label, whatever the model filled the box with — the same
@@ -567,7 +618,7 @@ router.post('/scan-label', requireAuth, aiBurstLimiter, asyncHandler(async (req,
     // (tryDebitAi refuses them above), so no throwaway account writes files.
     const scanImage = await persistLabelScan({ buffer: safeBuffer, userId: req.user.id, side: 'front' });
 
-    res.json({ extracted, match, labelImage, scanImageId: scanImage ? String(scanImage._id) : null });
+    res.json({ extracted, match: scanMatchPayload(match, req.user.roles), labelImage, scanImageId: scanImage ? String(scanImage._id) : null });
   } catch (err) {
     console.error('Label scan match error:', err.message);
     res.status(500).json({ error: 'Label scan failed' });
@@ -710,7 +761,7 @@ router.post('/scan-label-back', requireAuth, aiBurstLimiter, asyncHandler(async 
 
     // Re-run the registry lookup on the MERGED identity — the whole point of
     // the rescue is that the wine may now be identifiable when it was not.
-    const match = await matchScannedIdentity(merged);
+    const match = await matchScannedIdentity(merged, { userId: req.user.id, roles: req.user.roles });
 
     // The rescue can also FILL the producer box with a string that is not a
     // producer (the back label's "Produit de France" line is the classic), and
@@ -728,7 +779,7 @@ router.post('/scan-label-back', requireAuth, aiBurstLimiter, asyncHandler(async 
       merged,
       conflicts,
       filled,
-      match,
+      match: scanMatchPayload(match, req.user.roles),
       backScanImageId: backScan ? String(backScan._id) : null,
       // Echoed, not re-derived: the client threads both ids into the commit,
       // and this keeps the two halves of that payload coming from one response.
@@ -874,7 +925,7 @@ router.post('/identify-text', requireAuth, aiBurstLimiter, asyncHandler(async (r
   } catch (err) {
     await debit.refund();
     console.error('Identify text error:', err);
-    return res.status(500).json({ error: err.message || 'Failed to identify wine' });
+    return res.status(500).json({ error: 'Failed to identify wine' });
   }
 
   if (!result.data) {
@@ -943,13 +994,22 @@ router.post('/ai-info', requireAuth, aiBurstLimiter, asyncHandler(async (req, re
   } catch (err) {
     await debit.refund();
     console.error('AI info error:', err);
-    return res.status(500).json({ error: err.message || 'Failed to get AI wine info' });
+    return res.status(500).json({ error: 'Failed to get AI wine info' });
   }
 }));
 
 // GET /api/wines/:idOrSlug/public — Public wine detail (no auth required)
 // Accepts both ObjectId and slug. Used for shared links and social previews.
 const PUBLIC_PROJECTION = 'name producer slug country region appellation grapes type colour image communityRating classification aiProfile canary';
+// The populated places and grapes on the public page carry their public
+// fields only: a bare populate also sent createdBy / reviewedBy, the ids of
+// the members who added or reviewed a region or grape. Descriptions feed the
+// page context (services/winePageContext), regionalNames the grape display.
+const PUBLIC_TAXONOMY_POPULATE = [
+  { path: 'country', select: 'name slug code translations' },
+  { path: 'region', select: 'name slug description country translations' },
+  { path: 'grapes', select: 'name slug color description regionalNames translations' },
+];
 
 // Anti-enumeration limit for the ONE wine endpoint that needs no account.
 //
@@ -973,8 +1033,10 @@ const PUBLIC_PROJECTION = 'name producer slug country region appellation grapes 
 const publicWineLimiter = rateLimit({
   // Static window, dynamic max — the same shape as apiLimiter and
   // aiBurstLimiter. express-rate-limit resolves max() per request but wants a
-  // real number for the window at construction.
-  windowMs: rateLimitsConfig.get().publicWineRead.windowMs,
+  // real number for the window at construction, which is before the stored
+  // settings are loaded — so the window is the code default (no admin
+  // setting changes it).
+  windowMs: rateLimitsConfig.defaults.publicWineRead.windowMs,
   max: () => rateLimitsConfig.get().publicWineRead.max,
   keyGenerator: (req) => rateLimitKey(req),
   standardHeaders: true,
@@ -1010,7 +1072,7 @@ router.get('/:idOrSlug/public', publicWineLimiter, optionalAuth, async (req, res
       : { ...WineDefinition.slugFilter(idOrSlug), ...hidden };
 
     const wine = await WineDefinition.findOne(filter)
-      .populate(['country', 'region', 'grapes'])
+      .populate(PUBLIC_TAXONOMY_POPULATE)
       .select(PUBLIC_PROJECTION);
 
     if (!wine) {
@@ -1023,9 +1085,27 @@ router.get('/:idOrSlug/public', publicWineLimiter, optionalAuth, async (req, res
     }
     // A canary page must never be indexed — and must never say it is one.
     if (wine.canary === true) res.set('X-Robots-Tag', 'noindex, nofollow');
-    const payload = tierWinePayload(decorateGrapes(wine), { full: !!req.user });
+    // The answer depends on who asks (members get more), so no shared cache
+    // may serve one reader's copy to another.
+    res.set('Vary', 'Authorization');
+    // A public-demo session is signed in but is not a member: the full tier
+    // and the drink windows are for real accounts.
+    const member = !!req.user && !req.user.isDemo;
+    const payload = tierWinePayload(decorateGrapes(wine), { full: member });
     delete payload.canary;
-    res.json({ wine: payload });
+    // The page around the wine (links, region and grape notes, related
+    // wines, drink windows for members only), behind the same counted read.
+    // Optional: when it fails the wine itself still answers.
+    let context = null;
+    try {
+      context = await buildWinePageContext(
+        typeof wine.toObject === 'function' ? wine.toObject() : wine,
+        { full: member },
+      );
+    } catch (err) {
+      console.error('Wine page context error:', err.message);
+    }
+    res.json({ wine: payload, context });
   } catch (error) {
     console.error('Get public wine error:', error);
     res.status(500).json({ error: 'Failed to get wine' });
@@ -1067,6 +1147,24 @@ router.get('/:idOrSlug/community-prices', publicWineLimiter, async (req, res) =>
   }
 });
 
+// GET /api/wines/barcode/:code — the registry wine a retail barcode belongs to,
+// learned from members' bottles that were added after scanning it
+// (services/barcodeLookup). Answers { wine, vintage, owners } or { wine: null }
+// — an unknown or invalid code is not an error, it is simply not known yet.
+// No AI and no write: a cheap read the add-bottle camera makes when it sees a
+// barcode.
+router.get('/barcode/:code', requireAuth, async (req, res) => {
+  try {
+    const code = normalizeBarcode(req.params.code);
+    if (!code) return res.json({ wine: null, invalid: true });
+    const result = await lookupBarcode(code, { userId: req.user.id, roles: req.user.roles });
+    res.json({ ...result, code });
+  } catch (error) {
+    console.error('Barcode lookup error:', error.message);
+    res.status(500).json({ error: 'Barcode lookup failed' });
+  }
+});
+
 // Authenticated wine detail. A pendingIdentity row is visible ONLY to its
 // creator (whose bottle page has to render — hiding, not breaking, same
 // principle as the nonWine quarantine one route up) and to curation
@@ -1085,12 +1183,14 @@ router.get('/:id', requireAuth, async (req, res) => {
     // Registry lockdown (2026-09-06, L5): the dedup keys, verification record
     // and provenance are curation internals. Nothing a member's screens render
     // needs them, and together they are the part of a copy that is hardest to
-    // rebuild. Curators keep the full document. pendingIdentity/createdBy stay
-    // selected for the gate below and are then dropped from the response.
+    // rebuild. Who contributed the row (contribution, createdVia) is never a
+    // member's business either. Curators keep the full document.
+    // pendingIdentity/createdBy stay selected for the gate below and are then
+    // dropped from the response.
     const isCurator = req.user.roles.includes('admin') || req.user.roles.includes('somm');
     const select = isCurator
       ? '-scanImage -scanImageBack -scanFieldConflicts'
-      : '-scanImage -scanImageBack -scanFieldConflicts -normalizedKey -canonicalKey -verifiedChecks -identityProvenance -productNumber -previousSlugs -canary';
+      : MEMBER_WINE_EXCLUDE_KEEP_CREATOR;
     const wine = await WineDefinition.findById(req.params.id)
       .select(select)
       .populate(['country', 'region', 'grapes']);

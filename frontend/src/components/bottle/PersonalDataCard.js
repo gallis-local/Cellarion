@@ -29,8 +29,17 @@ const emptyForm = {
   value: '',
 };
 
-function PersonalDataCard({ apiFetch, bottleId, currentUserId, wineId, vintage }) {
+// `scope="vintage"`: the card on the vintage page, which reaches the data
+// through one bottle of the vintage. There "this bottle" means nothing, so
+// new data goes on this vintage or on every vintage of the wine, and one
+// bottle's own entries stay on that bottle's page (beta feedback 2026-10-10).
+// `vintageScopable`: whether that bottle has a vintage to scope to — the
+// server scopes "this vintage" through it, and an NV group of imported
+// bottles may have only empty ones; then "every vintage" is the one choice.
+function PersonalDataCard({ apiFetch, bottleId, currentUserId, wineId, vintage, scope = 'bottle', vintageScopable = true }) {
   const { t } = useTranslation();
+  const onVintagePage = scope === 'vintage' && !!vintage;
+  const offerVintage = !!vintage && (!onVintagePage || vintageScopable);
   const [data, setData] = useState({ bottleEntries: [], wineEntries: [] });
   const [keys, setKeys] = useState([]);
   const [modal, setModal] = useState(null); // { mode: 'add' } | { mode: 'edit', entry }
@@ -68,7 +77,7 @@ function PersonalDataCard({ apiFetch, bottleId, currentUserId, wineId, vintage }
   const effectiveType = matchedKey ? matchedKey.type : form.keyType;
 
   const openAdd = async () => {
-    setForm(emptyForm);
+    setForm(onVintagePage ? { ...emptyForm, level: offerVintage ? 'wine-vintage' : 'wine' } : emptyForm);
     setError(null);
     setModal({ mode: 'add' });
     try {
@@ -279,7 +288,8 @@ function PersonalDataCard({ apiFetch, bottleId, currentUserId, wineId, vintage }
     textTransform: 'uppercase', letterSpacing: '0.03em', color: 'var(--color-text-muted)',
   };
 
-  const hasEntries = data.bottleEntries.length > 0 || data.wineEntries.length > 0;
+  const bottleEntries = onVintagePage ? [] : data.bottleEntries;
+  const hasEntries = bottleEntries.length > 0 || data.wineEntries.length > 0;
 
   return (
     <div className="card pd-card" style={{ padding: '1rem 1.25rem' }}>
@@ -301,10 +311,10 @@ function PersonalDataCard({ apiFetch, bottleId, currentUserId, wineId, vintage }
         </p>
       )}
 
-      {data.bottleEntries.length > 0 && (
+      {bottleEntries.length > 0 && (
         <>
           <h3 style={sectionTitleStyle}>{t('personalData.bottleSection', 'This bottle')}</h3>
-          {renderEntries(data.bottleEntries)}
+          {renderEntries(bottleEntries)}
         </>
       )}
       {data.wineEntries.length > 0 && (
@@ -381,8 +391,10 @@ function PersonalDataCard({ apiFetch, bottleId, currentUserId, wineId, vintage }
                     value={form.level}
                     onChange={(e) => setForm({ ...form, level: e.target.value })}
                   >
-                    <option value="bottle">{t('personalData.levelBottle', 'This bottle only')}</option>
-                    {vintage && (
+                    {!onVintagePage && (
+                      <option value="bottle">{t('personalData.levelBottle', 'This bottle only')}</option>
+                    )}
+                    {offerVintage && (
                       <option value="wine-vintage">{t('personalData.levelWineVintage', 'Every bottle of this vintage ({{vintage}})', { vintage })}</option>
                     )}
                     <option value="wine">{t('personalData.levelWine', 'Every bottle of this wine (all vintages)')}</option>

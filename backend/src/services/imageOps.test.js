@@ -24,6 +24,8 @@ jest.mock('../services/photoFormat', () => ({
 // attachOfficialWineImage lazy-requires search (ESM meilisearch — unparseable
 // by jest) — mock at top level like every other suite.
 jest.mock('../services/search', () => ({ indexWine: jest.fn(), indexBottle: jest.fn() }));
+// The attach audit row has its own suite (imageOps.audit.test.js).
+jest.mock('./audit', () => ({ logAudit: jest.fn() }));
 
 const fs = require('fs');
 // Kept files are written to a temp name and renamed into place (utils/atomicWrite).
@@ -191,7 +193,7 @@ describe('attachOfficialWineImage', () => {
     expect(BottleImage.updateMany).toHaveBeenCalledWith(
       { wineDefinition: 'w1', assignedToWine: true }, { assignedToWine: false });
     expect(WineDefinition.findByIdAndUpdate).toHaveBeenCalledWith('w1',
-      expect.objectContaining({ imageCredit: 'Photo: Systembolaget' }));
+      expect.objectContaining({ imageCredit: 'Photo: Systembolaget', updatedAt: expect.any(Date) }));
     expect(searchService.indexWine).toHaveBeenCalledWith('w1');
   });
 
@@ -214,4 +216,48 @@ describe('attachOfficialWineImage', () => {
     expect(WineDefinition.findByIdAndUpdate).not.toHaveBeenCalled();
     expect(BottleImage.updateMany).not.toHaveBeenCalled();
   });
+});
+
+// A photo an admin publishes at ingest (the back label of an approved wine
+// request) is born approved + public, BEFORE the background-removal worker is
+// handed the row — the worker keeps an approved row approved, while a row
+// approved after the hand-off raced it and usually settled 'processed', out
+// of every gallery (release audit 2026-10-09, H1).
+describe('publish at ingest', () => {
+  test('the row is saved approved, public, reviewed by the uploader and marked with its side before bg removal starts', async () => {
+    const res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'admin-1', userRoles: ['admin'], wineDefinitionId: 'w1', publish: { side: 'back' } }, REQ);
+    expect(res.error).toBeUndefined();
+    expect(res.image).toMatchObject({ status: 'approved', visibility: 'public', side: 'back', reviewedBy: 'admin-1', wineDefinition: 'w1', bottle: null });
+    expect(res.image.reviewedAt).toBeInstanceOf(Date);
+    expect(res.image.assignedToWine).toBeUndefined(); // never the wine's picture
+    // Saved first, handed to the worker second.
+    expect(res.image.save.mock.invocationCallOrder[0]).toBeLessThan(processImage.mock.invocationCallOrder[0]);
+    expect(processImage).toHaveBeenCalledWith('img-new');
+  });
+
+  test('an unknown side falls back to front; keepBackground still publishes, with the original as the kept photo', async () => {
+    const res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'admin-1', keepBackground: true, publish: { side: 'sideways' } }, REQ);
+    expect(res.image).toMatchObject({ status: 'approved', visibility: 'public', side: 'front' });
+    expect(res.image.processedUrl).toBe(res.image.originalUrl);
+    expect(processImage).not.toHaveBeenCalled();
+  });
+
+  test('without publish nothing changes: born uploaded and private', async () => {
+    const res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'u1', bottle: { _id: 'b1' } }, REQ);
+    expect(res.image.status).toBe('uploaded');
+    expect(res.image.visibility).toBeUndefined();
+    expect(res.image.reviewedBy).toBeUndefined();
+  });
+});
+
+// Photos per vintage (support ticket 2026-10-09): a photo is of ONE bottle,
+// so the row is filed under that bottle's vintage; a wine-level upload has
+// no bottle and stays wine-wide.
+test('the row carries its bottle\'s vintage; a wine-level upload carries none', async () => {
+  let res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'u1', bottle: { _id: 'b1', vintage: '2015' } }, REQ);
+  expect(res.image.vintage).toBe('2015');
+  res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'u1', bottle: { _id: 'b2', vintage: 'Unknown' } }, REQ);
+  expect(res.image.vintage).toBeNull();
+  res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'u1', wineDefinitionId: 'w1', keepBackground: true }, REQ);
+  expect(res.image.vintage).toBeNull();
 });

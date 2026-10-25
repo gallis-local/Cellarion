@@ -10,8 +10,12 @@ import './WineSearchPicker.css';
  *   selected   – currently selected wine object (or null)
  *   onSelect   – callback(wine | null)
  *   placeholder – input placeholder text
+ *   includeOwnHidden – also list the member's own drinks that are not wine
+ *                (hidden from the shared registry). Only where a bottle goes
+ *                onto the pick — never a forum wine tag: those rows have no
+ *                public page.
  */
-export default function WineSearchPicker({ selected, onSelect, placeholder }) {
+export default function WineSearchPicker({ selected, onSelect, placeholder, includeOwnHidden = false }) {
   const { t } = useTranslation();
   const { apiFetch } = useAuth();
   const [query, setQuery] = useState('');
@@ -22,13 +26,18 @@ export default function WineSearchPicker({ selected, onSelect, placeholder }) {
   const [activeIndex, setActiveIndex] = useState(-1);
   const wrapperRef = useRef(null);
   const debounceRef = useRef(null);
+  // Searches overlap on a slow network: only the one for the current query
+  // may fill the dropdown or stop the spinner.
+  const searchSeq = useRef(0);
   const listboxId = useId();
 
   // Debounced search
   useEffect(() => {
+    const seq = ++searchSeq.current;
     if (!query.trim()) {
       setResults([]);
       setNoResults(false);
+      setLoading(false);
       return;
     }
 
@@ -36,23 +45,26 @@ export default function WineSearchPicker({ selected, onSelect, placeholder }) {
     debounceRef.current = setTimeout(async () => {
       setLoading(true);
       try {
-        const res = await searchWines(apiFetch, `search=${encodeURIComponent(query.trim())}&limit=8`);
+        const own = includeOwnHidden ? '&ownHidden=1' : '';
+        const res = await searchWines(apiFetch, `search=${encodeURIComponent(query.trim())}&limit=8${own}`);
         const data = await res.json();
+        if (seq !== searchSeq.current) return;
         const wines = data.wines || [];
         setResults(wines);
         setNoResults(wines.length === 0);
         setActiveIndex(-1);
         setOpen(true);
       } catch {
+        if (seq !== searchSeq.current) return;
         setResults([]);
         setNoResults(false);
       } finally {
-        setLoading(false);
+        if (seq === searchSeq.current) setLoading(false);
       }
     }, 300);
 
     return () => clearTimeout(debounceRef.current);
-  }, [query, apiFetch]);
+  }, [query, apiFetch, includeOwnHidden]);
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -152,7 +164,9 @@ export default function WineSearchPicker({ selected, onSelect, placeholder }) {
                   {wine.region?.name && <span>{wine.region.name}</span>}
                 </span>
               </div>
-              {wine.type && (
+              {wine.nonWine ? (
+                <span className="own-hidden-pill" title={t('wineSearchPicker.onlyInYourCellarTitle')}>{t('wineSearchPicker.onlyInYourCellar')}</span>
+              ) : wine.type && (
                 <span className={`wine-search-picker__option-type ${wine.type}`}>{wine.type}</span>
               )}
             </li>

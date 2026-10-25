@@ -8,11 +8,19 @@ export const getCellar = (apiFetch, id, params = '') =>
 export const getCellarStatistics = (apiFetch, id, currency) =>
   apiFetch(`/api/cellars/${id}/statistics?currency=${currency}`);
 
+/** Bottles per maturity stage, for the filter's maturity buttons: { maturity, total }. */
+export const getCellarMaturityCounts = (apiFetch, id) =>
+  apiFetch(`/api/cellars/${id}/maturity-counts`);
+
 export const getCellarAudit = (apiFetch, id) =>
   apiFetch(`/api/cellars/${id}/audit`);
 
 export const getCellarHistory = (apiFetch, id, params = '') =>
   apiFetch(`/api/cellars/${id}/history${params ? `?${params}` : ''}`);
+
+// Bottles bought for this cellar that have not arrived yet (status 'ordered').
+export const getCellarOnOrder = (apiFetch, id) =>
+  apiFetch(`/api/cellars/${id}/on-order`);
 
 // Cross-cellar (multi-select) views. `params` is a URLSearchParams string that
 // must include `cellars=id1,id2,...` plus any search/filter params.
@@ -47,3 +55,8 @@ export const transferCellarOwnership = (apiFetch, id, newOwnerId) =>
     headers: JSON_HEADERS,
     body: JSON.stringify({ newOwnerId }),
   });
+
+// One wine and vintage in a cellar: the page behind a grouped "n identical
+// bottles" entry (support ticket 2026-10-09).
+export const getCellarVintage = (apiFetch, id, wineId, vintage) =>
+  apiFetch(`/api/cellars/${id}/vintages/${wineId}/${encodeURIComponent(vintage || 'NV')}`);

@@ -1,5 +1,6 @@
 const https = require('https');
 const ExchangeRateSnapshot = require('../models/ExchangeRateSnapshot');
+const { normalizeCurrency } = require('../config/currencies');
 
 /**
  * Fetches current USD-based exchange rates from open.er-api.com.
@@ -67,6 +68,16 @@ function getSnapshotForDate(date) {
 }
 
 /**
+ * The newest stored snapshot no more than `maxAgeDays` days old (today
+ * included), or null. For a job that must not lose its run to one failed
+ * fetch: a recent day's rates stand in for today's.
+ */
+function getRecentSnapshot(maxAgeDays) {
+  const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return ExchangeRateSnapshot.findOne({ date: { $gte: cutoff } }).sort({ date: -1 }).lean();
+}
+
+/**
  * Batch-fetches snapshots for an array of date strings.
  * Returns a Map<date, rates> for quick lookups.
  */
@@ -88,6 +99,10 @@ async function getSnapshotsForDates(dates) {
  */
 function convertCurrency(amount, from, to, rates) {
   if (!amount || !from || !to) return null;
+  // An alias reads as its code ("EURO" → "EUR"), so a bottle stored before
+  // writes normalised it still converts (config/currencies).
+  from = normalizeCurrency(from);
+  to = normalizeCurrency(to);
   // Same-currency is a no-op even without a rates map — callers legitimately
   // pass rates=null when no snapshot exists, and USD→USD must still work.
   if (from === to) return amount;
@@ -98,4 +113,4 @@ function convertCurrency(amount, from, to, rates) {
   return (amount / fromRate) * toRate;
 }
 
-module.exports = { fetchExchangeRates, getOrCreateDailySnapshot, getSnapshotForDate, getSnapshotsForDates, convertCurrency };
+module.exports = { fetchExchangeRates, getOrCreateDailySnapshot, getSnapshotForDate, getRecentSnapshot, getSnapshotsForDates, convertCurrency };

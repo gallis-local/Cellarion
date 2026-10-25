@@ -11,8 +11,9 @@ const { z } = require('zod');
 const Bottle = require('../../models/Bottle');
 const Cellar = require('../../models/Cellar');
 const Rack = require('../../models/Rack');
-const { WINE_POPULATE, WINE_POPULATE_LIST, CONSUMED_STATUSES } = require('../../config/constants');
+const { WINE_POPULATE, WINE_POPULATE_LIST, CONSUMED_STATUSES, NOT_IN_CELLAR_STATUSES, ORDERED_STATUS } = require('../../config/constants');
 const { registerTool } = require('../registry');
+const { slotLocation } = require('../../utils/rackGeometry');
 const {
   ok, fail, objectId, MSG_CELLAR_NOT_FOUND, MSG_BOTTLE_NOT_FOUND,
   resolveCellarAccess, resolveBottleAccess,
@@ -25,7 +26,8 @@ const bottleSearch = require('../../services/bottleSearch');
 function statusToMongo(status) {
   if (status === 'all') return {};
   if (status === 'consumed') return { status: { $in: CONSUMED_STATUSES } };
-  return { status: { $nin: CONSUMED_STATUSES } }; // active (default)
+  if (status === 'on_order') return { status: ORDERED_STATUS };
+  return { status: { $nin: NOT_IN_CELLAR_STATUSES } }; // active (default)
 }
 
 registerTool({
@@ -33,7 +35,7 @@ registerTool({
   title: 'Search / list bottles',
   description:
     'Searches the bottles in the cellars the user owns (pass cellar_id to search one specific cellar, including shared ' +
-    'ones). Filters: free-text query (wine name, producer, region, grape, notes), status (active | consumed | all), ' +
+    'ones). Filters: free-text query (wine name, producer, region, grape, notes), status (active | consumed | on_order | all), ' +
     'vintage, wine type, reserved (only/exclude "spoken for" bottles). Paginated and bounded; every item includes its ' +
     'rating, so filter by rating yourself from the results, and has_photo (own or published photo, or a registry ' +
     'image — get_bottle → photos has the detail). wine carries grapes, region and country. maturity is the drink ' +
@@ -52,7 +54,8 @@ registerTool({
   inputSchema: {
     query: z.string().max(200).optional().describe('Free-text search (name, producer, region, grape…)'),
     cellar_id: objectId.optional().describe('Restrict to one cellar (any cellar you own or are a member of)'),
-    status: z.enum(['active', 'consumed', 'all']).default('active'),
+    status: z.enum(['active', 'consumed', 'on_order', 'all']).default('active')
+      .describe('active = in the cellar now; on_order = bought, not delivered yet; consumed = history'),
     // Alphanumeric only — a vintage is a year or "NV". The search path and
     // the list path below both exact-match it; rejecting anything else here
     // keeps a stray punctuation mark from reading as "no vintage matches".
@@ -105,12 +108,13 @@ registerTool({
     if ((query || args.type) && !args.reserved) {
       const res = await bottleSearch.searchBottles(query, {
         cellarIds: cellarIds.map(String),
-        statusFilter: args.status || 'active',
+        statusFilter: args.status === 'on_order' ? ORDERED_STATUS : (args.status || 'active'),
         type: args.type,
         vintage: args.vintage,
         sort: query ? undefined : '-createdAt',
         limit,
         offset,
+        withFacets: false, // never read here
       });
       // Hydration re-asserts the SAME cellar scope the search ran on, so a
       // bottle moved out of scope in between is never shown. No OTHER filter
@@ -221,7 +225,7 @@ registerTool({
   title: 'Get one bottle',
   description:
     'Full detail for one bottle: wine (incl. tasting profile when enriched), vintage, price, ratings, personal drink ' +
-    'window, notes, reservation ("spoken for") state, purchase info, open-bottle state, rack placement, cellar, ' +
+    'window, notes, reservation ("spoken for") state, purchase info, open-bottle state, rack placement (position, and shelf / row / col where the rack has them), cellar, ' +
     'consumption info if consumed, and photos — every photo that applies to the bottle with its state (queued, ' +
     'processing, awaiting_review, published, rejected), so an upload can be confirmed and a duplicate avoided; ' +
     'photos.label_scans lists the frames the user scanned to identify the wine. The URLs are for people; to SEE ' +
@@ -249,8 +253,11 @@ async function buildBottleDetail(userId, bottleId) {
   }
   const { cellar, role } = access;
   const b = await Bottle.findById(access.bottle._id).populate(WINE_POPULATE).lean();
+  // The rack's geometry too: placement says shelf / row / col, not only the
+  // position (utils/rackGeometry.slotLocation — the same words GET
+  // /api/inventory uses), so nobody has to count positions by hand.
   const rack = await Rack.findOne({ 'slots.bottle': b._id, deletedAt: null })
-    .select('name slots.position slots.bottle').lean();
+    .select('name type rows cols typeConfig isModular modules.type slots.position slots.bottle').lean();
   const slot = rack ? rack.slots.find((s) => String(s.bottle) === String(b._id)) : null;
   const wd = b.wineDefinition;
   // Every photo that applies, with its state, from this viewer's side.
@@ -318,6 +325,11 @@ async function buildBottleDetail(userId, bottleId) {
         ? { for: b.reservedFor || null, until: b.reservedUntil ?? null }
         : null,
       purchase: { date: b.purchaseDate || null, location: b.purchaseLocation || null },
+      // Bought, not delivered yet: not in the cellar, so it cannot be opened,
+      // consumed or placed until the user marks it as arrived in the app.
+      on_order: b.status === ORDERED_STATUS
+        ? { expected_arrival_month: b.expectedArrival ? new Date(b.expectedArrival).toISOString().slice(0, 7) : null }
+        : null,
       open_bottle: b.openedAt
         ? { opened_at: b.openedAt, preservation: b.preservationMethod || null, pours: (b.pours || []).length }
         : null,
@@ -331,7 +343,9 @@ async function buildBottleDetail(userId, bottleId) {
             rating_scale: b.consumedRating != null ? b.consumedRatingScale : null,
           }
         : null,
-      placement: slot ? { rack_id: rack._id, rack_name: rack.name, position: slot.position } : null,
+      // shelf: cabinets only (1 = top); row: from the plank up on a cabinet
+      // shelf, the grid row on a grid; col: left to right. null elsewhere.
+      placement: slot ? { rack_id: rack._id, rack_name: rack.name, position: slot.position, ...slotLocation(rack, slot.position) } : null,
       photos,
       cellar: { cellar_id: cellar._id, name: cellar.name, your_role: role },
       added_at: b.addedToCellarAt || b.createdAt,

@@ -1,5 +1,6 @@
 const FormData = require('form-data');
 const Mailgun = require('mailgun.js');
+const { isHostedCellarion } = require('../config/hostedInstance');
 
 const EMAIL_VERIFICATION_ENABLED = !!(process.env.MAILGUN_API_KEY && process.env.MAILGUN_DOMAIN);
 
@@ -21,6 +22,18 @@ if (EMAIL_VERIFICATION_ENABLED) {
 
 const DOMAIN = process.env.MAILGUN_DOMAIN;
 const FROM = process.env.MAILGUN_FROM || `Cellarion <no-reply@${DOMAIN}>`;
+
+/**
+ * Reply-To for the emails that promise a person reads the answer (support
+ * answers, the supporter thank-you). SUPPORT_REPLY_TO when the install sets
+ * it. Otherwise the hosted inbox, but on the hosted cellarion.app only: any
+ * other install answers with its own From address, so its users' replies
+ * stay on its own domain and never reach the hosted service.
+ */
+function supportReplyTo() {
+  if (process.env.SUPPORT_REPLY_TO) return process.env.SUPPORT_REPLY_TO;
+  return isHostedCellarion() ? 'info@cellarion.app' : FROM;
+}
 
 /**
  * Send an email verification link to a newly registered user.
@@ -142,6 +155,10 @@ async function sendDrinkWindowDigest(toEmail, username, bottles, userId) {
   // every email. FRONTEND_URL is already required for CORS so it's guaranteed
   // present in any working production setup.
   const unsubLink = `${frontendUrl}/api/users/unsubscribe?token=${unsubToken}`;
+  // One click, no login: stop only these emails (the bell keeps the alerts).
+  const { createScopedUnsubscribeToken } = require('../utils/unsubscribe');
+  const stopLink = `${frontendUrl}/api/users/unsubscribe/drink-window?token=${createScopedUnsubscribeToken(userId, 'drinkWindow')}`;
+  const settingsLink = `${frontendUrl}/settings#notifications`;
 
   const statusLabel = (s) =>
     s === 'peak'      ? 'Entered peak — drink now'
@@ -175,7 +192,10 @@ async function sendDrinkWindowDigest(toEmail, username, bottles, userId) {
       '',
       `View your cellar: ${frontendUrl}/cellars`,
       '',
-      `You can manage these alerts in Settings > Notifications, or unsubscribe here: ${unsubLink}`
+      'You get at most one of these emails a week.',
+      `Stop emailing me drink-window alerts: ${stopLink}`,
+      `Choose which emails you get: ${settingsLink}`,
+      `Unsubscribe from all Cellarion emails: ${unsubLink}`
     ].join('\n'),
     html: `
       <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#2a2a2a;">
@@ -200,8 +220,10 @@ async function sendDrinkWindowDigest(toEmail, username, bottles, userId) {
         </p>
         <hr style="border:none;border-top:1px solid #ddd;margin:2rem 0;" />
         <p style="color:#9A9484;font-size:0.85em;">
-          You can manage these alerts in Settings &gt; Notifications.
-          <br /><a href="${unsubLink}" style="color:#9A9484;">Unsubscribe from all emails</a>
+          You get at most one of these emails a week.
+          <a href="${stopLink}" style="color:#9A9484;">Stop emailing me drink-window alerts</a> ·
+          <a href="${settingsLink}" style="color:#9A9484;">Choose which emails you get</a> ·
+          <a href="${unsubLink}" style="color:#9A9484;">Unsubscribe from all Cellarion emails</a>
         </p>
       </div>
     `
@@ -275,8 +297,12 @@ async function sendCellarInviteEmail(toEmail, senderName, senderEmail, cellarNam
 
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
   const registerLink = `${frontendUrl}/register`;
-  const googlePlayLink = 'https://play.google.com/store/apps/details?id=app.cellarion.twa';
-  const websiteLink = 'https://cellarion.app';
+  // The shared cellar exists only on this instance, and the Google Play app is
+  // bound to cellarion.app: only the hosted service offers the app.
+  const hosted = isHostedCellarion();
+  const googlePlayLink = hosted ? 'https://play.google.com/store/apps/details?id=app.cellarion.twa' : null;
+  const websiteLink = frontendUrl;
+  const websiteLabel = hosted ? 'Visit cellarion.app' : 'Open Cellarion';
   const roleLabel = role === 'editor' ? 'view and edit' : 'view';
 
   await mg.messages.create(DOMAIN, {
@@ -293,9 +319,7 @@ async function sendCellarInviteEmail(toEmail, senderName, senderEmail, cellarNam
       '',
       'Once you sign up, the shared cellar will automatically appear in your account.',
       '',
-      'You can also get Cellarion on Google Play:',
-      googlePlayLink,
-      '',
+      ...(googlePlayLink ? ['You can also get Cellarion on Google Play:', googlePlayLink, ''] : []),
       `Or visit our website: ${websiteLink}`,
       '',
       'Cheers!',
@@ -317,9 +341,9 @@ async function sendCellarInviteEmail(toEmail, senderName, senderEmail, cellarNam
         </p>
         <p>Once you sign up, the shared cellar will automatically appear in your account.</p>
         <p style="margin-top:1.5rem;">
-          <a href="${googlePlayLink}" style="color:#7B9E88;font-weight:600;">Get it on Google Play</a>
+          ${googlePlayLink ? `<a href="${googlePlayLink}" style="color:#7B9E88;font-weight:600;">Get it on Google Play</a>
           &nbsp;&middot;&nbsp;
-          <a href="${websiteLink}" style="color:#7B9E88;font-weight:600;">Visit cellarion.app</a>
+          ` : ''}<a href="${websiteLink}" style="color:#7B9E88;font-weight:600;">${websiteLabel}</a>
         </p>
         <hr style="border:none;border-top:1px solid #ddd;margin:2rem 0;" />
         <p style="color:#9A9484;font-size:0.85em;">
@@ -536,7 +560,7 @@ async function sendSecurityAlertEmail(toEmail, trigger) {
  *                                      the wrong thing after a tier switch
  */
 async function sendSupporterThankYou(toEmail, username, tier) {
-  const replyTo = process.env.SUPPORT_REPLY_TO || 'info@cellarion.app';
+  const replyTo = supportReplyTo();
 
   await mg.messages.create(DOMAIN, {
     from: FROM,
@@ -606,7 +630,7 @@ async function sendSupportReplyEmail(toEmail, recipientName, recipientId, ticket
   await mg.messages.create(DOMAIN, {
     from: FROM,
     to: [toEmail],
-    'h:Reply-To': process.env.SUPPORT_REPLY_TO || 'info@cellarion.app',
+    'h:Reply-To': supportReplyTo(),
     subject: `Reply to your support ticket: ${topic}`,
     text: [
       `Hello ${recipientName},`,
@@ -640,6 +664,234 @@ async function sendSupportReplyEmail(toEmail, recipientName, recipientId, ticket
           You get this email because you asked us a question.
           <a href="${stopRepliesLink}" style="color:#9A9484;">Stop emailing me answers to my support tickets</a> ·
           <a href="${settingsLink}" style="color:#9A9484;">Choose which emails you get</a> ·
+          <a href="${unsubLink}" style="color:#9A9484;">Unsubscribe from all Cellarion emails</a>
+        </p>
+      </div>
+    `
+  });
+}
+
+/**
+ * A curator's question about a wine the recipient owns a bottle of
+ * (services/ownerInquiryEmail). Until 2026-10-20 these reached the in-app bell
+ * and push only, and almost nobody answered. Sent unless the recipient turned
+ * it off (preferences.notifications.ownerInquiry) or unsubscribed; the caller
+ * checks both, and rations it to one a day.
+ *
+ * The question is in the email itself, so an owner can read the label first;
+ * the button opens the question in the app, where it is answered. Reply-To
+ * reaches a person, so an answer sent by email is not lost.
+ *
+ * @param {string} toEmail
+ * @param {string} recipientName  display/username of the recipient (greeting)
+ * @param {string} recipientId    user ObjectId (for the unsubscribe tokens)
+ * @param {string} wineLabel      "Producer — Name" of the registry wine
+ * @param {string} question       the curator's question (plain text, already stripped of HTML)
+ * @param {string} questionPath   app path of the question, e.g. /questions/<id>
+ */
+async function sendOwnerInquiryEmail(toEmail, recipientName, recipientId, wineLabel, question, questionPath) {
+  if (!EMAIL_VERIFICATION_ENABLED) return;
+
+  const { createUnsubscribeToken, createScopedUnsubscribeToken } = require('../utils/unsubscribe');
+  // See sendDrinkWindowDigest for why this uses FRONTEND_URL not BACKEND_URL.
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const unsubLink = `${frontendUrl}/api/users/unsubscribe?token=${createUnsubscribeToken(recipientId)}`;
+  // One click, no login: stop only these question emails (the rest stays on).
+  const stopQuestionsLink = `${frontendUrl}/api/users/unsubscribe/owner-questions?token=${createScopedUnsubscribeToken(recipientId, 'ownerInquiry')}`;
+  const settingsLink = `${frontendUrl}/settings#notifications`;
+  const questionUrl = `${frontendUrl}${questionPath}`;
+  // Registry text: one line, bounded, before it becomes a header.
+  const wine = String(wineLabel || 'your wine').replace(/[\r\n]+/g, ' ').trim().slice(0, 120);
+  const ask = String(question || '').trim();
+
+  await mg.messages.create(DOMAIN, {
+    from: FROM,
+    to: [toEmail],
+    'h:Reply-To': supportReplyTo(),
+    subject: `A question about your ${wine}`,
+    text: [
+      `Hello ${recipientName},`,
+      '',
+      `A Cellarion curator is checking the shared record for ${wine}, and you have a bottle of it. Their question:`,
+      '',
+      ask,
+      '',
+      `Answer it in a minute, with the bottle in front of you: ${questionUrl}`,
+      'Your own bottle, notes and ratings will not change.',
+      '',
+      'You get this email because you own a bottle of this wine.',
+      `Stop emailing me questions about my wines: ${stopQuestionsLink}`,
+      `Choose which emails you get: ${settingsLink}`,
+      `Unsubscribe from all Cellarion emails: ${unsubLink}`
+    ].join('\n'),
+    html: `
+      <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#2a2a2a;line-height:1.5;">
+        <p>Hello <strong>${escapeHtml(recipientName)}</strong>,</p>
+        <p>A Cellarion curator is checking the shared record for <strong>${escapeHtml(wine)}</strong>, and you have a bottle of it. Their question:</p>
+        <blockquote style="border-left:3px solid #D4A373;margin:1rem 0;padding:0.25rem 0.75rem;color:#333;">${escapeHtml(ask).replace(/\n/g, '<br>')}</blockquote>
+        <p style="margin:1.5rem 0;">
+          <a href="${questionUrl}"
+             style="background:#7B9E88;color:#0d0d0d;padding:10px 22px;
+                    border-radius:4px;text-decoration:none;font-weight:600;
+                    display:inline-block;">
+            Answer the question
+          </a>
+        </p>
+        <p style="color:#555;">It takes a minute, with the bottle in front of you. Your own bottle, notes and ratings will not change.</p>
+        <hr style="border:none;border-top:1px solid #ddd;margin:2rem 0;" />
+        <p style="color:#9A9484;font-size:0.85em;">
+          You get this email because you own a bottle of this wine.
+          <a href="${stopQuestionsLink}" style="color:#9A9484;">Stop emailing me questions about my wines</a> ·
+          <a href="${settingsLink}" style="color:#9A9484;">Choose which emails you get</a> ·
+          <a href="${unsubLink}" style="color:#9A9484;">Unsubscribe from all Cellarion emails</a>
+        </p>
+      </div>
+    `
+  });
+}
+
+// Shared footer pieces of the two new-member emails (services/newMemberEmails).
+function newMemberLinks(recipientId) {
+  const { createUnsubscribeToken } = require('../utils/unsubscribe');
+  const { deleteAccountLink } = require('../utils/accountDeletionLink');
+  // See sendDrinkWindowDigest for why this uses FRONTEND_URL not BACKEND_URL.
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  return {
+    frontendUrl,
+    unsubLink: `${frontendUrl}/api/users/unsubscribe?token=${createUnsubscribeToken(recipientId)}`,
+    deleteLink: deleteAccountLink(recipientId),
+  };
+}
+const NEW_MEMBER_BUTTON = 'padding:10px 22px;border-radius:4px;text-decoration:none;font-weight:600;display:inline-block;';
+const bottlesWord = (n) => (n === 1 ? '1 bottle' : `${n} bottles`);
+const readyLine = (r) => `${r.wine}${r.vintage ? ` ${r.vintage}` : ''}${r.count > 1 ? ` (×${r.count})` : ''}`;
+
+/**
+ * "Your cellar so far" — two days after joining, to someone who added bottles
+ * and has not come back since (services/newMemberEmails decides who, once
+ * per account). What is in the cellar, what is ready to drink now, a link back,
+ * and the one habit that keeps a cellar right: marking a bottle as drunk.
+ *
+ * @param {string} toEmail
+ * @param {string} recipientName  display/username (greeting)
+ * @param {string} recipientId    user ObjectId (unsubscribe + delete links)
+ * @param {object} summary        { bottles, readyCount, readyWines, ready: [{ wine, vintage, count }], cellarPath }
+ */
+async function sendNewMemberCellarEmail(toEmail, recipientName, recipientId, summary) {
+  if (!EMAIL_VERIFICATION_ENABLED) return;
+  const { frontendUrl, unsubLink, deleteLink } = newMemberLinks(recipientId);
+  const cellarUrl = `${frontendUrl}${summary.cellarPath || '/cellars'}`;
+  const ready = summary.ready || [];
+  // "among them" only when more ready wines exist than the list shows.
+  const more = (summary.readyWines || ready.length) > ready.length ? ', among them' : '';
+  let readyIntro;
+  if (summary.bottles === 1) readyIntro = 'It is ready to drink now:';
+  else if (summary.readyCount === summary.bottles) readyIntro = `All ${summary.bottles} are ready to drink now${more}:`;
+  else if (summary.readyCount === 1) readyIntro = '1 of them is ready to drink now:';
+  else readyIntro = `${summary.readyCount} of them are ready to drink now${more}:`;
+  // Nothing ready can also mean no drink window is known yet, so this never
+  // claims "not ready".
+  const notYet = summary.bottles === 1
+    ? 'Cellarion works out when it is at its best.'
+    : 'Cellarion works out when each of them is at its best.';
+  const readyText = ready.length
+    ? [readyIntro, ...ready.map((r) => `- ${readyLine(r)}`)]
+    : [notYet];
+  const readyHtml = ready.length
+    ? `<p>${escapeHtml(readyIntro)}</p>
+       <ul style="margin:0 0 1rem;padding-left:1.25rem;">${ready.map((r) => `<li>${escapeHtml(readyLine(r))}</li>`).join('')}</ul>`
+    : `<p>${escapeHtml(notYet)}</p>`;
+
+  await mg.messages.create(DOMAIN, {
+    from: FROM,
+    to: [toEmail],
+    'h:Reply-To': supportReplyTo(),
+    subject: `Your Cellarion cellar so far: ${bottlesWord(summary.bottles)}`,
+    text: [
+      `Hello ${recipientName},`,
+      '',
+      `You added ${bottlesWord(summary.bottles)} to Cellarion a couple of days ago.`,
+      ...readyText,
+      '',
+      `Open your cellar: ${cellarUrl}`,
+      '',
+      'Tip: when you open a bottle, choose Drink on it, and your cellar stays right.',
+      '',
+      'You get this email once, two days after joining.',
+      `Changed your mind? Delete your account: ${deleteLink}`,
+      `Unsubscribe from all Cellarion emails: ${unsubLink}`
+    ].join('\n'),
+    html: `
+      <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#2a2a2a;line-height:1.5;">
+        <p>Hello <strong>${escapeHtml(recipientName)}</strong>,</p>
+        <p>You added ${escapeHtml(bottlesWord(summary.bottles))} to Cellarion a couple of days ago.</p>
+        ${readyHtml}
+        <p style="margin:1.5rem 0;">
+          <a href="${cellarUrl}" style="background:#7B9E88;color:#0d0d0d;${NEW_MEMBER_BUTTON}">Open your cellar</a>
+        </p>
+        <p style="color:#555;">Tip: when you open a bottle, choose <strong>Drink</strong> on it, and your cellar stays right.</p>
+        <hr style="border:none;border-top:1px solid #ddd;margin:2rem 0;" />
+        <p style="color:#9A9484;font-size:0.85em;">
+          You get this email once, two days after joining.
+          <a href="${deleteLink}" style="color:#9A9484;">Changed your mind? Delete your account</a> ·
+          <a href="${unsubLink}" style="color:#9A9484;">Unsubscribe from all Cellarion emails</a>
+        </p>
+      </div>
+    `
+  });
+}
+
+/**
+ * "Your cellar is still empty" — two days after joining, to someone with no
+ * bottles who has not come back (services/newMemberEmails, once per account).
+ * Two equal choices: add the first bottle, or delete the account. Nobody is
+ * talked into staying.
+ *
+ * @param {string} toEmail
+ * @param {string} recipientName  display/username (greeting)
+ * @param {string} recipientId    user ObjectId (unsubscribe + delete links)
+ */
+async function sendNewMemberEmptyEmail(toEmail, recipientName, recipientId) {
+  if (!EMAIL_VERIFICATION_ENABLED) return;
+  const { frontendUrl, unsubLink, deleteLink } = newMemberLinks(recipientId);
+  const addUrl = `${frontendUrl}/cellars`;
+
+  await mg.messages.create(DOMAIN, {
+    from: FROM,
+    to: [toEmail],
+    'h:Reply-To': supportReplyTo(),
+    subject: 'Your Cellarion cellar is still empty',
+    text: [
+      `Hello ${recipientName},`,
+      '',
+      'You joined Cellarion a couple of days ago, but there are no bottles in your cellar yet.',
+      '',
+      'The quickest way in: scan a wine label with your phone, and Cellarion fills in the details. You can also import a list from a spreadsheet or another wine app.',
+      `Add your first bottle: ${addUrl}`,
+      '',
+      'Not for you? That is fine. You can delete your account and everything in it (you then have 7 days to change your mind):',
+      deleteLink,
+      '',
+      'You get this email once, two days after joining.',
+      `Unsubscribe from all Cellarion emails: ${unsubLink}`
+    ].join('\n'),
+    html: `
+      <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#2a2a2a;line-height:1.5;">
+        <p>Hello <strong>${escapeHtml(recipientName)}</strong>,</p>
+        <p>You joined Cellarion a couple of days ago, but there are no bottles in your cellar yet.</p>
+        <p>The quickest way in: scan a wine label with your phone, and Cellarion fills in the details.
+           You can also import a list from a spreadsheet or another wine app.</p>
+        <p style="margin:1.5rem 0;">
+          <a href="${addUrl}" style="background:#7B9E88;color:#0d0d0d;${NEW_MEMBER_BUTTON}">Add your first bottle</a>
+        </p>
+        <p>Not for you? That is fine. You can delete your account and everything in it
+           (you then have 7 days to change your mind).</p>
+        <p style="margin:1.5rem 0;">
+          <a href="${deleteLink}" style="background:#ffffff;color:#2a2a2a;border:1px solid #bbb;${NEW_MEMBER_BUTTON}">Delete my account</a>
+        </p>
+        <hr style="border:none;border-top:1px solid #ddd;margin:2rem 0;" />
+        <p style="color:#9A9484;font-size:0.85em;">
+          You get this email once, two days after joining.
           <a href="${unsubLink}" style="color:#9A9484;">Unsubscribe from all Cellarion emails</a>
         </p>
       </div>
@@ -727,4 +979,4 @@ async function sendAiCapAlertEmail(toEmail, alert) {
   });
 }
 
-module.exports = { sendVerificationEmail, sendPasswordResetEmail, sendDrinkWindowDigest, sendRecommendationEmail, sendCellarInviteEmail, sendDiscussionReplyEmail, sendAccountLockoutAlert, sendSecurityAlertEmail, sendAiCapAlertEmail, sendSupporterThankYou, sendSupportReplyEmail, EMAIL_VERIFICATION_ENABLED };
+module.exports = { sendVerificationEmail, sendPasswordResetEmail, sendDrinkWindowDigest, sendRecommendationEmail, sendCellarInviteEmail, sendDiscussionReplyEmail, sendAccountLockoutAlert, sendSecurityAlertEmail, sendAiCapAlertEmail, sendSupporterThankYou, sendSupportReplyEmail, sendOwnerInquiryEmail, sendNewMemberCellarEmail, sendNewMemberEmptyEmail, EMAIL_VERIFICATION_ENABLED };

@@ -4,6 +4,7 @@ import { useTranslation, Trans } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { listCellars } from '../api/cellars';
 import { previewCellarImport, runCellarImport } from '../api/cellarImport';
+import { friendlyError, httpError } from '../utils/friendlyError';
 
 /**
  * Import a Cellarion cellar export (.json or .zip).
@@ -51,13 +52,13 @@ function ImportCellar() {
     try {
       const res = await previewCellarImport(apiFetch, f);
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || t('importCellar.errorReadFile'));
+      if (!res.ok) throw httpError(res, data, t('importCellar.errorReadFile'));
       setPreview(data);
       const initNames = {}; const initConfirms = {};
       data.cellars.forEach(c => { initNames[c.sourceName] = c.defaultTargetName; initConfirms[c.sourceName] = false; });
       setNames(initNames); setConfirms(initConfirms); setForcedOverwrites(new Set());
     } catch (err) {
-      setError(err.message);
+      setError(friendlyError(err, t));
     } finally {
       setBusy(false);
     }
@@ -107,12 +108,12 @@ function ImportCellar() {
           setForcedOverwrites(prev => new Set(prev).add(String(data.needsConfirm).toLowerCase()));
           refreshOwnedNames();
         }
-        throw new Error(data.error || t('importCellar.errorImportFailed'));
+        throw httpError(res, data, t('importCellar.errorImportFailed'));
       }
       setResult(data.results || []);
       refreshOwnedNames();
     } catch (err) {
-      setError(err.message);
+      setError(friendlyError(err, t));
     } finally {
       setBusy(false);
     }
@@ -132,6 +133,12 @@ function ImportCellar() {
           i18nKey="importCellar.intro"
           components={{ 1: <strong />, 3: <strong />, 5: <strong />, 7: <strong /> }}
         />
+      </p>
+      {/* People holding a CSV or a CellarTracker/Vivino export land here from
+          the cellar list's header button, which restores backups only. */}
+      <p className="settings-hint">
+        {t('importCellar.wineListPointer', 'Bringing a wine list from CellarTracker, Vivino or a spreadsheet instead? Open a cellar and choose “Import bottles”.')}{' '}
+        <Link to="/cellars?all=1">{t('importCellar.toCellars', 'Go to my cellars')}</Link>
       </p>
 
       {/* Result view */}

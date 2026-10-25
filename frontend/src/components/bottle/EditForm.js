@@ -1,13 +1,14 @@
-import { useState, useRef, Suspense } from 'react';
+import { useState, useRef, useEffect, Suspense } from 'react';
 import { lazy } from '../../utils/lazyWithReload';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../../contexts/AuthContext';
 import { updateBottle, setBottleDefaultImage, bulkUpdateBottles } from '../../api/bottles';
 import { toInputDate, validateDrinkWindowFields, DRINK_YEAR_MIN, DRINK_YEAR_MAX } from '../../utils/drinkStatus';
 import { API_URL } from '../../api/apiConstants';
-import { CURRENCIES } from '../../config/currencies';
+import { CURRENCIES, normalizeCurrency } from '../../config/currencies';
 import { BOTTLE_SIZES, bottleSizeLabel, normalizeBottleSize } from '../../config/bottleSizes';
 import RatingInput from '../RatingInput';
+import { isOnOrder, toMonthInput } from '../../utils/onOrder';
 
 const ImageUpload = lazy(() => import('../ImageUpload'));
 const ImageGallery = lazy(() => import('../ImageGallery'));
@@ -37,6 +38,9 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
   const { t } = useTranslation();
   const { apiFetch, user } = useAuth();
   const galleryRef = useRef(null);
+  // The error shows at the top of the form; Save is at the bottom. On a phone
+  // a refused save looked like nothing happened — bring the message into view.
+  const errorRef = useRef(null);
   const [form, setForm] = useState({
     vintage:          bottle.vintage     || '',
     rating:           bottle.rating      || '',
@@ -52,14 +56,28 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
     price:            bottle.price   || '',
     // If bottle has a price, keep stored currency (price and currency must stay in sync).
     // If no price yet, default to user's preference so they don't have to change it every time.
-    currency:         bottle.price ? (bottle.currency || 'USD') : (user?.preferences?.currency || bottle.currency || 'USD'),
+    currency:         normalizeCurrency(bottle.price ? (bottle.currency || 'USD') : (user?.preferences?.currency || bottle.currency || 'USD')),
     bottleSize:       normalizeBottleSize(bottle.bottleSize) || bottle.bottleSize || '750ml',
     purchaseDate:     toInputDate(bottle.purchaseDate),
     purchaseLocation: bottle.purchaseLocation || '',
     purchaseUrl:      bottle.purchaseUrl || '',
+    // Only sent for a bottle on order ('YYYY-MM'; '' clears the month).
+    expectedArrival:  toMonthInput(bottle.expectedArrival),
   });
   const [saving, setSaving] = useState(false);
-  const [error, setError]   = useState(null);
+  const [error, setErrorText] = useState(null);
+  // Bumped with every error shown, so the same message shown twice (a second
+  // tap on Save) is brought into view again.
+  const [errorTick, setErrorTick] = useState(0);
+  const setError = (message) => {
+    setErrorText(message);
+    if (message) setErrorTick((n) => n + 1);
+  };
+  useEffect(() => {
+    if (!errorTick || !errorRef.current) return;
+    try { errorRef.current.scrollIntoView({ block: 'center' }); } catch { /* old browser */ }
+    errorRef.current.focus({ preventScroll: true });
+  }, [errorTick]);
   const [applyToLot, setApplyToLot] = useState(false);
 
   const set = (field) => (e) => setForm(f => ({ ...f, [field]: e.target.value }));
@@ -80,8 +98,10 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
     setSaving(true);
     setError(null);
     try {
+      const { expectedArrival, ...formFields } = form;
       const payload = {
-        ...form,
+        ...formFields,
+        ...(isOnOrder(bottle) ? { expectedArrival: expectedArrival || null } : {}),
         price:  form.price  ? parseFloat(form.price)  : null,
         rating: form.rating ? parseFloat(form.rating) : null,
         ratingScale: form.ratingScale || '5',
@@ -127,7 +147,7 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
   return (
     <form className="bd-edit-form card" onSubmit={handleSave}>
       <h2>{t('bottleDetail.editBottleTitle')}</h2>
-      {error && <div className="alert alert-error">{error}</div>}
+      {error && <div className="alert alert-error" role="alert" ref={errorRef} tabIndex={-1}>{error}</div>}
 
       <div className="bd-edit-grid">
         <div className="form-group">
@@ -161,7 +181,7 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
 
         <div className="form-group">
           <label>{t('common.currency')}</label>
-          <select value={form.currency} onChange={set('currency')}>
+          <select translate="no" value={form.currency} onChange={set('currency')}>
             {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
         </div>
@@ -182,6 +202,13 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
           <label>{t('addBottle.purchaseDate')}</label>
           <input type="date" value={form.purchaseDate} onChange={set('purchaseDate')} />
         </div>
+
+        {isOnOrder(bottle) && (
+          <div className="form-group">
+            <label htmlFor="edit-expected-arrival">{t('addBottle.expectedArrival')}</label>
+            <input id="edit-expected-arrival" type="month" placeholder="YYYY-MM" pattern="\d{4}-\d{2}" value={form.expectedArrival} onChange={set('expectedArrival')} />
+          </div>
+        )}
       </div>
 
       <div className="form-group">
@@ -207,6 +234,7 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
             <label>{t('addBottle.drinkFrom')}</label>
             <input
               type="number"
+              inputMode="numeric"
               value={form.drinkFrom}
               onChange={set('drinkFrom')}
               placeholder={t('addBottle.drinkFromPlaceholder')}
@@ -219,6 +247,7 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
             <label>{t('addBottle.drinkTo')}</label>
             <input
               type="number"
+              inputMode="numeric"
               value={form.drinkTo}
               onChange={set('drinkTo')}
               placeholder={t('addBottle.drinkToPlaceholder')}
@@ -233,6 +262,7 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
             <label>{t('addBottle.peakFrom')}</label>
             <input
               type="number"
+              inputMode="numeric"
               value={form.peakFrom}
               onChange={set('peakFrom')}
               placeholder={t('addBottle.peakFromPlaceholder')}
@@ -245,6 +275,7 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
             <label>{t('addBottle.peakUntil')}</label>
             <input
               type="number"
+              inputMode="numeric"
               value={form.peakUntil}
               onChange={set('peakUntil')}
               placeholder={t('addBottle.peakUntilPlaceholder')}
@@ -283,6 +314,7 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
             <label>{t('bottleDetail.reservedUntilLabel')}</label>
             <input
               type="number"
+              inputMode="numeric"
               value={form.reservedUntil}
               onChange={set('reservedUntil')}
               placeholder={t('bottleDetail.reservedUntilPlaceholder')}
@@ -302,7 +334,7 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
 
       <div className="form-group">
         <label>{t('addBottle.purchaseUrl')}</label>
-        <input type="url" value={form.purchaseUrl} onChange={set('purchaseUrl')} placeholder="https://\u2026" />
+        <input type="url" value={form.purchaseUrl} onChange={set('purchaseUrl')} placeholder="https://…" />
       </div>
 
       <div className="form-group bd-image-section">

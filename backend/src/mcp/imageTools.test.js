@@ -96,15 +96,72 @@ describe('attach_bottle_image', () => {
     expect(row.detail.imageId).toBeDefined();
   });
 
-  test('keep_background reaches the shared pipeline as keepBackground (label-only photos, ticket 6a97f870)', async () => {
+  test('photos added through MCP always go through background removal: keep_background is accepted but ignored', async () => {
     ownBottle();
     safeFetchImage.mockResolvedValue({ buffer: Buffer.from('imgbytes'), contentType: 'image/jpeg' });
+    // Still accepted (an older caller is not refused) — and still removed.
     await tool('attach_bottle_image').handler({ bottle_id: oid('d'), image_url: 'https://cdn.example.com/label.jpg', keep_background: true }, CTX);
-    expect(ingestBottleImage).toHaveBeenCalledWith(expect.objectContaining({ keepBackground: true }), CTX.req);
+    expect(ingestBottleImage).toHaveBeenCalledWith(expect.objectContaining({ keepBackground: false }), CTX.req);
 
     ingestBottleImage.mockClear();
     await tool('attach_bottle_image').handler({ bottle_id: oid('d'), image_url: 'https://cdn.example.com/label.jpg' }, CTX);
     expect(ingestBottleImage).toHaveBeenCalledWith(expect.objectContaining({ keepBackground: false }), CTX.req);
+  });
+
+  test('label_only keeps the background of a photo of the label alone — background removal would cut its edges away', async () => {
+    ownBottle();
+    safeFetchImage.mockResolvedValue({ buffer: Buffer.from('imgbytes'), contentType: 'image/jpeg' });
+    ingestBottleImage.mockImplementation(async () => ({ image: { _id: oid('9'), status: 'processed', keepBackground: true } }));
+    const res = await tool('attach_bottle_image').handler({ bottle_id: oid('d'), image_url: 'https://cdn.example.com/label.jpg', label_only: true }, CTX);
+    expect(ingestBottleImage).toHaveBeenCalledWith(expect.objectContaining({ keepBackground: true }), CTX.req);
+    const body = parse(res);
+    expect(body.data.background_kept).toBe(true);
+    expect(body.data.state).toBe('awaiting_review');
+
+    // label_only: false with keep_background: true keeps nothing — and the
+    // answer says the background went (a fresh default answer: nothing kept).
+    ingestBottleImage.mockReset();
+    ingestBottleImage.mockResolvedValue({ image: { _id: oid('9'), status: 'uploaded' } });
+    const res2 = await tool('attach_bottle_image').handler({ bottle_id: oid('d'), image_url: 'https://cdn.example.com/label.jpg', label_only: false, keep_background: true }, CTX);
+    expect(ingestBottleImage).toHaveBeenCalledWith(expect.objectContaining({ keepBackground: false }), CTX.req);
+    expect(parse(res2).data.background_kept).toBe(false);
+    expect(parse(res2).data.state).toBe('queued');
+  });
+
+  test('a picture shaped like a whole bottle is cut out even with label_only, and the answer says why', async () => {
+    const sharp = require('sharp');
+    ownBottle();
+    const picture = (width, height) => sharp({ create: { width, height, channels: 3, background: '#ffffff' } }).jpeg().toBuffer();
+    // A retailer's bottle shot: 300×900.
+    safeFetchImage.mockResolvedValue({ buffer: await picture(300, 900), contentType: 'image/jpeg' });
+    const res = await tool('attach_bottle_image').handler({ bottle_id: oid('d'), image_url: 'https://shop.example.com/bottle.jpg', label_only: true }, CTX);
+    expect(ingestBottleImage).toHaveBeenCalledWith(expect.objectContaining({ keepBackground: false }), CTX.req);
+    expect(parse(res).warnings.join(' ')).toMatch(/tall and narrow like a whole bottle/);
+
+    // A rectified label, 1000×1230: kept.
+    ingestBottleImage.mockClear();
+    const label = (await picture(1000, 1230)).toString('base64');
+    const res2 = await tool('attach_bottle_image').handler({ bottle_id: oid('d'), image_base64: label, label_only: true }, CTX);
+    expect(ingestBottleImage).toHaveBeenCalledWith(expect.objectContaining({ keepBackground: true }), CTX.req);
+    expect(parse(res2).warnings || []).toEqual([]);
+  });
+
+  test('a caller that still sends keep_background is told it is ignored and what to use instead', async () => {
+    ownBottle();
+    safeFetchImage.mockResolvedValue({ buffer: Buffer.from('imgbytes'), contentType: 'image/jpeg' });
+    const res = await tool('attach_bottle_image').handler({ bottle_id: oid('d'), image_url: 'https://cdn.example.com/label.jpg', keep_background: true }, CTX);
+    expect(parse(res).warnings.join(' ')).toMatch(/keep_background is ignored.*label_only: true/);
+  });
+
+  test('the tool says which photos label_only is for, so a client does not find out by trial', () => {
+    const t = tool('attach_bottle_image');
+    expect(t.description).toMatch(/label_only/);
+    // Clients that turn MCP tools into function definitions cut at 1024.
+    expect(t.description.length).toBeLessThanOrEqual(1024);
+    const schema = t.inputSchema;
+    expect(schema.label_only.description).toMatch(/label alone/i);
+    expect(schema.label_only.description).toMatch(/never set it for a retailer product image or any photo with the bottle in it/i);
+    expect(schema.keep_background.description).toMatch(/label_only/);
   });
 
   test('a bottle with no registry wine yet attaches bottle-only (no wine linkage)', async () => {

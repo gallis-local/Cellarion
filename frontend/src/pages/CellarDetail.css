@@ -213,6 +213,21 @@
   position: relative;
 }
 
+/* "Show on cards": the same dropdown, holding checkboxes. It hangs from the
+   toolbar's right edge, not its button's: in list view the button sits ~200px
+   in, and a menu opening leftward from there ran off a 360px phone (release
+   audit 2026-10-12). */
+.card-fields-wrap { position: static; }
+.more-menu-dropdown.card-fields-menu { min-width: 190px; }
+.card-fields-title {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  padding: 0.3rem 0.75rem 0.15rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.card-fields-item input { margin: 0; }
+
 .btn-more {
   font-size: 1.2rem;
   letter-spacing: 0.05em;
@@ -453,6 +468,8 @@
 }
 
 .active-filter-chip-remove {
+  position: relative;
+  --tap-reach: -4px -12px; /* touch tap area, styles/common.css */
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -563,6 +580,7 @@
 
 /* ── View toggle ── */
 .bottles-view-toggle {
+  position: relative;
   display: flex;
   gap: 0.35rem;
   justify-content: flex-end;
@@ -570,6 +588,8 @@
 }
 
 .view-toggle-btn {
+  position: relative;
+  --tap-reach: -6px -2px; /* touch tap area, styles/common.css */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -984,6 +1004,13 @@
     min-width: 0;
   }
 
+  /* The clearable search box (components/SearchInput) is the flex item in
+     the row, so it is the wrapper that takes the full first line. */
+  .search-row .search-input-clearable {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
   .sort-select {
     min-width: 0;
     flex: 1;
@@ -1066,6 +1093,8 @@
 .bulk-bar-link:disabled { color: var(--color-text-muted); cursor: default; }
 
 .bulk-bar-close {
+  position: relative;
+  --tap-reach: -6px; /* touch tap area, styles/common.css */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1077,6 +1106,7 @@
   color: var(--color-text-muted);
   cursor: pointer;
 }
+
 .bulk-bar-close:hover { background: var(--color-primary-light); color: var(--color-primary); }
 
 .bulk-bar-actions {
@@ -1112,17 +1142,103 @@
 .bulk-action-btn:disabled { opacity: 0.45; cursor: default; }
 .bulk-action-icon { font-size: 1.25rem; line-height: 1; }
 
-/* The bulk modals' forms (purchase details, consume, reserve, add to list). */
-.bulk-form .form-group { display: flex; flex-direction: column; gap: 0.25rem; margin-bottom: 0.75rem; }
-.bulk-form .form-group > span { font-size: 0.85rem; color: var(--color-text-secondary); }
-.bulk-form input[type="text"], .bulk-form input[type="url"], .bulk-form input[type="date"],
-.bulk-form input[type="number"], .bulk-form select, .bulk-form textarea { width: 100%; }
-.bulk-form small { color: var(--color-text-muted); font-size: 0.75rem; }
-.bulk-price-row { display: grid; grid-template-columns: 1fr 120px; gap: 0.5rem; }
-.bulk-price-row label { display: flex; flex-direction: column; gap: 0.25rem; }
-.bulk-mode-row { display: flex; flex-direction: row; gap: 1rem; }
-.move-bottle-skipped { color: var(--color-text-secondary); }
+/* The bulk modals' forms live in styles/common.css: they also open outside
+   this page (the pick list, the bottle page). */
+
+/* Bulk delete: the one select-mode action that reads as dangerous. */
+/* Red at rest too — phones have no hover to tell it apart from the others. */
+.bulk-action-btn--danger { color: var(--color-danger); }
+.bulk-action-btn--danger:hover:not(:disabled) {
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
+  border-color: var(--color-danger-border);
+}
+
+/* Bulk delete confirm: what goes, wine by wine. */
+.trash-summary {
+  list-style: none;
+  margin: 0 0 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.88rem;
+}
+.trash-summary li { display: flex; justify-content: space-between; gap: 0.75rem; }
+.trash-summary-name { min-width: 0; overflow-wrap: anywhere; }
+.trash-summary-count { flex: none; color: var(--color-text-secondary); font-variant-numeric: tabular-nums; }
+.trash-summary-more { color: var(--color-text-muted); }
+.trash-where { color: var(--color-text-secondary); font-size: 0.85rem; }
+
+/* Recently deleted: one block per bulk delete. */
+.trash-intro { color: var(--color-text-secondary); margin-top: 0; }
+.trash-empty { color: var(--color-text-muted); text-align: center; padding: 1.5rem 0; }
+.trash-message p { margin: 0 0 0.35rem; }
+.trash-batch { border-top: 1px solid var(--color-border); padding: 0.75rem 0; }
+.trash-batch-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+.trash-batch-head > div { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.trash-batch-left { color: var(--color-text-muted); font-size: 0.8rem; }
+.trash-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.35rem; }
+.trash-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; font-size: 0.9rem; }
+.trash-row-label { min-width: 0; overflow-wrap: anywhere; }
+.trash-row .btn { flex: none; }
+.trash-show-all { margin-top: 0.5rem; }
 
 /* Bulk drink window: the four year fields in two columns (one on a phone). */
 .bulk-year-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 0.75rem; }
 @media (max-width: 480px) { .bulk-year-grid { grid-template-columns: 1fr; } }
+
+/* The cellar page's link to this view (CellarDetail, bottles tab). */
+.on-order-link-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.75rem;
+  padding: 0.55rem 0.9rem;
+  background: var(--color-info-bg);
+  border: 1px solid var(--color-info-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  text-decoration: none;
+  font-size: 0.88rem;
+}
+
+.on-order-link-bar:hover {
+  border-color: var(--color-info);
+}
+
+.on-order-link-bar .on-order-link-next {
+  color: var(--color-text-secondary);
+}
+
+.on-order-link-bar svg {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.on-order-link-bar .on-order-link-next.is-late {
+  color: var(--color-warning);
+  font-weight: 600;
+}
+
+/* The import link under "Add Your First Bottle" in an empty cellar (the same
+   look as the hint on the empty cellar list, which may not be loaded here). */
+.cellar-detail-page .empty-state-import {
+  margin-top: 1rem;
+  font-size: 0.9rem;
+  color: var(--color-text-secondary);
+  max-width: 46ch;
+  margin-left: auto;
+  margin-right: auto;
+  line-height: 1.6;
+}

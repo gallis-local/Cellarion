@@ -1,11 +1,12 @@
 import React, { Suspense, useCallback, useEffect, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { lazy } from '../utils/lazyWithReload';
 import { useAuth } from '../contexts/AuthContext';
 import { listDashboards, createDashboard, updateDashboard, deleteDashboard, runAnalyticsQuery } from '../api/analytics';
 import AnalyticsCharts from '../components/AnalyticsCharts';
 import { humanMeasureLabel } from '../utils/analyticsLabels';
+import { isRatingField, ratingMeasureField, viewerRatingScale, formatRatingCell } from '../utils/analyticsRatings';
 // Shares .at-chip / .at-beta with the analytics table so the two surfaces
 // stay visually one feature.
 import '../components/AnalyticsTable.css';
@@ -78,17 +79,19 @@ const DEFAULT_WIDGETS = [
 
 function KpiWidget({ data, t }) {
   const bucket = data.buckets[0];
-  if (!bucket) return <div className="ad-empty">{t('analytics.empty', 'No bottles match this scope and these filters.')}</div>;
+  if (!bucket) return <div className="dash-empty">{t('analytics.empty', 'No bottles match this scope and these filters.')}</div>;
   return (
-    <div className="ad-kpis">
+    <div className="dash-kpis">
       {data.measureLabels.map((label, i) => {
         const v = bucket.measures[i];
         return (
-          <div key={label} className="ad-kpi">
-            <div className="ad-kpi-value">
-              {v === null || v === undefined ? '—' : typeof v === 'number' ? Math.round(v * 100) / 100 : String(v)}
+          <div key={label} className="dash-kpi">
+            <div className="dash-kpi-value">
+              {v === null || v === undefined ? '—'
+                : typeof v === 'number' && ratingMeasureField(label) ? formatRatingCell(v, data.ratingScale || '5')
+                : typeof v === 'number' ? Math.round(v * 100) / 100 : String(v)}
             </div>
-            <div className="ad-kpi-label">
+            <div className="dash-kpi-label">
               {humanMeasureLabel(label, null, t)}
               {label.includes('purchase.price') && data.currency ? ` (${data.currency.target})` : ''}
             </div>
@@ -100,24 +103,24 @@ function KpiWidget({ data, t }) {
 }
 
 function RowsWidget({ data, t }) {
-  if (!data.rows.length) return <div className="ad-empty">{t('analytics.empty', 'No bottles match this scope and these filters.')}</div>;
+  if (!data.rows.length) return <div className="dash-empty">{t('analytics.empty', 'No bottles match this scope and these filters.')}</div>;
   const cols = Object.keys(data.rows[0].values);
   return (
-    <div className="ad-mini-scroll">
+    <div className="dash-mini-scroll">
       <table>
         <tbody>
           {data.rows.map((r) => (
             <tr key={r.id}>
               {cols.map((k) => {
                 const v = r.values[k];
-                return <td key={k}>{v === null || v === undefined ? '—' : Array.isArray(v) ? v.join(', ') : String(v)}</td>;
+                return <td key={k}>{v === null || v === undefined ? '—' : Array.isArray(v) ? v.join(', ') : isRatingField(k) ? formatRatingCell(v, data.ratingScale || '5') : String(v)}</td>;
               })}
             </tr>
           ))}
         </tbody>
       </table>
       {data.total > data.rows.length && (
-        <div className="ad-more">{t('analytics.andMore', '…and {{n}} more', { n: data.total - data.rows.length })}</div>
+        <div className="dash-more">{t('analytics.andMore', '…and {{n}} more', { n: data.total - data.rows.length })}</div>
       )}
     </div>
   );
@@ -125,7 +128,9 @@ function RowsWidget({ data, t }) {
 
 function Widget({ widget, onRemove }) {
   const { t } = useTranslation();
-  const { apiFetch } = useAuth();
+  const { apiFetch, user } = useAuth();
+  // Ratings come back in the viewer's own scale (Settings), not always stars.
+  const ratingScale = viewerRatingScale(user);
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
 
@@ -136,7 +141,7 @@ function Widget({ widget, onRemove }) {
         const q = widget.query?.mode === 'rows' || (!widget.query?.mode && widget.query?.columns)
           ? { ...widget.query, mode: 'rows', limit: 8 }
           : widget.query;
-        const res = await runAnalyticsQuery(apiFetch, q);
+        const res = await runAnalyticsQuery(apiFetch, { ...q, ratingScale });
         const body = await res.json();
         if (!live) return;
         if (!res.ok) setError(body.error || 'Query failed');
@@ -146,22 +151,22 @@ function Widget({ widget, onRemove }) {
       }
     })();
     return () => { live = false; };
-  }, [apiFetch, widget, t]);
+  }, [apiFetch, widget, ratingScale, t]);
 
   const scopeNote = data?.scope && data.scope.bottles !== 'active'
     ? t(`analytics.scope.${data.scope.bottles}`, data.scope.bottles)
     : null;
 
   return (
-    <div className={`ad-widget ad-${widget.size || 'half'}`}>
-      <div className="ad-widget-head">
-        <span className="ad-widget-title">{widget.title}{scopeNote ? <em> · {scopeNote}</em> : null}</span>
+    <div className={`dash-widget dash-${widget.size || 'half'}`}>
+      <div className="dash-widget-head">
+        <span className="dash-widget-title">{widget.title}{scopeNote ? <em> · {scopeNote}</em> : null}</span>
         {onRemove && (
-          <button className="ad-x" onClick={onRemove} aria-label={t('analytics.removeWidget', 'Remove widget')}>×</button>
+          <button className="dash-x" onClick={onRemove} aria-label={t('analytics.removeWidget', 'Remove widget')}>×</button>
         )}
       </div>
-      {error && <div className="ad-error">{error}</div>}
-      {!error && !data && <div className="ad-empty">{t('analytics.loading', 'Loading…')}</div>}
+      {error && <div className="dash-error">{error}</div>}
+      {!error && !data && <div className="dash-empty">{t('analytics.loading', 'Loading…')}</div>}
       {!error && data && data.mode === 'rows' && <RowsWidget data={data} t={t} />}
       {!error && data && data.mode === 'grouped' && widget.viz === 'kpi' && <KpiWidget data={data} t={t} />}
       {!error && data && data.mode === 'grouped' && widget.viz === 'table' && (
@@ -169,26 +174,26 @@ function Widget({ widget, onRemove }) {
         // silent coercion to bars).
         data.buckets.length
           ? (
-            <div className="ad-mini-scroll">
+            <div className="dash-mini-scroll">
               <table>
                 <tbody>
                   {data.buckets.slice(0, 8).map((b, i) => (
                     <tr key={i}>
                       {b.dimensions.map((d, j) => <td key={`d${j}`}>{d ?? '—'}</td>)}
-                      {b.measures.map((m, j) => <td key={`m${j}`}>{m == null ? '—' : typeof m === 'number' ? Math.round(m * 100) / 100 : String(m)}</td>)}
+                      {b.measures.map((m, j) => <td key={`m${j}`}>{m == null ? '—' : typeof m === 'number' && ratingMeasureField(data.measureLabels[j]) ? formatRatingCell(m, data.ratingScale || '5') : typeof m === 'number' ? Math.round(m * 100) / 100 : String(m)}</td>)}
                     </tr>
                   ))}
                 </tbody>
               </table>
-              {data.buckets.length > 8 && <div className="ad-more">{t('analytics.andMore', '…and {{n}} more', { n: data.buckets.length - 8 })}</div>}
+              {data.buckets.length > 8 && <div className="dash-more">{t('analytics.andMore', '…and {{n}} more', { n: data.buckets.length - 8 })}</div>}
             </div>
           )
-          : <div className="ad-empty">{t('analytics.empty', 'No bottles match this scope and these filters.')}</div>
+          : <div className="dash-empty">{t('analytics.empty', 'No bottles match this scope and these filters.')}</div>
       )}
       {!error && data && data.mode === 'grouped' && widget.viz !== 'kpi' && widget.viz !== 'table' && (
         data.buckets.length
           ? <AnalyticsCharts data={data} chartType={widget.viz} measureIndex={data.measureLabels.length > 1 ? 1 : 0} />
-          : <div className="ad-empty">{t('analytics.empty', 'No bottles match this scope and these filters.')}</div>
+          : <div className="dash-empty">{t('analytics.empty', 'No bottles match this scope and these filters.')}</div>
       )}
     </div>
   );
@@ -292,25 +297,25 @@ export default function AnalyticsDashboard() {
 
   return (
     <div className="analytics-dashboard">
-      <div className="ad-tabs" role="tablist" aria-label={t('analytics.tabsAria', 'Analytics sections')}>
-        <button type="button" role="tab" className={`ad-tab${tab === 'boards' ? ' active' : ''}`} aria-selected={tab === 'boards'} onClick={() => showTab('boards')}>
+      <div className="dash-tabs" role="tablist" aria-label={t('analytics.tabsAria', 'Analytics sections')}>
+        <button type="button" role="tab" className={`dash-tab${tab === 'boards' ? ' active' : ''}`} aria-selected={tab === 'boards'} onClick={() => showTab('boards')}>
           {t('analytics.tabs.boards', 'Boards')}
         </button>
-        <button type="button" role="tab" className={`ad-tab${tab === 'table' ? ' active' : ''}`} aria-selected={tab === 'table'} onClick={() => showTab('table')}>
+        <button type="button" role="tab" className={`dash-tab${tab === 'table' ? ' active' : ''}`} aria-selected={tab === 'table'} onClick={() => showTab('table')}>
           {t('analytics.tabs.table', 'Table')}
         </button>
       </div>
       {tab === 'table' ? (
-        <Suspense fallback={<div className="ad-empty">{t('analytics.loading', 'Loading…')}</div>}>
+        <Suspense fallback={<div className="dash-empty">{t('analytics.loading', 'Loading…')}</div>}>
           <AnalyticsTable cellarId={cellarParam} />
         </Suspense>
       ) : (
       <>
-      <div className="ad-head">
+      <div className="dash-head">
         <h1>
           {boards && boards.length > 0 ? (
             <select
-              className="ad-board-select"
+              className="dash-board-select"
               value={activeId ?? boards[0].id}
               onChange={(e) => setActiveId(e.target.value)}
             >
@@ -323,25 +328,27 @@ export default function AnalyticsDashboard() {
             {t('analytics.beta', 'Beta')}
           </span>
         </h1>
-        <div className="ad-head-actions">
-          {saveState === 'saving' && <span className="ad-save-note">{t('analytics.saving', 'Saving…')}</span>}
-          {saveState === 'error' && <span className="ad-save-note ad-save-error">{t('analytics.saveFailed', 'Could not save')}</span>}
+        <div className="dash-head-actions">
+          {saveState === 'saving' && <span className="dash-save-note">{t('analytics.saving', 'Saving…')}</span>}
+          {saveState === 'error' && <span className="dash-save-note dash-save-error">{t('analytics.saveFailed', 'Could not save')}</span>}
           <button className="at-chip" onClick={newBoard}>{t('analytics.newDashboard', '+ New dashboard')}</button>
           {active && (
             <button className="at-chip" onClick={deleteBoard}>{t('analytics.deleteDashboard', 'Delete')}</button>
           )}
         </div>
       </div>
-      <p className="ad-hint">
+      <p className="dash-hint">
         {t('analytics.dashboardHint', 'Widgets come from the Table tab: group something interesting there and press "Add to dashboard".')}
+        {' '}
+        <Link to="/statistics">{t('analytics.statisticsLink', 'Your collection at a glance: Statistics →')}</Link>
       </p>
-      <div className="ad-grid">
-        {boards === null && <div className="ad-empty">{t('analytics.loading', 'Loading…')}</div>}
+      <div className="dash-grid">
+        {boards === null && <div className="dash-empty">{t('analytics.loading', 'Loading…')}</div>}
         {boards !== null && widgets.map((w, i) => (
           <Widget key={`${w.title}-${i}`} widget={w} onRemove={() => removeWidget(i)} />
         ))}
         {boards !== null && active && !widgets.length && (
-          <div className="ad-empty">{t('analytics.emptyBoard', 'This dashboard is empty — pin views to it from the Table tab.')}</div>
+          <div className="dash-empty">{t('analytics.emptyBoard', 'This dashboard is empty — pin views to it from the Table tab.')}</div>
         )}
       </div>
       </>

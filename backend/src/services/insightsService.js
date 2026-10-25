@@ -14,7 +14,7 @@ const User = require('../models/User');
 const Cellar = require('../models/Cellar');
 const Bottle = require('../models/Bottle');
 const WishlistItem = require('../models/WishlistItem');
-const { CONSUMED_STATUSES, WINE_POPULATE_LIST } = require('../config/constants');
+const { CONSUMED_STATUSES, NOT_IN_CELLAR_STATUSES, ORDERED_STATUS, WINE_POPULATE_LIST } = require('../config/constants');
 const { classifyMaturity, buildProfileMap, maturityLabel, resolveWindowForBottle } = require('../utils/maturityUtils');
 const { toNormalized } = require('../utils/ratingUtils');
 
@@ -41,7 +41,7 @@ async function loadPortfolio(userId, currencyOverride) {
   }
   const scope = { user: userId, cellar: { $in: cellars.map((c) => c._id) } };
   const [activeBottles, consumedBottles] = await Promise.all([
-    Bottle.find({ ...scope, status: { $nin: CONSUMED_STATUSES } }).populate(WINE_POPULATE_LIST).lean(),
+    Bottle.find({ ...scope, status: { $nin: NOT_IN_CELLAR_STATUSES } }).populate(WINE_POPULATE_LIST).lean(),
     Bottle.find({ ...scope, status: { $in: CONSUMED_STATUSES } }).populate(WINE_POPULATE_LIST).lean(),
   ]);
   return { cellars, activeBottles, consumedBottles, targetCurrency, targetRatingScale };
@@ -390,6 +390,15 @@ function vintageSortKey(vintage) {
   return Number.isFinite(n) ? n : -Infinity;
 }
 
+/** The cellars these bottles sit in, the one holding the most first (ties by id, so the order is stable). */
+function cellarsByCount(bottles) {
+  const counts = new Map();
+  for (const b of bottles) counts.set(String(b.cellar), (counts.get(String(b.cellar)) || 0) + 1);
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([cellar]) => cellar);
+}
+
 /**
  * Multi-bottle lots (same wine + vintage) with their acquisition/consumption
  * story. focusWineId/focusVintage narrow to one wine (all vintages / one lot);
@@ -404,14 +413,22 @@ function vintageSortKey(vintage) {
  * must be among them — or a 21-vintage vertical's oldest bottle would read
  * "no bottles of this vintage" about the one in the owner's hand (audit
  * 2026-09-16). The pinned lot takes the last place when it would be cut.
+ *
+ * `withCellars`: each lot also names the cellars to open it in
+ * (`cellar_ids`): the cellars with bottles of it left, or — all drunk — the
+ * cellars it was drunk from, the one holding the most first. A per-wine page
+ * then links another vintage to its own vintage page, which belongs to a
+ * cellar, without landing on an empty one while the bottles sit in another.
+ * Off by default, so the MCP case_journey envelope is unchanged.
  */
 async function buildCaseJourneys(userId, {
   focusWineId = null, focusVintage = null, minCount = 3, limit = 8,
-  sort = 'count', noteMaxLength = JOURNEY_NOTE_MAX, pinVintage = null,
+  sort = 'count', noteMaxLength = JOURNEY_NOTE_MAX, pinVintage = null, withCellars = false,
 } = {}) {
   const cellars = await Cellar.find({ user: userId, deletedAt: null }).select('_id').lean();
   if (cellars.length === 0) return { summary: 'No cellars yet', data: [] };
-  const scope = { cellar: { $in: cellars.map((c) => c._id) } };
+  // A lot is what came INTO the cellar: bottles still on order join it on arrival.
+  const scope = { cellar: { $in: cellars.map((c) => c._id) }, status: { $ne: ORDERED_STATUS } };
   if (focusWineId) scope.wineDefinition = focusWineId;
   const bottles = await Bottle.find(scope).populate(WINE_POPULATE_LIST).lean();
 
@@ -546,6 +563,7 @@ async function buildCaseJourneys(userId, {
       consumed_events: events,
       rating_trend: ratingTrend,
       pace,
+      ...(withCellars ? { cellar_ids: cellarsByCount(active.length ? active : lot.bottles) } : {}),
     };
   });
 

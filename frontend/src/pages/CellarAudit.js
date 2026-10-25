@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { getCellar, getCellarAudit } from '../api/cellars';
 import './CellarAudit.css';
+import { backLabel } from '../utils/backLabel';
 
 function formatTimestamp(ts) {
   return new Date(ts).toLocaleString(undefined, {
@@ -22,6 +23,15 @@ const ACTION_LABEL_KEYS = {
   'bottle.bulk_move':    'cellarAudit.actions.bottleBulkMove',
   'bottle.bulk_update':  'cellarAudit.actions.bottleBulkUpdate',
   'bottle.bulk_consume': 'cellarAudit.actions.bottleBulkConsume',
+  'bottle.restore':      'cellarAudit.actions.bottleRestore',
+  'bottle.bulk_restore': 'cellarAudit.actions.bottleBulkRestore',
+  'bottle.arrive':       'cellarAudit.actions.bottleArrive',
+  'bottle.arrive.undo':  'cellarAudit.actions.bottleArriveUndo',
+  'bottle.bulk_arrive':  'cellarAudit.actions.bottleBulkArrive',
+  'bottle.change_wine':  'cellarAudit.actions.bottleChangeWine',
+  'image.attach':        'cellarAudit.actions.imageAttach',
+  'image.link':          'cellarAudit.actions.imageLink',
+  'image.default':       'cellarAudit.actions.imageDefault',
   'cellar.delete':       'cellarAudit.actions.cellarDelete',
   'cellar.share.add':    'cellarAudit.actions.cellarShareAdd',
   'cellar.share.update': 'cellarAudit.actions.cellarShareUpdate',
@@ -38,6 +48,15 @@ const ACTION_ICONS = {
   'bottle.bulk_move':    '📦',
   'bottle.bulk_update':  '✏️',
   'bottle.bulk_consume': '🍷',
+  'bottle.restore':      '↩️',
+  'bottle.bulk_restore': '↩️',
+  'bottle.arrive':       '🚚',
+  'bottle.arrive.undo':  '↩️',
+  'bottle.bulk_arrive':  '🚚',
+  'bottle.change_wine':  '🔁',
+  'image.attach':        '📷',
+  'image.link':          '📷',
+  'image.default':       '📷',
   'cellar.delete':       '🗑️',
   'cellar.share.add':    '🔗',
   'cellar.share.update': '🔄',
@@ -57,7 +76,10 @@ function fmtVal(val) {
 function formatDetail(action, detail, t) {
   if (!detail || Object.keys(detail).length === 0) return null;
   if (action === 'bottle.add' && detail.wineName) {
-    return `${detail.wineName}${detail.vintage ? ` · ${detail.vintage}` : ''}`;
+    return `${detail.wineName}${detail.vintage ? ` · ${detail.vintage}` : ''}${detail.onOrder ? ` · ${t('onOrder.badge')}` : ''}`;
+  }
+  if (action === 'bottle.change_wine' && detail.toWine) {
+    return `${detail.fromWine || '—'} → ${detail.toWine}${detail.vintage ? ` · ${detail.vintage}` : ''}`;
   }
   if (action === 'bottle.consume' && detail.reason) {
     return detail.reason;
@@ -71,6 +93,12 @@ function formatDetail(action, detail, t) {
   // The one summary row a bulk action writes on top of its per-bottle rows.
   if (action === 'bottle.bulk_move') {
     return t('cellarAudit.bulkMoveDetail', { moved: detail.moved ?? 0, requested: detail.requested ?? 0 });
+  }
+  if (action === 'bottle.bulk_arrive') {
+    return t('cellarAudit.bulkArriveDetail', { done: detail.done ?? 0, requested: detail.requested ?? 0 });
+  }
+  if (action === 'bottle.bulk_restore') {
+    return t('cellarAudit.bulkRestoreDetail', { done: detail.done ?? 0, requested: detail.requested ?? 0 });
   }
   if (action === 'bottle.bulk_update' || action === 'bottle.bulk_consume') {
     const what = action === 'bottle.bulk_update'
@@ -136,7 +164,7 @@ function CellarAudit() {
       <div className="audit-header">
         <Link to={`/cellars/${id}`} className="back-link">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
-          {t('cellarAudit.backToCellar')}
+          {backLabel(t('cellarAudit.backToCellar'))}
         </Link>
         <h1 style={h1Style}>{cellarName ? `${cellarName} — ${t('cellarAudit.auditLogTitle')}` : t('cellarAudit.auditLogTitle')}</h1>
         <p className="page-subtitle">{t('cellarAudit.last100Events')}</p>

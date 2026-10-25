@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { normalizeCurrency } = require('../config/currencies');
 
 // One entry per cellar the bottle has lived in, in chronological order. The
 // cellar name is snapshotted so the journey survives a later rename/delete of
@@ -55,6 +56,14 @@ const bottleSchema = new mongoose.Schema({
     default: 'USD',
     uppercase: true,
     trim: true,
+    // Every write path (form, MCP, import, restore) stores an alias as its
+    // code: "EURO" → "EUR" (config/currencies). No enum here — older imports
+    // hold codes outside the supported list, and a save of such a bottle must
+    // keep working; the routes refuse a NEW unsupported code instead.
+    // ⚠️ Mongoose runs this setter on QUERY FILTERS too: Bottle.find({
+    // currency: 'EURO' }) searches for 'EUR'. To find rows stored under an
+    // alias, use Bottle.collection or an aggregation (release audit 2026-10-13).
+    set: normalizeCurrency,
     maxlength: [10, 'Currency code too long']
   },
   // Date ('YYYY-MM-DD') when the price was last entered or confirmed.
@@ -81,6 +90,16 @@ const bottleSchema = new mongoose.Schema({
     type: String,
     trim: true,
     maxlength: [2048, 'Purchase URL too long (max 2048 characters)']
+  },
+  // The retail barcode scanned when this bottle was added, in the canonical
+  // form utils/barcode.normalizeBarcode returns. The member's own data
+  // (exported and deleted with the bottle); bottles carrying a barcode are
+  // also how the same wine is recognised when another member scans it
+  // (services/barcodeLookup) — counted, never shown with whose they are.
+  barcode: {
+    type: String,
+    match: /^\d{8,14}$/,
+    default: undefined
   },
   // Cellar management
   location: {
@@ -213,13 +232,28 @@ const bottleSchema = new mongoose.Schema({
   // Set by the daily notifier when the reserved-until alert fires, so it fires
   // exactly once per reservation. Reset whenever reservedUntil changes.
   reservationNotifiedAt: { type: Date, default: null },
-  // Bottle lifecycle — 'active' until the user consumes/gifts/sells it
+  // Bottle lifecycle — 'active' until the user consumes/gifts/sells it.
+  // 'ordered' comes BEFORE active: bought, not delivered yet (en primeur, a
+  // pre-order). See ORDERED_STATUS in config/constants.
   status: {
     type: String,
-    enum: ['active', 'drank', 'gifted', 'sold', 'other'],
+    enum: ['ordered', 'active', 'drank', 'gifted', 'sold', 'other'],
     default: 'active',
     index: true
   },
+  // ── On order ─────────────────────────────────────────────────────────
+  // When an ordered bottle is expected, to the MONTH: always stored as the
+  // 1st of that month at noon UTC (utils/onOrder.parseExpectedArrival), so
+  // it reads as the same month in every zone. Optional — an en primeur
+  // purchase often has no date yet.
+  expectedArrival: { type: Date, default: undefined },
+  // When the bottle was marked as arrived (status ordered → active). The
+  // order date stays purchaseDate/createdAt; addedToCellarAt moves to this.
+  arrivedAt: { type: Date, default: undefined },
+  // Set by the daily notifier when the "should have arrived by now" reminder
+  // fires, so it fires once per expected month. Reset when expectedArrival
+  // changes. (A query on `arrivalNotifiedAt: null` also matches "absent".)
+  arrivalNotifiedAt: { type: Date, default: undefined },
   consumedAt: { type: Date },
   // When the consume was LOGGED (always now), as distinct from consumedAt,
   // which the user may backdate (bulk "mark as drunk" with one date). The
@@ -286,6 +320,9 @@ const bottleSchema = new mongoose.Schema({
 // Compound indexes for efficient queries
 bottleSchema.index({ user: 1, cellar: 1, wineDefinition: 1 });
 bottleSchema.index({ wineDefinition: 1 }); // For reverse lookup
+// Barcode → wine recognition (services/barcodeLookup). Partial: only the few
+// bottles added by scanning carry one, so the index stays small.
+bottleSchema.index({ barcode: 1, wineDefinition: 1 }, { partialFilterExpression: { barcode: { $type: 'string' } } });
 bottleSchema.index({ cellar: 1, vintage: 1 }); // For filtering by vintage
 bottleSchema.index({ cellar: 1, rating: 1 }); // For filtering by rating
 bottleSchema.index({ user: 1, vintage: 1 }); // For user-wide vintage queries

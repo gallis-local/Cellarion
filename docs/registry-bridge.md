@@ -37,7 +37,8 @@ header that names your install in the readers report and on contributions.
 | `GET /search?q=` | Up to 10 identities matching `q` (2–120 chars) | 600 |
 | `GET /wines/:id` | One wine in full: identity, profile, reviewed drink windows, published values | 300 |
 | `POST /wines/changes` | `{ ids: [≤5000], since: ISO }` → which of those changed, which were removed | 1 |
-| `POST /requests` | `{ wineName, sourceUrl, image? }` → a wine request into the hosted queue | 50 (shared) |
+| `POST /requests` | `{ wineName, sourceUrl, image? }` → a wine request into the hosted queue; `image` is a link or an inline label photo (≤ 500,000 characters) | 50 (shared) |
+| `GET /requests?ids=` | Up to 50 ids from `POST /requests` → `{ id, status, notes, wine }` for each that this key's owner filed over the bridge; `wine` is the registry identity a resolved request was linked to | — |
 | `POST /corrections` | `{ wineId, fields, reason, evidenceUrl }` → an admin-reviewed proposal | 50 (shared) |
 | `POST /values` | `{ wineId, keyName \| keyId, value, reason, evidenceUrl, vintage? }` → a value suggestion | 50 (shared) |
 
@@ -49,7 +50,7 @@ hours, for importing a whole cellar.
 
 - Search items: `{ id, slug, producer, name, type, appellation, classification, region, country, grapes, image, imageCredit }`. Identities only; no profiles travel in search results.
 - A wine: the identity above plus `lwin`, `communityRating`, `updatedAt`, `profile` (`body`, `tannin`, `acidity`, `sweetness`, `flavors`, `foodPairings`, `description`, `source`, `generatedAt`, `verifiedAt`), `windows` (per vintage: `early`, `peak`, `late` phases; `relative: true` rows hold year offsets from purchase for non-vintage wines) and `values` (published registry values: `key`, `value`, `wineValue`, `overrides`).
-- Changes: `{ since, checkedAt, checked, changed: [{ id, updatedAt }], removed: [id] }`. `removed` means the id no longer exists as a wine (merged away or quarantined); keep your local copy and stop refreshing it.
+- Changes: `{ since, checkedAt, checked, changed: [{ id, updatedAt }], removed: [id] }`. A wine counts as changed when its record, one of its reviewed `windows` or one of its published `values` changed after `since`. `updatedAt` is the latest of those three, which can be later than the `updatedAt` a fetch returns for the record itself. Skip a fetch when your copy was synced at or after it, and use `checkedAt`, the registry's clock, as your next `since`. Windows and values count from 2026-10-14; a `since` before that reports every window and value change, so copies that missed one catch up. `removed` means the id no longer exists as a wine (merged away or quarantined); keep your local copy and stop refreshing it.
 - Errors: `401 no_key | invalid_key`, `400 invalid`, `404 not_found`, `409 conflict`, `429 quota | burst | rate_limited` (with `resetAt` on quota), `403 banned`.
 
 Images are referenced by URL, never sent as bytes.
@@ -132,8 +133,20 @@ users until they search.
   one the install already shows.
 - **Contributions flow back.** A field correction or a value suggestion filed on the
   install for an adopted wine is also sent to the hosted queues, and a new-wine
-  request is forwarded too. All fire-and-forget: the local record stands alone if the
-  hosted side is unreachable.
+  request is forwarded too, with its label photo. The photo is re-encoded before it
+  leaves (WebP, at most 1200 px), so no camera metadata (EXIF, GPS) goes with it. All
+  fire-and-forget: the local record stands alone if the hosted side is unreachable.
+- **Requests come back answered.** The install keeps the id the registry gives a
+  forwarded request and asks about its pending ones every hour (`GET /requests`). When
+  a request is approved on cellarion.app, the install copies the wine and finishes its
+  own request against it exactly as an admin resolve on the install would: the
+  requester is notified, and any bottles an import left waiting on it move onto the
+  wine. A decline comes back with its reason. A request an admin on the install
+  decides first keeps that decision. Requests forwarded before this existed carry no
+  registry id and are resolved by hand.
+- **No bulk download.** Nothing is copied when the key is set: registry wines appear in
+  the add-bottle search straight away and a wine is copied when someone picks it. The
+  Monday run only refreshes wines already copied.
 - **Settings.** A "Shared wine registry" card shows the connection (key prefix, copies
   held, today's quota use, last refresh) or, when not connected, the three steps.
 

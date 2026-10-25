@@ -22,7 +22,7 @@ const { requireAuth } = require('../middleware/auth');
 const router = express.Router();
 
 const WINE_TYPES = ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'];
-const MIN_WINES = 3; // gate: don't render pages with fewer wines
+const { MIN_WINES } = require('../config/taxonomyPages'); // gate: don't render pages with fewer wines
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -50,11 +50,16 @@ function getCachedList(key) {
   return entry && Date.now() - entry.at < LIST_CACHE_TTL_MS ? entry.body : null;
 }
 
-/** Count wines per value of `field` in one aggregation (vs one countDocuments per taxon). */
+/**
+ * Count wines per value of `field` in one aggregation (vs one countDocuments
+ * per taxon). Canaries are not counted, the same as the detail pages' totals:
+ * a count that included them would give away how many each taxon holds, and
+ * list a taxon that only reaches MIN_WINES through canaries but 404s.
+ */
 async function countWinesBy(field, { unwind = false } = {}) {
   const pipeline = unwind
     ? [
-        { $match: { nonWine: { $ne: true }, pendingIdentity: { $ne: true } } },
+        { $match: { nonWine: { $ne: true }, pendingIdentity: { $ne: true }, canary: { $ne: true } } },
         // $setUnion dedups the array first: the old countDocuments({grapes: id})
         // counted a wine once however many times the grape appeared in its
         // array; a bare $unwind would count every occurrence.
@@ -63,7 +68,7 @@ async function countWinesBy(field, { unwind = false } = {}) {
         { $group: { _id: '$values', count: { $sum: 1 } } },
       ]
     : [
-        { $match: { [field]: { $ne: null }, nonWine: { $ne: true }, pendingIdentity: { $ne: true } } },
+        { $match: { [field]: { $ne: null }, nonWine: { $ne: true }, pendingIdentity: { $ne: true }, canary: { $ne: true } } },
         { $group: { _id: `$${field}`, count: { $sum: 1 } } },
       ];
   const rows = await WineDefinition.aggregate(pipeline);

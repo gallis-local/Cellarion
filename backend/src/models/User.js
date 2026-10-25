@@ -117,6 +117,19 @@ const userSchema = new mongoose.Schema({
     type: Date,
     default: null
   },
+  // The one email a new member may get two days after joining, when they have
+  // not come back since their first day (services/newMemberEmails): 'cellar'
+  // (what they added) or 'empty' (no bottles; offers to delete the account).
+  // Claimed before the send and never cleared, so nobody gets it twice.
+  newMemberEmailSentAt: {
+    type: Date,
+    default: null
+  },
+  newMemberEmailKind: {
+    type: String,
+    enum: ['cellar', 'empty'],
+    default: null
+  },
   preferences: {
     currency: {
       type: String,
@@ -149,16 +162,21 @@ const userSchema = new mongoose.Schema({
       // they're a pull surface, not interruptive. The toggles below gate
       // outbound channels (email, push) per category.
       //
-      // Defaults: drink-window stays opt-in (existing behaviour); community
-      // categories default ON for push (push is already explicit-subscription
-      // gated, so it's safe to opt in once subscribed) and OFF for email
-      // (email is the more intrusive channel — opt in if you want it).
+      // Defaults: drink-window alerts are about the member's own bottles, so
+      // a NEW account gets them by email (at most one a week) and push. An
+      // account created before that change keeps its stored off — the boot
+      // step drinkWindowNotifier.storeDrinkWindowDefaultsOff stores off where
+      // nothing was stored, so the new default never switches anyone on.
+      // Community categories default ON for push (push is already
+      // explicit-subscription gated, so it's safe to opt in once subscribed)
+      // and OFF for email (email is the more intrusive channel — opt in if
+      // you want it).
       drinkWindow: {
         // Master toggle (back-compat with the old single boolean — still drives
         // the in-app bell; the email/push children gate outbound channels).
         enabled: { type: Boolean, default: true },
-        email:   { type: Boolean, default: false },
-        push:    { type: Boolean, default: false }
+        email:   { type: Boolean, default: true },
+        push:    { type: Boolean, default: true }
       },
       communityReply: {
         // Reply to your discussion, or someone quoted your reply.
@@ -183,6 +201,17 @@ const userSchema = new mongoose.Schema({
         // and so does the one-click unsubscribe (utils/notifications.js).
         // No push: the bell already carries it inside the app.
         email: { type: Boolean, default: true }
+      },
+      ownerInquiry: {
+        // A curator's question about a wine you own a bottle of (2026-10-20).
+        // Until now it reached the bell and push only, and none of 64 open
+        // questions had an answer. Not marketing: one precise question about
+        // the record of your own bottle, with every send rationed by the
+        // curators' contact budget and at most one such email a day. On by
+        // default; Settings turns it off, so do the "stop these" link in the
+        // email and the one-click unsubscribe (utils/notifications.js).
+        // Push already goes out with the in-app notification.
+        email: { type: Boolean, default: true }
       }
     },
     restockScope: {
@@ -198,6 +227,23 @@ const userSchema = new mongoose.Schema({
     // frontend ignores a value it doesn't offer.
     cellarSort: {
       type: String
+    },
+    // The blocks of the wine and vintage page this member folded away
+    // (config/constants COLLAPSIBLE_BLOCKS). Validated in accountOps and,
+    // like cellarSort, deliberately not a schema enum: retiring a block later
+    // must never make a stored value fail validation on sign-in. Absent until
+    // the member folds something.
+    collapsedBlocks: {
+      type: [String],
+      default: undefined
+    },
+    // "Try new features early" (Settings → Early access): this user sees the
+    // features a super admin has put in beta (config/featureFlags) before
+    // everyone does. One switch for all of them. It only changes which
+    // screens the app shows; nothing is stored differently for a beta user.
+    earlyAccess: {
+      type: Boolean,
+      default: false
     }
   },
   // One entry per signed-in device/browser (per-device sessions, 2026-09-04):
@@ -266,6 +312,13 @@ const userSchema = new mongoose.Schema({
   // 2026-09-27 M7). Cleared when they turn any email back on in Settings
   // (services/accountOps): from then on the per-category switches decide.
   emailOptOutAt: {
+    type: Date,
+    default: null
+  },
+  // When the last drink-window email went out (services/drinkWindowNotifier).
+  // At most one a week: changes in between wait in the bell and come together
+  // in the next one.
+  drinkWindowEmailedAt: {
     type: Date,
     default: null
   },
@@ -371,6 +424,18 @@ const userSchema = new mongoose.Schema({
       method:         { type: String, enum: ['password', 'google', 'oidc'] },
       recordedAt:     { type: Date },
     }, { _id: false }),
+    default: undefined
+  },
+  // true from account creation (password or SSO) until the first sign-in, when
+  // the app saves the language it is showing and a currency guessed from the
+  // device's region as the account's preferences (POST /api/users/me/locale-
+  // defaults), then this is removed. Without it every new account started on
+  // English + USD whatever the visitor's browser said, and a Swedish visitor
+  // was switched from Swedish to English the moment they signed up.
+  // Deliberately NO default: accounts created before it existed have no field
+  // and are never touched, so their settings stay exactly as they are.
+  localeDefaultsPending: {
+    type: Boolean,
     default: undefined
   },
   // GDPR consent tracking

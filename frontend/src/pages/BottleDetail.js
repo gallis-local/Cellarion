@@ -1,20 +1,22 @@
-import { useState, useEffect, Suspense } from 'react';
+import { useState, useEffect, useRef, Suspense } from 'react';
 import { lazy } from '../utils/lazyWithReload';
 import { useParams, useNavigate, Link, useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import ReactMarkdown from 'react-markdown';
-import rehypeSanitize from 'rehype-sanitize';
 import { useAuth } from '../contexts/AuthContext';
-import { getBottle, consumeBottle, setBottleDefaultImage, undoBottle, openBottle, restoreBottle } from '../api/bottles';
+import { getBottle, consumeBottle, setBottleDefaultImage, undoBottle, openBottle, restoreBottle, markBottleArrived } from '../api/bottles';
+import { TRASH_DAYS } from '../utils/trash';
+import { withinRestoreWindow } from '../utils/restoreWindow';
+import { bottleNoticeName } from '../components/BottleUndoNotice';
+import { lookupPriceHistory } from '../api/somm';
+import { isOnOrder, formatArrivalMonth, isArrivalLate } from '../utils/onOrder';
+import { useFeature } from '../utils/featureFlags';
 import { isReserved, reservationSummary } from '../utils/reservation';
+import { slotLabel } from '../utils/slotLabel';
 import OpenBottlePanel from '../components/bottle/OpenBottlePanel';
 import { PRESERVATION_METHODS } from '../utils/openBottle';
 import { fetchRates } from '../utils/currency';
 import SITE_URL from '../config/siteUrl';
 import { API_URL } from '../api/apiConstants';
-import ReviewCard from '../components/ReviewCard';
-import { getWineReviews } from '../api/reviews';
-import { fromNormalized } from '../utils/ratingUtils';
 import ShareButton from '../components/ShareButton';
 import HeroImage from '../components/bottle/HeroImage';
 import ConsumedDetails from '../components/bottle/ConsumedDetails';
@@ -24,27 +26,51 @@ import BottleJourney from '../components/BottleJourney';
 import OwnerInquiryCard from '../components/bottle/OwnerInquiryCard';
 import PersonalDataCard from '../components/bottle/PersonalDataCard';
 import LotHistory from '../components/bottle/LotHistory';
+import TastingProfileCard from '../components/bottle/TastingProfileCard';
+import WineReviewsCard from '../components/bottle/WineReviewsCard';
+import CollapsibleBlock from '../components/CollapsibleBlock';
+import { useCollapsedBlocks } from '../utils/collapsedBlocks';
 import DialogBox from '../components/DialogBox';
 import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
 import { swatchType, wineTypeLabel } from '../utils/wineColour';
 import './BottleDetail.css';
+import { backLabel as backLabelText } from '../utils/backLabel';
+import { isSafeInternalPath } from '../utils/postLoginRedirect';
+import { backPlaceLabel, RETURNING } from '../utils/useBackHere';
 
 // Lazy-load heavy components only needed on user interaction
 const ReportWineModal = lazy(() => import('../components/ReportWineModal'));
 const MoveBottleModal = lazy(() => import('../components/MoveBottleModal'));
-const ReviewForm = lazy(() => import('../components/ReviewForm'));
+const ChangeWineModal = lazy(() => import('../components/ChangeWineModal'));
 const ConsumeModal = lazy(() => import('../components/ConsumeModal').then(m => ({ default: m.ConsumeModal })));
 const RecommendWineModal = lazy(() => import('../components/RecommendWineModal'));
 const AddMoreBottlesModal = lazy(() => import('../components/AddMoreBottlesModal'));
+const AddToPickListModal = lazy(() => import('../components/AddToPickListModal'));
+const BarcodeScanModal = lazy(() => import('../components/BarcodeScanModal'));
 
 function BottleDetail() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { id: cellarId, bottleId } = useParams();
   const { apiFetch, user } = useAuth();
+  const pickListsOn = useFeature('pickLists');
   const navigate = useNavigate();
   const location = useLocation();
   const fromHistory = location.state?.fromHistory === true;
   const fromChat = location.state?.fromChat === true;
+  // Any other page that opened this one (racks, the room, a pick list,
+  // statistics, all bottles) hands over where it is and which page it is, so
+  // the back link returns there instead of to the bottle list. In-app paths
+  // only — the same check the post-login return uses — and only known pages;
+  // the label is looked up here, so it follows a language switch.
+  const handedPlace = backPlaceLabel(location.state?.backFrom);
+  const handedBack = handedPlace && isSafeInternalPath(location.state?.backTo)
+    ? { to: location.state.backTo, label: t(handedPlace[0], handedPlace[1]) }
+    : null;
+  // Opened from a row on the vintage page: back goes there.
+  // Only an in-app cellar path is taken from the router state.
+  const fromVintage = typeof location.state?.fromVintage === 'string' && location.state.fromVintage.startsWith('/cellars/')
+    ? location.state.fromVintage
+    : null;
   const [bottle, setBottle] = useState(null);
   const [userRole, setUserRole] = useState(null);
   const [cellarColor, setCellarColor] = useState(null);
@@ -64,47 +90,50 @@ function BottleDetail() {
   const [editing, setEditing] = useState(false);
   const [consumeOpen, setConsumeOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
+  const [changeWineOpen, setChangeWineOpen] = useState(false);
   const [bdMoreOpen, setBdMoreOpen] = useState(false); // ⋮ overflow (Move, Added by mistake)
   const [restoreBusy, setRestoreBusy] = useState(false);
+  const [arriveBusy, setArriveBusy] = useState(false);
   const [restoreError, setRestoreError] = useState(null);
   const [mistakeOpen, setMistakeOpen] = useState(false);
   const [mistakeBusy, setMistakeBusy] = useState(false);
   // Bumped to send the reader to the wine record in "suggest a fix" mode —
   // wrong DATA is corrected there, with the right value, not reported in prose.
   const [suggestFixSignal, setSuggestFixSignal] = useState(0);
+  // Cards that fold to their title row and stay folded, as on the vintage
+  // page (2026-10-14). The SAME block names as there: the same card folded on
+  // one page is folded on the other — "the stuff I don't want to see" is not
+  // per page. Remembered on the account (preferences.collapsedBlocks).
+  const { isCollapsed, toggle: toggleBlock, expand: expandBlocks } = useCollapsedBlocks();
+  const blockProps = (blockId, label) => ({ id: blockId, label, collapsed: isCollapsed(blockId), onToggle: () => toggleBlock(blockId) });
   // What the last draft publish / attach did; survives the refetch that
   // unmounts the draft banner. Cleared when the page moves to another bottle.
   const [draftNotice, setDraftNotice] = useState(null);
   useEffect(() => { setDraftNotice(null); }, [bottleId]);
   const [addMoreOpen, setAddMoreOpen] = useState(false);
+  const [pickOpen, setPickOpen] = useState(false);
+  const [barcodeOpen, setBarcodeOpen] = useState(false);
   const [addMoreMsg, setAddMoreMsg] = useState(null); // success banner after "Add more bottles"
   const [reportWineOpen, setReportWineOpen] = useState(false);
   const [reportDefaultReason, setReportDefaultReason] = useState(null);
   const [recommendOpen, setRecommendOpen] = useState(false);
   const [journalPromptOpen, setJournalPromptOpen] = useState(false);
+  // What the list we go back to should say (with Undo) about this bottle —
+  // held while the journal prompt is open, handed over as router state.
+  const leaveNoticeRef = useRef(null);
   const [openPickerOpen, setOpenPickerOpen] = useState(false);
   const [openingMethod, setOpeningMethod] = useState('coravin');
   const [openingBusy, setOpeningBusy] = useState(false);
-  const [reviewFormOpen, setReviewFormOpen] = useState(false);
-  const [wineReviews, setWineReviews] = useState([]);
-  const [communityRating, setCommunityRating] = useState(null);
-  const [reviewAudience, setReviewAudience] = useState('all');
-  const [reviewVintage, setReviewVintage] = useState('this');
-  const [reviewPage, setReviewPage] = useState(1);
-  const [reviewTotal, setReviewTotal] = useState(0);
-  const [reviewPages, setReviewPages] = useState(0);
   const [pendingImage, setPendingImage] = useState(null);
   const [defaultImage, setDefaultImage] = useState(null);
+  // The vintage's official photo with its credit, and the viewer's own photo
+  // of another vintage as the last resort (ticket 2026-10-09).
+  const [vintageImage, setVintageImage] = useState(null);
+  const [otherVintageImage, setOtherVintageImage] = useState(null);
 
   useEffect(() => {
     fetchBottle();
   }, [bottleId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Re-fetch reviews when audience or vintage filter changes
-  useEffect(() => {
-    const wineId = bottle?.wineDefinition?._id;
-    if (wineId) fetchWineReviews(wineId, { audience: reviewAudience, vintage: reviewVintage, page: 1 });
-  }, [reviewAudience, reviewVintage]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const fetchBottle = async () => {
     // A new bottle id on the same mounted page (a notification link from
@@ -140,16 +169,17 @@ function BottleDetail() {
             : `${API_URL}${data.defaultImageUrl}`;
           setDefaultImage(url);
         }
-        // Fetch community reviews for this wine. Pass the vintage explicitly —
-        // this closure still sees the pre-setBottle (null) state, so reading
-        // `bottle?.vintage` here would silently drop the default
-        // "this vintage" filter on the initial load.
-        const wineObj = data.bottle?.wineDefinition;
-        if (wineObj?._id) {
-          fetchWineReviews(wineObj._id, { bottleVintage: data.bottle.vintage });
-          if (wineObj.communityRating?.reviewCount > 0) {
-            setCommunityRating(wineObj.communityRating);
-          }
+        if (data.vintageImageUrl) {
+          const url = data.vintageImageUrl.startsWith('http')
+            ? data.vintageImageUrl
+            : `${API_URL}${data.vintageImageUrl}`;
+          setVintageImage({ url, credit: data.vintageImageCredit || null });
+        }
+        if (data.otherVintageImageUrl) {
+          const url = data.otherVintageImageUrl.startsWith('http')
+            ? data.otherVintageImageUrl
+            : `${API_URL}${data.otherVintageImageUrl}`;
+          setOtherVintageImage(url);
         }
         // Fetch the sommelier maturity profile. NV bottles (non-vintage
         // Champagne / Cap Classique blends) get a profile too — somms can set a
@@ -174,37 +204,6 @@ function BottleDetail() {
     }
   };
 
-  const fetchWineReviews = async (wineId, opts = {}) => {
-    try {
-      const audience = opts.audience ?? reviewAudience;
-      const vintageFilter = opts.vintage ?? reviewVintage;
-      const page = opts.page ?? 1;
-      const bottleVintage = opts.bottleVintage ?? bottle?.vintage;
-
-      const params = new URLSearchParams();
-      params.set('limit', '10');
-      params.set('page', String(page));
-      params.set('audience', audience);
-
-      if (vintageFilter === 'this' && bottleVintage) {
-        params.set('vintage', bottleVintage);
-      } else if (vintageFilter !== 'all' && vintageFilter !== 'this') {
-        params.set('vintage', vintageFilter);
-      }
-
-      const res = await getWineReviews(apiFetch, wineId, params.toString());
-      const data = await res.json();
-      if (res.ok) {
-        setWineReviews(data.reviews || []);
-        setReviewTotal(data.total || 0);
-        setReviewPages(data.pages || 0);
-        setReviewPage(page);
-      }
-    } catch {
-      // Non-critical
-    }
-  };
-
   const fetchVintageProfile = async (wineId, vintage) => {
     try {
       const res = await apiFetch(
@@ -219,9 +218,7 @@ function BottleDetail() {
 
   const fetchPriceHistory = async (wineId, vintage) => {
     try {
-      const res = await apiFetch(
-        `/api/somm/prices/lookup?wine=${wineId}&vintage=${vintage}`
-      );
+      const res = await lookupPriceHistory(apiFetch, wineId, vintage);
       const data = await res.json();
       if (res.ok) setPriceHistory(data.history || []);
       else setPriceHistory([]);
@@ -236,20 +233,32 @@ function BottleDetail() {
     setLotMsg(lotOutcome);
   };
 
+  // The name the list's notice uses for this bottle ("Château X 2018").
+  const noticeName = () => bottleNoticeName(bottle);
+
+  // "Added by mistake?" / "Cancel order": the bottle goes to the cellar's
+  // Recently deleted (POST /:id/undo now trashes it), not away for good — it
+  // used to be the one delete in the app with no way back, while selecting the
+  // same bottle and deleting it could be undone for TRASH_DAYS. The list it
+  // returns to offers Undo at once.
   const handleMistakeConfirm = async () => {
     if (mistakeBusy) return;
     setMistakeBusy(true);
     try {
       const res = await undoBottle(apiFetch, bottleId);
-      if (res.ok) {
-        navigate(`/cellars/${cellarId}`);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.batchId) {
+        const bottleNotice = { kind: 'deleted', bottleId, batchId: data.batchId, name: noticeName(), onOrder: isOnOrder(bottle) };
+        // A cancelled order goes back to the list it came from.
+        navigate(isOnOrder(bottle) ? `/cellars/${cellarId}/on-order` : `/cellars/${cellarId}`, { state: { bottleNotice } });
       } else {
-        const data = await res.json().catch(() => ({}));
-        alert(data.error || t('bottleDetail.mistakeError', 'Failed to remove bottle'));
+        setMistakeOpen(false);
+        setError(data.error || t('bottleDetail.mistakeError', 'Could not move the bottle to Recently deleted. Please try again.'));
         setMistakeBusy(false);
       }
     } catch {
-      alert(t('bottleDetail.mistakeError', 'Failed to remove bottle'));
+      setMistakeOpen(false);
+      setError(t('bottleDetail.mistakeError', 'Could not move the bottle to Recently deleted. Please try again.'));
       setMistakeBusy(false);
     }
   };
@@ -282,12 +291,15 @@ function BottleDetail() {
       const res = await consumeBottle(apiFetch, bottleId, { reason, note, rating, consumedRatingScale, consumedAt });
       const data = await res.json();
       if (res.ok) {
+        // The cellar list says what happened and offers Undo (the restore this
+        // page offers for two days, which nobody found from History).
+        leaveNoticeRef.current = { kind: 'consumed', reason, bottleId, name: noticeName() };
         // Prompt for journal entry if user hasn't opted out
         if (!journalPromptOptedOut() && reason === 'drank') {
           setConsumeOpen(false);
           setJournalPromptOpen(true);
         } else {
-          navigate(`/cellars/${cellarId}`);
+          navigate(`/cellars/${cellarId}`, { state: { bottleNotice: leaveNoticeRef.current } });
         }
       } else {
         // Close the modal so the inline error banner is visible behind it.
@@ -308,21 +320,43 @@ function BottleDetail() {
   const isPending = !wine && !!bottle?.pendingWineRequest;
   const displayName = wine?.name || bottle?.pendingWineRequest?.wineName;
   const displayProducer = wine?.producer || bottle?.pendingWineRequest?.producer;
-  const isConsumed = bottle?.status && bottle.status !== 'active';
+  // On order = bought, not delivered yet: editable and movable, but nothing
+  // can be opened, drunk or racked until it is marked as arrived.
+  const onOrderNow = isOnOrder(bottle);
+  const isConsumed = bottle?.status && bottle.status !== 'active' && !onOrderNow;
   const canEdit = !isConsumed && (userRole === 'owner' || userRole === 'editor');
   const canEditConsumed = isConsumed && (userRole === 'owner' || userRole === 'editor');
-  // v1: move only active bottles, and only between cellars you own.
+  // v1: move only active (or on-order) bottles, and only between cellars you own.
   const canMove = !isConsumed && userRole === 'owner';
+  const arrivalMonth = onOrderNow ? formatArrivalMonth(bottle.expectedArrival, i18n.language) : '';
+  const arrivalLate = onOrderNow && isArrivalLate(bottle.expectedArrival);
+  const backTo = fromChat
+    ? '/cellar-chat'
+    : handedBack
+      ? handedBack.to
+    : onOrderNow
+      ? `/cellars/${cellarId}/on-order`
+      : fromVintage
+        ? fromVintage
+        : (isConsumed || fromHistory ? `/cellars/${cellarId}/history` : `/cellars/${cellarId}`);
+  const backLabel = fromChat
+    ? t('bottleDetail.backToChat', 'Back to chat')
+    : handedBack
+      ? handedBack.label
+    : onOrderNow
+      ? t('onOrder.backToOnOrder')
+      : fromVintage
+        ? t('bottleDetail.backToVintage', 'Back to the vintage')
+        : (isConsumed || fromHistory ? t('bottleDetail.backToHistory', 'Back to history') : t('bottleDetail.backToCellar'));
 
   // "Move back to cellar" (undo an accidental removal) — only for a bottle
-  // consumed within the last 2 days. Matches the server-side restore window;
+  // consumed within the last 2 days (utils/restoreWindow, the server's rule);
   // past it the button is hidden and the endpoint refuses.
-  const RESTORE_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
-  // The window counts from when the consume was logged (a backdated bulk
-  // "mark as drunk" stays undoable); rows from before that field only have consumedAt.
-  const restoreAnchor = bottle?.consumedLoggedAt || bottle?.consumedAt;
-  const canRestore = canEditConsumed && restoreAnchor &&
-    (Date.now() - new Date(restoreAnchor).getTime()) <= RESTORE_WINDOW_MS;
+  const canRestore = canEditConsumed && withinRestoreWindow(bottle);
+  // "Add again": new bottles of this wine and vintage, copied from this one —
+  // the drunk bottle's page had no way to buy it again (Add more bottles is
+  // for bottles still in the cellar). Same gate as Add more bottles.
+  const canAddAgain = canEditConsumed && !!wine && !user?.isDemo;
 
   // Shared overflow-menu contents — same list used by the desktop header ⋮ and
   // the mobile bar ⋮, so these actions live in exactly one place and can never
@@ -334,9 +368,24 @@ function BottleDetail() {
           Needs a real registry wine to clone (pending-request bottles have
           none) and a non-demo account (POST /api/bottles is requireNonDemo,
           same gate that hides the Add Bottle form in the demo). */}
-      {canEdit && wine && !user?.isDemo && (
+      {canEdit && wine && !user?.isDemo && !onOrderNow && (
         <button className="bd-overflow-item" role="menuitem" onClick={() => { setAddMoreOpen(true); setBdMoreOpen(false); }}>
           <span aria-hidden="true">➕</span> {t('bottleDetail.addMore.action', 'Add more bottles')}
+        </button>
+      )}
+      {/* Early access (flag pickLists): put this bottle on a pick list, which
+          shows where each bottle sits so they can be fetched in one go. */}
+      {pickListsOn && canEdit && bottle?.status === 'active' && (
+        <button className="bd-overflow-item" role="menuitem" onClick={() => { setPickOpen(true); setBdMoreOpen(false); }}>
+          <span aria-hidden="true">📍</span> {t('pickLists.addAction', 'Add to pick list')}
+        </button>
+      )}
+      {/* The retail barcode, for a bottle already in the cellar — until now
+          only Add Bottle could read one. Demo accounts cannot (each code is
+          a vote in the shared barcode lookup; the server refuses too). */}
+      {canEdit && !user?.isDemo && (
+        <button className="bd-overflow-item" role="menuitem" onClick={() => { setBarcodeOpen(true); setBdMoreOpen(false); }}>
+          <span aria-hidden="true">📷</span> {bottle?.barcode ? t('barcodeScan.titleChange', 'Change barcode') : t('barcodeScan.title', 'Add barcode')}
         </button>
       )}
       {canMove && (
@@ -344,13 +393,42 @@ function BottleDetail() {
           <span aria-hidden="true">📦</span> {t('moveBottle.action')}
         </button>
       )}
+      {/* Saved under the wrong wine (the estate's white instead of its red,
+          a near-twin from the search): move it, keeping all its own data. */}
+      {canEdit && (
+        <button className="bd-overflow-item" role="menuitem" onClick={() => { setChangeWineOpen(true); setBdMoreOpen(false); }}>
+          <span aria-hidden="true">🔁</span> {t('changeWine.action')}
+        </button>
+      )}
       {canEdit && (
         <button className="bd-overflow-item bd-overflow-item--danger" role="menuitem" onClick={() => { setMistakeOpen(true); setBdMoreOpen(false); }}>
-          <span aria-hidden="true">↩️</span> {t('bottleDetail.mistakeLink', 'Added by mistake?')}
+          <span aria-hidden="true">↩️</span> {onOrderNow ? t('onOrder.cancelOrder') : t('bottleDetail.mistakeLink', 'Added by mistake?')}
         </button>
       )}
     </>
   );
+
+  // The order arrived: the bottle becomes an ordinary, unplaced bottle and the
+  // page re-reads it (rack slot, lot, journey all change with the status).
+  const handleArrive = async () => {
+    if (arriveBusy) return;
+    setArriveBusy(true);
+    setError(null);
+    try {
+      const res = await markBottleArrived(apiFetch, bottleId);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.error || t('onOrder.arriveFailed'));
+        return;
+      }
+      setAddMoreMsg(t('onOrder.arrivedOne'));
+      fetchBottle();
+    } catch {
+      setError(t('onOrder.arriveFailed'));
+    } finally {
+      setArriveBusy(false);
+    }
+  };
 
   const handleMoved = () => {
     setMoveOpen(false);
@@ -437,9 +515,9 @@ function BottleDetail() {
       {/* ── Clean header ── */}
       <div className="bd-page-header">
         <div className="bd-header-top">
-          <Link to={fromChat ? '/cellar-chat' : (isConsumed || fromHistory ? `/cellars/${cellarId}/history` : `/cellars/${cellarId}`)} className="back-link">
+          <Link to={backTo} state={RETURNING} className="back-link">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
-            {fromChat ? t('bottleDetail.backToChat', 'Back to chat') : (isConsumed || fromHistory ? t('bottleDetail.backToHistory', 'Back to history') : t('bottleDetail.backToCellar'))}
+            {backLabelText(backLabel)}
           </Link>
           {!loading && !editing && (
             <div className="bd-header-actions">
@@ -449,15 +527,21 @@ function BottleDetail() {
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                     <span className="bd-btn-label">{t('bottleDetail.editDetails')}</span>
                   </button>
-                  {!bottle?.openedAt && (
-                    <button className="btn btn-secondary btn-small" onClick={() => setOpenPickerOpen(true)}>
-                      🍷 <span className="bd-btn-label">{t('openBottle.openBtn', 'Open bottle…')}</span>
-                    </button>
+                  {/* A bottle on order cannot be opened or drunk yet; its one
+                      action, "Mark as arrived", lives in the on-order banner. */}
+                  {!onOrderNow && (
+                    <>
+                      {!bottle?.openedAt && (
+                        <button className="btn btn-secondary btn-small" onClick={() => setOpenPickerOpen(true)}>
+                          🍷 <span className="bd-btn-label">{t('openBottle.openBtn', 'Open bottle…')}</span>
+                        </button>
+                      )}
+                      <button className="btn btn-consume btn-small" onClick={() => setConsumeOpen(true)}>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M8 2h8l4 10H4L8 2z"/><path d="M12 12v6"/><path d="M8 22h8"/></svg>
+                        <span className="bd-btn-label">{t('bottleDetail.removeBottle')}</span>
+                      </button>
+                    </>
                   )}
-                  <button className="btn btn-consume btn-small" onClick={() => setConsumeOpen(true)}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M8 2h8l4 10H4L8 2z"/><path d="M12 12v6"/><path d="M8 22h8"/></svg>
-                    <span className="bd-btn-label">{t('bottleDetail.removeBottle')}</span>
-                  </button>
                 </>
               )}
               {/* Less-frequent actions (Add more, Move, Added by mistake) live
@@ -502,6 +586,26 @@ function BottleDetail() {
         />
       )}
 
+      {/* ── On order: bought, not delivered yet ── */}
+      {onOrderNow && (
+        <div className={`bd-on-order card${arrivalLate ? ' is-late' : ''}`} role="status">
+          <div className="bd-on-order-text">
+            <strong>🚚 {t('onOrder.badge')}</strong>
+            <span className="bd-on-order-when">
+              {arrivalMonth
+                ? (arrivalLate ? t('onOrder.expectedLate', { month: arrivalMonth }) : t('onOrder.expected', { month: arrivalMonth }))
+                : t('onOrder.noDate')}
+            </span>
+            <p className="bd-on-order-hint">{t('onOrder.bottleHint')}</p>
+          </div>
+          {canEdit && (
+            <button type="button" className="btn btn-primary btn-small" onClick={handleArrive} disabled={arriveBusy}>
+              {arriveBusy ? t('common.saving', 'Saving…') : t('onOrder.markArrived')}
+            </button>
+          )}
+        </div>
+      )}
+
       {/* ── Wine hero card ── */}
       <div className="bd-wine-header card">
         <div className="bd-wine-identity">
@@ -510,6 +614,9 @@ function BottleDetail() {
             wine={wine}
             defaultImage={defaultImage}
             pendingImage={pendingImage}
+            vintageImage={vintageImage?.url || null}
+            vintageImageCredit={vintageImage?.credit || null}
+            otherVintageImage={otherVintageImage}
             isPending={isPending}
             displayName={displayName}
             canEdit={canEdit}
@@ -522,6 +629,17 @@ function BottleDetail() {
             }}
           />
           <div className="bd-wine-meta">
+            {/* A wine and vintage has its own page: say this is ONE
+                bottle — where it sits — and lead to all of them. */}
+            {wine?._id && !isConsumed && !onOrderNow && (
+              <div className="page-kind-line bd-page-kind">
+                <span className="page-kind">{t('bottleDetail.kind', 'Bottle')}</span>
+                <span>{slotLabel(rackInfo, t)}</span>
+                <Link to={`/cellars/${cellarId}/vintages/${wine._id}/${encodeURIComponent(bottle?.vintage || 'NV')}`}>
+                  {t('bottleDetail.allOfVintage', 'All bottles of this vintage')} ›
+                </Link>
+              </div>
+            )}
             <div className="bd-wine-name-row">
               <h1 className={cellarColor ? 'cellar-accent-border' : ''} style={cellarColor ? { '--cellar-color': cellarColor } : undefined}>
                 {displayName || t('common.unknownWine')}
@@ -577,6 +695,15 @@ function BottleDetail() {
           {restoreError && <span className="bd-restore-error">{restoreError}</span>}
         </div>
       )}
+      {canAddAgain && (
+        <div className="bd-restore-row">
+          <button type="button" className="bd-restore-btn" onClick={() => setAddMoreOpen(true)}>
+            <span aria-hidden="true">➕</span>
+            {t('bottleDetail.addAgain', 'Add again')}
+          </button>
+          <span className="bd-restore-hint">{t('bottleDetail.addAgainHint', 'Bought it again? Add new bottles of this wine and vintage to the cellar.')}</span>
+        </div>
+      )}
 
       {/* Bottle details or edit form */}
       {editing ? (
@@ -601,6 +728,7 @@ function BottleDetail() {
           hasImage={!!(defaultImage || pendingImage || bottle.wineDefinition?.image)}
           onEdit={() => setEditing(true)}
           suggestFixSignal={suggestFixSignal}
+          recordFold={blockProps('vintage.record', t('wineRecord.title', 'Wine record'))}
           onRemove={() => setConsumeOpen(true)}
           onReportWine={(reason) => { setReportWineOpen(true); setReportDefaultReason(typeof reason === 'string' ? reason : null); }}
           wineDraft={bottle.wineDraft || null}
@@ -613,196 +741,39 @@ function BottleDetail() {
           Demo visitors are excluded: writes are requireNonDemo and their
           ephemeral accounts would orphan shared-visible rows. ── */}
       {!user?.isDemo && (
-        <PersonalDataCard apiFetch={apiFetch} bottleId={bottleId} currentUserId={user?.id} wineId={wine?._id} vintage={bottle?.vintage} />
+        <CollapsibleBlock {...blockProps('vintage.personal', t('personalData.title', 'Your wine data'))}>
+          <PersonalDataCard apiFetch={apiFetch} bottleId={bottleId} currentUserId={user?.id} wineId={wine?._id} vintage={bottle?.vintage} />
+        </CollapsibleBlock>
       )}
 
       {/* ── The viewer's other bottles of this wine, and what happened to the
           ones already drunk (support ticket 2026-09-16). Hides itself when
           there is nothing to say. Personal, so it sits with the personal
           cards, above the registry's profile and the community reviews. ── */}
-      <LotHistory apiFetch={apiFetch} bottleId={bottleId} vintage={bottle?.vintage} isOwner={userRole === 'owner'} />
+      <CollapsibleBlock {...blockProps('vintage.history', t('lotHistory.title', 'This wine in your cellar'))}>
+        <LotHistory
+          apiFetch={apiFetch}
+          bottleId={bottleId}
+          vintage={bottle?.vintage}
+          isOwner={userRole === 'owner'}
+          vintageHref={wine?._id ? `/cellars/${cellarId}/vintages/${wine._id}/${encodeURIComponent(bottle?.vintage || 'NV')}` : null}
+        />
+      </CollapsibleBlock>
 
-      {/* ── AI tasting profile (generated, vintage-neutral) ── */}
-      {wine?.aiProfile?.description && (
-        <div className="bd-ai-profile card">
-          <div className="bd-ai-profile__header">
-            <h2>{t('bottleDetail.tastingProfile', 'Tasting profile')}</h2>
-            {/* Provenance is load-bearing (#985): never present AI-generated
-                profile text as established fact. */}
-            {wine.aiProfile.source === 'curator' ? (
-              <span className="bd-ai-tag bd-ai-tag--curator" title={t('bottleDetail.provenanceCuratorTitle', 'A sommelier has verified this profile')}>
-                {t('bottleDetail.provenanceCurator', 'Curator-verified')}
-              </span>
-            ) : (
-              <span className="bd-ai-tag" title={t('bottleDetail.provenanceAiTitle', 'Written by AI from the wine’s identity — a starting point, not a fact')}>
-                {t('bottleDetail.provenanceAi', 'AI-generated')}
-              </span>
-            )}
-          </div>
+      {/* ── Tasting profile (generated or curator-verified, vintage-neutral;
+          "not yet assessed" when there is none) — shared with the vintage
+          page ── */}
+      <CollapsibleBlock {...blockProps('vintage.tasting', t('bottleDetail.tastingProfile', 'Tasting profile'))}>
+        <TastingProfileCard
+          wine={wine}
+          onReport={() => { setReportDefaultReason('wrong_tasting_profile'); setReportWineOpen(true); }}
+        />
+      </CollapsibleBlock>
 
-          {(() => {
-            const ap = wine.aiProfile;
-            const structure = [
-              ap.body && `${ap.body}-bodied`,
-              ap.tannin && `${ap.tannin} tannin`,
-              ap.acidity && `${ap.acidity} acidity`,
-              ap.sweetness,
-            ].filter(Boolean);
-            const flavours = ap.flavors || [];
-            return (
-              <>
-                {structure.length > 0 && (
-                  <div className="bd-ai-group">
-                    <span className="bd-ai-group-label">{t('bottleDetail.structure', 'Structure')}</span>
-                    <div className="bd-ai-chips">
-                      {structure.map((c, i) => <span key={`s${i}`} className="bd-ai-chip bd-ai-chip--style">{c}</span>)}
-                    </div>
-                  </div>
-                )}
-                {flavours.length > 0 && (
-                  <div className="bd-ai-group">
-                    <span className="bd-ai-group-label">{t('bottleDetail.flavours', 'Flavours')}</span>
-                    <div className="bd-ai-chips">
-                      {flavours.map((f, i) => <span key={`f${i}`} className="bd-ai-chip">{f}</span>)}
-                    </div>
-                  </div>
-                )}
-              </>
-            );
-          })()}
-
-          <div className="bd-ai-prose">
-            <ReactMarkdown rehypePlugins={[rehypeSanitize]} disallowedElements={['img']} unwrapDisallowed>{wine.aiProfile.description}</ReactMarkdown>
-          </div>
-
-          {wine.aiProfile.foodPairings?.length > 0 && (
-            <div className="bd-ai-pairings">
-              <span className="bd-ai-pairings__label">{t('bottleDetail.pairsWith', 'Pairs with')}:</span>
-              {wine.aiProfile.foodPairings.join(' · ')}
-            </div>
-          )}
-
-          <div className="bd-report-wine">
-            <button
-              type="button"
-              className="btn-report-wine"
-              onClick={() => { setReportDefaultReason('wrong_tasting_profile'); setReportWineOpen(true); }}
-            >
-              {t('bottleDetail.reportTastingProfile', 'Report tasting profile')}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* No published profile — an honest "not yet assessed" instead of a
-          silent blank (somm ticket 6a83e765 rollout note). Held-by-the-gate
-          and never-generated are deliberately indistinguishable here, so the
-          card can never leak WHY a profile is missing. */}
-      {wine && !wine.aiProfile?.description && (
-        <div className="bd-ai-profile card">
-          <div className="bd-ai-profile__header">
-            <h2>{t('bottleDetail.tastingProfile', 'Tasting profile')}</h2>
-            <span className="bd-ai-tag" title={t('bottleDetail.profilePendingTitle', 'This wine has not been through assessment yet — profiles are generated and reviewed over time')}>
-              {t('bottleDetail.profilePending', 'Not yet assessed')}
-            </span>
-          </div>
-          <p style={{ color: 'var(--color-text-muted)', margin: 0, fontSize: '0.9rem' }}>
-            {t('bottleDetail.profilePendingBody', 'This wine hasn’t been assessed yet. A tasting profile appears here once it has been.')}
-          </p>
-        </div>
-      )}
-
-      {/* ── Reviews section ── */}
-      {wine && (
-        <div className="bd-reviews card">
-          <div className="bd-reviews__header">
-            <h2>{t('reviews.communityReviews', 'Reviews')}</h2>
-            {communityRating && communityRating.reviewCount > 0 && (
-              <span className="bd-reviews__avg">
-                {fromNormalized(communityRating.averageNormalized, user?.preferences?.ratingScale || '5').toFixed(1)}
-                {user?.preferences?.ratingScale === '100' ? 'pts' : user?.preferences?.ratingScale === '20' ? '/20' : '★'}
-                <span className="bd-reviews__count">({communityRating.reviewCount})</span>
-              </span>
-            )}
-          </div>
-          <div className="bd-reviews__filters">
-            <select
-              value={reviewAudience}
-              onChange={e => setReviewAudience(e.target.value)}
-              className="bd-reviews__filter-select"
-            >
-              <option value="all">{t('reviews.audienceAll', 'All')}</option>
-              <option value="mine">{t('reviews.audienceMine', 'My Reviews')}</option>
-              <option value="following">{t('reviews.audienceFollowing', 'Following')}</option>
-            </select>
-            <select
-              value={reviewVintage}
-              onChange={e => setReviewVintage(e.target.value)}
-              className="bd-reviews__filter-select"
-            >
-              <option value="this">{t('reviews.vintageThis', 'This vintage')}</option>
-              <option value="all">{t('reviews.vintageAll', 'All vintages')}</option>
-            </select>
-          </div>
-          {wineReviews.length > 0 ? (
-            wineReviews.map(review => (
-              <ReviewCard
-                key={review._id}
-                review={review}
-                showWine={false}
-                onDelete={() => {
-                  // Same refresh as after saving a review: refetch the list and
-                  // drop the (now stale) community aggregate.
-                  fetchWineReviews(wine._id);
-                  setCommunityRating(null);
-                }}
-              />
-            ))
-          ) : (
-            <p className="bd-reviews__empty">{t('reviews.noReviews', 'No reviews yet. Be the first to review this wine!')}</p>
-          )}
-          {reviewPages > 1 && (
-            <div className="bd-reviews__pagination">
-              <button
-                className="btn btn-secondary btn-small"
-                disabled={reviewPage <= 1}
-                onClick={() => fetchWineReviews(wine._id, { page: reviewPage - 1 })}
-              >
-                {t('common.previous', 'Previous')}
-              </button>
-              <span className="bd-reviews__page-info">{reviewPage} / {reviewPages}</span>
-              <button
-                className="btn btn-secondary btn-small"
-                disabled={reviewPage >= reviewPages}
-                onClick={() => fetchWineReviews(wine._id, { page: reviewPage + 1 })}
-              >
-                {t('common.next', 'Next')}
-              </button>
-            </div>
-          )}
-          <button
-            className="btn btn-primary btn-small"
-            onClick={() => setReviewFormOpen(true)}
-          >
-            {t('reviews.writeReview', 'Write a Review')}
-          </button>
-        </div>
-      )}
-
-      <Suspense fallback={null}>
-        {reviewFormOpen && wine && (
-          <ReviewForm
-            wineDefinition={wine._id}
-            wineName={wine.name}
-            defaultVintage={bottle?.vintage !== 'NV' ? bottle?.vintage : ''}
-            onClose={() => setReviewFormOpen(false)}
-            onSaved={() => {
-              fetchWineReviews(wine._id);
-              setCommunityRating(null);
-            }}
-          />
-        )}
-      </Suspense>
+      {/* ── Reviews (the wine's and this vintage's; shared with the vintage page) ── */}
+      <CollapsibleBlock {...blockProps('vintage.reviews', t('reviews.communityReviews', 'Reviews'))}>
+        <WineReviewsCard wine={wine} vintage={bottle?.vintage} communityRating={wine?.communityRating} />
+      </CollapsibleBlock>
 
       </>}
 
@@ -815,17 +786,22 @@ function BottleDetail() {
           </button>
           {/* Same visibility rule as the desktop header button — the mobile
               bar was missed when open-bottle tracking shipped (canEdit already
-              excludes consumed bottles). */}
-          {!bottle?.openedAt && (
-            <button className="bd-mobile-action-btn bd-mobile-action-open" onClick={() => setOpenPickerOpen(true)}>
-              <span aria-hidden="true">🍷</span>
-              {t('openBottle.openBtnShort', 'Open')}
-            </button>
+              excludes consumed bottles). A bottle on order gets neither: its
+              "Mark as arrived" lives in the on-order banner. */}
+          {!onOrderNow && (
+            <>
+              {!bottle?.openedAt && (
+                <button className="bd-mobile-action-btn bd-mobile-action-open" onClick={() => setOpenPickerOpen(true)}>
+                  <span aria-hidden="true">🍷</span>
+                  {t('openBottle.openBtnShort', 'Open')}
+                </button>
+              )}
+              <button className="bd-mobile-action-btn bd-mobile-action-consume" onClick={() => setConsumeOpen(true)}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M8 2h8l4 10H4L8 2z"/><path d="M12 12v6"/><path d="M8 22h8"/></svg>
+                {t('bottleDetail.removeBottleShort')}
+              </button>
+            </>
           )}
-          <button className="bd-mobile-action-btn bd-mobile-action-consume" onClick={() => setConsumeOpen(true)}>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M8 2h8l4 10H4L8 2z"/><path d="M12 12v6"/><path d="M8 22h8"/></svg>
-            {t('bottleDetail.removeBottleShort')}
-          </button>
           {/* Less-frequent actions (Add more, Move, Added by mistake) — keeps
               the bar to three visible buttons so nothing gets cut off on
               narrow screens */}
@@ -857,7 +833,7 @@ function BottleDetail() {
             label={t('bottleDetail.mistakeTitle', 'Remove as a mistake?')}
           >
             <h2>{t('bottleDetail.mistakeTitle', 'Remove as a mistake?')}</h2>
-            <p>{t('bottleDetail.mistakeBody', 'This will permanently remove the bottle as if it had never been added. It will not appear in your stats, history, or search. This cannot be undone.')}</p>
+            <p>{t('bottleDetail.mistakeBodyRecoverable', 'The bottle is removed as if it had never been added, so it won’t count in your stats or history. It goes to Recently deleted, where you can bring it back for {{days}} days.', { days: TRASH_DAYS })}</p>
             <div className="modal-actions">
               <button
                 type="button"
@@ -906,11 +882,47 @@ function BottleDetail() {
           />
         )}
 
+        {changeWineOpen && bottle && (
+          <ChangeWineModal
+            bottleId={bottle._id}
+            currentLabel={[displayProducer, displayName].filter(Boolean).join(' — ')}
+            lotCount={lotSiblingIds.length}
+            onClose={() => setChangeWineOpen(false)}
+            onChanged={({ alsoMoved }) => {
+              setChangeWineOpen(false);
+              setAddMoreMsg(alsoMoved > 0
+                ? t('changeWine.doneMany', { count: alsoMoved + 1 })
+                : t('changeWine.done'));
+              // The page re-reads the bottle: wine, drink window, lot and
+              // reviews all belong to the new wine now.
+              fetchBottle();
+            }}
+          />
+        )}
+
         {addMoreOpen && bottle && (
           <AddMoreBottlesModal
             bottle={bottle}
+            // "Add again" of a drunk bottle is a new purchase: its details start blank.
+            copyDetailsDefault={!isConsumed}
             onClose={() => setAddMoreOpen(false)}
             onAdded={handleAddedMore}
+          />
+        )}
+
+        {pickOpen && bottle && (
+          <AddToPickListModal bottleIds={[bottle._id]} onClose={() => setPickOpen(false)} onDone={() => setPickOpen(false)} />
+        )}
+
+        {barcodeOpen && bottle && (
+          <BarcodeScanModal
+            bottle={bottle}
+            onClose={() => setBarcodeOpen(false)}
+            onSaved={(code) => {
+              setBarcodeOpen(false);
+              setBottle((prev) => ({ ...prev, barcode: code || null }));
+              setAddMoreMsg(code ? t('barcodeScan.saved', 'Barcode saved: {{code}}', { code }) : t('barcodeScan.removed', 'Barcode removed.'));
+            }}
           />
         )}
 
@@ -924,7 +936,8 @@ function BottleDetail() {
             // tasting-profile report button stays clickable there, so the
             // hand-off would have been a dead click (pre-deploy audit 2026-09-18).
             onSuggestFix={!editing && !user?.isDemo && bottle.wineDefinition.draft !== true
-              ? () => { setReportWineOpen(false); setReportDefaultReason(null); setSuggestFixSignal(n => n + 1); }
+              // The form opens in the wine record: unfold it if it is folded.
+              ? () => { setReportWineOpen(false); setReportDefaultReason(null); expandBlocks('vintage.record'); setSuggestFixSignal(n => n + 1); }
               : undefined}
             onClose={() => { setReportWineOpen(false); setReportDefaultReason(null); }}
           />
@@ -941,7 +954,10 @@ function BottleDetail() {
         {journalPromptOpen && (
           <JournalPrompt
             bottle={bottle}
-            onDone={() => { setJournalPromptOpen(false); navigate(`/cellars/${cellarId}`); }}
+            onDone={() => {
+              setJournalPromptOpen(false);
+              navigate(`/cellars/${cellarId}`, { state: { bottleNotice: leaveNoticeRef.current } });
+            }}
           />
         )}
 

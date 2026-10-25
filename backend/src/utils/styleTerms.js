@@ -36,7 +36,7 @@
  * reject; where one side is silent it is silence, not disagreement.
  */
 
-const { normalizeString } = require('./normalize');
+const { normalizeString, spellStarGrades, MAX_STAR_GRADE } = require('./normalize');
 
 // Sweetness / dryness across label languages, pre-normalized (normalizeString
 // folds "Roșu" → 'rosu', "off-dry" → 'offdry'; ß is not decomposable and is
@@ -121,11 +121,19 @@ const JOINED_PHRASES = [
   [/\boff dry\b/g, 'offdry'],
 ];
 
+// A producer's own grade inside a Prädikat, printed as stars ("Auslese**",
+// "Auslese***" at Markus Molitor): spellStarGrades turns a run of stars into
+// one of these words. Each grade is its own wine, so two names stating
+// different grades are two wines, exactly like two Prädikate. Bounded by
+// MAX_STAR_GRADE: a typed "400000000star" is text, not a grade (an unbounded
+// count fed '*'.repeat in the reason below — release audit 2026-10-13).
+const STAR_GRADE_TOKEN = new RegExp(`^[1-${MAX_STAR_GRADE}]star$`);
+
 /**
- * The style a NAME declares, as two independent term sets.
+ * The style a NAME declares, as independent term sets.
  *
  * @param {string} name
- * @returns {{pradikat: Set<string>, sweetness: Set<string>}}
+ * @returns {{pradikat: Set<string>, sweetness: Set<string>, grade: Set<string>}}
  */
 function statedStyle(name) {
   // Lowercase BEFORE the ß-fold: the capital eszett ẞ (U+1E9E — the official
@@ -133,19 +141,21 @@ function statedStyle(name) {
   // toLowerCase, and folding first left it for normalizeString to delete as
   // punctuation, silently dropping the sweetness term (post-release audit,
   // verified by execution: "SÜẞ" read as stating nothing).
-  let folded = normalizeString(String(name == null ? '' : name).toLowerCase().replace(/ß/g, 'ss'));
+  let folded = normalizeString(spellStarGrades(String(name == null ? '' : name).toLowerCase().replace(/ß/g, 'ss')));
   for (const [re, joined] of JOINED_PHRASES) folded = folded.replace(re, joined);
 
   const pradikat = new Set();
   const sweetness = new Set();
+  const grade = new Set();
   for (const token of folded.split(/[^a-z0-9]+/)) {
     if (!token) continue;
+    if (STAR_GRADE_TOKEN.test(token)) { grade.add(token); continue; }
     const tier = PRADIKAT_ALIASES.get(token) || token;
     if (PRADIKAT_WORDS.has(tier)) { pradikat.add(tier); continue; }
     const sweet = SWEETNESS_ALIASES.get(token) || token;
     if (SWEETNESS_WORDS.has(sweet) && !NAME_AMBIGUOUS_WORDS.has(sweet)) sweetness.add(sweet);
   }
-  return { pradikat, sweetness };
+  return { pradikat, sweetness, grade };
 }
 
 /**
@@ -250,6 +260,10 @@ function conflictingStyleTerms(nameA, nameB) {
   }
   if (disagree(a.sweetness, b.sweetness)) {
     return `each name states a different sweetness (${[...a.sweetness].sort().join(', ')} vs ${[...b.sweetness].sort().join(', ')})`;
+  }
+  if (disagree(a.grade, b.grade)) {
+    const stars = (set) => [...set].sort().map((g) => '*'.repeat(parseInt(g, 10))).join(', ');
+    return `each name states a different star grade (${stars(a.grade)} vs ${stars(b.grade)})`;
   }
   return null;
 }

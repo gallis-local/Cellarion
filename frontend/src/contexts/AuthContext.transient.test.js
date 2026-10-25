@@ -106,6 +106,21 @@ describe('a refresh during a deploy or a hiccup', () => {
     routes['/api/auth/refresh'] = answer(401);
     await act(async () => { await ctx.apiFetch('/api/cellars'); });
     expect(await screen.findByText('no user')).toBeInTheDocument();
+    // …and leaves word for the login page. Set after logout's
+    // sessionStorage.clear() — set before it, it never survived.
+    expect(sessionStorage.getItem('cellarion.sessionExpired')).toBe('1');
+  });
+
+  it('a new session clears the "session ended" word', async () => {
+    sessionStorage.setItem('cellarion.sessionExpired', '1');
+    await signedIn();
+    expect(sessionStorage.getItem('cellarion.sessionExpired')).toBeNull();
+  });
+
+  it('signing out yourself leaves no "session ended" word', async () => {
+    await signedIn();
+    await act(async () => { await ctx.logout(); });
+    expect(sessionStorage.getItem('cellarion.sessionExpired')).toBeNull();
   });
 });
 

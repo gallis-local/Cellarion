@@ -17,6 +17,17 @@
   color: var(--color-text);
 }
 
+/* "Look in Help first": one line under the title, not a banner. */
+.support-help-hint {
+  margin: -8px 0 16px;
+  color: var(--color-text-secondary);
+  font-size: 0.9rem;
+}
+
+.support-help-hint a {
+  color: var(--color-accent);
+}
+
 .support-tabs {
   display: flex;
   gap: 4px;
@@ -219,6 +230,17 @@
   font-size: 0.9rem;
 }
 
-.support-reply-form .btn-primary {
-  align-self: flex-end;
+.support-reply-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* On a phone the two buttons share the row, or each fills its own line once
+   they wrap, instead of a ragged right-aligned stack. */
+@media (max-width: 480px) {
+  .support-reply-actions .btn {
+    flex: 1 1 auto;
+  }
 }

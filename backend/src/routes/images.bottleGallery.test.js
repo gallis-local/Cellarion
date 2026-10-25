@@ -120,3 +120,76 @@ describe('a photo published on another owner\'s bottle of the same wine', () => 
     expect(body.images).toEqual([{ ...theirs, mine: false }]);
   });
 });
+
+/**
+ * Photos per vintage (support ticket 2026-10-09): the first wine-level slide
+ * is the one a bottle without its own photo opens on, and a 2016 bottle
+ * should open on a 2016 label when one exists. Within each half the
+ * official-first, newest-first order the query returns is kept.
+ */
+describe('wine-level photos of the bottle\'s own vintage come first', () => {
+  test('same-vintage photos lead, the official photo of another year follows, untagged rows last', async () => {
+    Bottle.findById.mockResolvedValue({ _id: BOTTLE, cellar: CELLAR, wineDefinition: WINE, vintage: '2016', defaultImage: null });
+    const pub = (c, over) => ({ _id: oid(c), processedUrl: `/api/uploads/processed/${c}.webp`, originalUrl: null, status: 'approved', visibility: 'public', uploadedBy: oid('2'), ...over });
+    BottleImage.find
+      .mockReturnValueOnce(makeQuery([]))
+      .mockReturnValueOnce(makeQuery([
+        pub('3', { assignedToWine: true, vintage: '2015' }),  // the wine's official photo, another year
+        pub('4', { assignedToWine: false, vintage: null }),   // untagged (older than the field)
+        pub('5', { assignedToWine: false, vintage: '2016' }), // this bottle's vintage
+      ]));
+
+    const res = await get(`/api/images/bottle/${BOTTLE}`, tokenFor(USER, ['user']));
+    const body = await res.json();
+    expect(body.images.map((i) => i._id)).toEqual([oid('5'), oid('3'), oid('4')]);
+    expect(body.images[1].vintage).toBe('2015'); // the slide can say which year it shows
+  });
+});
+
+describe('the vintage\'s official photo leads the bottle\'s gallery (ticket 2026-10-09)', () => {
+  test('an admin\'s choice of 2016 photo comes first, ahead of an earlier 2016 photo and the wine\'s official image', async () => {
+    Bottle.findById.mockResolvedValue({ _id: BOTTLE, cellar: CELLAR, wineDefinition: WINE, vintage: '2016', defaultImage: null });
+    const pub = (c, over) => ({ _id: oid(c), processedUrl: `/api/uploads/processed/${c}.webp`, originalUrl: null, status: 'approved', visibility: 'public', uploadedBy: oid('2'), createdAt: '2026-01-01T00:00:00Z', ...over });
+    BottleImage.find
+      .mockReturnValueOnce(makeQuery([]))
+      .mockReturnValueOnce(makeQuery([
+        pub('3', { assignedToWine: true, vintage: null }),
+        pub('4', { vintage: '2016', createdAt: '2026-02-01T00:00:00Z' }),
+        pub('5', { vintage: '2016', createdAt: '2026-06-01T00:00:00Z', assignedToVintage: true }),
+      ]));
+
+    const res = await get(`/api/images/bottle/${BOTTLE}`, tokenFor(USER, ['user']));
+    const body = await res.json();
+    expect(body.images.map((i) => i._id)).toEqual([oid('5'), oid('4'), oid('3')]);
+  });
+});
+
+// The vintage page (?scope=vintage): a label photo added through one bottle
+// belongs to the vintage, so the gallery takes in every bottle of this wine
+// and vintage in the same cellar — same visibility rule per photo.
+describe('scope=vintage', () => {
+  test('lists the photos of every bottle of the wine and vintage in this cellar', async () => {
+    Bottle.findById.mockResolvedValue({ _id: BOTTLE, cellar: CELLAR, wineDefinition: WINE, vintage: '2015', defaultImage: null });
+    const sibling = oid('d');
+    Bottle.find = jest.fn(() => ({ select: () => ({ limit: () => ({ lean: async () => [{ _id: BOTTLE }, { _id: sibling }] }) }) }));
+    BottleImage.find.mockReturnValue(makeQuery([]));
+
+    const res = await get(`/api/images/bottle/${BOTTLE}?scope=vintage`, tokenFor(USER, ['user']));
+    expect(res.status).toBe(200);
+    expect(Bottle.find).toHaveBeenCalledWith({ cellar: CELLAR, wineDefinition: WINE, vintage: '2015' });
+    const bottleFilter = BottleImage.find.mock.calls[0][0];
+    expect(bottleFilter.bottle).toEqual({ $in: [BOTTLE, sibling] });
+    expect(bottleFilter.$or).toEqual([
+      { status: 'approved', visibility: 'public' },
+      { uploadedBy: USER, status: { $ne: 'rejected' } },
+    ]);
+  });
+
+  test('NV takes in the bottles filed under an empty or missing vintage too', async () => {
+    Bottle.findById.mockResolvedValue({ _id: BOTTLE, cellar: CELLAR, wineDefinition: WINE, vintage: 'NV', defaultImage: null });
+    Bottle.find = jest.fn(() => ({ select: () => ({ limit: () => ({ lean: async () => [] }) }) }));
+    BottleImage.find.mockReturnValue(makeQuery([]));
+    await get(`/api/images/bottle/${BOTTLE}?scope=vintage`, tokenFor(USER, ['user']));
+    expect(Bottle.find.mock.calls[0][0].vintage).toEqual({ $in: ['NV', '', null] });
+  });
+});

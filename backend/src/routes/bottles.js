@@ -13,21 +13,28 @@ const WineVintageProfile = require('../models/WineVintageProfile');
 const PriceTrackingRequest = require('../models/PriceTrackingRequest');
 const PriceTrackingSkip = require('../models/PriceTrackingSkip');
 const BottleImage = require('../models/BottleImage');
-const WineRequest = require('../models/WineRequest');
 const { getCellarRole } = require('../utils/cellarAccess');
 const { isReserved } = require('../utils/reservationUtils');
+const { photoVintage, vintageKey } = require('../utils/imageVintage');
+const { findVintageOfficials } = require('../services/vintageImages');
+// The bottle page's own-photo pick reads a handful of the viewer's newest
+// photos of the wine and chooses among them; it never needs them all.
+const OWN_PHOTO_CANDIDATES = 50;
 const { logAudit } = require('../services/audit');
 const { getSnapshotForDate } = require('../utils/exchangeRates');
 const { resolveRating } = require('../utils/ratingUtils');
-const { CONSUMED_STATUSES, WINE_POPULATE, WINE_POPULATE_LIST } = require('../config/constants');
-const { unlinkImageFiles } = require('../services/imageProcessor');
+const { CONSUMED_STATUSES, NOT_IN_CELLAR_STATUSES, ORDERED_STATUS, WINE_POPULATE, WINE_POPULATE_LIST } = require('../config/constants');
+const { parseCurrency, normalizeCurrency, isSupportedCurrency } = require('../config/currencies');
 const { gatherPriceWarnings } = require('../services/priceWarnings');
 const { getCurrentRelease } = require('../services/communityPrice');
-const { findLotSiblingIds } = require('../services/bottleLot');
+const { findLotSiblingIds, findLotSiblings } = require('../services/bottleLot');
 const { buildCaseJourneys } = require('../services/insightsService');
 const { stripHtml, escapeRegex } = require('../utils/sanitize');
-const { toNormalized } = require('../utils/ratingUtils');
-const { classifyMaturity, buildProfileMap, parseMaturityFilter, matchesMaturityFilter } = require('../utils/maturityUtils');
+const { bottleRating, filterByRating } = require('../utils/ratingUtils');
+const {
+  classifyMaturity, buildProfileMap, parseMaturityFilter, matchesMaturityFilter,
+  buildMaturitySortKeys, compareMaturitySortKeys,
+} = require('../utils/maturityUtils');
 const { parsePagination } = require('../utils/pagination');
 const personalData = require('../services/personalData');
 // Read-surface decoration: populated grapes gain `displayName` — the
@@ -40,16 +47,21 @@ const mongoose = require('mongoose');
 // add/update/consume/restore/remove logic + rack-slot freeing live in the
 // shared service so the REST routes and the MCP tools can never drift (§7).
 const {
-  addBottle, validateBottleCommitFields, updateBottleFields, consumeBottle, restoreBottle, removeFromRacks, removeBottleCascade,
-  openBottle, pourFromBottle, closeBottle,
+  addBottle, validateBottleCommitFields, updateBottleFields, consumeBottle, restoreBottle, removeBottleCascade,
+  openBottle, pourFromBottle, closeBottle, markArrived, changeBottleWine,
 } = require('../services/bottleOps');
 // Mint-at-commit for the POST route's `newWine` branch — the wine is created
 // (or resolved) INSIDE the bottle create, never before it. Shared with the
 // wishlist route; findOrCreateWine itself is lazy-required inside the service.
 const { resolveOrMintWine } = require('../services/wineCommit');
+const { parseExpectedArrival } = require('../utils/onOrder');
 const { moveBottleToCellar } = require('../services/rackOps');
 const { getDataVersion } = require('../services/dataVersion');
-const { REGISTRY_PHOTO, OWN_PHOTO } = require('../services/photoRetention');
+const DeletedBottle = require('../models/DeletedBottle');
+const { TRASH_DAYS, trashBottle, restoreTrashed } = require('../services/bottleTrash');
+
+// "Recently deleted" lists at most this many bottles per cellar.
+const TRASH_LIST_MAX = 2000;
 
 const router = express.Router();
 
@@ -146,6 +158,7 @@ router.get('/', async (req, res) => {
     const bottleSize       = q(req.query.bottleSize);
     const minRating        = q(req.query.minRating);
     const maxRating        = q(req.query.maxRating);
+    const ratingBandParam  = q(req.query.ratingBand); // one of RATING_BANDS (a statistics band link)
     // null when absent; a Set of statuses otherwise (multi-select, OR).
     const maturityFilter   = parseMaturityFilter(q(req.query.maturity));
     const sort             = q(req.query.sort) || '-createdAt';
@@ -168,16 +181,19 @@ router.get('/', async (req, res) => {
 
     // Status / lifecycle scope
     if (!statusFilter || statusFilter === 'active') {
-      filter.status = { $nin: CONSUMED_STATUSES };
+      filter.status = { $nin: NOT_IN_CELLAR_STATUSES };
     } else if (statusFilter === 'all') {
       // no status constraint — include everything
+    } else if (statusFilter === ORDERED_STATUS) {
+      // Bought, not delivered yet
+      filter.status = ORDERED_STATUS;
     } else if (CONSUMED_STATUSES.includes(statusFilter)) {
       filter.status = statusFilter;
     } else if (statusFilter === 'consumed') {
       filter.status = { $in: CONSUMED_STATUSES };
     } else {
       // Unknown value — fall back to the default active scope
-      filter.status = { $nin: CONSUMED_STATUSES };
+      filter.status = { $nin: NOT_IN_CELLAR_STATUSES };
     }
 
     if (vintage) {
@@ -282,9 +298,13 @@ router.get('/', async (req, res) => {
       filter.wineDefinition = null;
     }
 
-    const directSortFields = ['createdAt', 'vintage', 'price', 'rating'];
+    // A list that holds history bottles sorts "by rating" on the rating each
+    // bottle counts with — for a drunk one the rating given when drinking —
+    // as it filters (utils/ratingUtils.bottleRating), so in memory.
+    const holdsHistory = statusFilter === 'all' || statusFilter === 'consumed' || CONSUMED_STATUSES.includes(statusFilter);
+    const directSortFields = ['createdAt', 'vintage', 'price', ...(holdsHistory ? [] : ['rating'])];
     const canSortInDb = directSortFields.includes(sortField);
-    const needsInMemoryFilter = !!(search || minRating || maxRating || maturityFilter);
+    const needsInMemoryFilter = !!(search || minRating || maxRating || ratingBandParam || maturityFilter);
     const canPaginateInDb = canSortInDb && !needsInMemoryFilter;
 
     let query = Bottle.find(filter).populate(WINE_POPULATE_LIST);
@@ -336,28 +356,14 @@ router.get('/', async (req, res) => {
       });
     }
 
-    // ── Min-rating post-filter (rating scales must be normalised) ──────────────
-    if (minRating) {
-      const min = parseFloat(minRating);
-      if (!isNaN(min)) {
-        bottles = bottles.filter(b => {
-          if (b.rating == null) return false;
-          return toNormalized(b.rating, b.ratingScale || '5') >= min;
-        });
-      }
-    }
-    if (maxRating) {
-      const max = parseFloat(maxRating);
-      if (!isNaN(max)) {
-        bottles = bottles.filter(b => {
-          if (b.rating == null) return false;
-          return toNormalized(b.rating, b.ratingScale || '5') <= max;
-        });
-      }
-    }
+    // ── Rating post-filter (rating scales must be normalised) ──────────────────
+    // A drunk bottle counts with the rating given when drinking, and a band is
+    // exactly the statistics' band (utils/ratingUtils).
+    bottles = filterByRating(bottles, { minRating, maxRating, ratingBand: ratingBandParam });
 
     // ── Maturity post-filter / sort (needs WineVintageProfile lookup) ─────────
     let maturityMap = null;
+    let maturitySortKeys = null;
     const needsMaturity = !!(maturityFilter || sortField === 'maturity');
     if (needsMaturity) {
       const profileMap = await buildProfileMap(bottles);
@@ -365,6 +371,7 @@ router.get('/', async (req, res) => {
       for (const b of bottles) {
         maturityMap.set(b._id.toString(), classifyMaturity(b, profileMap));
       }
+      if (sortField === 'maturity') maturitySortKeys = buildMaturitySortKeys(bottles, profileMap, maturityMap);
     }
 
     if (maturityFilter && maturityMap) {
@@ -373,17 +380,20 @@ router.get('/', async (req, res) => {
 
     // ── In-memory sort for fields we couldn't sort in the DB ──────────────────
     if (!canSortInDb) {
-      const MATURITY_RANK = { declining: 0, late: 1, peak: 2, early: 3, 'not-ready': 4 };
       bottles.sort((a, b) => {
+        // Stage, then the year that stage ends (utils/maturityUtils).
+        if (maturitySortKeys) {
+          return sortDir * compareMaturitySortKeys(
+            maturitySortKeys.get(a._id.toString()), maturitySortKeys.get(b._id.toString()));
+        }
         let aVal, bVal;
         if (sortField === 'name') {
           aVal = a.wineDefinition?.name || '';
           bVal = b.wineDefinition?.name || '';
-        } else if (sortField === 'maturity' && maturityMap) {
-          const aStatus = maturityMap.get(a._id.toString());
-          const bStatus = maturityMap.get(b._id.toString());
-          aVal = aStatus != null ? MATURITY_RANK[aStatus] : 5;
-          bVal = bStatus != null ? MATURITY_RANK[bStatus] : 5;
+        } else if (sortField === 'rating') {
+          // Unrated last when sorting high to low, as the database sorts nulls.
+          aVal = bottleRating(a) ?? -1;
+          bVal = bottleRating(b) ?? -1;
         } else {
           aVal = a.createdAt;
           bVal = b.createdAt;
@@ -479,7 +489,7 @@ router.get('/', async (req, res) => {
 // semantics to the old find-or-create route, so the UI dialog is unchanged).
 router.post('/', requireNonDemo, async (req, res) => {
   try {
-    const { cellar, wineDefinition, newWine, price, currency, personalData: customFields } = req.body;
+    const { cellar, wineDefinition, newWine, price, personalData: customFields } = req.body;
 
     if (!cellar || (!wineDefinition && !newWine)) {
       return res.status(400).json({ error: 'Cellar and a wine (wineDefinition or newWine) are required' });
@@ -614,7 +624,7 @@ router.post('/', requireNonDemo, async (req, res) => {
       try {
         priceWarnings = await gatherPriceWarnings({
           price,
-          currency: currency || 'USD',
+          currency: bottle.currency || 'USD', // as stored (an alias mapped)
           userId: cellarDoc.user,
           // wineDoc, not the request field — on the newWine path there is no
           // wineDefinition id in the body.
@@ -634,6 +644,97 @@ router.post('/', requireNonDemo, async (req, res) => {
   } catch (error) {
     console.error('Create bottle error:', error);
     res.status(500).json({ error: 'Failed to create bottle' });
+  }
+});
+
+// ── Recently deleted (services/bottleTrash) ──────────────────────────────
+// Defined BEFORE the /:id routes: Express would otherwise read "trash" as a
+// bottle id (GET /:id, POST /:id/restore). Both act on ONE cellar the caller
+// can edit — the same role a bulk delete needs — and a cellar they can't
+// reads as not found, as everywhere else.
+async function editableCellar(req, cellarId) {
+  if (!cellarId || !mongoose.isValidObjectId(String(cellarId))) {
+    return { error: { status: 400, message: 'A valid cellar id is required' } };
+  }
+  const cellar = await Cellar.findById(String(cellarId));
+  const role = cellar && !cellar.deletedAt ? getCellarRole(cellar, req.user.id) : null;
+  if (!role || (ROLE_LEVELS[role] || 0) < ROLE_LEVELS.editor) {
+    return { error: { status: 404, message: 'Cellar not found' } };
+  }
+  return { cellar };
+}
+
+// GET /api/bottles/trash?cellar=<id> - the cellar's "Recently deleted",
+// newest first. The stored snapshots never leave the server.
+// Response: { items: [{ id, batchId, deletedAt, purgeAt, label }], retentionDays }
+router.get('/trash', async (req, res) => {
+  try {
+    const found = await editableCellar(req, req.query.cellar);
+    if (found.error) return res.status(found.error.status).json({ error: found.error.message });
+    const rows = await DeletedBottle.find({ cellar: found.cellar._id })
+      .sort({ deletedAt: -1, _id: 1 })
+      .limit(TRASH_LIST_MAX)
+      .select('batchId deletedAt purgeAt label')
+      .lean();
+    res.json({
+      items: rows.map((r) => ({ id: r._id, batchId: r.batchId, deletedAt: r.deletedAt, purgeAt: r.purgeAt, label: r.label })),
+      retentionDays: TRASH_DAYS,
+    });
+  } catch (error) {
+    console.error('List recently deleted error:', error);
+    res.status(500).json({ error: 'Failed to load recently deleted bottles' });
+  }
+});
+
+// POST /api/bottles/trash/restore - bring bottles back from "Recently deleted".
+// Body: { cellar, ids?: string[] (trash row ids), batchId?: string } — ids,
+// a whole batch (the Undo after a bulk delete, "Restore all"), or both.
+// Each bottle returns under its old id and re-takes its rack slot if free.
+// Response: { restored, restoredIds: string[] (bottle ids), placed, skipped: [{ id, reason }] }
+//   reason ∈ 'cellar_gone', 'wine_gone', 'exists', 'error'
+router.post('/trash/restore', async (req, res) => {
+  try {
+    const { cellar: cellarId, ids, batchId } = req.body || {};
+    const found = await editableCellar(req, cellarId);
+    if (found.error) return res.status(found.error.status).json({ error: found.error.message });
+    const idList = Array.isArray(ids) ? ids : [];
+    if (idList.length > BULK_MAX) {
+      return res.status(400).json({ error: `At most ${BULK_MAX} bottles per request` });
+    }
+    if (!idList.every((x) => typeof x === 'string' && mongoose.isValidObjectId(x))) {
+      return res.status(400).json({ error: 'ids must be valid ids' });
+    }
+    const hasBatch = typeof batchId === 'string' && mongoose.isValidObjectId(batchId);
+    if (idList.length === 0 && !hasBatch) {
+      return res.status(400).json({ error: 'Give the ids to restore, or a batchId' });
+    }
+    const or = [];
+    if (idList.length) or.push({ _id: { $in: idList.map((x) => new mongoose.Types.ObjectId(x)) } });
+    if (hasBatch) or.push({ batchId: new mongoose.Types.ObjectId(batchId) });
+    const rows = await DeletedBottle.find({ cellar: found.cellar._id, $or: or }).sort({ deletedAt: 1, _id: 1 }).limit(BULK_MAX);
+
+    const restoredIds = [];
+    const skipped = [];
+    let placed = 0;
+    for (const row of rows) {
+      let result;
+      try {
+        result = await restoreTrashed(row, req);
+      } catch (err) {
+        console.error(`Restore from trash: row ${row._id} failed:`, err.message);
+        result = { error: { code: 'error' } };
+      }
+      if (result.error) { skipped.push({ id: String(row._id), reason: result.error.code || 'error' }); continue; }
+      restoredIds.push(String(row.bottleId));
+      if (result.placed) placed += 1;
+    }
+    logAudit(req, 'bottle.bulk_restore',
+      { type: 'cellar', id: found.cellar._id, cellarId: found.cellar._id },
+      { requested: rows.length, restored: restoredIds.length, skipped: skipped.length, ...(hasBatch ? { batchId } : {}) });
+    res.json({ restored: restoredIds.length, restoredIds, placed, skipped });
+  } catch (error) {
+    console.error('Restore recently deleted error:', error);
+    res.status(500).json({ error: 'Failed to restore the bottles' });
   }
 });
 
@@ -672,6 +773,9 @@ router.get('/:id', requireBottleAccess('viewer'), async (req, res) => {
     // omitted, or `{ wineDefinition: undefined }` matches every document and the
     // lookup returns a pending image from an unrelated bottle.
     const pendingImgOr = [{ bottle: bottle._id }];
+    // Each sibling's vintage: a photo pinned to a sibling is a photo of THAT
+    // bottle's vintage even before the row carries its own tag.
+    const vintageOfSibling = new Map();
     if (bottle.wineDefinition) {
       pendingImgOr.push({ wineDefinition: bottle.wineDefinition });
       // The viewer's other bottles of the same wine: a photo uploaded while a
@@ -679,14 +783,15 @@ router.get('/:id', requireBottleAccess('viewer'), async (req, res) => {
       // so only its bottle knows the wine (support ticket 2026-09-07 — same
       // fix as the cellar list's attachBottleImageUrls).
       try {
-        const siblings = await Bottle.find({ user: req.user.id, wineDefinition: bottle.wineDefinition, _id: { $ne: bottle._id } }).select('_id').lean();
+        const siblings = await Bottle.find({ user: req.user.id, wineDefinition: bottle.wineDefinition, _id: { $ne: bottle._id } }).select('_id vintage').lean();
+        for (const s of siblings) vintageOfSibling.set(String(s._id), photoVintage(s.vintage));
         if (siblings.length) pendingImgOr.push({ bottle: { $in: siblings.map((s) => s._id) } });
       } catch (err) {
         // A photo nicety must never take the bottle page down.
         console.error('Sibling photo lookup failed:', err.message);
       }
     }
-    const pendingImg = await BottleImage.findOne({
+    const ownPhotos = await BottleImage.find({
       $or: pendingImgOr,
       uploadedBy: req.user.id,
       // Pending OR approved — the uploader's own photo must not vanish from
@@ -697,11 +802,42 @@ router.get('/:id', requireBottleAccess('viewer'), async (req, res) => {
       // attachBottleImageUrls, support ticket 2026-09-03): the scanner's raw
       // frame is private curation evidence, not a bottle photo.
       kind: { $ne: 'label-scan' },
-    }).sort({ createdAt: -1 }).lean();
+    }).sort({ createdAt: -1 }).limit(OWN_PHOTO_CANDIDATES).lean();
+    // Same order as the cellar list (routes/cellars.js attachBottleImageUrls,
+    // support ticket 2026-10-09), so the card and the page agree: this
+    // bottle's own photo, else the viewer's photo of the same vintage, else
+    // the vintage's official photo, else the wine's registry image (client),
+    // and only then the viewer's photo of another vintage.
+    const thisVintage = photoVintage(bottle.vintage);
+    const vintageOfPhoto = (img) => photoVintage(img.vintage) || (img.bottle ? vintageOfSibling.get(String(img.bottle)) : null) || null;
+    const pendingImg = ownPhotos.find((img) => img.bottle && String(img.bottle) === String(bottle._id))
+      || (thisVintage ? ownPhotos.find((img) => vintageOfPhoto(img) === thisVintage) : null)
+      || null;
+    const otherVintageImg = pendingImg ? null : (ownPhotos[0] || null);
 
     const pendingImageUrl = pendingImg
       ? (pendingImg.processedUrl || pendingImg.originalUrl)
       : null;
+    const otherVintageImageUrl = otherVintageImg
+      ? (otherVintageImg.processedUrl || otherVintageImg.originalUrl)
+      : null;
+
+    // The vintage's official photo: the first one of this wine AND vintage
+    // an admin approved (or the one they chose), by anyone, with its credit.
+    let vintageImageUrl = null;
+    let vintageImageCredit = null;
+    if (bottle.wineDefinition && thisVintage) {
+      try {
+        const wineIdStr = String(bottle.wineDefinition._id || bottle.wineDefinition);
+        const official = (await findVintageOfficials([wineIdStr], [thisVintage])).get(vintageKey(wineIdStr, thisVintage));
+        if (official) {
+          vintageImageUrl = official.url;
+          vintageImageCredit = official.credit;
+        }
+      } catch (err) {
+        console.error('Vintage photo lookup failed:', err.message);
+      }
+    }
 
     // Resolve user's chosen default bottle image to a URL
     let defaultImageUrl = null;
@@ -771,7 +907,7 @@ router.get('/:id', requireBottleAccess('viewer'), async (req, res) => {
     }
 
     const ucEntry = cellar.userColors?.find(uc => uc.user.toString() === req.user.id.toString());
-    res.json({ bottle: bottleObj, userRole: role, cellarColor: ucEntry?.color || null, pendingImageUrl, defaultImageUrl, currentRelease, rackInfo, lotSiblingIds });
+    res.json({ bottle: bottleObj, userRole: role, cellarColor: ucEntry?.color || null, pendingImageUrl, defaultImageUrl, vintageImageUrl, vintageImageCredit, otherVintageImageUrl, currentRelease, rackInfo, lotSiblingIds });
   } catch (error) {
     console.error('Get bottle error:', error);
     res.status(500).json({ error: 'Failed to get bottle' });
@@ -820,6 +956,9 @@ router.get('/:id/lot-history', requireBottleAccess('viewer'), async (req, res) =
       pinVintage: scope === 'all' ? (bottle.vintage || 'NV') : null,
       // The page shows a note as the user wrote it (the field allows 1000).
       noteMaxLength: 1000,
+      // The vintage page links each other vintage to ITS vintage page, which
+      // lives under a cellar — the lot says which cellars hold it.
+      withCellars: true,
     });
     res.json({ ...empty, lots: result.data || [] });
   } catch (error) {
@@ -911,41 +1050,16 @@ router.put('/:id/default-image', requireBottleAccess('editor'), async (req, res)
     const { bottle } = req;
     const { imageId } = req.body;
 
-    if (!imageId) {
-      // Clear default image
-      bottle.defaultImage = null;
-      await bottle.save();
-      return res.json({ bottle });
-    }
+    // Shared with the MCP set_bottle_default_image tool (services/imageOps):
+    // the candidate rule, the id cast, the clear-on-empty and the audit row
+    // live there once.
+    // Lazy: imageOps pulls in the image pipeline, which this route needs only here.
+    const { setBottleDefaultImage } = require('../services/imageOps');
+    const result = await setBottleDefaultImage(bottle, imageId, req);
+    if (result.error) return res.status(result.error.status).json({ error: result.error.message });
+    if (!imageId) return res.json({ bottle });
 
-    // Cast the user-provided id to a real ObjectId before it touches the
-    // query (a junk string would otherwise throw a CastError → 500; the cast
-    // also clears the user-input-in-query taint for static analysis).
-    if (!mongoose.isValidObjectId(imageId)) {
-      return res.status(400).json({ error: 'Invalid image ID' });
-    }
-    const imageOid = new mongoose.Types.ObjectId(String(imageId));
-
-    // Verify the image exists and belongs to this bottle or its wine
-    // definition. Only add the wine clause when the bottle HAS a wine:
-    // BottleImage.wineDefinition defaults to null, so for a pending-request
-    // bottle (wineDefinition null) the clause would match ANY approved
-    // unattached image in the DB. Also require public visibility, matching
-    // the candidate list the UI offers (images.js /bottle/:bottleId).
-    const orClauses = [{ bottle: bottle._id }];
-    if (bottle.wineDefinition) {
-      orClauses.push({ wineDefinition: bottle.wineDefinition, status: 'approved', visibility: 'public' });
-    }
-    const image = await BottleImage.findOne({ _id: imageOid, $or: orClauses });
-
-    if (!image) {
-      return res.status(404).json({ error: 'Image not found or not associated with this bottle' });
-    }
-
-    bottle.defaultImage = image._id;
-    await bottle.save();
     await bottle.populate(WINE_POPULATE);
-
     res.json({ bottle });
   } catch (error) {
     console.error('Set default image error:', error);
@@ -976,6 +1090,59 @@ router.post('/:id/consume', requireBottleAccess('editor'), async (req, res) => {
     }
     console.error('Consume bottle error:', error);
     res.status(500).json({ error: 'Failed to consume bottle' });
+  }
+});
+
+// POST /api/bottles/:id/change-wine — move a saved bottle to another registry
+// wine (owner or editor): { wineDefinitionId, applyToLot? }. The bottle keeps
+// all its own data (services/bottleOps.changeBottleWine). applyToLot also
+// moves the other bottles of the same wine and vintage in the caller's OWN
+// cellars (services/bottleLot — the "also apply to the other N" lot), found
+// BEFORE the move so they are the old wine's lot.
+router.post('/:id/change-wine', requireBottleAccess('editor'), async (req, res) => {
+  try {
+    const { wineDefinitionId, applyToLot } = req.body || {};
+    if (!mongoose.isValidObjectId(wineDefinitionId)) {
+      return res.status(400).json({ error: 'A valid wineDefinitionId is required' });
+    }
+    // The same visibility rule as adding a bottle: someone else's pending or
+    // private draft wine is reported as not found.
+    const wineDoc = await findVisibleWine(String(wineDefinitionId), { userId: req.user.id, roles: req.user.roles });
+    if (!wineDoc) return res.status(404).json({ error: 'Wine not found' });
+
+    const siblings = applyToLot === true ? await findLotSiblings(req.user.id, req.bottle) : [];
+    const result = await changeBottleWine(req.bottle, wineDoc, req);
+    if (result.error) {
+      const { status, message, code } = result.error;
+      return res.status(status).json({ error: message, ...(code ? { code } : {}) });
+    }
+    let alsoMoved = 0;
+    for (const sibling of siblings) {
+      const r = await changeBottleWine(sibling, wineDoc, req);
+      if (!r.error) alsoMoved += 1;
+    }
+    await result.bottle.populate(WINE_POPULATE);
+    res.json({ bottle: result.bottle, alsoMoved });
+  } catch (error) {
+    console.error('Change wine error:', error);
+    res.status(500).json({ error: 'Failed to change the wine' });
+  }
+});
+
+// POST /api/bottles/:id/arrive — a bottle on order has been delivered (owner
+// or editor). It becomes active and lands unplaced; body.arrivedAt is an
+// optional day, default today. Many at once: POST /bulk { action: 'arrive' }.
+router.post('/:id/arrive', requireBottleAccess('editor'), async (req, res) => {
+  try {
+    const result = await markArrived(req.bottle, { arrivedAt: req.body?.arrivedAt }, req);
+    if (result.error) {
+      const { status, message, code } = result.error;
+      return res.status(status).json({ error: message, ...(code ? { code } : {}) });
+    }
+    res.json({ bottle: result.bottle });
+  } catch (error) {
+    console.error('Mark arrived error:', error);
+    res.status(500).json({ error: 'Failed to mark the bottle as arrived' });
   }
 });
 
@@ -1012,8 +1179,13 @@ router.delete('/:id/open', requireBottleAccess('editor'), async (req, res) => {
 // POST /api/bottles/:id/pour — record a pour (default: one 125 ml glass)
 router.post('/:id/pour', requireBottleAccess('editor'), async (req, res) => {
   try {
-    const result = await pourFromBottle(req.bottle, { ml: req.body?.ml }, req);
-    if (result.error) return res.status(result.error.status).json({ error: result.error.message });
+    // expectPours: the pours the user saw, sent by the offline queue — 409
+    // state_changed when the bottle has more or fewer by now (services/bottleOps).
+    const result = await pourFromBottle(req.bottle, { ml: req.body?.ml, expectPours: req.body?.expectPours }, req);
+    if (result.error) {
+      const { status, message, code } = result.error;
+      return res.status(status).json({ error: message, ...(code ? { code } : {}) });
+    }
     res.json({ bottle: result.bottle });
   } catch (error) {
     console.error('Pour error:', error);
@@ -1048,7 +1220,7 @@ router.delete('/:id/pour', requireBottleAccess('editor'), async (req, res) => {
 });
 
 // POST /api/bottles/:id/move - Move an active bottle to another cellar you own.
-// v1: own-cellars-only + active bottles only; the bottle lands UNPLACED in the
+// v1: own-cellars-only + active (or on-order) bottles only; it lands UNPLACED in the
 // destination (freed from any source rack slot). All bottle data is kept —
 // createdAt (acquisition date) is preserved; addedToCellarAt + cellarHistory are
 // updated. requireBottleAccess('owner') enforces you own the SOURCE cellar.
@@ -1063,8 +1235,8 @@ router.post('/:id/move', requireBottleAccess('owner'), async (req, res) => {
     if (String(toCellarId) === String(sourceCellar._id)) {
       return res.status(400).json({ error: 'Bottle is already in that cellar' });
     }
-    if (bottle.status !== 'active') {
-      return res.status(400).json({ error: 'Only active bottles can be moved' });
+    if (bottle.status !== 'active' && bottle.status !== ORDERED_STATUS) {
+      return res.status(400).json({ error: 'Only bottles in the cellar or on order can be moved' });
     }
 
     // Destination must be an active cellar the user OWNS (v1: own cellars only).
@@ -1175,7 +1347,7 @@ router.post('/bulk-move', async (req, res) => {
       if (item.reason) { skipped.push({ id: item.id, reason: item.reason }); continue; }
       const { id, bottle, cellar: sourceCellar } = item;
       if (String(sourceCellar._id) === String(destCellar._id)) { skipped.push({ id, reason: 'same_cellar' }); continue; }
-      if (bottle.status !== 'active') { skipped.push({ id, reason: 'not_active' }); continue; }
+      if (bottle.status !== 'active' && bottle.status !== ORDERED_STATUS) { skipped.push({ id, reason: 'not_active' }); continue; }
       const result = await moveBottleToCellar(bottle, sourceCellar, destCellar, req);
       if (result.error) { skipped.push({ id, reason: result.error.code || 'error' }); continue; }
       movedIds.push(id);
@@ -1199,12 +1371,81 @@ router.post('/bulk-move', async (req, res) => {
   }
 });
 
+// POST /api/bottles/bulk-delete - Move MANY bottles to the cellar's "Recently
+// deleted" in ONE request (forum feedback 2026-10-12: an import to redo, a
+// batch added wrong). Nothing is gone for good yet: each bottle keeps its
+// snapshot and its own photos for TRASH_DAYS and can be restored, one at a
+// time or the whole batch (services/bottleTrash). Its rack slot is freed now.
+// Editor+ on each bottle's cellar — the single DELETE rule. Any status,
+// unless onlyOnOrder: an order's quantity lowered from a list that may be out
+// of date (another member marked bottles as arrived meanwhile) takes off only
+// bottles still on order; the rest are skipped as 'not_on_order'.
+//
+// Body:     { bottleIds: string[] (1..BULK_MAX), onlyOnOrder?: boolean }
+// Response: { deleted, deletedIds: string[], skipped: [{ id, reason }], batchId, purgeAt }
+//   reason ∈ 'not_found', 'not_on_order', 'error'
+router.post('/bulk-delete', async (req, res) => {
+  try {
+    const resolved = await resolveBulkBottles(req, (req.body || {}).bottleIds, 'editor');
+    if (resolved.error) return res.status(resolved.error.status).json({ error: resolved.error.message });
+
+    const batchId = new mongoose.Types.ObjectId();
+    const deletedAt = new Date();
+    const deletedIds = [];
+    const skipped = [];
+    let firstCellar = null;
+    const onlyOnOrder = (req.body || {}).onlyOnOrder === true;
+    for (const item of resolved.items) {
+      if (item.reason) { skipped.push({ id: item.id, reason: item.reason }); continue; }
+      // Read again right before it goes: one marked as arrived since the
+      // batch was loaded stays (the window left is milliseconds).
+      if (onlyOnOrder && (item.bottle.status !== ORDERED_STATUS
+        || !(await Bottle.exists({ _id: item.bottle._id, status: ORDERED_STATUS })))) {
+        skipped.push({ id: item.id, reason: 'not_on_order' });
+        continue;
+      }
+      // One bottle that fails is reported, not a 500 halfway through a batch
+      // whose first bottles are already in "Recently deleted".
+      let result;
+      try {
+        result = await trashBottle(item.bottle, req, { batchId, deletedAt });
+      } catch (err) {
+        console.error(`Bulk delete: bottle ${item.id} failed:`, err.message);
+        result = { error: { code: 'error' } };
+      }
+      if (result.error) { skipped.push({ id: item.id, reason: result.error.code || 'error' }); continue; }
+      if (!firstCellar) firstCellar = item.cellar;
+      deletedIds.push(item.id);
+    }
+
+    // One summary row on top of the per-bottle bottle.delete rows.
+    if (firstCellar) {
+      logAudit(req, 'bottle.bulk_delete',
+        { type: 'cellar', id: firstCellar._id, cellarId: firstCellar._id },
+        { requested: resolved.ids.length, deleted: deletedIds.length, skipped: skipped.length, batchId: String(batchId), retentionDays: TRASH_DAYS });
+    }
+
+    res.json({
+      deleted: deletedIds.length,
+      deletedIds,
+      skipped,
+      batchId,
+      purgeAt: new Date(deletedAt.getTime() + TRASH_DAYS * 24 * 60 * 60 * 1000),
+    });
+  } catch (error) {
+    console.error('Bulk delete error:', error);
+    res.status(500).json({ error: 'Failed to delete the bottles' });
+  }
+});
+
 // POST /api/bottles/bulk - ONE edit or consume applied to MANY bottles.
 //   { action: 'update',  bottleIds, fields }  → services/bottleOps.updateBottleFields
 //       per bottle. `fields` is limited to BULK_UPDATE_FIELDS — the purchase
 //       details a delivery shares (date, shop, price), the reservation
-//       ("spoken for X until 2028") and the drink window a wine and vintage
-//       share (support ticket 2026-09-06) — everything else stays per bottle.
+//       ("spoken for X until 2028"), and the drink window and notes a wine and
+//       vintage share (support ticket 2026-09-06; notes for the vintage page's
+//       "Edit vintage"), and the barcode every bottle of one product carries
+//       (the vintage page's "Add barcode") — everything else stays per bottle.
 //   { action: 'consume', bottleIds, reason, note, consumedAt, includeReserved }
 //       → services/bottleOps.consumeBottle per bottle, one date for all;
 //       already-consumed bottles are skipped as not_active, and a "spoken for"
@@ -1212,21 +1453,37 @@ router.post('/bulk-move', async (req, res) => {
 //       warns and the MCP tool refuses without an acknowledgement — bulk must
 //       not be the one path that consumes a reservation silently). The
 //       restock-gap check runs ONCE per wine+vintage afterwards, not per bottle.
-// Editor+ on each bottle's cellar (the single PUT / consume rule).
+//   { action: 'arrive', bottleIds, arrivedAt }
+//       → services/bottleOps.markArrived per bottle: a delivery of bottles on
+//       order, one day for all. A bottle not on order is skipped as
+//       'not_on_order'. expectedArrival rides 'update' like the purchase
+//       details (it is dropped on a bottle that is not on order).
+//   { action: 'restore', bottleIds }
+//       → services/bottleOps.restoreBottle per bottle: Undo of a bulk "mark
+//       as drunk" (the cellar list's and the pick list's), in ONE request —
+//       one restore call per bottle ate the member's write budget and could
+//       not undo a batch larger than the write limit. The single restore's
+//       rules: a bottle not taken out is skipped as 'not_consumed', one taken
+//       out more than two days ago as 'restore_window_expired'. Every refusal
+//       is per bottle; restore has no payload to reject.
+// Editor+ on each bottle's cellar (the single PUT / consume / restore rule).
 // A payload the shared validation rejects (a bad date, a note too long) is
 // the SAME error for every bottle, so it fails the whole request with that
 // message before anything is touched, rather than reporting N identical skips.
 // Response: { done, doneIds: string[], skipped: [{ id, reason }] }
-const BULK_UPDATE_FIELDS = ['price', 'currency', 'purchaseDate', 'purchaseLocation', 'purchaseUrl', 'reservedFor', 'reservedUntil', 'drinkFrom', 'drinkTo', 'peakFrom', 'peakUntil'];
+const BULK_UPDATE_FIELDS = ['price', 'currency', 'purchaseDate', 'purchaseLocation', 'purchaseUrl', 'reservedFor', 'reservedUntil', 'drinkFrom', 'drinkTo', 'peakFrom', 'peakUntil', 'notes', 'barcode', 'expectedArrival'];
 router.post('/bulk', async (req, res) => {
   try {
     const { action, bottleIds } = req.body || {};
-    if (!['update', 'consume'].includes(action)) {
-      return res.status(400).json({ error: 'action must be "update" or "consume"' });
+    if (!['update', 'consume', 'arrive', 'restore'].includes(action)) {
+      return res.status(400).json({ error: 'action must be "update", "consume", "arrive" or "restore"' });
     }
     let fields = null;
     let consumeArgs = null;
-    if (action === 'update') {
+    const arriveArgs = action === 'arrive' ? { arrivedAt: req.body.arrivedAt } : null;
+    if (action === 'arrive' || action === 'restore') {
+      // Nothing more to collect — markArrived validates the date; restore takes none.
+    } else if (action === 'update') {
       const src = req.body.fields;
       if (!src || typeof src !== 'object' || Array.isArray(src)) {
         return res.status(400).json({ error: 'fields must be an object' });
@@ -1235,6 +1492,28 @@ router.post('/bulk', async (req, res) => {
       for (const k of BULK_UPDATE_FIELDS) if (src[k] !== undefined) fields[k] = src[k];
       if (Object.keys(fields).length === 0) {
         return res.status(400).json({ error: `fields must include at least one of: ${BULK_UPDATE_FIELDS.join(', ')}` });
+      }
+      // A demo account cannot add a barcode (each code is a vote in the
+      // shared lookup). The shared update refuses it per bottle with a 403,
+      // which the loop below would turn into "skipped" behind a 200 — refuse
+      // the request itself, as the single-bottle route does.
+      if (fields.barcode && req.user.isDemo) {
+        return res.status(403).json({ error: 'Demo accounts cannot add barcodes' });
+      }
+      // A bad month is the same error for every bottle: refuse it up front.
+      // The shared update only parses it on bottles on order (it drops the
+      // field on any other), so an invalid value would otherwise pass or fail
+      // depending on which bottle came first in the list.
+      if (fields.expectedArrival !== undefined) {
+        const p = parseExpectedArrival(fields.expectedArrival);
+        if (!p.ok) return res.status(400).json({ error: p.error });
+      }
+      // A currency: an alias is sent on as its code ("EURO" → "EUR") and a
+      // non-string is refused here; an unsupported code is checked below,
+      // once the bottles are known.
+      if (fields.currency !== undefined && fields.currency !== null && fields.currency !== '') {
+        if (typeof fields.currency !== 'string') return res.status(400).json({ error: 'Invalid currency' });
+        fields.currency = normalizeCurrency(fields.currency);
       }
     } else {
       const { reason = 'drank', note, consumedAt } = req.body;
@@ -1248,6 +1527,15 @@ router.post('/bulk', async (req, res) => {
     const resolved = await resolveBulkBottles(req, bottleIds, 'editor');
     if (resolved.error) return res.status(resolved.error.status).json({ error: resolved.error.message });
 
+    // An unsupported currency is refused once, not skipped bottle by bottle —
+    // unless it is the own code of a bottle in the selection (an older
+    // import's code, which a lot edit of that bottle carries; release audit
+    // 2026-10-13). The shared update then keeps it or refuses it per bottle.
+    if (fields && typeof fields.currency === 'string' && fields.currency && !isSupportedCurrency(fields.currency)
+        && !resolved.items.some((it) => it.bottle && normalizeCurrency(it.bottle.currency || '') === fields.currency)) {
+      return res.status(400).json({ error: parseCurrency(fields.currency).error });
+    }
+
     const doneIds = [];
     const skipped = [];
     const restockPairs = new Map(); // `${wine}|${vintage}` → one representative bottle
@@ -1260,6 +1548,12 @@ router.post('/bulk', async (req, res) => {
       let result;
       if (action === 'update') {
         result = await updateBottleFields(bottle, { ...fields }, req);
+      } else if (action === 'arrive') {
+        if (bottle.status !== ORDERED_STATUS) { skipped.push({ id, reason: 'not_on_order' }); continue; }
+        result = await markArrived(bottle, arriveArgs, req);
+      } else if (action === 'restore') {
+        if (!CONSUMED_STATUSES.includes(bottle.status)) { skipped.push({ id, reason: 'not_consumed' }); continue; }
+        result = await restoreBottle(bottle, req);
       } else {
         if (bottle.status !== 'active') { skipped.push({ id, reason: 'not_active' }); continue; }
         if (!includeReserved && isReserved(bottle)) { skipped.push({ id, reason: 'reserved' }); continue; }
@@ -1270,8 +1564,10 @@ router.post('/bulk', async (req, res) => {
         // A 400 about THIS bottle's own values (its peak outside the new
         // window) is a per-bottle skip, whatever its position in the list;
         // only a payload-wide error still fails the whole request up front
-        // (audit 2026-09-07: the outcome depended on list order).
-        const perBottle = result.error.status === 400 && /cannot be (after|before)/.test(result.error.message || '');
+        // (audit 2026-09-07: the outcome depended on list order). A restore
+        // refusal is always about the bottle (its two days are over).
+        const perBottle = action === 'restore'
+          || (result.error.status === 400 && /cannot be (after|before)/.test(result.error.message || ''));
         if (result.error.status === 400 && !touched && !perBottle) {
           return res.status(400).json({ error: result.error.message });
         }
@@ -1287,18 +1583,25 @@ router.post('/bulk', async (req, res) => {
     // fires a paid embedding call.
     if (action === 'consume' && consumeArgs.reason === 'drank' && !req.user.isDemo && restockPairs.size) {
       const { checkRestockGap } = require('../services/restockChecker');
+      // Same no-AI rule for a token as consumeBottle (this route is not on
+      // the token allowlist today; the option keeps it safe if it ever is).
       for (const b of restockPairs.values()) {
-        checkRestockGap(req.user.id, b._id, b.cellar).catch(() => {});
+        checkRestockGap(req.user.id, b._id, b.cellar, { storedVectorOnly: !!req.apiToken }).catch(() => {});
       }
     }
 
-    // One summary row on top of the per-bottle update / consume rows.
+    // One summary row on top of the per-bottle update / consume / arrive /
+    // restore rows.
     if (firstCellar) {
-      logAudit(req, action === 'update' ? 'bottle.bulk_update' : 'bottle.bulk_consume',
+      const summaryAction = {
+        update: 'bottle.bulk_update', consume: 'bottle.bulk_consume', arrive: 'bottle.bulk_arrive', restore: 'bottle.bulk_restore',
+      }[action];
+      logAudit(req, summaryAction,
         { type: 'cellar', id: firstCellar._id, cellarId: firstCellar._id },
         {
           requested: resolved.ids.length, done: doneIds.length, skipped: skipped.length,
-          ...(action === 'update' ? { fields: Object.keys(fields) } : { reason: consumeArgs.reason }),
+          ...(action === 'update' ? { fields: Object.keys(fields) } : {}),
+          ...(action === 'consume' ? { reason: consumeArgs.reason } : {}),
         });
     }
 
@@ -1339,19 +1642,34 @@ router.post('/:id/restore', requireBottleAccess('editor'), async (req, res) => {
 
 // POST /api/bottles/:id/undo - Reverse an incorrectly-added bottle.
 // The bottle disappears from cellar, racks, search, and stats as if it had
-// never been added. Internal audit log keeps the original `bottle.add` row
-// plus a new `bottle.undo` row so admins can still investigate disputes.
-// Active bottles only — consumed bottles must use a different path.
+// never been added — into the cellar's "Recently deleted" for TRASH_DAYS, like
+// any delete in the app (services/bottleTrash), so a slip on "Added by
+// mistake?" can be undone. It used to be gone for good. The audit log keeps the
+// original `bottle.add` row plus a `bottle.undo` row so admins can still tell
+// a mistaken add from a deletion. Active (or on-order) bottles only — consumed
+// bottles must use a different path. The MCP undo tools call the service
+// layer directly and are unchanged.
+// Response: { message, batchId, purgeAt } — batchId restores it (POST /trash/restore).
 router.post('/:id/undo', requireBottleAccess('editor'), async (req, res) => {
   try {
-    // Full cleanup cascade shared with the MCP undo path (services/bottleOps).
-    const result = await removeBottleCascade(req.bottle, req, 'bottle.undo');
-    if (result.error) {
-      return res.status(result.error.status).json({
+    if (req.bottle.status !== 'active' && req.bottle.status !== ORDERED_STATUS) {
+      return res.status(400).json({
         error: 'Only active bottles can be marked as a mistake. Already-consumed bottles cannot be undone.'
       });
     }
-    res.json({ message: 'Bottle removed as mistake' });
+    const batchId = new mongoose.Types.ObjectId();
+    const deletedAt = new Date();
+    const result = await trashBottle(req.bottle, req, { batchId, deletedAt, auditAction: 'bottle.undo' });
+    if (result.error) {
+      return res.status(result.error.status || 400).json({
+        error: 'Only active bottles can be marked as a mistake. Already-consumed bottles cannot be undone.'
+      });
+    }
+    res.json({
+      message: 'Bottle removed as mistake',
+      batchId,
+      purgeAt: new Date(deletedAt.getTime() + TRASH_DAYS * 24 * 60 * 60 * 1000),
+    });
   } catch (error) {
     console.error('Undo bottle error:', error);
     res.status(500).json({ error: 'Failed to undo bottle' });
@@ -1364,44 +1682,15 @@ router.post('/:id/undo', requireBottleAccess('editor'), async (req, res) => {
 // of orphaning BottleImage docs and pending requests.
 router.delete('/:id', requireBottleAccess('editor'), async (req, res) => {
   try {
-    const { bottle } = req;
-    const pendingRequestId = bottle.pendingWineRequest || null;
-
-    // Remove bottle from any rack slot that references it
-    await removeFromRacks(bottle._id);
-
-    // The user's own photos go with the bottle; registry photos (the wine's
-    // picture, or any photo approved as public — services/photoRetention)
-    // are kept and detached, other people see them.
-    const ownImages = await BottleImage.find({ bottle: bottle._id, ...OWN_PHOTO })
-      .select('originalUrl processedUrl').lean();
-    for (const img of ownImages) await unlinkImageFiles(img);
-    await BottleImage.deleteMany({ bottle: bottle._id, ...OWN_PHOTO });
-    await BottleImage.updateMany(
-      { bottle: bottle._id, ...REGISTRY_PHOTO },
-      { $set: { bottle: null } }
-    );
-    await bottle.deleteOne();
-
-    // After the delete, as every other writer audits: the audit moves the
-    // data version, and a search reading the new version before the bottle
-    // is gone would keep it for its whole cache window.
-    logAudit(req, 'bottle.delete',
-      { type: 'bottle', id: bottle._id, cellarId: bottle.cellar },
-      {}
-    );
-
-    // Only when THIS was the last bottle waiting on the request — see the
-    // same guard in services/bottleOps.removeBottleCascade for the full
-    // reasoning. One import request covers every bottle of that wine, so
-    // deleting it outright orphaned the siblings. Counted after the bottle
-    // is gone so it cannot count itself.
-    if (pendingRequestId) {
-      const stillWaiting = await Bottle.countDocuments({ pendingWineRequest: pendingRequestId });
-      if (stillWaiting === 0) {
-        await WineRequest.deleteOne({ _id: pendingRequestId, status: 'pending' });
-      }
-    }
+    // The shared cascade (services/bottleOps.removeBottleCascade), the same
+    // one MCP delete_bottle runs, for a bottle of any status: rack slot
+    // freed, the user's own photos deleted with their files, registry photos
+    // (the wine's picture, or any photo approved as public) kept and
+    // detached, the import request withdrawn only when THIS was the last
+    // bottle waiting on it, and the audit written after the delete so the
+    // data version moves once the bottle is really gone.
+    const result = await removeBottleCascade(req.bottle, req, 'bottle.delete', { anyStatus: true, auditDetail: {} });
+    if (result.error) return res.status(result.error.status).json({ error: result.error.message });
     res.json({ message: 'Bottle deleted successfully' });
   } catch (error) {
     console.error('Delete bottle error:', error);
