@@ -44,6 +44,9 @@ COPY nginx-main.conf /etc/nginx/nginx.conf
 # asked to (NGINX_ENTRYPOINT_LOCAL_RESOLVERS); a value set in the
 # environment wins over the file.
 ENV NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1
+# host:port of the backend for the upstream block in nginx.conf. Kubernetes
+# needs the Service's full name here (see the comment there).
+ENV CELLARION_BACKEND_UPSTREAM=backend:5000
 # The one host search engines may index; every other host answers with
 # X-Robots-Tag: noindex (the $robots_tag map in robots-tag.conf). A self-hoster
 # who wants their own public install in search results sets this to its bare
