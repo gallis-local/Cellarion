@@ -59,8 +59,35 @@ jobs:
           fi
           echo "Merging $BEHIND commit(s) from upstream/main."
           git merge upstream/main --no-edit
-          git push origin main
+          # GITHUB_TOKEN can never hold the `workflows` permission, so GitHub
+          # rejects this push whenever upstream's new commits touch
+          # .github/workflows/** (runs 38143115706, 39131222623). Say so
+          # instead of leaving a bare "remote rejected" to decode.
+          if ! git push origin main; then
+            if git diff --name-only ORIG_HEAD HEAD -- .github/workflows | grep -q .; then
+              echo "::error::upstream changed .github/workflows/**, which GITHUB_TOKEN may not push. Sync by hand: clone, git merge upstream/main, push (or open a PR)."
+            fi
+            exit 1
+          fi
           echo "synced=true" >> "$GITHUB_OUTPUT"
+
+      # The ARC runner image has no `gh` -- run 40197289657 merged and pushed,
+      # then died here with `gh: command not found` (exit 127), so the synced
+      # code was never built. Pinned version + in-repo SHA-256, not a checksum
+      # file fetched from the same place as the tarball.
+      - name: Install GitHub CLI
+        if: steps.sync.outputs.synced == 'true'
+        env:
+          GH_CLI_VERSION: "2.101.0"
+          GH_CLI_SHA256: 9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8
+        run: |
+          set -euo pipefail
+          command -v gh >/dev/null && { gh --version; exit 0; }
+          tgz="gh_${GH_CLI_VERSION}_linux_amd64.tar.gz"
+          curl -sSfLo "$RUNNER_TEMP/$tgz" "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/$tgz"
+          echo "${GH_CLI_SHA256}  $RUNNER_TEMP/$tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gh_${GH_CLI_VERSION}_linux_amd64/bin" >> "$GITHUB_PATH"
 
       - name: Trigger Harbor build
         if: steps.sync.outputs.synced == 'true'
