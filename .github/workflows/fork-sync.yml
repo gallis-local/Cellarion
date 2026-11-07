@@ -62,8 +62,13 @@ jobs:
           git push origin main
           echo "synced=true" >> "$GITHUB_OUTPUT"
 
+      # actions/github-script, not `gh workflow run`: the self-hosted runner
+      # image has no gh CLI, so that step would exit 127 after a good sync.
       - name: Trigger Harbor build
         if: steps.sync.outputs.synced == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run build-harbor.yml --repo ${{ github.repository }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              ...context.repo, workflow_id: "build-harbor.yml", ref: "main",
+            });
