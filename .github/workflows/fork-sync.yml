@@ -62,6 +62,24 @@ jobs:
           git push origin main
           echo "synced=true" >> "$GITHUB_OUTPUT"
 
+      # The self-hosted ARC runner image ships without the gh CLI, so the
+      # dispatch below exited 127 after a good sync. Install a pinned,
+      # checksum-verified gh into the job (same pattern as eg-hermes).
+      - name: Install gh
+        if: steps.sync.outputs.synced == 'true'
+        run: |
+          set -euo pipefail
+          V=2.103.3
+          cd "$RUNNER_TEMP"
+          curl -fsSLo "gh_${V}_linux_amd64.tar.gz" "https://github.com/cli/cli/releases/download/v${V}/gh_${V}_linux_amd64.tar.gz"
+          curl -fsSLo "gh_${V}_checksums.txt" "https://github.com/cli/cli/releases/download/v${V}/gh_${V}_checksums.txt"
+          grep " gh_${V}_linux_amd64.tar.gz$" "gh_${V}_checksums.txt" | sha256sum --check --quiet
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "gh_${V}_linux_amd64.tar.gz"
+          install -m 0755 "gh_${V}_linux_amd64/bin/gh" "$RUNNER_TEMP/bin/gh"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/gh" --version
+
       - name: Trigger Harbor build
         if: steps.sync.outputs.synced == 'true'
         env:
