@@ -70,7 +70,9 @@ const {
 } = require('./findOrCreateWine');
 
 const USER_ID = 'user-1';
-const POPULATE = ['country', 'region', 'grapes'];
+// Mirrors the service's POPULATE: the label sweetness term rides along so the
+// style guard reads a candidate's record, not only its name.
+const POPULATE = ['country', 'region', 'grapes', { path: 'labelSweetness', select: 'name band scale regulated -_id' }];
 
 const INPUT = {
   name: 'Clos des Papes',
@@ -116,7 +118,7 @@ function primeFind({ canonicalHits = [], canonicalSiblings = [], siblings = [], 
     if (q && q.normalizedKey) {
       return { limit: jest.fn().mockReturnValue({ populate: jest.fn().mockResolvedValue(siblings) }) };
     }
-    // Label-variant stage (somm ticket e9b346ba): producer-scoped sweep.
+    // Label-variant stage: producer-scoped sweep.
 
     if (q && q.producer && !q.canonicalKey && !q.normalizedKey) {
 
@@ -262,7 +264,7 @@ describe('findOrCreateWine — producer-prefix canonicalization (step 0)', () =>
   test('a name identical to the producer is left alone (nothing would remain)', async () => {
     // Step 0 is the subject here: the strip must not eat the whole name.
     //
-    // INVERTED (audit H-1): this briefly asserted pendingIdentity: true, because
+    // INVERTED: this briefly asserted pendingIdentity: true, because
     // the shape gate refused producer === name. That refusal is gone — it is the
     // single-wine estate, and "Paul Avril"/"Paul Avril" is exactly the shape
     // Petrus and Château Margaux have. The row mints PUBLIC, name intact.
@@ -637,8 +639,7 @@ describe('findOrCreateWine — fuzzy threshold routing', () => {
 
     const result = await findOrCreateWine(INPUT, USER_ID);
 
-    // A quarantined non-wine is out of the index and out of this fallback too
-    // (audit 2026-10-14).
+    // A quarantined non-wine is out of the index and out of this fallback too.
     expect(WineDefinition.find).toHaveBeenCalledWith({
       $text: { $search: 'Clos des Papes Paul Avril' },
       nonWine: { $ne: true },
@@ -826,6 +827,12 @@ describe('findOrCreateWine — creation', () => {
     expect(WineDefinition.mock.calls[0][0].type).toBe('sparkling');
   });
 
+  test('the Other category (opts.nonWine) mints with no wine type and the non-wine flag', async () => {
+    await findOrCreateWine({ ...INPUT, type: 'sparkling' }, USER_ID, { nonWine: true });
+    expect(WineDefinition.mock.calls[0][0].type).toBeNull();
+    expect(WineDefinition.mock.calls[0][0].nonWine).toBe(true);
+  });
+
   test('field lengths are capped at 200 characters (registry pollution / fuzzy-cost bound)', async () => {
     await findOrCreateWine({ ...INPUT, name: 'x'.repeat(300) }, USER_ID);
 
@@ -848,7 +855,7 @@ describe('findOrCreateWine — creation', () => {
     expect(doc.normalizedKey).toBe(generateWineKey('Clos des Papes', 'Paul Avril', ''));
   });
 
-  describe('an appellation typed in the region column (Johan, 2026-09-08)', () => {
+  describe('an appellation typed in the region column', () => {
     const fleurie = { _id: 'ap-fleurie', name: 'Fleurie', region: 'region-beaujolais' };
     const beaujolais = { _id: 'region-beaujolais', name: 'Beaujolais' };
     // appellationInRegionColumn queries find({country, $or}).limit(2).lean();
@@ -1190,7 +1197,7 @@ describe('taxonomy find-or-create dedup', () => {
     expect(Grape).toHaveBeenCalledWith({
       name: 'Syrah', normalizedName: 'syrah', createdBy: USER_ID,
       createdByUser: true,
-      // Somm ticket 6a942a60 ("Honey", "Alvarão"): a user-write grape mint is
+      // A user-write grape mint is
       // born flagged for admin review — visible, never blocking. Same R3 rule
       // as the region mint above.
       createdByUser: true,
@@ -1265,7 +1272,7 @@ describe('taxonomy find-or-create dedup', () => {
 });
 
 /**
- * Region canon (policy 2026-08-16, ticket 6a8162c5): when the appellation
+ * Region canon: when the appellation
  * itself names a region the taxonomy has, the region field holds THAT region
  * — the most specific granularity — regardless of what the caller supplied.
  * This is what stops one import batch minting the same producer's wines under
@@ -1274,7 +1281,7 @@ describe('taxonomy find-or-create dedup', () => {
  */
 describe('findOrCreateWine — region canon: appellation granularity wins', () => {
   // The canon lookup is Region.find(...).limit(2) — TWO hits mean a taxonomy
-  // duplicate and the canon must refuse to pick (audit 2026-08-16). This
+  // duplicate and the canon must refuse to pick. This
   // dispatcher serves that shape for canon queries and keeps the chainable
   // taxonomy default for everything else (cross-field reference loads).
   const primeRegionCanon = (map) => {
@@ -1351,8 +1358,8 @@ describe('findOrCreateWine — region canon: appellation granularity wins', () =
 });
 
 /**
- * Classification (ticket 6a8162c5, the Giscours case): the scan prompt now
- * has a slot for the printed classification line, and it is stored on a
+ * Classification: the scan prompt has a slot for the printed classification
+ * line, and it is stored on a
  * CREATE — folded and capped like the identity fields, but never matched or
  * keyed on.
  */
@@ -1370,13 +1377,13 @@ describe('findOrCreateWine — classification is stored on create', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Label-variant detection must survive confirmCreate (somm ticket e9b346ba).
+// Label-variant detection must survive confirmCreate.
 //
-// v1.171.0 shipped this stage gated on skipSiblingMatch, which wineCommit sets
-// from confirmCreate. Five hours later HALL "The North End Cabernet Sauvignon"
-// was minted through the UI, duplicating "The North End" — because the pair
-// scores 0.748, BELOW the 0.85 soft-zone floor, so the existing wine was never
-// in the candidate list the user rejected. confirmCreate means "I reviewed the
+// wineCommit sets skipSiblingMatch from confirmCreate, so a stage gated on it
+// would let "The North End Cabernet Sauvignon" be minted beside the same
+// producer's "The North End" — the pair scores 0.748, BELOW the 0.85
+// soft-zone floor, so the existing wine is never in the candidate list the
+// user rejected. confirmCreate means "I reviewed the
 // suggestions"; it cannot mean "I rejected a wine nobody showed me".
 // ---------------------------------------------------------------------------
 describe('findOrCreateWine — label variants are caught even on confirmCreate', () => {
@@ -1467,10 +1474,10 @@ describe('findOrCreateWine — label variants are caught even on confirmCreate',
   });
 });
 
-describe('findOrCreateWine — a ripeness Prädikat is not an appellation (audit ticket 2026-09-03)', () => {
-  // The import paths already routed a bare Prädikat out of the appellation
-  // (PR #1173); the add-bottle form did not, and a Weingut Herztal record
-  // arrived with appellation "Kabinett". Every mint now applies the rule.
+describe('findOrCreateWine — a ripeness Prädikat is not an appellation', () => {
+  // The import paths route a bare Prädikat out of the appellation;
+  // the add-bottle form must too, or a record arrives with appellation
+  // "Kabinett". Every mint applies the rule.
   test('a bare Prädikat leaves the appellation and lands in classification', async () => {
     await findOrCreateWine({ ...INPUT, name: 'Spätburgunder Rotwein Kabinett Trocken', appellation: 'Kabinett' }, USER_ID);
     const doc = WineDefinition.mock.calls[0][0];

@@ -6,13 +6,14 @@ import { fetchLotHistory } from '../../api/bottles';
 import RatingDisplay from '../RatingDisplay';
 import { CONSUMED_LABEL_KEYS } from '../BottleJourney';
 import './LotHistory.css';
+import { formatVintage } from '../../utils/vintage';
 
 const REASON_ICONS = { drank: '\u{1F377}', gifted: '\u{1F381}', sold: '\u{1F4B0}', other: '\u{1F4E6}' };
 
 /**
  * "This wine in your cellar" — what happened to the viewer's OTHER bottles of
- * the wine on screen (support ticket 2026-09-16: "if I drink a bottle, I can't
- * see that information in the other bottles"). Each drunk sibling shows its
+ * the wine on screen, so drinking one bottle is visible from the others.
+ * Each drunk sibling shows its
  * date, rating and note, and links to its own page.
  *
  * Nothing is copied between bottles: the rows are computed on read by
@@ -114,7 +115,7 @@ function LotBlock({ lot, currentBottleId, heading }) {
 // vintage there are, so the counts would only repeat it. What stays is what
 // the page does not show — the bottles of this vintage already drunk, with
 // their dates, ratings and notes — and the other vintages of the wine as
-// rows that open their own vintage pages (beta feedback 2026-10-10). Each
+// rows that open their own vintage pages. Each
 // opens in the cellar the lot names: where bottles of it are left, else
 // where it was drunk; this cellar when it is one of them.
 //
@@ -160,7 +161,7 @@ function VintagePageHistory({ thisLot, otherLots, cellarId, fromPath = null, con
             {otherLots.map((lot) => (
               <li key={String(lot.vintage)}>
                 <Link to={hrefOf(lot)} className="lot-history__vintage-row">
-                  <span className="lot-history__vintage-year">{lot.vintage}</span>
+                  <span className="lot-history__vintage-year">{formatVintage(lot.vintage, t)}</span>
                   <span className="lot-history__vintage-counts"><LotCounts lot={lot} /></span>
                   <span className="lot-history__vintage-go" aria-hidden="true">›</span>
                 </Link>
@@ -173,8 +174,8 @@ function VintagePageHistory({ thisLot, otherLots, cellarId, fromPath = null, con
   );
 }
 
-// `vintageHref`: the vintage page for this bottle's wine and vintage (support
-// ticket 2026-10-09). Offered from the card so the page stays reachable from
+// `vintageHref`: the vintage page for this bottle's wine and vintage.
+// Offered from the card so the page stays reachable from
 // a DRUNK bottle too — once the last bottle of a vintage is gone the cellar
 // list has no group to open it from, and this card is where the history of
 // that vintage already lives.
@@ -270,7 +271,7 @@ export default function LotHistory({ apiFetch, bottleId, vintage, isOwner = true
                   key={String(lot.vintage)}
                   lot={lot}
                   currentBottleId={bottleId}
-                  heading={lot.vintage}
+                  heading={formatVintage(lot.vintage, t)}
                 />
               ))}
             </>

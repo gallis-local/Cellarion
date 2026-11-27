@@ -91,15 +91,15 @@ describe('buildRecipients', () => {
 
     const pipeline = Bottle.aggregate.mock.calls[0][0];
     expect(pipeline[0].$match.status).toEqual({ $nin: NOT_IN_CELLAR_STATUSES });
-    // Only bottles in a cellar that still exists (support ticket 2026-10-14:
-    // a question linked to a bottle in a deleted cellar led to "not found").
+    // Only bottles in a cellar that still exists (a question linked to a
+    // bottle in a deleted cellar would lead to "not found").
     expect(pipeline[1].$lookup).toMatchObject({ from: 'cellars', localField: 'cellar', foreignField: '_id' });
     expect(pipeline[1].$lookup.pipeline[0]).toEqual({ $match: { deletedAt: null } });
     expect(pipeline[2]).toEqual({ $match: { 'liveCellar.0': { $exists: true } } });
     // Newest-first sort feeds $first, so each user's entry is their latest bottle.
     expect(pipeline[3]).toEqual({ $sort: { createdAt: -1 } });
     expect(pipeline[4].$group._id).toBe('$user');
-    // Audit 2026-08-11: demo accounts can never respond (requireNonDemo) and
+    // Demo accounts can never respond (requireNonDemo) and
     // must not crowd real owners out of the cap — excluded BEFORE $limit; and
     // the cap must be deterministic (newest owners), so the group re-sorts on
     // the captured latest before limiting ($group emits undefined order).
@@ -211,7 +211,7 @@ describe('createOwnerInquiry', () => {
     expect(created.recipients[0].cellar).toBeUndefined();
 
     // One batch call, one item per recipient, linked to the QUESTION, which
-    // finds a bottle they can open when they click (support ticket 2026-10-14).
+    // finds a bottle they can open when they click.
     expect(createNotifications).toHaveBeenCalledTimes(1);
     const items = createNotifications.mock.calls[0][0];
     expect(items).toHaveLength(2);
@@ -330,7 +330,7 @@ describe('resolveOwnerInquiry', () => {
       message: REPLY,
       link: `/questions/${INQUIRY}`,
     });
-    // The link no longer needs the bottles' cellars (support ticket 2026-10-14).
+    // The link does not need the bottles' cellars.
     expect(Bottle.find).not.toHaveBeenCalled();
     // The recipient who ignored the question is owed nothing.
     expect(items.map((i) => i.userId)).not.toContain(oid('7'));
@@ -357,10 +357,9 @@ describe('resolveOwnerInquiry', () => {
     expect(Bottle.find).not.toHaveBeenCalled();
   });
 
-  // Support ticket 2026-10-14: this used to lose the link (a bottle deleted
-  // since the answer had no cellar to link to). The question link needs no
-  // bottle, and finds one the owner can open when they click.
-  test('a bottle deleted since the answer no longer costs the link', async () => {
+  // A bottle deleted since the answer has no cellar to link to. The question
+  // link needs no bottle, and finds one the owner can open when they click.
+  test('a bottle deleted since the answer does not cost the link', async () => {
     mockClaim(claimedDoc([answered[0]]));
 
     await resolveOwnerInquiry({ inquiryId: INQUIRY, userId: ADMIN, note: NOTE, ownerReply: REPLY });
@@ -512,7 +511,7 @@ describe('closeInquiriesForWineDelete', () => {
   });
 });
 
-// ── The OWNER side (2026-09-24): shared by routes/ownerInquiries.js and the
+// ── The OWNER side: shared by routes/ownerInquiries.js and the
 // MCP tools list_curator_questions / answer_curator_question. The route test
 // pins the HTTP contract; these pin the service the MCP path calls directly.
 describe('owner side', () => {
@@ -540,6 +539,19 @@ describe('owner side', () => {
   });
 
   describe('listInquiriesForRecipient', () => {
+    const C1 = oid('3');
+    const C2 = oid('4');
+    // Where a bottle of the wine is: Cellar.find → select → lean; the recorded
+    // bottles by id (Bottle.find → select → lean); the newest bottle on a shelf
+    // per wine (Bottle.aggregate, one group per wine).
+    const places = ({ cellars = [], recorded = [], newest = [] } = {}) => {
+      Cellar.find.mockReturnValue({ select: jest.fn(() => ({ lean: async () => cellars })) });
+      Bottle.find.mockReturnValue({ select: jest.fn(() => ({ lean: async () => recorded })) });
+      Bottle.aggregate.mockResolvedValue(newest);
+    };
+    beforeEach(() => places());
+    const withPlaces = { withPlaces: true };
+
     test('projects ONLY the caller recipient entry — never the other recipients, their ids or answers', async () => {
       WineOwnerInquiry.find.mockReturnValue(findChain([row()]));
 
@@ -556,7 +568,7 @@ describe('owner side', () => {
       // Addressed to me; answered, or open-and-not-expired, or recently resolved.
       const filter = WineOwnerInquiry.find.mock.calls[0][0];
       expect(filter['recipients.user']).toBe(ME);
-      // An answered inquiry expires like an open one (release audit 2026-09-27, L).
+      // An answered inquiry expires like an open one.
       expect(filter.$or[0]).toMatchObject({ status: 'answered' });
       expect(filter.$or[0].expiresAt.$gt).toBeInstanceOf(Date);
       expect(filter.$or[1].status).toBe('open');
@@ -594,11 +606,162 @@ describe('owner side', () => {
       expect(await listInquiriesForRecipient(ME, { wineId: 'not-an-id' })).toEqual([]);
       expect(WineOwnerInquiry.find).toHaveBeenCalledTimes(1);
     });
+
+    test('each row names the cellar and vintage of the recorded bottle while it is on a shelf, in three queries for the whole list', async () => {
+      const I2 = oid('d');
+      WineOwnerInquiry.find.mockReturnValue(findChain([
+        row(),
+        row({ _id: I2, recipients: [{ user: ME, bottle: oid('7'), response: null }, { user: OTHER, bottle: oid('6'), response: null }] }),
+      ]));
+      places({
+        cellars: [{ _id: C1, name: 'Summer house' }, { _id: C2, name: 'Flat' }],
+        recorded: [
+          { _id: oid('5'), wineDefinition: WINE, cellar: C1, vintage: '2016' },
+          { _id: oid('7'), wineDefinition: WINE, cellar: C1, vintage: 'NV' },
+        ],
+        // A newer bottle of the wine elsewhere does not displace the recorded one.
+        newest: [{ _id: WINE, cellar: C2, vintage: '2020' }],
+      });
+
+      const out = await listInquiriesForRecipient(ME, withPlaces);
+
+      expect(out.map((r) => [r._id, r.cellar, r.vintage])).toEqual([
+        [I1, { _id: C1, name: 'Summer house' }, '2016'],
+        [I2, { _id: C1, name: 'Summer house' }, 'NV'],
+      ]);
+      expect(Cellar.find).toHaveBeenCalledTimes(1);
+      expect(Cellar.find).toHaveBeenCalledWith({ $or: [{ user: ME }, { 'members.user': ME }], deletedAt: null });
+      expect(Bottle.find).toHaveBeenCalledTimes(1);
+      expect(Bottle.aggregate).toHaveBeenCalledTimes(1);
+      // Only the caller's recorded bottles, only of the list's wines, only on a
+      // shelf in cellars they can open — the other recipient's bottle is never
+      // even read.
+      const byId = Bottle.find.mock.calls[0][0];
+      expect(byId._id).toEqual({ $in: [oid('5'), oid('7')] });
+      expect(byId.wineDefinition.$in.map(String)).toEqual([WINE]);
+      expect(byId.cellar).toEqual({ $in: [C1, C2] });
+      expect(byId.status).toEqual({ $nin: NOT_IN_CELLAR_STATUSES });
+      // The fallback is one bottle per wine (the newest on a shelf), however
+      // many the member holds.
+      const pipeline = Bottle.aggregate.mock.calls[0][0];
+      expect(pipeline[0].$match).toEqual({ wineDefinition: byId.wineDefinition, cellar: byId.cellar, status: byId.status });
+      expect(pipeline[1]).toEqual({ $sort: { createdAt: -1, _id: -1 } });
+      expect(pipeline[2].$group._id).toBe('$wineDefinition');
+      expect(pipeline).toHaveLength(3);
+      const raw = JSON.stringify(out);
+      expect(raw).not.toContain(oid('6'));
+      expect(raw).not.toContain(OTHER);
+    });
+
+    test('the recorded bottle drunk, deleted or out of reach: the newest bottle of the wine on a shelf names the place', async () => {
+      WineOwnerInquiry.find.mockReturnValue(findChain([row()]));
+      // The recorded bottle no longer matches (drunk, deleted, or in a cellar
+      // the caller cannot open): the query by id finds nothing.
+      places({
+        cellars: [{ _id: C1, name: 'Summer house' }, { _id: C2, name: 'Flat' }],
+        recorded: [],
+        newest: [{ _id: WINE, cellar: C2, vintage: '2019' }],
+      });
+
+      const [view] = await listInquiriesForRecipient(ME, withPlaces);
+
+      expect(view).toMatchObject({ cellar: { _id: C2, name: 'Flat' }, vintage: '2019' });
+      expect(String(view.bottle)).toBe(oid('5')); // the recorded bottle itself is not rewritten
+    });
+
+    test('a recorded bottle re-linked to another wine does not place the question: a bottle of the inquiry\'s wine does, or nothing', async () => {
+      const OTHER_WINE = oid('e');
+      WineOwnerInquiry.find.mockReturnValue(findChain([row()]));
+      const relinked = { _id: oid('5'), wineDefinition: OTHER_WINE, cellar: C1, vintage: '2016' };
+
+      places({
+        cellars: [{ _id: C1, name: 'Summer house' }, { _id: C2, name: 'Flat' }],
+        recorded: [relinked],
+        newest: [{ _id: WINE, cellar: C2, vintage: '2018' }],
+      });
+      let [view] = await listInquiriesForRecipient(ME, withPlaces);
+      expect(view).toMatchObject({ cellar: { _id: C2, name: 'Flat' }, vintage: '2018' });
+
+      // No other bottle of the inquiry's wine on a shelf: no place, and not the
+      // re-linked bottle's cellar or vintage.
+      places({ cellars: [{ _id: C1, name: 'Summer house' }], recorded: [relinked], newest: [{ _id: OTHER_WINE, cellar: C1, vintage: '2016' }] });
+      [view] = await listInquiriesForRecipient(ME, withPlaces);
+      expect(view).toMatchObject({ cellar: null, vintage: null });
+    });
+
+    test('no bottle of the wine on a shelf the caller can open gives cellar and vintage null', async () => {
+      WineOwnerInquiry.find.mockReturnValue(findChain([row()]));
+
+      places({ cellars: [{ _id: C1, name: 'Summer house' }], recorded: [], newest: [] });
+      let [view] = await listInquiriesForRecipient(ME, withPlaces);
+      expect(view).toMatchObject({ cellar: null, vintage: null });
+
+      // No cellar they can open at all: no bottle is looked up.
+      places({ cellars: [] });
+      Bottle.find.mockClear();
+      Bottle.aggregate.mockClear();
+      [view] = await listInquiriesForRecipient(ME, withPlaces);
+      expect(view).toMatchObject({ cellar: null, vintage: null });
+      expect(Bottle.find).not.toHaveBeenCalled();
+      expect(Bottle.aggregate).not.toHaveBeenCalled();
+    });
+
+    test('a row with no recorded bottle is placed by the wine; a row with no wine costs no query', async () => {
+      WineOwnerInquiry.find.mockReturnValue(findChain([row({ recipients: [{ user: ME, bottle: null, response: null }] })]));
+      places({ cellars: [{ _id: C1, name: 'Summer house' }], newest: [{ _id: WINE, cellar: C1, vintage: '2016' }] });
+      let [view] = await listInquiriesForRecipient(ME, withPlaces);
+      expect(view).toMatchObject({ bottle: null, cellar: { _id: C1, name: 'Summer house' }, vintage: '2016' });
+      expect(Bottle.find).not.toHaveBeenCalled(); // no recorded bottle to look up by id
+
+      Cellar.find.mockClear();
+      Bottle.aggregate.mockClear();
+      WineOwnerInquiry.find.mockReturnValue(findChain([row({ wineDefinition: null })]));
+      [view] = await listInquiriesForRecipient(ME, withPlaces);
+      expect(view).toMatchObject({ wine: null, cellar: null, vintage: null });
+      expect(Cellar.find).not.toHaveBeenCalled();
+      expect(Bottle.aggregate).not.toHaveBeenCalled();
+    });
+
+    test('places are opt-in: the one-wine card and the MCP list run no place query and carry no place', async () => {
+      WineOwnerInquiry.find.mockReturnValue(findChain([row()]));
+      for (const opts of [undefined, { wineId: WINE }]) {
+        const [view] = await listInquiriesForRecipient(ME, opts);
+        expect(view).not.toHaveProperty('cellar');
+        expect(view).not.toHaveProperty('vintage');
+      }
+      expect(Cellar.find).not.toHaveBeenCalled();
+      expect(Bottle.find).not.toHaveBeenCalled();
+      expect(Bottle.aggregate).not.toHaveBeenCalled();
+    });
+
+    test('an inquiry another owner answered still reads open to a recipient who has not; their own answer reads answered', async () => {
+      // Stored 'answered' because OTHER replied (row() carries OTHER's answer).
+      WineOwnerInquiry.find.mockReturnValue(findChain([row({ status: 'answered' })]));
+      let [view] = await listInquiriesForRecipient(ME);
+      expect(view).toMatchObject({ status: 'open', responded: false });
+      expect(JSON.stringify(view)).not.toContain('answered');
+
+      WineOwnerInquiry.find.mockReturnValue(findChain([row({
+        status: 'answered',
+        recipients: [{ user: ME, bottle: oid('5'), response: 'Says E. Pira', respondedAt: new Date('2026-08-03') }],
+      })]));
+      [view] = await listInquiriesForRecipient(ME);
+      expect(view).toMatchObject({ status: 'answered', responded: true });
+
+      // Resolved passes through (only an answerer sees it at all).
+      WineOwnerInquiry.find.mockReturnValue(findChain([row({
+        status: 'resolved',
+        resolvedAt: new Date('2026-08-10'),
+        recipients: [{ user: ME, bottle: oid('5'), response: 'Says E. Pira' }],
+      })]));
+      [view] = await listInquiriesForRecipient(ME);
+      expect(view.status).toBe('resolved');
+    });
   });
 
-  // Support ticket 2026-10-14: a notification's bottle link went dead once the
-  // bottle's cellar was deleted. The question is now opened by id and finds a
-  // bottle page of the wine the recipient can open at click time.
+  // A notification's bottle link would go dead once the bottle's cellar is
+  // deleted. The question is opened by id and finds a bottle page of the
+  // wine the recipient can open at click time.
   describe('inquiryForRecipient + liveBottleLink', () => {
     const C1 = oid('3');
     const C2 = oid('9');
@@ -658,6 +821,13 @@ describe('owner side', () => {
       expect(filter.$or.map((o) => o.status)).toEqual(['answered', 'open', 'resolved']);
     });
 
+    test('an inquiry another owner answered reads open to a recipient who has not answered', async () => {
+      WineOwnerInquiry.findOne.mockReturnValue(findOneChain(row({ status: 'answered' })));
+      cellars([]);
+      const res = await inquiryForRecipient(ME, I1);
+      expect(res.inquiry).toMatchObject({ status: 'open', responded: false });
+    });
+
     test('no bottle left → link null, the question still answerable on its own page', async () => {
       WineOwnerInquiry.findOne.mockReturnValue(findOneChain(row()));
       cellars([]);
@@ -689,7 +859,7 @@ describe('owner side', () => {
       const filter = WineOwnerInquiry.findOne.mock.calls[0][0];
       expect(filter.wineDefinition).toBe(WINE);
       expect(filter.recipients.$elemMatch).toEqual({ user: ME, response: null });
-      // An answered inquiry expires like an open one (release audit 2026-09-27, L).
+      // An answered inquiry expires like an open one.
       expect(filter.$or[0]).toMatchObject({ status: 'answered' });
       expect(filter.$or[0].expiresAt.$gt).toBeInstanceOf(Date);
       expect(filter.$or[1].expiresAt.$gt).toBeInstanceOf(Date);
@@ -724,7 +894,7 @@ describe('owner side', () => {
       const [filter, update] = WineOwnerInquiry.findOneAndUpdate.mock.calls[0];
       expect(filter._id).toBe(I1);
       expect(filter.recipients.$elemMatch).toEqual({ user: ME, response: null });
-      // An answered inquiry expires like an open one (release audit 2026-09-27, L).
+      // An answered inquiry expires like an open one.
       expect(filter.$or[0]).toMatchObject({ status: 'answered' });
       expect(filter.$or[0].expiresAt.$gt).toBeInstanceOf(Date);
       expect(update.$set['recipients.$.response']).toBe('The label says E. Pira e Figli.');

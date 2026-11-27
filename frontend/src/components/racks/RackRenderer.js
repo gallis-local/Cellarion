@@ -2,9 +2,11 @@ import { useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { computeLayout, computeModularLayout, SLOT_RADIUS, SLOT_HIT_FACTOR, minSlotDistance, multiBottleCells } from '../../utils/rackLayouts';
 import useSlotDrag from '../../hooks/useSlotDrag';
+import WallDecor from './WallDecor';
 import { isReserved } from '../../utils/reservation';
 import { swatchType } from '../../utils/wineColour';
 import './RackRenderer.css';
+import { formatVintage } from '../../utils/vintage';
 
 const WINE_COLORS = {
   red:       { fill: '#8A1028', stroke: '#6A0820' },
@@ -13,6 +15,7 @@ const WINE_COLORS = {
   sparkling: { fill: '#88A848', stroke: '#688830' },
   dessert:   { fill: '#A06020', stroke: '#805018' },
   fortified: { fill: '#7A3010', stroke: '#5A2008' },
+  other:     { fill: '#9A9A9A', stroke: '#707070' }, // not wine (cider, beer, spirits)
 };
 
 const EMPTY_FILL   = '#C4A478';
@@ -141,8 +144,8 @@ export default function RackRenderer({
             <button
               className="rack-icon-btn"
               onClick={onEdit}
-              title={t('racks.editRack', 'Rename or group this rack')}
-              aria-label={t('racks.editRack', 'Rename or group this rack')}
+              title={layout.wall ? t('racks.wall.editRack', 'Rename, group or change this wall') : t('racks.editRack', 'Rename or group this rack')}
+              aria-label={layout.wall ? t('racks.wall.editRack', 'Rename, group or change this wall') : t('racks.editRack', 'Rename or group this rack')}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg>
             </button>
@@ -214,30 +217,39 @@ export default function RackRenderer({
             </pattern>
           </defs>
 
-          {/* Wood background with grain */}
-          <rect
-            x={0} y={0}
-            width={layout.viewBox.width}
-            height={layout.viewBox.height}
-            rx={8}
-            fill="url(#wood-grain)"
-          />
+          {/* A wall is its boxes: each has its own wood and frame, and the
+              cells no box covers stay open. Every other rack is one panel. */}
+          {layout.wall ? (
+            <WallDecor wall={layout.wall} fill="url(#wood-grain)" />
+          ) : (
+            <>
+              {/* Wood background with grain */}
+              <rect
+                x={0} y={0}
+                width={layout.viewBox.width}
+                height={layout.viewBox.height}
+                rx={8}
+                fill="url(#wood-grain)"
+              />
 
-          {/* Frame border */}
-          <rect
-            x={1} y={1}
-            width={layout.viewBox.width - 2}
-            height={layout.viewBox.height - 2}
-            rx={7}
-            fill="none"
-            stroke={WOOD_FRAME}
-            strokeWidth={3}
-          />
+              {/* Frame border */}
+              <rect
+                x={1} y={1}
+                width={layout.viewBox.width - 2}
+                height={layout.viewBox.height - 2}
+                rx={7}
+                fill="none"
+                stroke={WOOD_FRAME}
+                strokeWidth={3}
+              />
+            </>
+          )}
 
           {/* Shelf lines (horizontal) between rows. X-racks have no shelves —
               their many distinct slot heights would draw spurious planks
-              straight through the diagonal dividers below. */}
-          {!layout.isXRack && <ShelfLines layout={layout} />}
+              straight through the diagonal dividers below. A wall draws
+              the planks of its own boxes (WallDecor above). */}
+          {!layout.isXRack && !layout.wall && <ShelfLines layout={layout} />}
 
           {/* Module separators for cube type */}
           {!isModular && rack.type === 'cube' && <CubeModuleLines rack={rack} layout={layout} />}
@@ -461,7 +473,7 @@ function SlotCircle({ position, cx, cy, R, hitR = null, isNeck = false, isSidewa
       role="button"
       tabIndex={0}
       aria-label={slot
-        ? `${wine?.name || '?'} (${slot.bottle?.vintage || ''})${isNeck ? `, ${t('rackView.neckForwardAria', 'neck forward')}` : ''}${isSideways ? `, ${t('rackView.sidewaysAria', 'lying across')}` : ''}${isReserved(slot.bottle) ? ` — ${t('rackView.reservedAria', 'reserved')}` : ''}`
+        ? `${wine?.name || '?'} (${formatVintage(slot.bottle?.vintage, t)})${isNeck ? `, ${t('rackView.neckForwardAria', 'neck forward')}` : ''}${isSideways ? `, ${t('rackView.sidewaysAria', 'lying across')}` : ''}${isReserved(slot.bottle) ? ` — ${t('rackView.reservedAria', 'reserved')}` : ''}`
         : `Empty slot ${position}${isSideways ? `, ${t('rackView.sidewaysAria', 'lying across')}` : ''}`}
       style={{ cursor: draggable ? 'grab' : 'pointer', ...dimStyle }}
     >

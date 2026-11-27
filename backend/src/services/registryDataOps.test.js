@@ -21,12 +21,19 @@ jest.mock('./contributionGate', () => ({
 jest.mock('./wineVisibility', () => ({ findVisibleWine: jest.fn() }));
 jest.mock('./audit', () => ({ logAudit: jest.fn() }));
 jest.mock('./notifications', () => ({ createNotification: jest.fn(() => Promise.resolve()) }));
+// The suggester's Cellar Cred is unit-tested in suggestionCred.test.js; here
+// it is the seam a publish must call. The supersede reason stays the real one.
+jest.mock('./suggestionCred', () => ({
+  SUPERSEDED_REASON: jest.requireActual('./suggestionCred').SUPERSEDED_REASON,
+  awardValue: jest.fn().mockResolvedValue(true),
+}));
 
 const RegistryDataKey = require('../models/RegistryDataKey');
 const RegistryDataValue = require('../models/RegistryDataValue');
 const { checkContributionGate } = require('./contributionGate');
 const { findVisibleWine } = require('./wineVisibility');
 const { createNotification } = require('./notifications');
+const { awardValue, SUPERSEDED_REASON } = require('./suggestionCred');
 const ops = require('./registryDataOps');
 
 const oid = (c) => c.repeat(24);
@@ -60,8 +67,8 @@ describe('proposeKey', () => {
     expect((await ops.proposeKey(ME, { name: 'Closure', type: 'enum', enumOptions: ['cork'], rationale: GOOD.rationale })).code).toBe('invalid');
   });
 
-  test('reserved names cannot shadow first-class fields', async () => {
-    for (const name of ['producer', 'Region', 'FLAVORS']) {
+  test('reserved names cannot shadow first-class fields — the label sweetness term among them', async () => {
+    for (const name of ['producer', 'Region', 'FLAVORS', 'Label Sweetness', 'labelSweetness']) {
       const res = await ops.proposeKey(ME, { ...GOOD, name });
       expect(res).toMatchObject({ ok: false, code: 'conflict' });
     }
@@ -110,6 +117,54 @@ describe('suggestValue', () => {
     expect(RegistryDataKey.findOne).toHaveBeenCalledWith({ nameKey: { $eq: 'abv' }, status: 'accepted' });
 
     expect((await ops.suggestValue(ME, { wineId: WINE, value: 1 })).code).toBe('invalid');
+  });
+
+  // A member names the figure in their own language — "Alkoholhalt" is ABV.
+  // Without this the promotion from a personal entry 404'd and then proposed
+  // the same field again under the translated name.
+  describe('keyName through the translations', () => {
+    const translated = {
+      ...acceptedKey,
+      translations: { sv: 'Alkoholhalt', fr: 'Degré d’alcool', de: 'Alkoholgehalt' },
+    };
+    beforeEach(() => {
+      RegistryDataKey.findOne.mockResolvedValue(null); // no exact nameKey hit
+      RegistryDataKey.find.mockReturnValue(chain([translated]));
+      RegistryDataValue.findOne.mockResolvedValue(null);
+      RegistryDataValue.create.mockResolvedValue({ _id: oid('9'), value: 13.5, status: 'suggested' });
+    });
+
+    test('a translated name resolves to the accepted key, ignoring case, accents and punctuation', async () => {
+      for (const keyName of ['alkoholhalt', "degré d'alcool", 'Degre d’Alcool', 'ALKOHOLGEHALT']) {
+        RegistryDataValue.create.mockClear();
+        const res = await ops.suggestValue(ME, { wineId: WINE, keyName, value: '13,5' });
+        expect(res.ok).toBe(true);
+        expect(res.value.key.name).toBe('ABV');
+        expect(RegistryDataValue.create).toHaveBeenCalledWith(expect.objectContaining({ key: KEY, value: 13.5 }));
+      }
+    });
+
+    test('only the ACCEPTED vocabulary is searched — a proposed or rejected key never matches', async () => {
+      await ops.suggestValue(ME, { wineId: WINE, keyName: 'Alkoholhalt', value: 13.5 });
+      expect(RegistryDataKey.findOne).toHaveBeenCalledWith({ nameKey: { $eq: 'alkoholhalt' }, status: 'accepted' });
+      expect(RegistryDataKey.find).toHaveBeenCalledWith({ status: 'accepted' });
+    });
+
+    test('an unknown name is still not_found, and nothing is written', async () => {
+      const res = await ops.suggestValue(ME, { wineId: WINE, keyName: 'Residual sugar', value: 3 });
+      expect(res).toMatchObject({ ok: false, code: 'not_found' });
+      expect(RegistryDataValue.create).not.toHaveBeenCalled();
+    });
+
+    test('findAcceptedKeyByName: exact hit first, translation second, blank never', async () => {
+      RegistryDataKey.findOne.mockResolvedValueOnce(acceptedKey);
+      expect(await ops.findAcceptedKeyByName('ABV')).toBe(acceptedKey);
+      expect(RegistryDataKey.find).not.toHaveBeenCalled();
+
+      expect((await ops.findAcceptedKeyByName('alkoholhalt'))._id).toBe(KEY);
+      expect(await ops.findAcceptedKeyByName('Closure')).toBeNull();
+      expect(await ops.findAcceptedKeyByName('  ')).toBeNull();
+    });
   });
 
   test('value validated against the key type before any write', async () => {
@@ -208,7 +263,7 @@ describe('dataForWine', () => {
   });
 });
 
-// Display names (2026-09-09). The vocabulary refused "Alkoholgehalt" as a
+// Display names. The vocabulary refused "Alkoholgehalt" as a
 // duplicate of ABV, correctly — and the German reader who proposed it could
 // not have known, because the only key on his page was named in English. A
 // key now carries the reader's name in `displayName`; `name` is unchanged
@@ -348,7 +403,35 @@ describe('admin decisions', () => {
     expect(RegistryDataValue.updateOne).not.toHaveBeenCalled();
   });
 
-  // ── Contributor feedback (2026-08-30) ────────────────────────────────────
+  // Accepted contributions raise the daily suggestion budget: a published
+  // value earns its suggester Cellar Cred (who earns, and once only, is
+  // services/suggestionCred's rule). The demoted value keeps what it earned,
+  // which the shared supersede reason is how the helper tells.
+  test('publishing awards the suggester through the helper, after the row is saved; a rejection awards nothing', async () => {
+    const row = () => ({
+      _id: oid('9'), wineDefinition: WINE, key: acceptedKey, value: 13.5,
+      status: 'suggested', suggestedBy: ME, save: jest.fn().mockResolvedValue(undefined),
+    });
+    const published = row();
+    RegistryDataValue.findOne.mockReturnValue({ populate: jest.fn().mockResolvedValue(published) });
+    RegistryDataValue.updateOne.mockResolvedValue({ modifiedCount: 1 });
+
+    await ops.decideValue(ADMIN, oid('9'), 'publish');
+    expect(awardValue).toHaveBeenCalledTimes(1);
+    expect(awardValue).toHaveBeenCalledWith(published);
+    expect(published).toMatchObject({ status: 'published', decidedBy: ADMIN, suggestedBy: ME });
+    expect(published.save.mock.invocationCallOrder[0]).toBeLessThan(awardValue.mock.invocationCallOrder[0]);
+    expect(RegistryDataValue.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'published' }),
+      { $set: expect.objectContaining({ status: 'rejected', rejectReason: SUPERSEDED_REASON }) }
+    );
+
+    RegistryDataValue.findOne.mockReturnValue({ populate: jest.fn().mockResolvedValue(row()) });
+    await ops.decideValue(ADMIN, oid('9'), 'reject', 'unsourced');
+    expect(awardValue).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Contributor feedback ────────────────────────────────────
   // The rejectReason field was written, capped and stored — and had no
   // reader: no notification type existed, and the user-facing keys endpoint
   // returns only the accepted vocabulary, so a curator's explanation reached
@@ -427,5 +510,82 @@ describe('admin decisions', () => {
     await ops.listReviewQueues();
     expect(kChain.limit).toHaveBeenCalledWith(ops.REVIEW_QUEUE_LIMIT);
     expect(vChain.limit).toHaveBeenCalledWith(ops.REVIEW_QUEUE_LIMIT);
+  });
+});
+
+// A server whose admin turned review of contributions off:
+// a value is published and a field accepted as made, through the same
+// decide code an admin runs, decided by the contributor, nobody notified,
+// no daily limit. A relay from another server (via 'bridge') always waits.
+describe('a server that does not review contributions', () => {
+  const contributionReview = require('../config/contributionReview');
+  beforeEach(() => contributionReview.set({ enabled: false }));
+  afterEach(() => contributionReview.set({ enabled: true }));
+
+  const VALUE = { wineId: WINE, keyId: KEY, value: '13,5' };
+  const suggestedRow = () => ({
+    _id: oid('9'), wineDefinition: WINE, key: acceptedKey, value: 13.5, vintage: null,
+    status: 'suggested', suggestedBy: ME, save: jest.fn().mockResolvedValue(undefined),
+  });
+  const valueRows = (row) => (q) => (q && q.status === 'suggested'
+    ? { populate: jest.fn().mockResolvedValue(row) }
+    : Promise.resolve(null));
+
+  test('a value is published as suggested: decided by the suggester, no notification, no limit', async () => {
+    const row = suggestedRow();
+    RegistryDataKey.findOne.mockResolvedValue(acceptedKey);
+    RegistryDataValue.findOne.mockImplementation(valueRows(row));
+    RegistryDataValue.create.mockResolvedValue({ _id: oid('9'), value: 13.5, status: 'suggested' });
+    RegistryDataValue.updateOne.mockResolvedValue({ modifiedCount: 0 });
+
+    const res = await ops.suggestValue(ME, VALUE, { via: 'web' });
+
+    expect(res).toMatchObject({ ok: true, applied: true, value: { status: 'published', value: 13.5 } });
+    expect(checkContributionGate).toHaveBeenCalledWith(ME, { budget: false });
+    expect(row.status).toBe('published');
+    expect(row.decidedBy).toBe(ME);
+    expect(awardValue).toHaveBeenCalledWith(row);
+    expect(createNotification).not.toHaveBeenCalled();
+  });
+
+  test('a field is accepted as proposed, decided by its proposer, without a notification', async () => {
+    RegistryDataKey.findOne.mockResolvedValue(null);
+    RegistryDataKey.create.mockResolvedValue({ ...acceptedKey, status: 'proposed' });
+    RegistryDataKey.findOneAndUpdate.mockResolvedValue({ ...acceptedKey, status: 'accepted' });
+
+    const res = await ops.proposeKey(ME, { name: 'ABV', type: 'decimal', unit: '%', rationale: 'Alcohol strength matters to every drinker.' });
+
+    expect(res).toMatchObject({ ok: true, applied: true, key: { status: 'accepted' } });
+    expect(checkContributionGate).toHaveBeenCalledWith(ME, { budget: false });
+    expect(RegistryDataKey.findOneAndUpdate).toHaveBeenCalledWith(
+      { _id: { $eq: KEY }, status: 'proposed' },
+      expect.objectContaining({ $set: expect.objectContaining({ status: 'accepted', decidedBy: ME }) }),
+      { new: true }
+    );
+    expect(createNotification).not.toHaveBeenCalled();
+  });
+
+  test('a value relayed from another server over the bridge waits, limit included', async () => {
+    RegistryDataKey.findOne.mockResolvedValue(acceptedKey);
+    RegistryDataValue.findOne.mockResolvedValue(null);
+    RegistryDataValue.create.mockResolvedValue({ _id: oid('9'), value: 13.5, status: 'suggested' });
+
+    const res = await ops.suggestValue(ME, VALUE, { via: 'bridge' });
+
+    expect(res).toMatchObject({ ok: true, value: { status: 'suggested' } });
+    expect(res.applied).toBeUndefined();
+    expect(checkContributionGate).toHaveBeenCalledWith(ME, { budget: true });
+    expect(RegistryDataValue.updateOne).not.toHaveBeenCalled();
+  });
+
+  test('with review on (the default) nothing changes: suggested, limit applies', async () => {
+    contributionReview.set({ enabled: true });
+    RegistryDataKey.findOne.mockResolvedValue(acceptedKey);
+    RegistryDataValue.findOne.mockResolvedValue(null);
+    RegistryDataValue.create.mockResolvedValue({ _id: oid('9'), value: 13.5, status: 'suggested' });
+
+    const res = await ops.suggestValue(ME, VALUE, { via: 'web' });
+    expect(res.value.status).toBe('suggested');
+    expect(checkContributionGate).toHaveBeenCalledWith(ME, { budget: true });
   });
 });

@@ -1,6 +1,6 @@
 /**
- * The one-time relink of curator-question notifications (support ticket
- * 2026-10-14): only exact matches change, only their link, and a dry run
+ * The one-time relink of curator-question notifications: only exact matches
+ * change, only their link, and a dry run
  * writes nothing.
  */
 jest.mock('../models/Notification', () => ({ find: jest.fn(), updateOne: jest.fn() }));
@@ -62,7 +62,7 @@ test('--apply relinks only the exact match, to its question, guarded on the old 
   });
 });
 
-// Pre-release audit 2026-10-14: a second question about the same wine can be
+// A second question about the same wine can be
 // created before the first is resolved, so a reply is matched by when the
 // inquiry was RESOLVED, not created.
 test('a curator’s-reply notification goes to the inquiry resolved at or before it', async () => {

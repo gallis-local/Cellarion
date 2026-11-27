@@ -1,22 +1,22 @@
 /**
  * Telling a submitter what became of their wine correction — shared by every
  * place a correction gets DECIDED, so none of them can forget:
- *   - routes/admin/wineProposals.js   an admin approves or rejects it
- *   - routes/admin/wines.js           the wine is merged away or deleted and
- *                                     its pending corrections close with it
+ *   - services/wineProposalDecisionOps  an admin approves or rejects it
+ *   - services/wineMergeOps (merge),    the wine is merged away or deleted and
+ *     routes/admin/wines.js (delete)    its pending corrections close with it
  *
- * The second group is why this is a service (pre-deploy audit 2026-09-18): the
- * bottle page promises "we'll notify you when a curator has decided", and a
- * correction that makes a wine collide with its twin ends in exactly that
- * merge — auto-rejected by a bare updateMany, with nobody told, and invisible
- * on the web too because the bottle now points at the keeper.
+ * The second group is why this is a service: the bottle page promises "we'll
+ * notify you when a curator has decided", and a correction that makes a wine
+ * collide with its twin ends in exactly that merge. Closed without a word, it
+ * would be invisible on the web too, because the bottle now points at the
+ * keeper.
  *
  * Only the USER pipeline (services/wineProposalOps stamps `via` on every row
  * it files — web, connector or bridge). A sommelier's own proposals are filed
  * without one and decided in batches of a hundred; a notification per row
  * would bury that account's inbox under its own work. Rows filed by users
- * before `via` existed (2026-09-08) carry none either and stay silent. And
- * never for a decision on one's own proposal.
+ * before `via` existed carry none either and stay silent. And never for a
+ * decision on one's own proposal.
  *
  * Fire-and-forget, like every notify call: a notification failure must never
  * undo — or even surface as the failure of — a recorded decision.
@@ -28,6 +28,7 @@ const { createNotification } = require('./notifications');
 const FIELD_WORDS = {
   producer: 'producer', name: 'wine name', appellation: 'appellation', region: 'region',
   country: 'country', classification: 'classification', type: 'type', grapes: 'grapes',
+  sweetnessStyle: 'sweetness style',
 };
 
 const plain = (v) => (v && typeof v.toObject === 'function' ? v.toObject() : (v || {}));
@@ -70,8 +71,8 @@ function notifyProposer(proposal, wine, deciderId, approved, reason) {
  * that is going away, and tell the user-pipeline submitters why. The rows
  * become status 'closed', not 'rejected' — nobody judged them; the wine simply
  * stopped existing under that id (a merge usually resolves the complaint) —
- * and `decidedBy` stays null. Until 2026-09-28 they were stored as 'rejected'
- * and counted as disagreements with the sommelier.
+ * and `decidedBy` stays null, so a closure never counts as a disagreement with
+ * the sommelier.
  *
  * The submitters are read BEFORE the update (afterwards the rows are just
  * closed rows); a lookup failure costs the notifications, never the closure.
@@ -101,4 +102,4 @@ async function closePendingForWine(wineId, rejectReason, { wine = null, linkWine
   return result;
 }
 
-module.exports = { notifyProposer, closePendingForWine, FIELD_WORDS };
+module.exports = { notifyProposer, closePendingForWine };

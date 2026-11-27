@@ -27,7 +27,7 @@ jest.mock('../models/Notification', () => ({
 jest.mock('../models/ClimateDevice', () => ({ find: jest.fn() }));
 jest.mock('../models/SupportTicket', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../services/climateAlerts', () => ({ effectiveClimateConfig: jest.fn() }));
-jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn() }));
+jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn() }));
 jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), buildEmptyStats: jest.fn() }));
 jest.mock('../services/bottleOps', () => ({
   consumeBottle: jest.fn(), restoreBottle: jest.fn(), addBottle: jest.fn(), updateBottleFields: jest.fn(),
@@ -347,7 +347,7 @@ describe('close_ticket (the user ends the conversation)', () => {
   });
 });
 
-describe('idempotency on the human-queue writes (support ticket 2026-09-12)', () => {
+describe('idempotency on the human-queue writes', () => {
   const McpActionLog = require('../models/McpActionLog');
   const claimed = () => ({ lastErrorObject: { updatedExisting: false } });
   const completed = (tool, result) => ({ lastErrorObject: { updatedExisting: true }, value: { tool, pending: false, result } });

@@ -5,6 +5,7 @@ import { adminGetImages, adminApproveImage, adminRejectImage, adminUnapproveImag
 import AuthImage from '../components/AuthImage';
 import { API_URL } from '../api/apiConstants';
 import AdminImagesByWine from './AdminImagesByWine';
+import ContributionReviewSwitch from '../components/ContributionReviewSwitch';
 import './AdminImages.css';
 
 function AdminImages() {
@@ -137,18 +138,17 @@ function AdminImages() {
   // added through the normal add-bottle flow carries `bottle` and a null
   // `wineDefinition` by design (services/imageOps sets the direct ref only for
   // wine-level uploads, and the by-wine query resolves the rest through the
-  // bottle) — so reading the direct ref alone made every ordinary bottle photo
-  // render as "no wine linked" on this page, which is what it looked like in
-  // review. The LIST already falls back this way; the detail did not.
+  // bottle) — so reading the direct ref alone would render every ordinary
+  // bottle photo as "no wine linked". The list and the detail both read
+  // through this helper.
   const effectiveWine = (img) => img?.wineDefinition || img?.bottle?.wineDefinition || null;
 
   // Adopt an ACTION response as the selection without losing the populated
   // bottle: approve/visibility/unapprove/assign responses populate only
   // uploadedBy/reviewedBy/wineDefinition, so their `bottle` is a bare id —
-  // taking them wholesale degraded the via-bottle wine display one click
-  // after it worked (audit 2026-08-16). Keep the previously populated bottle
-  // whenever the response's isn't an object; a genuinely bottle-less image
-  // (null) stays null.
+  // taking them wholesale would lose the via-bottle wine display one click
+  // after it worked. Keep the previously populated bottle whenever the
+  // response's isn't an object; a genuinely bottle-less image (null) stays null.
   const adoptSelected = (img) => setSelected(prev => ({
     ...img,
     bottle: (img && img.bottle && typeof img.bottle !== 'object')
@@ -194,6 +194,8 @@ function AdminImages() {
         <h1>{t('admin.images.title')}</h1>
         {view === 'queue' && <span className="image-count">{t('admin.images.image', { count: total })}</span>}
       </div>
+
+      <ContributionReviewSwitch />
 
       <div className="admin-images-tabs">
         <button

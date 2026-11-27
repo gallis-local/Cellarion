@@ -1,6 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import ReactMarkdown from 'react-markdown';
 import rehypeSanitize from 'rehype-sanitize';
+import { profileText } from '../../utils/profileText';
 
 /**
  * The wine's tasting profile (generated or curator-verified, vintage-neutral):
@@ -12,9 +13,11 @@ import rehypeSanitize from 'rehype-sanitize';
 export default function TastingProfileCard({ wine, onReport }) {
   const { t } = useTranslation();
   if (!wine) return null;
+  // A drink that is not wine (the Other category) is never assessed: no card.
+  if (wine.nonWine === true) return null;
 
   // No published profile — an honest "not yet assessed" instead of a
-  // silent blank (somm ticket 6a83e765 rollout note). Held-by-the-gate and
+  // silent blank. Held-by-the-gate and
   // never-generated are deliberately indistinguishable here, so the card
   // can never leak WHY a profile is missing.
   if (!wine.aiProfile?.description) {
@@ -34,20 +37,24 @@ export default function TastingProfileCard({ wine, onReport }) {
   }
 
   const ap = wine.aiProfile;
+  // The prose in the language set in SuperAdmin → AI while the server sent a
+  // fresh copy, else the English (utils/profileText); `lang` marks it.
+  const text = profileText(ap);
+  const lang = text.lang || undefined;
   const structure = [
     ap.body && `${ap.body}-bodied`,
     ap.tannin && `${ap.tannin} tannin`,
     ap.acidity && `${ap.acidity} acidity`,
     ap.sweetness,
   ].filter(Boolean);
-  const flavours = ap.flavors || [];
+  const flavours = text.flavors;
 
   return (
     <div className="bd-ai-profile card">
       <div className="bd-ai-profile__header">
         <h2>{t('bottleDetail.tastingProfile', 'Tasting profile')}</h2>
-        {/* Provenance is load-bearing (#985): never present AI-generated
-            profile text as established fact. */}
+        {/* Provenance is load-bearing: never present AI-generated profile
+            text as established fact. */}
         {ap.source === 'curator' ? (
           <span className="bd-ai-tag bd-ai-tag--curator" title={t('bottleDetail.provenanceCuratorTitle', 'A sommelier has verified this profile')}>
             {t('bottleDetail.provenanceCurator', 'Curator-verified')}
@@ -70,20 +77,20 @@ export default function TastingProfileCard({ wine, onReport }) {
       {flavours.length > 0 && (
         <div className="bd-ai-group">
           <span className="bd-ai-group-label">{t('bottleDetail.flavours', 'Flavours')}</span>
-          <div className="bd-ai-chips">
+          <div className="bd-ai-chips" lang={lang}>
             {flavours.map((f, i) => <span key={`f${i}`} className="bd-ai-chip">{f}</span>)}
           </div>
         </div>
       )}
 
-      <div className="bd-ai-prose">
-        <ReactMarkdown rehypePlugins={[rehypeSanitize]} disallowedElements={['img']} unwrapDisallowed>{ap.description}</ReactMarkdown>
+      <div className="bd-ai-prose" lang={lang}>
+        <ReactMarkdown rehypePlugins={[rehypeSanitize]} disallowedElements={['img']} unwrapDisallowed>{text.description}</ReactMarkdown>
       </div>
 
-      {ap.foodPairings?.length > 0 && (
+      {text.foodPairings.length > 0 && (
         <div className="bd-ai-pairings">
           <span className="bd-ai-pairings__label">{t('bottleDetail.pairsWith', 'Pairs with')}:</span>
-          {ap.foodPairings.join(' · ')}
+          {lang ? <span lang={lang}>{text.foodPairings.join(' · ')}</span> : text.foodPairings.join(' · ')}
         </div>
       )}
 

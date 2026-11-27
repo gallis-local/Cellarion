@@ -9,7 +9,7 @@ import DraftWineEditModal from '../components/DraftWineEditModal';
 import './WineDrafts.css';
 
 /**
- * My private draft wines (support ticket 2026-09-12): every wine the user
+ * My private draft wines: every wine the user
  * created as a draft, with its bottle count and its untouched-clock deadline.
  * Publish one, publish a selection, edit, or delete an empty one. A publish
  * that meets a registry match opens the same "attach instead" dialog the
@@ -162,11 +162,13 @@ function WineDrafts() {
 
   return (
     <div className="wine-drafts-page">
-      <div className="wine-drafts-header">
-        <h1>{t('draftWine.pageTitle', 'My draft wines')}</h1>
-        <p className="wine-drafts-intro">
-          {t('draftWine.pageIntro', 'Wines you created as private drafts. Only you can see them; edit them freely, then publish them to the shared registry. An untouched draft with bottles publishes by itself after 7 days; an empty one is deleted.')}
-        </p>
+      <div className="page-header">
+        <div>
+          <h1>{t('draftWine.pageTitle', 'My draft wines')}</h1>
+          <p className="wine-drafts-intro">
+            {t('draftWine.pageIntro', 'Wines you created as private drafts. Only you can see them; edit them freely, then publish them to the shared registry. An untouched draft with bottles publishes by itself after 7 days; an empty one is deleted.')}
+          </p>
+        </div>
       </div>
 
       {error && <div className="alert alert-error" role="alert">{error}</div>}

@@ -35,13 +35,13 @@ const Rack = require('../models/Rack');
 const { RACK_TYPES } = require('../models/Rack');
 const CellarLayout = require('../models/CellarLayout');
 const BottleImage = require('../models/BottleImage');
-const WineRequest = require('../models/WineRequest');
 const { findOrCreatePendingRequest, pickImportHints } = require('./wineRequestIntake');
 const { currencyOrFallback } = require('../config/currencies');
 const Review = require('../models/Review');
 const WineVintageProfile = require('../models/WineVintageProfile');
 
 const { findOrCreateWine } = require('./findOrCreateWine');
+const importPolicy = require('../config/importPolicy');
 const { logAudit } = require('./audit');
 const { unlinkImageFiles, safeUploadPath } = require('./imageProcessor');
 const { REGISTRY_PHOTO, OWN_PHOTO } = require('./photoRetention');
@@ -53,6 +53,7 @@ const { getMaxPosition, fitCabinetTypeConfig } = require('../utils/rackGeometry'
 const { resolveRating } = require('../utils/ratingUtils');
 const { normalizeBottleSize, DEFAULT_SIZE } = require('../config/bottleSizes');
 const { normalizeBarcode } = require('../utils/barcode');
+const { learnBarcodesSoon } = require('./barcodeRegistry');
 const { stripHtml } = require('../utils/sanitize');
 const { parseAndValidateVintage, parseDrinkYear } = require('../utils/validation');
 const { photoVintage } = require('../utils/imageVintage');
@@ -252,8 +253,7 @@ async function clearCellarContents(cellarId) {
     // before deleting the bottles (else they dangle pointing at deleted bottles).
     // Registry photos (services/photoRetention: the wine's picture, or any
     // photo approved as public) are seen by other people: kept and detached,
-    // as every other cascade does. Until 2026-09-27 an overwrite import
-    // deleted even the wine's chosen picture.
+    // as every other cascade does.
     const images = await BottleImage.find({ bottle: { $in: bottleIds }, ...OWN_PHOTO });
     for (const img of images) await unlinkImageFiles(img); // reference-safe (dedup-shared files survive)
     await BottleImage.deleteMany({ bottle: { $in: bottleIds }, ...OWN_PHOTO });
@@ -404,12 +404,12 @@ async function resolveWine(item, userId, cache, result, demoMode = false) {
 
   try {
     const { wine, created, nearMiss } = await findOrCreateWine(
-      // producer is passed through AS GIVEN — no longer `producer || name`.
-      // That fallback fabricated a producer out of the wine's own name, which
-      // is precisely the junk identity the pending queue exists to catch: with
-      // allowPending a producerless row now files itself for curation instead
-      // of being minted as "Chardonnay — Chardonnay". Demo mode is matchOnly,
-      // so it never reaches the mint and can't create pending rows either.
+      // producer is passed through AS GIVEN, never as `producer || name`: that
+      // fallback fabricates a producer out of the wine's own name, precisely
+      // the junk identity the pending queue exists to catch. With allowPending
+      // a producerless row files itself for curation instead of being minted
+      // as "Chardonnay — Chardonnay". Demo mode is matchOnly, so it never
+      // reaches the mint and can't create pending rows either.
       { name, producer, country: item.country, region: item.region,
         appellation: item.appellation, type: item.type, colour: item.colour,
         grapes: Array.isArray(item.grapes) ? item.grapes : [] },
@@ -419,18 +419,23 @@ async function resolveWine(item, userId, cache, result, demoMode = false) {
       // producer column) still becomes a bottle — it just carries a wine a
       // sommelier finishes, instead of silently degrading to a WineRequest the
       // owner never hears about again.
-      { confirmCreate: true, matchOnly: demoMode, createdVia: 'import', allowPending: !demoMode }
+      { confirmCreate: true, matchOnly: demoMode, createdVia: 'import', allowPending: !demoMode,
+        // The same rule as the file import (routes/import.js /confirm): where
+        // the server checks imported wines, a wine this mints waits for it.
+        ...(!demoMode && importPolicy.checksNewWines() ? { unchecked: true } : {}) }
     );
     if (wine) {
       if (created) {
         result.winesCreated++;
-        if (wine.pendingIdentity) {
+        if (wine.pendingIdentity && !wine.producer) {
           result.pendingIdentityCount = (result.pendingIdentityCount || 0) + 1;
+        } else if (wine.uncheckedIdentity) {
+          result.uncheckedCount = (result.uncheckedCount || 0) + 1;
         }
         // confirmCreate skips the soft-zone prompt by design (imports must not
         // stall) — but a creation that sailed past a >=0.85 candidate is the
-        // exact shape that used to mint duplicates, so leave an audit trail
-        // the admin can review (dup analysis 2026-07-22, RC5).
+        // exact shape that mints duplicates, so leave an audit trail the admin
+        // can review.
         if (nearMiss) {
           result.winesCreatedNearMiss = (result.winesCreatedNearMiss || 0) + 1;
           logAudit(
@@ -473,6 +478,7 @@ async function resolveWine(item, userId, cache, result, demoMode = false) {
 /** Build (but don't save) a Bottle from an export item — mirrors routes/import.js. */
 function buildBottle({ cellarId, ownerId, item, canonicalVintage, wineDefinitionId, pendingWineRequestId, defaultCurrency }) {
   const priceSetAt = (item.price != null && item.price !== '') ? new Date() : undefined;
+  const occasion = stripHtml(item.occasion);
 
   // Personal drink window (drinkFrom/drinkTo years) — sanitized exactly like
   // routes/import.js: invalid values are silently dropped so a bad imported year
@@ -502,7 +508,7 @@ function buildBottle({ cellarId, ownerId, item, canonicalVintage, wineDefinition
     vintage: canonicalVintage,
     price: item.price || undefined,
     // File data: a code the app knows, else the import's default (the
-    // importer's profile currency), as the CSV path does (audit 2026-10-14).
+    // importer's profile currency), as the CSV path does.
     currency: currencyOrFallback(item.currency, currencyOrFallback(defaultCurrency, 'USD')),
     priceSetAt,
     bottleSize: normalizeBottleSize(item.bottleSize) || DEFAULT_SIZE,
@@ -512,7 +518,9 @@ function buildBottle({ cellarId, ownerId, item, canonicalVintage, wineDefinition
     barcode: normalizeBarcode(item.barcode) || undefined,
     location: stripHtml(item.location),
     notes: stripHtml(item.notes),
-    occasion: stripHtml(item.occasion),
+    // Cut to what a bottle keeps, as the CSV import does: a longer one
+    // would fail the bottle's validation and lose the whole row.
+    occasion: typeof occasion === 'string' ? occasion.slice(0, 500) : occasion,
     drinkFrom,
     drinkTo,
     reservedFor,
@@ -640,10 +648,10 @@ async function attachImages(bottle, images, userId, getFileBuffer, result, dedup
       // The record's hash is that of the STORED bytes, as the live upload path
       // stamps it: an export of this cellar carries exactly those bytes, so a
       // re-import of it matches on the first try instead of adding a copy
-      // (release audit 2026-09-27, L — hashing the archive bytes while storing
-      // a re-encode meant every export→import round wrote a new file). A
-      // repeat import of the SAME archive still dedupes: the encode is
-      // deterministic, so its stored bytes hash to the record's hash again.
+      // (hashing the archive bytes while storing a re-encode would write a new
+      // file on every export→import round). A repeat import of the SAME
+      // archive still dedupes: the encode is deterministic, so its stored
+      // bytes hash to the record's hash again.
       storedHash = crypto.createHash('sha256').update(stored).digest('hex');
       const twin = storedHash !== hash
         ? await BottleImage.findOne({ uploadedBy: userId, contentHash: storedHash }).select('originalUrl processedUrl').lean()
@@ -729,12 +737,12 @@ async function attachReviews(bottle, reviews, userId, wineDefinitionId, result) 
  *  the imported window is restored in full. Deduped per wine+vintage via `seen`
  *  so bottles that share a wine only trigger this once.
  *
- *  Status follows the IMPORTER, not the file (audit 2026-09-02 D09-4): only a
- *  sommelier/admin — someone who could set the same window by hand — restores
- *  it as `reviewed`. utils/maturityUtils gates every reader on
- *  status === 'reviewed', so a reviewed row from anyone's file was
- *  indistinguishable from curated data and became the drink window every
- *  other user of that wine+vintage saw, with the file's notes shown as the
+ *  Status follows the IMPORTER, not the file: only a sommelier/admin —
+ *  someone who could set the same window by hand — restores it as
+ *  `reviewed`. utils/maturityUtils gates every reader on status ===
+ *  'reviewed', so a reviewed row from anyone's file would be
+ *  indistinguishable from curated data and become the drink window every
+ *  other user of that wine+vintage sees, with the file's notes shown as the
  *  sommelier's. Any other importer's window lands as a PENDING suggestion:
  *  numbers and notes kept for the sommelier queue, nothing published until a
  *  curator reviews it — the same path a hand-added bottle takes. */
@@ -1036,7 +1044,7 @@ async function importCellar(userId, cellar, opts) {
   //    swap it in once the import has fully succeeded (see swapCellarContents).
   //    That way a mid-import crash/OOM/throw can never destroy the user's
   //    existing bottles, photos, history or 3D layout. For a CREATE we build
-  //    straight into the user's new cellar, as before.
+  //    straight into the user's new cellar.
   let liveCellar = null;
   if (opts.mode === 'overwrite') {
     liveCellar = await Cellar.findOne({ user: userId, name: opts.targetName, deletedAt: null });
@@ -1085,6 +1093,10 @@ async function importCellar(userId, cellar, opts) {
     throw err;
   }
 
+  // A restored cellar's barcodes teach the registry as bottles added by hand
+  // do (services/barcodeRegistry.js); a demo clone teaches nothing.
+  if (!opts.demoMode) learnBarcodesSoon(items.map((it) => normalizeBarcode(it.barcode)), { via: 'import' });
+
   return result;
 }
 
@@ -1097,7 +1109,6 @@ module.exports = {
   attachMaturity,
   attachImages,
   importCellar,
-  clearCellarContents,
   EXPORT_SCHEMA,
   MAX_IMAGES_PER_BOTTLE,
   MAX_IMPORT_CELLARS,

@@ -8,6 +8,7 @@ import WineImage from '../components/WineImage';
 import timeAgo from '../utils/timeAgo';
 import { swatchType } from '../utils/wineColour';
 import './SommPrices.css';
+import { formatVintage } from '../utils/vintage';
 
 // Mirror of the backend minimum (routes/somm/prices.js DECLINE_REASON_MIN) —
 // the reason is sent verbatim to the requester(s), so an empty one is useless.
@@ -214,7 +215,7 @@ function PriceCard({ item, defaultCurrency, userCurrency, rates, onSaved }) {
         </div>
 
         <div className="somm-card-right">
-          <span className="somm-vintage-pill">{item.vintage}</span>
+          <span className="somm-vintage-pill">{formatVintage(item.vintage, t)}</span>
           {item.latestPrice ? (
             <span className="sp-last-price">
               {item.latestPrice.price} {item.latestPrice.currency}
@@ -301,8 +302,8 @@ function PriceCard({ item, defaultCurrency, userCurrency, rates, onSaved }) {
 
             <div className="form-group sp-currency-field">
               <label>{t('common.currency')}</label>
-              {/* A value per option, never translated: page translation turned
-                  "EUR" into "EURO" in an option without a value (2026-10-13). */}
+              {/* A value per option, never translated: page translation turns
+                  "EUR" into "EURO" in an option without a value. */}
               <select translate="no" value={form.currency} onChange={set('currency')}>
                 {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
               </select>

@@ -17,13 +17,27 @@ export const sommGetPendingWines = (apiFetch, params) =>
 /**
  * Complete a pending wine's identity. Fields: producer, name, appellation,
  * regionName, countryName, grapeNames[], type — all optional, send what you
- * fixed. Filling producer + name promotes the wine automatically.
+ * fixed. Filling producer + name promotes the wine automatically. A wine that
+ * waits for a check (row.unchecked) is published by `identityChecked: true`,
+ * alone or with corrections.
  */
 export const sommFixPendingWine = (apiFetch, wineId, patch) =>
   apiFetch(`/api/somm/pending-wines/${wineId}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
+  });
+
+/**
+ * A pending wine IS a wine the registry already holds: move its bottles onto
+ * that published wine and remove the pending row. The fix answers 409 with
+ * `duplicate` (the wine it collided with) when that is the case.
+ */
+export const sommMergePendingWine = (apiFetch, wineId, intoWineId) =>
+  apiFetch(`/api/somm/pending-wines/${wineId}/merge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ intoWineId }),
   });
 
 /**

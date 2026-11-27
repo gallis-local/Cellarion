@@ -10,6 +10,17 @@ const { bumpNotificationsVersion } = require('./dataVersion');
 // push service.
 const PUSH_CONCURRENCY = 10;
 
+// A push service refuses a payload over 4 KB, and a device shows a few lines
+// at most. The push carries the opening of a long message (a curator's reason
+// can run to 2000 characters); the bell keeps the whole text. Counted in code
+// points so a character is never cut in half, and small enough that four-byte
+// characters still fit.
+const PUSH_MESSAGE_MAX = 500;
+function pushText(message) {
+  const chars = [...String(message ?? '')];
+  return chars.length > PUSH_MESSAGE_MAX ? `${chars.slice(0, PUSH_MESSAGE_MAX - 1).join('').trimEnd()}…` : chars.join('');
+}
+
 let webpush;
 const VAPID_CONFIGURED = !!(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
 if (VAPID_CONFIGURED) {
@@ -22,9 +33,9 @@ if (VAPID_CONFIGURED) {
 }
 
 // Map a notification category → which `preferences.notifications.<cat>.push`
-// flag gates web-push delivery. New community categories (Phase 5) read
-// per-category prefs; older subsystems pass undefined and fall back to a
-// permissive "any push enabled" check so they keep working.
+// flag gates web-push delivery. These categories read per-category prefs;
+// callers that pass no category fall back to a permissive "any push
+// enabled" check.
 const PUSH_PREF_PATH = {
   drinkWindow: 'drinkWindow',
   communityReply: 'communityReply',
@@ -45,9 +56,9 @@ const PUSH_PREF_PATH = {
  * @param {string} [link]
  * @param {string} [category] — preference category that gates push delivery
  *   ('drinkWindow' | 'communityReply' | 'communityMention' | 'communityFollow').
- *   When omitted, falls back to "any push toggle enabled" — covers legacy
- *   callers (recommendations, restock checker, etc.) that don't yet have
- *   per-category prefs.
+ *   When omitted, falls back to "any push toggle enabled" — covers callers
+ *   (recommendations, restock checker, etc.) whose notifications have no
+ *   push preference of their own.
  */
 async function createNotification(userId, type, title, message, link = null, category, actor = null) {
   return createNotifications([{ userId, type, title, message, link, category, actor }]);
@@ -56,12 +67,12 @@ async function createNotification(userId, type, title, message, link = null, cat
 // Categories that stay in the app (the bell): no push preference covers
 // them, and the permissive fallback below must not reach for one. Early
 // access notices (a feature entered beta, a thank-you) are not something a
-// member opted into push for (release audit 2026-10-10).
+// member opted into push for.
 const IN_APP_ONLY = new Set(['earlyAccess']);
 
 // Push-preference gate: category-specific when the caller named one,
-// otherwise permissive ("any push toggle enabled") so legacy callers that
-// haven't been migrated to pass a category keep working.
+// otherwise permissive ("any push toggle enabled") so callers that pass no
+// category still reach members who turned push on.
 function pushAllowedFor(prefs, category) {
   if (IN_APP_ONLY.has(category)) return false;
   if (!prefs) return false;
@@ -143,7 +154,7 @@ async function createNotifications(items) {
     for (const item of allowed) {
       const userSubs = subsByUser.get(String(item.userId));
       if (!userSubs) continue;
-      const payload = JSON.stringify({ title: item.title, message: item.message, link: item.link || null, tag: item.type });
+      const payload = JSON.stringify({ title: item.title, message: pushText(item.message), link: item.link || null, tag: item.type });
       for (const sub of userSubs) {
         tasks.push(() => sendToSubscription(sub, payload));
       }

@@ -1,7 +1,7 @@
 /**
  * update_bottle apply_to_lot — the drink window / price of ONE call written to
  * every active bottle of the same wine and vintage in the user's own cellars
- * (support ticket 2026-09-06: six identical calls for a case of six).
+ * (one call for a case of six, not six identical calls).
  *
  * Pins: only the lot-level fields travel to the siblings; each sibling runs
  * the shared validation and a refusal is reported, never fatal for the rest;
@@ -31,7 +31,7 @@ jest.mock('../models/WineEmbedding', () => ({ findOne: jest.fn() }));
 jest.mock('../models/McpActionLog', () => ({ create: jest.fn(), findOne: jest.fn(), findOneAndUpdate: jest.fn(), deleteOne: jest.fn(() => Promise.resolve({})) }));
 jest.mock('../utils/rackGeometry', () => ({ getMaxPosition: jest.fn(() => 12) }));
 jest.mock('../services/search', () => ({
-  getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn(),
+  getIsAvailable: jest.fn(() => false), search: jest.fn(),
 }));
 jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), buildEmptyStats: jest.fn() }));
 jest.mock('../services/vectorStore', () => ({ getPoints: jest.fn(), searchSimilar: jest.fn() }));

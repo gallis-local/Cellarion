@@ -1,5 +1,6 @@
 const express = require('express');
-const mongoose = require('mongoose');
+const { classificationsOut } = require('../services/classificationOps');
+const { labelSweetnessOut, sweetnessStyleOut, wineDisplayName } = require('../services/sweetnessOps');
 const rateLimit = require('express-rate-limit');
 const router = express.Router();
 
@@ -14,6 +15,9 @@ const { recordRead } = require('../services/registryReadTracker');
 const { dataForWine, suggestValue } = require('../services/registryDataOps');
 const { createFieldCorrection } = require('../services/wineProposalOps');
 const { createWineRequest } = require('../services/accountOps');
+const { parseContribution, fileContribution } = require('../services/registryContributionIntake');
+const { checkContributionGate } = require('../services/contributionGate');
+const asyncHandler = require('../utils/asyncHandler');
 const { createNotifications } = require('../services/notifications');
 const { logAudit } = require('../services/audit');
 const { rateLimitKey } = require('../utils/clientIp');
@@ -23,13 +27,15 @@ const { quota, usageFor, capsNow } = require('../services/bridgeQuota');
 const rateLimitsConfig = require('../config/rateLimits');
 const { CURRENT_REGISTRY_TERMS_VERSION } = require('../config/legal');
 
-// Registry Bridge, protocol v1 (REGISTRY_LOCKDOWN_PLAN §6). What a self-hosted
+// Registry Bridge, protocol v1 (docs/registry-bridge.md). What a self-hosted
 // Cellarion may do with the shared registry, one wine at a time:
 //   GET  /search?q=          up to 10 identities (no profiles)
 //   GET  /wines/:id          one wine in full: identity, profile, windows, values
 //   POST /wines/changes      which of the ids the install HOLDS changed since a time
 //   POST /requests           a wine request into the hosted intake (a label photo may ride along)
 //   GET  /requests?ids=      what became of the requests this install filed
+//   POST /contributions      a wine the install created, with its identity, photo and
+//                            drink windows, into the same intake (answered via GET /requests)
 //   POST /corrections        a field-correction proposal into the admin queue
 //   POST /values             a public-value suggestion into the review queue
 //   GET  /me                 the key, its quotas and today's spend
@@ -48,13 +54,27 @@ const VISIBLE = { nonWine: { $ne: true }, pendingIdentity: { $ne: true } };
 // that does not exist); a direct fetch still serves one — that is the path a
 // copier walks, and the fetch is what gets reported.
 const SEARCH_VISIBLE = { ...VISIBLE, canary: { $ne: true } };
-const IDENTITY_SELECT = 'name producer slug country region appellation classification grapes type colour image imageCredit';
+const IDENTITY_SELECT = 'name producer slug country region appellation classification classifications labelSweetness sweetnessInName sweetnessStyle grapes type colour image imageCredit';
+// Every identity read populates the same taxonomy rows.
+const BRIDGE_POPULATE = ['country', 'region', 'grapes', { path: 'classifications', select: 'name kind' }, { path: 'labelSweetness', select: 'name band scale regulated -_id' }, { path: 'sweetnessStyle.term', select: 'name band scale regulated' }];
+
+// Protocol version, negotiated by request header (`X-Cellarion-Bridge-Protocol`).
+// v1 — no header, every install before label sweetness — gets the name AS THE
+// LABEL READS IT (name + term, services/sweetnessOps.wineDisplayName) and no
+// `labelSweetness` key: byte for byte what it always received, so its own
+// keys and names never move. v2 gets the bare name and the term as its own
+// field, by WORD and scale (never an id: ids differ per server).
+const PROTOCOL = 2;
+const bridgeProtocol = (req) => {
+  const v = parseInt(String(req.get('x-cellarion-bridge-protocol') || '1'), 10);
+  return Number.isInteger(v) && v >= 2 ? 2 : 1;
+};
 // The profile fields that are registry content. Never the hold/suspect
 // bookkeeping, the model name, the input snapshot or the producer note.
-const PROFILE_FIELDS = ['body', 'tannin', 'acidity', 'sweetness', 'flavors', 'foodPairings', 'description', 'source', 'generatedAt', 'verifiedAt'];
+const PROFILE_FIELDS = ['body', 'tannin', 'acidity', 'sweetness', 'flavors', 'foodPairings', 'description', 'servingTempMin', 'servingTempMax', 'needsAir', 'source', 'generatedAt', 'verifiedAt'];
 
 // Strict: mongoose.isValidObjectId() also accepts any 12-character string, so
-// a nested value could reach $in and raise a CastError 500 (audit 2026-09-08).
+// a nested value could reach $in and raise a CastError 500.
 const isValidId = (id) => /^[a-f0-9]{24}$/i.test(String(id));
 
 // Pre-auth per-address limiter: bounds key guessing and probing. A
@@ -71,7 +91,7 @@ const ipLimiter = rateLimit({
     res.status(429).json({ error: 'Too many bridge requests from this network — try again in a few minutes.', code: 'rate_limited' });
   },
 });
-// Per-key burst limiter (plan §6: 60 per minute by default). Tunable at
+// Per-key burst limiter (60 per minute by default). Tunable at
 // runtime together with the daily quotas (config/rateLimits.js `bridge`
 // group); read per request so a change needs no restart.
 const BURST_PER_MINUTE = 60;
@@ -94,7 +114,7 @@ const keyLimiter = rateLimit({
 
 // Kill switch: `bridge.enabled = 0` closes the whole protocol with a clear
 // 503, the lever routes/mcp.js has had since it shipped and this surface
-// lacked (audit 2026-09-08). Read from the in-memory config, so it takes
+// lacked. Read from the in-memory config, so it takes
 // effect on the next request without a restart.
 function bridgeOpen(req, res, next) {
   if ((rateLimitsConfig.get().bridge || {}).enabled === 0) {
@@ -111,18 +131,26 @@ function nameOf(ref) {
   return null;
 }
 
-function identity(w) {
+function identity(w, protocol = 1) {
+  const term = labelSweetnessOut(w);
   return {
     id: String(w._id),
     slug: w.slug || null,
     producer: w.producer || null,
-    name: w.name,
+    name: protocol >= 2 ? w.name : wineDisplayName(w),
+    // v2 only, and only the shape: { name, band, scale, regulated } or null.
+    // The sweetness style beside it, v2 only too: { name, band, scale,
+    // regulated, source, sourceUrl } or null — descriptive, by word and
+    // scale like the term, never part of the identity a copy is keyed on.
+    ...(protocol >= 2 ? { labelSweetness: term, sweetnessStyle: sweetnessStyleOut(w) } : {}),
     type: w.type || null,
     // Additive (v1 clients ignore unknown keys): the colour of a sparkling,
     // dessert or fortified wine, null for the rest.
     colour: w.colour || null,
     appellation: w.appellation || null,
     classification: w.classification || null,
+    // Additive: the classification as taxonomy rows [{ name, kind }].
+    classifications: classificationsOut(w),
     region: nameOf(w.region),
     country: nameOf(w.country),
     grapes: Array.isArray(w.grapes) ? w.grapes.map((g) => (g && g.name) || null).filter(Boolean) : [],
@@ -168,8 +196,7 @@ function sendResult(res, r, ok) {
  *
  * The AUDIT row is written for every hit; the notification is throttled to one
  * per key per day. Canary ids are discoverable from public pages, so an
- * unthrottled notify was a way to bury admins in their own alarm (audit
- * 2026-09-08).
+ * unthrottled notify would be a way to bury admins in their own alarm.
  */
 async function reportCanaryFetch(req, wine) {
   try {
@@ -203,7 +230,11 @@ router.get('/me', async (req, res) => {
       quotas: capsNow(),
       burstPerMinute: burstPerMinute(),
       usage,
-      protocol: 'v1',
+      // The protocol THIS reply speaks (negotiated by header, see bridgeProtocol).
+      // A v1 peer gets exactly the reply it always got; a v2 peer also learns
+      // every version the server accepts.
+      protocol: `v${bridgeProtocol(req)}`,
+      ...(bridgeProtocol(req) >= 2 ? { accepts: ['v1', `v${PROTOCOL}`] } : {}),
     });
   } catch (error) {
     console.error('Bridge /me error:', error);
@@ -212,9 +243,9 @@ router.get('/me', async (req, res) => {
 });
 
 // GET /v1/search?q=  — identities only, capped like the web UI's add-bottle search.
-// Validation runs BEFORE the quota is spent: a malformed call used to cost a
-// unit, and with one change check a day that meant a single typo silenced the
-// weekly refresh until UTC midnight (audit 2026-09-08).
+// Validation runs BEFORE the quota is spent: with one change check a day, a
+// malformed call that cost a unit would let a single typo silence the weekly
+// refresh until UTC midnight.
 function validSearch(req, res, next) {
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
   if (q.length < QUERY_MIN || q.length > QUERY_MAX) {
@@ -244,7 +275,7 @@ router.get('/search', validSearch, quota('searches'), async (req, res) => {
       try {
         const { ids } = await searchService.search(q, { limit: SEARCH_LIMIT });
         const found = await WineDefinition.find({ _id: { $in: ids }, ...SEARCH_VISIBLE })
-          .select(IDENTITY_SELECT).populate(['country', 'region', 'grapes']).lean();
+          .select(IDENTITY_SELECT).populate(BRIDGE_POPULATE).lean();
         const order = new Map(ids.map((id, i) => [String(id), i]));
         found.sort((a, b) => order.get(String(a._id)) - order.get(String(b._id)));
         wines = found;
@@ -257,16 +288,17 @@ router.get('/search', validSearch, quota('searches'), async (req, res) => {
         .select({ ...Object.fromEntries(IDENTITY_SELECT.split(' ').map((f) => [f, 1])), score: { $meta: 'textScore' } })
         .sort({ score: { $meta: 'textScore' } })
         .limit(SEARCH_LIMIT)
-        .populate(['country', 'region', 'grapes'])
+        .populate(BRIDGE_POPULATE)
         .lean();
     }
     // A search is a read of the registry too — ten identities a call, hundreds
-    // of calls a day. Counting only single fetches left the copy detector
-    // blind to this path (audit 2026-09-08). Detection counts on the owner.
+    // of calls a day. Counting only single fetches would leave the copy
+    // detector blind to this path. Detection counts on the owner.
     if (wines.length) {
       recordRead({ key: `user:${req.user.id}`, kind: 'user' }, wines.map((w) => w._id)).catch(() => {});
     }
-    res.json({ query: q, count: wines.length, wines: wines.map(identity) });
+    const protocol = bridgeProtocol(req);
+    res.json({ query: q, count: wines.length, wines: wines.map((w) => identity(w, protocol)) });
   } catch (error) {
     console.error('Bridge search error:', error);
     res.status(500).json({ error: 'Search failed' });
@@ -281,13 +313,13 @@ router.get('/wines/:id', quota('fetches'), async (req, res) => {
     const wine = await findVisibleWine(req.params.id, {
       userId: null, roles: [], lean: true, noDrafts: true,
       select: `${IDENTITY_SELECT} aiProfile canary lwin communityRating updatedAt`,
-      populate: ['country', 'region', 'grapes'],
+      populate: ['country', 'region', 'grapes', { path: 'labelSweetness', select: 'name band scale regulated -_id' }, { path: 'sweetnessStyle.term', select: 'name band scale regulated' }],
     });
     if (!wine || wine.nonWine) return res.status(404).json({ error: 'Wine not found', code: 'not_found' });
 
     // Detection counts on the OWNER: keys are re-mintable, so a per-key row
-    // let one account stay under the alert level by cycling keys (audit
-    // 2026-09-08). The per-key row stays for attribution on the admin page.
+    // would let one account stay under the alert level by cycling keys. The
+    // per-key row stays for attribution on the admin page.
     await recordRead({ key: `user:${req.user.id}`, kind: 'user' }, wine._id);
     recordRead({ key: `key:${req.bridge.key.id}`, kind: 'key' }, wine._id).catch(() => {});
     if (wine.canary) await reportCanaryFetch(req, wine);
@@ -300,7 +332,7 @@ router.get('/wines/:id', quota('fetches'), async (req, res) => {
 
     res.json({
       wine: {
-        ...identity(wine),
+        ...identity(wine, bridgeProtocol(req)),
         lwin: wine.lwin || null,
         communityRating: wine.communityRating ?? null,
         updatedAt: wine.updatedAt || null,
@@ -309,7 +341,7 @@ router.get('/wines/:id', quota('fetches'), async (req, res) => {
         // Published registry values only; who contributed them stays on the
         // hosted page.
         // A field whose figures exist only per vintage has a null wine-wide
-        // value; dropping it took its overrides with it (audit 2026-09-08).
+        // value; dropping it would take its overrides with it.
         values: values && values.ok
           ? values.fields.filter((f) => f.value !== null && f.value !== undefined || f.wineValue !== null && f.wineValue !== undefined || (f.overrides || []).length > 0)
             .map((f) => ({ key: f.key, value: f.value, wineValue: f.wineValue ?? null, overrides: f.overrides || [] }))
@@ -322,23 +354,7 @@ router.get('/wines/:id', quota('fetches'), async (req, res) => {
   }
 });
 
-/**
- * The latest change to what a fetch carries BESIDES the wine record: its
- * reviewed drink windows and its published values. Neither touches the wine's
- * own updatedAt, so a change check on that alone never reported a window a
- * sommelier reviewed after an install copied the wine (support ticket
- * 2026-10-13: the install kept "awaiting staff review" while the hosted wine
- * had its window). A row's setAt / decidedAt counts as well as its updatedAt:
- * updates written with $set skip the pre-save hook that stamps updatedAt.
- *
- * A window withdrawn back to pending, or a value taken down, leaves nothing
- * here to report, and the install keeps what it copied: a fetch only adds and
- * replaces (services/registryBridge applyWindows / applyValues).
- *
- * @param {Array} wineIds
- * @returns {Promise<Map<string, Date>>}
- */
-// Windows and values count from this release on. An install whose watermark
+// Windows and values count from this date on. An install whose watermark
 // is older was never told about the ones reviewed between its copy and its
 // last check, and comparing them to that watermark would leave them missing
 // for good. So until its watermark passes this date it is told about every
@@ -348,6 +364,21 @@ router.get('/wines/:id', quota('fetches'), async (req, res) => {
 // catch-up resumes next week.
 const ATTACHED_COUNTED_FROM = new Date('2026-10-14T00:00:00Z');
 
+/**
+ * The latest change to what a fetch carries BESIDES the wine record: its
+ * reviewed drink windows and its published values. Neither touches the wine's
+ * own updatedAt, so a check on that alone would miss a window reviewed after
+ * an install copied the wine (it would keep "awaiting staff review" while the
+ * hosted wine has its window). A row's setAt / decidedAt counts as well as its
+ * updatedAt: $set updates skip the pre-save hook that stamps updatedAt.
+ *
+ * A window withdrawn back to pending, or a value taken down, leaves nothing
+ * here to report, and the install keeps what it copied: a fetch only adds and
+ * replaces (services/registryBridge applyWindows / applyValues).
+ *
+ * @param {Array} wineIds
+ * @returns {Promise<Map<string, Date>>}
+ */
 async function latestAttachedChange(wineIds) {
   const latest = new Map();
   if (!wineIds.length) return latest;
@@ -382,7 +413,7 @@ router.post('/wines/changes', validChanges, quota('changeChecks'), async (req, r
     const checkedAt = new Date();
     // The same visibility the single-wine fetch applies: a hidden row must
     // report as removed, not as changed, or the change check is an existence
-    // oracle for wines /wines/:id would 404 (audit 2026-09-08).
+    // oracle for wines /wines/:id would 404.
     const found = await WineDefinition.find({ _id: { $in: ids }, ...VISIBLE, canary: { $ne: true } })
       .select('_id updatedAt nonWine').lean();
     const present = new Map(found.map((w) => [String(w._id), w]));
@@ -414,7 +445,7 @@ router.post('/wines/changes', validChanges, quota('changeChecks'), async (req, r
 
 // POST /v1/requests — { wineName, sourceUrl, sourceUrls?, image?, backImage?, follow? }
 // → the hosted wine-request queue. sourceUrls (up to three links, sourceUrl
-// first) and backImage arrived with #1460; an older install sends neither.
+// first) and backImage are optional; an older install sends neither.
 router.post('/requests', quota('contributions'), async (req, res) => {
   try {
     const r = await createWineRequest(req.user.id, {
@@ -422,10 +453,10 @@ router.post('/requests', quota('contributions'), async (req, res) => {
       image: req.body?.image, backImage: req.body?.backImage,
     }, { via: 'bridge', req });
     if (r.error) return res.status(r.error.status || 400).json({ error: r.error.message, code: 'invalid' });
-    // An install from v1.264.0 says it will follow the request (follow: true):
-    // it asks for the outcome and tells its own requester, so the decision
-    // here stays silent for the key owner (models/WineRequest installFollowsAt).
-    // An older one sends nothing and is marked on its first GET /requests.
+    // An install that will follow the request says so (follow: true): it asks
+    // for the outcome and tells its own requester, so the decision here stays
+    // silent for the key owner (models/WineRequest installFollowsAt). One that
+    // sends nothing is marked on its first GET /requests.
     if (req.body?.follow === true) {
       const WineRequest = require('../models/WineRequest');
       await WineRequest.updateOne({ _id: r.wineRequest._id }, { $set: { installFollowsAt: new Date() } })
@@ -441,7 +472,7 @@ router.post('/requests', quota('contributions'), async (req, res) => {
 });
 
 // GET /v1/requests?ids=a,b,… — what became of requests this install filed.
-// Before this existed a request answered here stayed "pending" on the install
+// Without it a request answered here would stay "pending" on the install
 // for good. Only the key owner's own bridge-filed requests answer (any of
 // their keys, so a rotated key still learns the outcome); any other id is
 // simply absent from the answer, never confirmed to exist. A resolved
@@ -466,8 +497,9 @@ router.get('/requests', async (req, res) => {
     }
     const wineIds = rows.filter((r) => r.status === 'resolved' && r.linkedWineDefinition).map((r) => r.linkedWineDefinition);
     const wines = wineIds.length
-      ? await WineDefinition.find({ _id: { $in: wineIds }, ...VISIBLE }).select(IDENTITY_SELECT).populate('country region grapes', 'name').lean()
+      ? await WineDefinition.find({ _id: { $in: wineIds }, ...VISIBLE }).select(IDENTITY_SELECT).populate('country region grapes', 'name').populate('classifications', 'name kind').populate('labelSweetness', 'name band scale regulated -_id').populate('sweetnessStyle.term', 'name band scale regulated').lean()
       : [];
+    const protocol = bridgeProtocol(req);
     const byId = new Map(wines.map((w) => [String(w._id), w]));
     res.json({
       requests: rows.map((r) => {
@@ -478,7 +510,7 @@ router.get('/requests', async (req, res) => {
           resolvedAt: r.resolvedAt || null,
           // The admin's note to the requester — the reason, for a decline.
           notes: r.adminNotes || null,
-          wine: wine ? identity(wine) : null,
+          wine: wine ? identity(wine, protocol) : null,
         };
       }),
     });
@@ -487,6 +519,40 @@ router.get('/requests', async (req, res) => {
     res.status(500).json({ error: 'Failed to read the requests' });
   }
 });
+
+// POST /v1/contributions — { ref, name, producer, country?, region?,
+// appellation?, type?, classification?, colour?, sweetness?, lwin?, grapes?,
+// image?, windows? } → the hosted wine-request queue as a pending new_wine
+// request (services/registryContributionIntake). ref is the install's own id
+// for the wine; image is inline only; windows use the shape GET /wines/:id
+// serves: [{ vintage, early, peak, late }], each phase { from, until }.
+// Nothing is published: an admin resolves the request and the windows wait in
+// the maturity queue as suggestions. The install reads the outcome with
+// GET /requests. Checked before the quota is spent.
+function validContribution(req, res, next) {
+  const parsed = parseContribution(req.body);
+  if (parsed.error) return res.status(400).json({ error: parsed.error, code: 'invalid' });
+  req.contribution = parsed.contribution;
+  next();
+}
+
+// An account banned from contributing (services/contributionGate) files
+// nothing, and is told so before the quota is spent. The tier budget is not
+// applied: the daily bridge quota already bounds what an install sends.
+const contributorAllowed = asyncHandler(async (req, res, next) => {
+  const gate = await checkContributionGate(req.user.id, { budget: false });
+  if (!gate.ok) return res.status(gate.code === 'banned' ? 403 : 400).json({ error: gate.message, code: gate.code });
+  next();
+});
+
+router.post('/contributions', validContribution, contributorAllowed, quota('contributions'), asyncHandler(async (req, res) => {
+  const { wineRequest, reused } = await fileContribution(req.user.id, req.contribution, { via: 'bridge', req });
+  if (!reused) {
+    logAudit(req, 'bridge.contribution.forwarded', { type: 'wineRequest', id: wineRequest._id },
+      { key: req.bridge.key.id, instanceHost: req.bridge.key.instanceHost, windows: wineRequest.proposedWindows?.length || 0 });
+  }
+  res.status(reused ? 200 : 201).json({ request: { id: wineRequest._id, status: wineRequest.status, wineName: wineRequest.wineName, reused } });
+}));
 
 // POST /v1/corrections — { wineId, fields, reason, evidenceUrl } → admin-reviewed proposal.
 router.post('/corrections', quota('contributions'), async (req, res) => {
@@ -498,7 +564,7 @@ router.post('/corrections', quota('contributions'), async (req, res) => {
       logAudit(req, 'bridge.correction.forwarded', { type: 'wineCorrectionProposal', id: out.proposal?._id },
         { key: req.bridge.key.id, instanceHost: req.bridge.key.instanceHost, wine: req.body?.wineId });
       // 200 + amended when the key owner's own pending proposal absorbed the
-      // fields (support ticket 2026-09-12) — the install forwards each of its
+      // fields — the install forwards each of its
       // user's filings, so an amendment there is an amendment here.
       res.status(out.amended ? 200 : 201).json({
         proposal: { id: out.proposal?._id, status: out.proposal?.status || 'pending', applied: !!out.applied, amended: !!out.amended },
@@ -530,4 +596,3 @@ router.post('/values', quota('contributions'), async (req, res) => {
 
 module.exports = router;
 module.exports.SEARCH_VISIBLE = SEARCH_VISIBLE;
-module.exports.BURST_PER_MINUTE = BURST_PER_MINUTE;

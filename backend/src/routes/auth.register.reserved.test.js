@@ -43,10 +43,10 @@ jest.mock('../services/mcpOAuth', () => ({ revokeOAuthConnectionsForUser: jest.f
 // meilisearch; stub it as the other auth suites do.
 jest.mock('../services/search', () => ({
   initialize: jest.fn(), getIsAvailable: () => false, search: async () => ({ ids: [] }),
-  searchBottles: async () => ({ ids: [] }), searchDiscussions: async () => ({ ids: [] }),
-  indexWine: jest.fn(), removeWine: jest.fn(), indexBottle: jest.fn(), removeBottle: jest.fn(),
-  removeBottles: jest.fn(), bulkIndexBottles: jest.fn(), indexDiscussion: jest.fn(),
-  removeDiscussion: jest.fn(), fullSync: jest.fn(), fullSyncBottles: jest.fn(), fullSyncDiscussions: jest.fn(),
+  searchDiscussions: async () => ({ ids: [] }),
+  indexWine: jest.fn(), removeWine: jest.fn(),
+  indexDiscussion: jest.fn(),
+  removeDiscussion: jest.fn(), fullSync: jest.fn(), fullSyncDiscussions: jest.fn(),
 }));
 jest.mock('../utils/clientIp', () => {
   let n = 0;
@@ -95,7 +95,7 @@ test.each([
   const res = await register({ username });
 
   expect(res.status).toBe(400);
-  expect(await res.json()).toEqual({ error: USERNAME_RULE_MESSAGE });
+  expect(await res.json()).toEqual({ error: USERNAME_RULE_MESSAGE, code: 'username_invalid' });
   expect(mockCreated).toHaveLength(0);
 });
 

@@ -4,7 +4,7 @@
  * Holds the open /api/events/stream responses per user and fans out
  * "something changed" nudges. Events carry NO cellar data — clients react to
  * any event by refreshing via the normal REST API — so the bus can stay dumb:
- * per-user debounce, last event wins.
+ * per-user debounce, one of each event name per window.
  *
  * Single-process by design (the backend runs as one Node process). If the
  * deployment ever goes multi-instance this becomes a thin facade over Redis
@@ -18,15 +18,13 @@
  */
 
 const MAX_STREAMS_PER_USER = 5;
-// Sized for the measured growth (usage check 2026-10-09): about one active
-// user in four runs the Home Assistant integration, and every install holds
-// one stream, so the old cap of 500 would have been reached at roughly
-// fifteen times today's users. A stream costs a response object, one socket
-// and three timers (heartbeat, max age, the hourly revalidation read —
-// routes/events.js); nginx allows 8,192 connections per worker and a proxied
-// stream uses two of them; the Node process runs with a 524,288 open-file
-// limit (checked on prod 2026-10-09). SSE_MAX_STREAMS overrides for a
-// differently sized deployment.
+// Sized for growth: a large share of active users run the Home Assistant
+// integration, and every install holds one stream. A stream costs a response
+// object, one socket and three timers (heartbeat, max age, the hourly
+// revalidation read — routes/events.js); nginx allows 8,192 connections per
+// worker and a proxied stream uses two of them; the hosted Node process runs
+// with a 524,288 open-file limit. SSE_MAX_STREAMS overrides for a differently
+// sized deployment.
 const MAX_STREAMS_GLOBAL = Math.max(1, parseInt(process.env.SSE_MAX_STREAMS, 10) || 2000);
 const DEBOUNCE_MS = 2000;
 
@@ -34,10 +32,27 @@ const DEBOUNCE_MS = 2000;
 const streams = new Map();
 // userId -> pending debounce timer
 const timers = new Map();
+// userId -> Map<event name, data>: what the pending timer will deliver
+const pending = new Map();
 let totalStreams = 0;
 
+/** Drop a user's pending nudge without delivering it. */
+function cancelPending(key) {
+  clearTimeout(timers.get(key));
+  timers.delete(key);
+  pending.delete(key);
+}
+
+/**
+ * The user's last stream closed: the pending nudge has nobody to go to,
+ * unless an in-process listener (an MCP session) still waits for it.
+ */
+function cancelUnlessListening(key) {
+  if (!listeners.get(key)?.size) cancelPending(key);
+}
+
 // userId -> Set<fn(event, data)> — in-process listeners (MCP session
-// subscriptions, plan §4). They ride the same per-user debounce as the SSE
+// subscriptions). They ride the same per-user debounce as the SSE
 // streams; a listener that throws is dropped from that delivery only.
 const listeners = new Map();
 // Hooks invoked by dropUser/dropToken so OTHER session stores (MCP stateful
@@ -58,9 +73,11 @@ function safeEnd(res) {
 
 /**
  * Queue an event for all of a user's open streams, debounced per user so a
- * 50-bottle import produces one nudge, not 50. Within the window the LAST
- * event wins — clients refresh everything on any event, so coalescing loses
- * nothing.
+ * 50-bottle import produces one nudge, not 50. Within the window each event
+ * NAME is delivered once, with its latest data, in the order the names first
+ * came. A stream client refreshes on any event, but an in-process listener
+ * acts on the name (mcp/server.js EVENT_RESOURCE_MAP), so one kind of event
+ * must never swallow another.
  */
 function emit(userId, event, data = {}) {
   const key = String(userId);
@@ -68,18 +85,25 @@ function emit(userId, event, data = {}) {
   const fns = listeners.get(key);
   if ((!set || set.size === 0) && (!fns || fns.size === 0)) return;
 
+  let events = pending.get(key);
+  if (!events) { events = new Map(); pending.set(key, events); }
+  events.set(event, data);
+
   clearTimeout(timers.get(key));
   const timer = setTimeout(() => {
     timers.delete(key);
+    pending.delete(key);
     const current = streams.get(key);
-    if (current) {
-      const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-      for (const entry of current) safeWrite(entry.res, frame);
-    }
     const currentFns = listeners.get(key);
-    if (currentFns) {
-      for (const fn of currentFns) {
-        try { fn(event, data); } catch { /* one bad listener must not break the fan-out */ }
+    for (const [name, payload] of events) {
+      if (current) {
+        const frame = `event: ${name}\ndata: ${JSON.stringify(payload)}\n\n`;
+        for (const entry of current) safeWrite(entry.res, frame);
+      }
+      if (currentFns) {
+        for (const fn of currentFns) {
+          try { fn(name, payload); } catch { /* one bad listener must not break the fan-out */ }
+        }
       }
     }
   }, DEBOUNCE_MS);
@@ -90,7 +114,7 @@ function emit(userId, event, data = {}) {
 
 /**
  * Register an in-process listener for one user's events (same debounce as the
- * SSE streams; within a window the LAST event wins). Returns an unsubscribe
+ * SSE streams; within a window one of each event name). Returns an unsubscribe
  * function. Listener counts are NOT capped here — callers (MCP sessions) have
  * their own session caps.
  */
@@ -158,8 +182,7 @@ function unregister(userId, res) {
   }
   if (set.size === 0) {
     streams.delete(key);
-    clearTimeout(timers.get(key));
-    timers.delete(key);
+    cancelUnlessListening(key);
   }
 }
 
@@ -175,14 +198,16 @@ function dropUser(userId) {
     try { hook(key); } catch { /* a failing hook must not block session teardown */ }
   }
   const set = streams.get(key);
-  if (!set) return;
-  for (const entry of set) {
-    safeEnd(entry.res);
-    totalStreams--;
+  if (set) {
+    for (const entry of set) {
+      safeEnd(entry.res);
+      totalStreams--;
+    }
+    streams.delete(key);
   }
-  streams.delete(key);
-  clearTimeout(timers.get(key));
-  timers.delete(key);
+  // Also for a user with in-process listeners only: the hooks above have
+  // torn those down, so nothing may be delivered to them later.
+  cancelPending(key);
 }
 
 /** Force-close the streams a specific (revoked) API token authenticated. */
@@ -201,8 +226,7 @@ function dropToken(tokenId) {
     }
     if (set.size === 0) {
       streams.delete(key);
-      clearTimeout(timers.get(key));
-      timers.delete(key);
+      cancelUnlessListening(key);
     }
   }
 }
@@ -228,6 +252,7 @@ function closeAll({ retryMs = 10000 } = {}) {
   }
   streams.clear();
   timers.clear();
+  pending.clear();
   totalStreams = 0;
 }
 

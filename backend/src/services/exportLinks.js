@@ -1,6 +1,6 @@
 // Export-link service — mint and redeem the short-lived download URLs the MCP
-// export tools hand back (plan §3.3 / §3.18). See models/ExportLink.js for the
-// "why a link, not the bytes" rationale: an export is a file, not model context.
+// export tools hand back. See models/ExportLink.js for the "why a link, not
+// the bytes" rationale: an export is a file, not model context.
 //
 // One place owns the credential lifecycle so the tool (mint) and the redeem
 // route (consume) can't drift on token format, hashing, or expiry.
@@ -203,9 +203,7 @@ async function redeemExportLink(link, res, req = null) {
 }
 
 module.exports = {
-  LINK_PREFIX,
   LINK_TTL_MS,
-  ACCOUNT_EXPORT_COOLDOWN_MS,
   isExportLinkToken,
   hashLinkToken,
   mintExportLink,

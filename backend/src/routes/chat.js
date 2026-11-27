@@ -111,10 +111,10 @@ async function validateAndCheckLimit(req, res) {
     }
   }
 
-  // 6000, was 5000: the honest-scoping preamble (#946) added ~330 chars to the
+  // 6000, was 5000: the honest-scoping preamble added ~330 chars to the
   // FRONT of wineSection, and a cap that stayed put would silently truncate
-  // roughly one wine entry off the TAIL on every reuse round-trip
-  // (release-audit L-1). The bound exists to stop a hostile client inflating
+  // roughly one wine entry off the TAIL on every reuse round-trip.
+  // The bound exists to stop a hostile client inflating
   // the prompt, not to shave legitimate context.
   const previousWines = typeof rawPreviousWines === 'string'
     ? rawPreviousWines.slice(0, 6000)
@@ -213,8 +213,8 @@ router.post('/', requireAuth, chatBurstLimiter, asyncHandler(async (req, res) =>
   const { message, useQueryExpansion, history, previousWines, cellarIds, date, usedBefore, limit, period } = validated;
 
   // Count this chat request toward the site-wide daily AI cap (the SuperAdmin
-  // kill-switch) — chat has its own per-user quota (ChatUsage) but previously
-  // escaped the global brake entirely. If the site cap is hit, don't consume the
+  // kill-switch) — chat has its own per-user quota (ChatUsage), and the global
+  // brake applies on top of it. If the site cap is hit, don't consume the
   // user's chat quota that validateAndCheckLimit already reserved.
   const globalDebit = await tryDebitGlobalAi();
   if (!globalDebit.ok) {

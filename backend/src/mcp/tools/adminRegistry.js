@@ -1,13 +1,13 @@
-// Admin registry curation over MCP (Johan's launch-day request): an ADMIN's
+// Admin registry curation over MCP: an ADMIN's
 // connected AI can add a wine to the SHARED registry directly — with an
 // official image and its credit — instead of bouncing through the web admin.
 //
 // Role gating is STRUCTURAL (requireRole, same pattern as tools/somm.js): for
 // any non-admin connection this tool is UNREGISTERED, not hidden. Creation
-// still runs through findOrCreateWine — the same #674-hardened dedup
-// chokepoint as everything else — so an admin's AI gets "did you mean?"
-// candidates rather than minting duplicates; the image path shares
-// attachOfficialWineImage with the admin REST route (no drift).
+// still runs through findOrCreateWine — the same dedup chokepoint as
+// everything else — so an admin's AI gets "did you mean?" candidates rather
+// than minting duplicates; the image path shares attachOfficialWineImage
+// with the admin REST route (no drift).
 //
 // Registry actions are NOT personal-cellar actions: they are audited
 // (wine.create / admin.wine.image.set) but deliberately NOT written to the
@@ -19,7 +19,7 @@ const { registerTool } = require('../registry');
 const { logAudit } = require('../../services/audit');
 const { announceMintedWine } = require('../../services/wineCommit');
 const { isValidId } = require('../../utils/validation');
-const { ok, fail, wineSummary } = require('../toolUtil');
+const { ok, fail, wineSummary, FIELD_DESCRIPTIONS } = require('../toolUtil');
 const { safeFetchImage } = require('../../utils/safeImageFetch');
 
 const MAX_BASE64_CHARS = 1_500_000; // same budget as attach_bottle_image
@@ -41,8 +41,9 @@ registerTool({
     name: z.string().trim().min(1).max(200).describe('Wine name WITHOUT the producer in it'),
     producer: z.string().trim().min(1).max(200),
     country: z.string().trim().min(1).max(200).describe('Country name (required)'),
-    region: z.string().max(200).optional(),
-    appellation: z.string().max(200).optional(),
+    region: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.region),
+    appellation: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.appellation),
+    classification: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.classification),
     type: z.enum(['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified']).describe('Required: defaulting silently would mint wrong-type registry entries'),
     grapes: z.array(z.string().max(200)).max(10).optional(),
     confirm_create: z.boolean().optional().describe('Set true ONLY after reviewing returned candidates and confirming this is a different wine'),
@@ -61,7 +62,7 @@ registerTool({
     let created = false;
     if (args.existing_wine_id) {
       if (!isValidId(args.existing_wine_id)) return fail('invalid_input', 'existing_wine_id must be a 24-hex Mongo id.');
-      wineDoc = await WineDefinition.findById(args.existing_wine_id).populate(['country', 'region', 'grapes']);
+      wineDoc = await WineDefinition.findById(args.existing_wine_id).select('+sweetnessStyle').populate(['country', 'region', 'grapes', { path: 'labelSweetness', select: 'name band scale regulated -_id' }, { path: 'sweetnessStyle.term', select: 'name band scale regulated' }]);
       // A user's private draft is not registry content, not even to an admin.
       if (!wineDoc || wineDoc.draft === true) return fail('not_found', 'No registry wine with that id.');
     } else {
@@ -80,6 +81,7 @@ registerTool({
           country: args.country,
           region: args.region,
           appellation: args.appellation,
+          classification: args.classification,
           type: args.type,
           grapes: args.grapes,
         }, ctx.user.id, { confirmCreate: !!args.confirm_create, skipSiblingMatch: false, createdVia: 'mcp' });
@@ -140,7 +142,8 @@ registerTool({
       `${created ? 'Created registry wine' : 'Registry wine already existed'}: ${wineDoc.name} — ${wineDoc.producer}` +
       `${imageInfo ? ' (official image set, background removal in progress)' : ''}`,
       {
-        wine: wineSummary(wineDoc),
+        // Only an existing wine read by its id asked for the style; a created one carries no key.
+        wine: wineSummary(wineDoc, { termLoaded: true, styleLoaded: !!args.existing_wine_id }),
         wine_id: wineDoc._id,
         created,
         ...(imageInfo ? { official_image: imageInfo } : {}),
@@ -152,7 +155,7 @@ registerTool({
 
 module.exports = {};
 
-// ── Taxonomy review queues (strategy 2026-07-29 R2/R3) ───────────────────────
+// ── Taxonomy review queues ───────────────────────
 // The same queues as Admin → Taxonomy, so an admin can run a review session
 // from chat: list → judge → approve/promote. Same shared service as the REST
 // routes (services/taxonomyReview.js) — the two surfaces cannot drift. Same
@@ -281,9 +284,8 @@ registerTool({
   handler: async (args, ctx) => {
     if (!isValidId(args.country_id)) return fail('invalid_input', 'country_id must be a 24-hex Mongo id.');
     if (args.region_id && !isValidId(args.region_id)) return fail('invalid_input', 'region_id must be a 24-hex Mongo id.');
-    // The schema's "must belong to the same country" was documentation, not
-    // validation (code audit 2026-07-30) — enforce it via the shared guard so
-    // this surface and the REST twin cannot drift.
+    // The schema does not check that the region belongs to the same country:
+    // the shared guard does, so this surface and the REST twin cannot drift.
     const { appellationRefsError } = require('../../services/taxonomyReview');
     const refsError = await appellationRefsError(args.country_id, args.region_id);
     if (refsError) return fail('invalid_input', refsError);

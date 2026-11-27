@@ -1,4 +1,4 @@
-// Personal typed key/value data (issue #986) — full MCP parity with the web
+// Personal typed key/value data — full MCP parity with the web
 // bottle page: list, add, update, delete. All semantics (visibility, typed
 // validation, key match-or-create, caps, discussion ban) live in
 // services/personalData.js, shared with routes/personalData.js — the two
@@ -9,6 +9,8 @@
 const { z } = require('zod');
 const { registerTool } = require('../registry');
 const personalData = require('../../services/personalData');
+const registryData = require('../../services/registryDataOps');
+const { matchKeyByName } = require('../../utils/registryKeyName');
 const { logAudit } = require('../../services/audit');
 const {
   ok, fail, objectId, MSG_BOTTLE_NOT_FOUND, resolveBottleAccess,
@@ -30,7 +32,8 @@ const svcFail = (result) => fail(FAIL_CODE[result.code] || 'invalid_input', resu
 
 // Values arrive as string, number or boolean; the service casts them against
 // the key's declared type and rejects mismatches.
-const VALUE_SCHEMA = z.union([z.string().max(500), z.number(), z.boolean()]);
+const VALUE_SCHEMA = z.union([z.string().max(500), z.number(), z.boolean()])
+  .describe('For a text key, send the value as a string (e.g. "00123"), so leading zeros are kept');
 
 const entryOut = (e) => ({
   entry_id: e._id,
@@ -69,6 +72,42 @@ registerTool({
     );
   },
 });
+
+const idOf = (v) => (v && v._id ? String(v._id) : (v ? String(v) : null));
+
+/**
+ * A personal entry under a name the PUBLIC vocabulary already has (ABV,
+ * Alkoholhalt …) is usually a fact every owner of the wine could use: the
+ * caller hears what the wine record holds for it, or that it holds nothing
+ * and suggest_wine_public_value would offer the figure. Null when the key is
+ * not public or the wine has no record to read; never fails the write.
+ */
+async function publicKeyHint(ctx, bottle, keyName) {
+  const wineId = idOf(bottle && bottle.wineDefinition);
+  if (!wineId) return null;
+  try {
+    const res = await registryData.dataForWine(wineId, ctx.user.id, {
+      roles: ctx.user.roles, vintage: bottle.vintage,
+    });
+    if (!res || !res.ok) return null;
+    const key = matchKeyByName((res.fields || []).map((f) => f.key), keyName);
+    if (!key) return null;
+    const field = res.fields.find((f) => f.key === key);
+    const year = res.vintage || null;
+    if (field.value !== null && field.value !== undefined) {
+      const where = field.resolvedFrom === 'vintage' ? `for ${field.resolvedVintage}` : 'for every vintage';
+      return `The shared wine record already holds ${key.name} = ${JSON.stringify(field.value)}${key.unit ? ' ' + key.unit : ''} (${where}).`;
+    }
+    if (field.mySuggestion || field.hasPendingSuggestion) {
+      return `${key.name} is part of the shared wine record; a suggested value for it is already awaiting curator review.`;
+    }
+    return `${key.name} is part of the shared wine record and this wine has no published value${year ? ` for ${year}` : ''}. ` +
+      `suggest_wine_public_value (wine_id ${wineId}, key_id ${key._id}${year ? `, vintage ${year}` : ''}) would offer this figure ` +
+      'to every owner of the wine — a curator reviews it first. Ask the user before filing it.';
+  } catch {
+    return null;
+  }
+}
 
 registerTool({
   name: 'add_personal_data',
@@ -116,7 +155,7 @@ registerTool({
     if (!result.ok) {
       // Only when the key is genuinely NEW and no type came along — a value
       // error on an existing key must not send the caller hunting for a
-      // duplicate key (audit 2026-09-14 L2).
+      // duplicate key.
       if (result.code === 'invalid' && !args.key_type && result.needsType) {
         return svcFail({ ...result, message: `${result.message}. If "${args.key}" is a new key, pass key_type (${TYPES.join(' | ')}).` });
       }
@@ -127,12 +166,14 @@ registerTool({
       { type: args.level, id: result.entry._id, cellarId: access.cellar._id },
       { key: result.entry.key.name, keyCreated: result.keyCreated, via: 'mcp' });
 
+    const hint = await publicKeyHint(ctx, access.bottle, result.entry.key.name);
     const envelope = {
       summary: `Added ${args.level}-level "${result.entry.key.name}" = ${JSON.stringify(result.entry.value)}${result.entry.key.unit ? ' ' + result.entry.key.unit : ''}`,
       data: {
         entry: entryOut(result.entry),
         key_created: result.keyCreated,
         undo: 'undo_last removes this entry again if it was a mistake',
+        ...(hint ? { hint } : {}),
       },
     };
     await logAction(ctx, {
@@ -235,33 +276,42 @@ const keyOut = (k) => ({
 
 registerTool({
   name: 'update_personal_key',
-  title: 'Rename one of the user\'s personal data keys or change its unit',
+  title: 'Rename one of the user\'s personal data keys, change its unit or its allowed values',
   description:
     'Renames a key in the user\'s own personal-data vocabulary (key_id from list_analytics_fields — the part after ' +
-    '"personal." — or from an entry\'s key) and/or changes its unit. The id never changes, so every stored entry ' +
-    'and analytics field keeps working. The unit can change only on integer/decimal keys that hold NO entries yet ' +
-    '(a unit is part of what each stored value means); pass an empty string to clear it. The key\'s TYPE never ' +
-    'changes — create a new key instead. Reversible via undo_last.',
+    '"personal." — or from an entry\'s key), changes its unit and/or replaces the allowed values of an enum key. ' +
+    'The id never changes, so every stored entry and analytics field keeps working. The unit can change only on ' +
+    'integer/decimal keys that hold NO entries yet (a unit is part of what each stored value means); pass an empty ' +
+    'string to clear it. enum_options is the COMPLETE new list for an enum key: add values at any time; a value an ' +
+    'entry still holds must stay on the list (change those entries first). The key\'s TYPE never changes — create ' +
+    'a new key instead. Reversible via undo_last.',
   scope: 'write',
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   inputSchema: {
     key_id: objectId,
     name: z.string().min(1).max(60).optional().describe('New display name (case-insensitively unique among the user\'s keys)'),
     unit: z.string().max(20).optional().describe('New unit for a numeric key with no entries; "" clears it'),
+    enum_options: z.array(z.string().max(40)).min(2).max(20).optional()
+      .describe('For an enum key: the complete new list of allowed values (2–20); a value an entry still holds must stay'),
   },
   handler: async (args, ctx) => {
-    const result = await personalData.updateKey(ctx.user.id, args.key_id, { name: args.name, unit: args.unit });
+    const result = await personalData.updateKey(ctx.user.id, args.key_id, {
+      name: args.name, unit: args.unit, enumOptions: args.enum_options,
+    });
     if (!result.ok) return svcFail(result);
 
     logAudit(ctx.req, 'personal_data.key_update',
       { type: 'personalDataKey', id: result.key._id },
-      { from: result.prev, to: { name: result.key.name, unit: result.key.unit }, via: 'mcp' });
+      { from: result.prev, to: { name: result.key.name, unit: result.key.unit, enumOptions: result.key.enumOptions }, via: 'mcp' });
 
     const changes = [];
     const nameChanged = result.prev.name !== result.key.name;
     const unitChanged = (result.prev.unit || null) !== (result.key.unit || null);
+    const optionsChanged = Object.prototype.hasOwnProperty.call(result.prev, 'enumOptions')
+      && JSON.stringify(result.prev.enumOptions || null) !== JSON.stringify(result.key.enumOptions || null);
     if (nameChanged) changes.push(`renamed "${result.prev.name}" → "${result.key.name}"`);
     if (unitChanged) changes.push(`unit ${JSON.stringify(result.prev.unit || null)} → ${JSON.stringify(result.key.unit || null)}`);
+    if (optionsChanged) changes.push(`allowed values now: ${(result.key.enumOptions || []).join(', ')}`);
     const envelope = {
       summary: changes.length ? `Key ${changes.join(', ')}` : `Key "${result.key.name}" unchanged`,
       data: { key: keyOut(result.key), undo: 'undo_last restores what this call changed' },
@@ -271,8 +321,12 @@ registerTool({
       action: 'personal_data',
       detail: { op: 'key_update', keyId: String(result.key._id), key: result.key.name },
       // Only the fields THIS call changed — undoing a rename must not touch a
-      // unit set elsewhere (audit 2026-09-14 M2).
-      prev: { ...(nameChanged ? { name: result.prev.name } : {}), ...(unitChanged ? { unit: result.prev.unit } : {}) },
+      // unit set elsewhere.
+      prev: {
+        ...(nameChanged ? { name: result.prev.name } : {}),
+        ...(unitChanged ? { unit: result.prev.unit } : {}),
+        ...(optionsChanged ? { enumOptions: result.prev.enumOptions } : {}),
+      },
       result: envelope,
     });
     return ok(envelope.summary, envelope.data);

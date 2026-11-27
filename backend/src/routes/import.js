@@ -2,58 +2,59 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { requireAuth, requireNonDemo } = require('../middleware/auth');
 const aiBurstLimiter = require('../middleware/aiBurstLimiter');
+const importValidateLimiter = require('../middleware/importValidateLimiter');
 const Bottle = require('../models/Bottle');
 const Cellar = require('../models/Cellar');
-const Rack = require('../models/Rack');
-const WineDefinition = require('../models/WineDefinition');
-const Country = require('../models/Country');
 const Grape = require('../models/Grape');
 const { getCellarRole } = require('../utils/cellarAccess');
 const { logAudit } = require('../services/audit');
 const { getOrCreateDailySnapshot } = require('../utils/exchangeRates');
 const { resolveRating } = require('../utils/ratingUtils');
-const { normalizeString, normalizeWineName, resolveCountryName, isRecognizedCountry, isUnknownName, isIdentitySentinel
-} = require('../utils/normalize');
+const { normalizeString, normalizeWineName, resolveCountryName, isRecognizedCountry, isIdentitySentinel } = require('../utils/normalize');
 const { normalizeBottleSize, DEFAULT_SIZE } = require('../config/bottleSizes');
-const searchService = require('../services/search');
 const { identifyWineFromText } = require('../services/labelScan');
 const aiProvider = require('../services/aiProvider');
 const { findOrCreateWine } = require('../services/findOrCreateWine');
-const { scoreWineMatchVariants, stripProducerPrefix, stripAppellationPrefix, stripProducerBrackets, importQueryVariants } = require('../services/wineMatching');
-const { conflictingStyleTerms, pradikatOnlyValue, pradikatContradictsName } = require('../utils/styleTerms');
-const { statedColourConflict } = require('../utils/wineColour');
-const { wineVisibilityFilter, findVisibleWine } = require('../services/wineVisibility');
-// Audit 2026-09 D13-12: parse-time warnings are bounded before they are stored.
-const { sanitizeImportWarnings } = require('../utils/importWarnings');
+const { findVisibleWine } = require('../services/wineVisibility');
 const { tryDebitAi, isRefundableFailure } = require('../services/aiBudget');
 const rateLimitsConfig = require('../config/rateLimits');
-const { generateWineKey } = require('../utils/normalize');
+const importPolicy = require('../config/importPolicy');
 const {
   CONSUMED_STATUSES,
   ORDERED_STATUS,
   IMPORT_EXACT_THRESHOLD,
-  IMPORT_FUZZY_THRESHOLD,
   MAX_IMPORT_SIZE,
   AI_CONCURRENCY,
 } = require('../config/constants');
-const { stripHtml, escapeRegex, sanitizeGrapeNames } = require('../utils/sanitize');
-const { WINE_TYPES } = require('../services/wineProfileOps');
+const { stripHtml, sanitizeGrapeNames } = require('../utils/sanitize');
 const { parseAndValidateVintage, parseDrinkYear } = require('../utils/validation');
 const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
 const { extractAiExplanation } = require('../utils/jsonExtract');
-const { getMaxPosition, cabinetShelfRows, cabinetShelfCols, cabinetShelfAlternate, cabinetShelfSideways, fitCabinetTypeConfig } = require('../utils/rackGeometry');
-const { planRackCreations, placeBottlesInRack, VALID_ANCHORS, DEFAULT_ANCHOR } = require('../utils/rackImport');
+const { sanitizeRackConfigs, VALID_ANCHORS, DEFAULT_ANCHOR } = require('../utils/rackImport');
 const { RACK_TYPES } = require('../models/Rack');
+// The racks a file names: created before the bottles, filled after them.
+const { createImportRacks, placeImportedBottles } = require('../services/importRacks');
 const { validatePriceSanity } = require('../utils/priceValidation');
 const { computeUserMediansByCurrency } = require('../services/priceWarnings');
 const { parseCurrency, currencyOrFallback, isSupportedCurrency } = require('../config/currencies');
 const { runConcurrent } = require('../utils/concurrency');
-const WineRequest = require('../models/WineRequest');
 const { findOrCreatePendingRequest, pickImportHints } = require('../services/wineRequestIntake');
 const WishlistItem = require('../models/WishlistItem');
-const ImportSession = require('../models/ImportSession');
-const ImportArchive = require('../models/ImportArchive');
 const { parseExpectedArrival } = require('../utils/onOrder');
+// Which registry wine a row is, if any: the exact key, a known producer
+// split off the name, the scored candidates and the colour gate.
+const {
+  rowColourConflict, findExactRegistryWine, splitKnownProducerPrefix, findWineMatches,
+} = require('../services/importMatching');
+// What a row says a wine is: the proposed wine from file and AI, which
+// source supplied each field, and the rows that need no AI at all.
+const {
+  AI_GEOGRAPHY_MIN_CONFIDENCE, buildProposedWine, computeIdentityProvenance, fileCompleteIdentity, fileStatedIdentity,
+} = require('../services/importIdentity');
+const { withDerivedCountry } = require('../services/importCountry');
+// The failure reasons grouped for the audit row, and the archive of the
+// file's identity columns.
+const { summariseReasons, writeImportArchive } = require('../services/importArchive');
 
 /**
  * A row flagged `onOrder` (a CellarTracker pending purchase, or a receipt the
@@ -74,631 +75,8 @@ const router = express.Router();
 // wines; a throwaway demo must do neither. Demo users can't bulk-import.
 router.use(requireAuth, requireNonDemo);
 
-// Aliases for readability (imported from config/constants.js)
+// Alias for readability (imported from config/constants.js)
 const EXACT_THRESHOLD = IMPORT_EXACT_THRESHOLD;
-const FUZZY_THRESHOLD = IMPORT_FUZZY_THRESHOLD;
-
-// Below this identification confidence the AI is going on inference, not
-// knowledge ("0.5 = reasonably sure" in the prompt's own scale) — exactly the
-// band that wrote a producer's home region onto wines from elsewhere and split
-// one producer across region granularities (ticket 6a8162c5). Geography the
-// AI proposed under this floor is dropped before it can mint; the curation
-// backfill queue fills it from evidence instead.
-//
-// ⚠️ THIS FLOOR APPLIES TO AI-DERIVED GEOGRAPHY ONLY. It used to be justified
-// by "import files carry no region/appellation columns, so this only ever
-// strips AI inference — never user data", and that stopped being true:
-// importMappers maps CellarTracker's Appellation, its
-// Country/Region/SubRegion/Appellation Locale path, SubRegion and a generic
-// appellation column, and findExactRegistryWine/scoreCandidate below have been
-// matching on item.appellation all along. So the floor WAS deleting what the
-// user typed. Measured 2026-08-21: one 231-wine import produced 86 null/null
-// registry rows, and over half of a curation day went on putting back
-// appellations the file had supplied. File geography now wins outright and is
-// never subject to this floor — see buildProposedWine.
-const AI_GEOGRAPHY_MIN_CONFIDENCE = 0.6;
-
-// Distinct failure reasons kept in one import's audit row, and the length each
-// is truncated to. Enough to name every failure mode a real file hits without
-// letting a pathological one bloat the document.
-const AUDIT_REASON_MAX_KINDS = 12;
-const AUDIT_REASON_MAX_LEN = 160;
-
-/**
- * Group per-row {reason} entries into { reason: count } for the audit.
- *
- * Deliberately reason-only: the row's wine name, producer and notes are the
- * user's data and the audit needs the failure MODE, not the record. Messages
- * that embed a caught err.message can vary per row, so they are truncated and
- * the tail is folded into one "+N more" bucket rather than dropped silently —
- * a cap that hides its own truncation is how you end up trusting a partial
- * picture.
- */
-function summariseReasons(entries) {
-  const counts = new Map();
-  for (const e of entries) {
-    const raw = (e && typeof e.reason === 'string' && e.reason.trim()) ? e.reason.trim() : '(no reason recorded)';
-    const key = raw.length > AUDIT_REASON_MAX_LEN ? `${raw.slice(0, AUDIT_REASON_MAX_LEN)}…` : raw;
-    counts.set(key, (counts.get(key) || 0) + 1);
-  }
-  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  const kept = ranked.slice(0, AUDIT_REASON_MAX_KINDS);
-  const out = Object.fromEntries(kept);
-  const spilled = ranked.slice(AUDIT_REASON_MAX_KINDS);
-  if (spilled.length) {
-    out[`+${spilled.length} more reason kind(s)`] = spilled.reduce((s, [, n]) => s + n, 0);
-  }
-  return out;
-}
-
-/**
- * The wine a no-match row proposes to mint, built from the AI identification
- * and the user's own file row.
- *
- * PRECEDENCE: file geography beats AI geography, always. The file is what the
- * label says as the owner read it; the AI is recalling. The confidence floor
- * exists to stop the model ASSERTING a place it inferred, and it has no
- * business deleting a column the user filled in.
- *
- * Kept as a named function (rather than inline in the /validate loop) so the
- * precedence is unit-testable — it is the rule that decides what enters the
- * shared registry, and it was previously an expression buried 500 lines in.
- */
-function buildProposedWine(aiData, item) {
-  const clean = (v) => {
-    const s = typeof v === 'string' ? v.trim() : '';
-    return s || null;
-  };
-  // Below the floor the model is inferring, not knowing (part B below).
-  const lowGeoConfidence =
-    !(typeof aiData.confidence === 'number' && aiData.confidence >= AI_GEOGRAPHY_MIN_CONFIDENCE);
-  const fromAi = (v) => (lowGeoConfidence ? null : clean(v));
-
-  // A purely-Prädikat appellation is routed out of the field entirely; only a
-  // Prädikat the wine itself does not contradict is rescued into the
-  // classification. See pradikatContradictsName: the second ticket record put
-  // Trockenbeerenauslese on a wine named "Riesling Trocken", and rescuing that
-  // would have kept the falsehood and merely moved which field carried it.
-  const filePradikat = pradikatOnlyValue(clean(item && item.appellation));
-  const rescuedPradikat = filePradikat && !pradikatContradictsName(filePradikat, aiData.name)
-    ? filePradikat
-    : null;
-
-  return {
-    name: aiData.name,
-    // A file with no producer column gets its producer from the model, and
-    // the model — told a name-equals-producer estate wine is fine — sometimes
-    // mirrors an unknown cuvée name back as the producer ("Les Caractères" /
-    // "Les Caractères", boubou17's CSV; audit ticket 2026-09-04). That is a
-    // missing producer, not a producer: leave it empty so the row mints as a
-    // pending identity for a curator, unless the name itself is an estate.
-    producer: producerMirroredFromName(aiData, item) ? null : aiData.producer,
-    // Country keeps the AI's value first: it is fed the file's country as a
-    // hint and normalizes local-language names ("Deutschland" → "Germany"),
-    // which the raw column does not. The file is the fallback, which is new —
-    // a countryless identification used to cost the user the row entirely.
-    country: clean(aiData.country) || clean(item && item.country),
-    region: clean(item && item.region) || fromAi(aiData.region),
-    // A file's appellation column sometimes holds the ripeness Prädikat rather
-    // than a place — "Auslese" for a Mosel Riesling, "Trokenbeerenauslese" for
-    // a Nahe one (somm ticket 6a966386). Taken literally the wine ends up with
-    // NO appellation, which is the thin-identity condition that makes
-    // auto-enrichment decline it for good: the owner's data-entry habit
-    // silently costs him his tasting notes. So a purely-Prädikat value is not
-    // treated as geography, and the model's place name fills the field instead
-    // — for the Nahe wine that is the same source its region already came from.
-    // pradikatOnlyValue refuses anything that might also name a place.
-    appellation: filePradikat
-      ? fromAi(aiData.appellation)
-      : (clean(item && item.appellation) || fromAi(aiData.appellation)),
-    // Same floor as geography: a classification is an assertion of knowledge
-    // (ticket 6a83f014 added the field to the identify prompt), and the file's
-    // own value outranks it for the same reason.
-    //
-    // A Prädikat rescued from the appellation column lands HERE, where it was
-    // always meant to go, and outranks the model for the same reason any other
-    // file value does — the owner read it off the bottle. Only when the file
-    // states no classification of its own, which is the case that produced the
-    // ticket.
-    classification: clean(item && item.classification)
-      || rescuedPradikat
-      || fromAi(aiData.classification),
-    // Same precedence as the geography above: the file states what the label
-    // says, the model recalls. Only ever a value the schema accepts — a
-    // client can send anything, and an invalid colour must fall through to
-    // the AI rather than fail the mint. The parsers now emit null for an
-    // unknown colour instead of guessing 'red', so a null here is an honest
-    // "the file did not say", not a lost value.
-    type: (WINE_TYPES.includes(clean(item && item.type)) ? clean(item.type) : null) || aiData.type,
-    grapes: aiData.grapes,
-    confidence: aiData.confidence,
-  };
-}
-
-/**
- * Which source supplied each identity field of an AI-identified import row.
- *
- * Computed SERVER-SIDE at mint from the file row, deliberately not carried on
- * the aiWine object the client round-trips: provenance is a claim about our
- * own pipeline, and a claim a client could edit is worth nothing.
- *
- * The rules mirror mergeAiWithFile's precedence exactly — file first for the
- * label-stated fields, model for the rest. Its curator-facing point (somm
- * ticket 6a958dbc, 2026-08-31): a grape the model INFERRED FROM THE
- * APPELLATION must not look identical to one the owner's file stated. That
- * import's file carried appellation on all 205 rows and grapes on none, and
- * all eight of its Montlouis wines were duly assigned Chenin Blanc —
- * including a pétillant naturel that is mostly Menu Pineau.
- *
- * @param {Object} item the file's row
- * @param {Object} ai the identified wine actually being minted
- * @returns {Object<string,'file'|'model'>}
- */
-function computeIdentityProvenance(item, ai) {
-  const stated = (v) => typeof v === 'string' && v.trim() !== '';
-  const fileType = stated(item?.type) && WINE_TYPES.includes(String(item.type).trim().toLowerCase());
-  // The one field with a genuine file fallback on this path: /validate
-  // supplements the AI's empty grape list from the row (see the importGrapes
-  // branch), so a grape list CAN be the file's.
-  const fileGrapes = sanitizeGrapeNames(item?.grapes);
-  const aiGrapes = Array.isArray(ai?.grapes) ? ai.grapes : [];
-  const grapesFromFile = fileGrapes.length > 0 && aiGrapes.length > 0
-    && aiGrapes.every((g) => fileGrapes.some((f) => normalizeString(f) === normalizeString(g)));
-  const filePrad = pradikatOnlyValue(stated(item?.appellation) ? item.appellation.trim() : '');
-  const rescuedPrad = filePrad && !pradikatContradictsName(filePrad, ai?.name) ? filePrad : null;
-
-  return {
-    name: 'model',
-    producer: 'model',
-    country: stated(item?.country) && !stated(ai?.country) ? 'file' : 'model',
-    region: stated(item?.region) ? 'file' : 'model',
-    // Follows the VALUE, not the column it was typed in: a rescued Prädikat
-    // leaves the appellation to the model and supplies the classification
-    // itself, and provenance is what the sommelier reasons from.
-    appellation: stated(item?.appellation) && !filePrad ? 'file' : 'model',
-    classification: stated(item?.classification) || rescuedPrad ? 'file' : 'model',
-    type: fileType ? 'file' : 'model',
-    grapes: grapesFromFile ? 'file' : 'model',
-  };
-}
-
-/**
- * Complete-row AI bypass (2026-08-29, Johan's call: "the somm is free and we
- * pay for AI"). A row whose FILE already states the identity does not need a
- * model to restate it: findOrCreateWine's ladder does the normalization work
- * deterministically (producer-prefix canon, trailing-vintage strip,
- * estate-name unpollution, appellation resolution), the somm/enrichment
- * pipeline fills the tail, and the AI call would mostly echo the row back.
- * One large import measured 430 debited calls; most rows carried full data.
- * The AI keeps the rows it is actually FOR: incomplete or messy ones.
- *
- * The gate is "can this row mint cleanly and match correctly without AI",
- * NOT "is every column filled":
- *   - producer + wineName + country: required. Identity plus the one field
- *     the mint hard-requires — and the country must RESOLVE (the file may
- *     say "AU"; resolveCountryName normalizes it, and an unrecognizable
- *     country would only turn into a /confirm-time error).
- *   - type: the file's, or inferred from the file's grapes when they all
- *     share one taxonomy colour (Riesling → white). Without either the row
- *     goes to AI — findOrCreateWine defaults a missing type to 'red', and a
- *     white minted red is exactly the silent error the AI's answer prevents.
- *     (Known limit: a red-grape rosé with no type column infers 'red' — the
- *     file's own type column always wins when present.)
- *   - grapes, region, appellation: NEVER gate the bypass. Grapes are
- *     inferable from the name and enrichable later; region derives from the
- *     appellation (regionForAppellation — the appellation's region
- *     deliberately outranks the file's); appellation was never required.
- *
- * Returns an aiIdentified-shaped object (confidence null) so Pass 2 and the
- * result builder treat the row exactly like an AI-identified one — same
- * matchOnly probe, same buildProposedWine precedence, no third path — or
- * null when the row genuinely needs (or lacks the data to skip) the model.
- */
-// ── Import archive (2026-08-30) ─────────────────────────────────────────────
-//
-// The identity columns kept from each row, and nothing else. These are the
-// fields that decide how a wine is identified, matched and minted — every
-// import defect so far has lived in one of them. Price, purchase location,
-// notes and ratings are deliberately absent: they answer no import bug, and
-// leaving them out is what makes a 30-day archive of other people's cellars
-// a small thing rather than a large one. See models/ImportArchive.
-const IDENTITY_FIELDS = [
-  'wineName', 'producer', 'vintage', 'country', 'region', 'appellation',
-  'classification', 'type', 'grapes', 'quantity', 'bottleSize',
-];
-// One import is bounded by MAX_IMPORT_SIZE (2,000 rows); the archive keeps
-// the head of anything larger so a pathological file cannot write an
-// unbounded document. rowsTruncated + rowCount keep the omission visible.
-const ARCHIVE_ROW_CAP = 2000;
-// Retention window for the archive. Matches the unattached label-scan sweep
-// (services/scanImageRetentionJob) so the app has ONE retention story to
-// explain, not two.
-const IMPORT_ARCHIVE_DAYS = 30;
-
-/**
- * Project one import row down to its identity columns plus its outcome.
- * `outcome` is what the row's SELECTION resolved to — matched an existing
- * wine, minted a new one, or filed a request ('other' when it had none). A
- * confirmed AI proposal records what /confirm resolved it to: 'created' only
- * when this row minted the wine, 'matched' when it found one, 'unresolved'
- * when it found none. Any other row that errored keeps its selection's
- * outcome. "What the file said" and "what we did with it" are only diagnostic
- * together.
- */
-function archiveRow(item, outcome) {
-  const row = { outcome };
-  for (const f of IDENTITY_FIELDS) {
-    const v = item[f];
-    if (v === undefined || v === null || v === '') continue;
-    row[f] = Array.isArray(v) ? v.slice(0, 20).map((g) => String(g).slice(0, 80)) : String(v).slice(0, 200);
-  }
-  return row;
-}
-
-// Vivino-shaped cellar exports name the varietal composition rather than the
-// grape: "Sangiovese Blend", "Red Blend", "Sémillon-Sauvignon Blanc Blend".
-// None of those are taxonomy grape names, so a plain lookup misses every one
-// — which silently disabled the complete-row bypass for an entire export
-// format (measured on a real 186-row import: 60 wines fell through to
-// requests, 10 AI calls spent, the bypass never fired once).
-//
-// Two readings, both conservative, both anchored on the trailing "Blend":
-//
-//   "Red Blend" / "White Blend" / "Rosé Blend" / "Red Bordeaux Blend"
-//       — the file states the COLOUR itself. Better evidence than any
-//         inference: take it directly. Requiring the trailing "blend" is what
-//         keeps a grape merely STARTING with a colour word (the table grape
-//         "Red Globe") out of this branch.
-//
-//   "Sangiovese Blend" / "Tempranillo Blend" / "Trebbiano Blend"
-//       — a lead varietal plus a suffix. Strip the suffix and ask the
-//         taxonomy about the remainder.
-//
-// Everything else ("Port Blend", "SuperTuscan Blend", "Cabernet-Shiraz
-// Blend") resolves to nothing and falls through to the AI, which is the
-// right outcome: a composition this module cannot read is exactly what the
-// model is for.
-// NB the explicit `\s+` rather than a `\b` after the colour: "é" is not a
-// word character in JS regex, so `ros[ée]\b` never matches "Rosé Blend" —
-// the one case a boundary assertion silently drops.
-const COLOUR_BLEND = /^(red|white|ros[ée])\s+(.*\s+)?blends?$/i;
-const BLEND_SUFFIX = /\s+blends?$/i;
-
-function typeFromFileGrapes(grapes, grapeColourOf) {
-  for (const g of grapes) {
-    const m = COLOUR_BLEND.exec(String(g).trim());
-    if (m) {
-      const c = m[1].toLowerCase();
-      return c === 'red' ? 'red' : (c === 'white' ? 'white' : 'rosé');
-    }
-  }
-  if (typeof grapeColourOf !== 'function') return null;
-  const colours = new Set();
-  for (const g of grapes) {
-    const raw = String(g).trim();
-    const colour = grapeColourOf(raw) || grapeColourOf(raw.replace(BLEND_SUFFIX, ''));
-    if (colour) colours.add(colour);
-  }
-  if (colours.size !== 1) return null;              // silent or contradictory → AI
-  return colours.has('Red') ? 'red' : 'white';
-}
-
-// Estate names legitimately double as the wine name ("Château Talbot",
-// "Harlan Estate", "Schloss Johannisberg") — the estate word may lead or
-// trail (audit 2026-09-07).
-const ESTATE_WORD_RE = /\b(ch[âa]teau|domaine|clos|quinta|tenuta|castello|weingut|bodegas?|mas|cascina|fattoria|azienda|cantina|villa|podere|poderi|finca|casa|ch\.|estate|winery|vineyards?|cellars?|schloss|maison|weinbau|abbazia|marchesi|vignobles|adega|herdade)\b/i;
-function producerMirroredFromName(aiData, item) {
-  const str = (v) => (typeof v === 'string' ? v.trim() : '');
-  // A sentinel producer ("Unknown", "-") is "the file gave none" too.
-  const fileProducer = str(item && item.producer);
-  if (fileProducer && !isIdentitySentinel(fileProducer)) return false; // the file said it — keep it
-  const name = str(aiData && aiData.name);
-  const producer = str(aiData && aiData.producer);
-  if (!name || !producer) return false;
-  if (normalizeString(name) !== normalizeString(producer)) return false;
-  return !ESTATE_WORD_RE.test(name);
-}
-
-function fileCompleteIdentity(item, grapeColourOf) {
-  const clean = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
-  const name = clean(item.wineName);
-  const producer = clean(item.producer);
-  if (!name || !producer) return null;
-  if (isUnknownName(name) || isUnknownName(producer)) return null;
-
-  const country = resolveCountryName(clean(item.country) || '');
-  if (!country || !isRecognizedCountry(country)) return null;
-
-  const grapes = sanitizeGrapeNames(item.grapes);
-
-  let type = clean(item.type);
-  if (!WINE_TYPES.includes(type)) type = null;
-  if (!type && grapes.length > 0) type = typeFromFileGrapes(grapes, grapeColourOf);
-  if (!type) return null;
-
-  // Same Prädikat routing as the AI path (somm ticket 6a966386) — this path
-  // has no model to supply the place, so the appellation is simply left empty
-  // rather than filled with a ripeness level. Empty is the honest state and
-  // costs nothing here: enrichment's identityDataSufficient needs a place
-  // axis, and the region satisfies it. Storing the Prädikat instead would
-  // cost something real, because generateWineKey and the match scorer both
-  // read the appellation — the same wine arriving from another owner's file
-  // with a proper appellation would key differently and mint a duplicate.
-  const filePradikat = pradikatOnlyValue(clean(item.appellation));
-  const rescuedPradikat = filePradikat && !pradikatContradictsName(filePradikat, name)
-    ? filePradikat
-    : null;
-
-  return {
-    name,
-    producer,
-    country,
-    region: clean(item.region),
-    appellation: filePradikat ? null : clean(item.appellation),
-    classification: clean(item.classification) || rescuedPradikat,
-    type,
-    grapes,
-    confidence: null,
-  };
-}
-
-/**
- * Score a WineDefinition candidate against an import item.
- * Delegates to the shared wineMatching service. Variant-aware: import rows
- * often embed the producer inside the wine name (CellarTracker has no
- * Producer column), so the scorer takes the max over producer-embedded name
- * variants — strictly monotonic (only ever raises the score), so existing
- * matches keep their score and known wines stop being missed.
- */
-function scoreCandidate(candidate, item) {
-  return scoreWineMatchVariants(candidate, {
-    name: item.wineName,
-    producer: item.producer,
-    appellation: item.appellation,
-    // The region hint lets an appellation-first name ("Douro Old Vines
-    // Reserva") shed its prefix when the file names the region, not the
-    // appellation (registry backlog 2026-09-06).
-    region: item.region
-  });
-}
-
-/**
- * The colour gate: why this import row cannot be registry wine `wine`, or null.
- *
- * Neither the normalizedKey (`producer:name:appellation`) nor the scorer reads
- * colour, so a producer whose red and white share a name ("Châteauneuf-du-Pape"
- * for both) scores 1.0 either way, and the cascade filed a file's RED rows
- * under the registry's WHITE with status 'exact' — the one status users are
- * told needs no review. Where the row and the wine both state a colour and
- * the two differ, it is the other bottle of the pair. Same contract as
- * styleConflict: never auto-link it, carry the reason on the match, let the
- * user choose. Fails open — an untyped row, a style-typed row (no colour of
- * its own) or a wine of unknown colour is never a conflict.
- */
-function rowColourConflict(item, wine) {
-  return statedColourConflict(String((item && item.type) || '').trim().toLowerCase(), wine);
-}
-
-/**
- * Registry-first exact lookup for an import item — step (a) of the AI-saving
- * cascade. Tries the raw normalizedKey and, when the wine name embeds the
- * producer as a prefix, the prefix-stripped variant key. One indexed query,
- * zero AI.
- */
-async function findExactRegistryWine(item) {
-  if (!item.wineName || !item.producer) return null;
-  // Prefer the exact-as-typed registry entry: query the RAW normalizedKey
-  // first, and only fall back to the producer-prefix-stripped variant when
-  // there is no raw hit. A single `$in: [rawKey, strippedKey]` returns an
-  // ARBITRARY doc when the registry holds BOTH a clean entry and a
-  // "producer-in-name" duplicate (~430 such duplicates exist pending cleanup),
-  // making the import outcome depend on Mongo's storage order. Two cheap
-  // indexed findOnes make it deterministic.
-  const rawKey = generateWineKey(item.wineName, item.producer, item.appellation);
-  const rawHit = await WineDefinition.findOne({ normalizedKey: rawKey })
-    .populate(['country', 'region', 'grapes']);
-  if (rawHit) return rawHit;
-
-  const stripped = stripProducerPrefix(item.wineName, item.producer);
-  if (!stripped) return null;
-  const strippedKey = generateWineKey(stripped, item.producer, item.appellation);
-  if (strippedKey === rawKey) return null; // same key — nothing new to try
-  return WineDefinition.findOne({ normalizedKey: strippedKey })
-    .populate(['country', 'region', 'grapes']);
-}
-
-// Longest producer prefix tried against the registry, in tokens. Real
-// producer names run to five tokens ("Domaine de la Romanée-Conti", "A.A.
-// Badenhorst Family Wines"); six covers the rest without scanning a whole
-// display name word by word.
-const PRODUCER_PREFIX_MAX_TOKENS = 6;
-
-/**
- * Split a producer-less display name on a producer the REGISTRY already knows.
- *
- * A CellarTracker export without a Producer column carries "Louis Jadot
- * Moulin-à-Vent Château des Jacques" in its Wine column. The client used to
- * guess the first word ("Louis"), which minted 285 wines under one-word
- * producers on 2026-09-12 and cost 121 curator corrections. The registry is
- * the better oracle: the longest leading token run that equals an existing
- * producer (normalizedKey is `<producer>:<name>:<appellation>`, so an
- * anchored prefix on the unique index is one cheap read per length) is the
- * producer, and the rest is the wine's own name. Nothing matches → null, and
- * the row goes to the model with the full display name instead.
- *
- * Pending and draft rows are excluded by construction (their key namespaces
- * start with `pending~` / `draft~`), non-wine records explicitly.
- */
-async function splitKnownProducerPrefix(displayName) {
-  const tokens = String(displayName || '').trim().split(/\s+/).filter(Boolean);
-  if (tokens.length < 2) return null;
-  for (let n = Math.min(PRODUCER_PREFIX_MAX_TOKENS, tokens.length - 1); n >= 1; n--) {
-    const prefixKey = normalizeString(tokens.slice(0, n).join(' '));
-    if (!prefixKey) continue;
-    const filter = { normalizedKey: new RegExp(`^${escapeRegex(prefixKey)}:`), nonWine: { $ne: true } };
-    const hit = await WineDefinition.findOne(filter).select('producer').lean();
-    if (!hit || !hit.producer) continue;
-    // A ONE-word producer is the shape the 2026-09-12 first-word guess left
-    // behind ("Kim", "Louis", "19"), and those junk rows are still in the
-    // registry until their purge. A single wine under a one-word producer is
-    // not corroboration; two or more is (Hugel, Penfolds, Ridge all qualify).
-    // Anything longer than one word is trusted as before (audit 2026-09-14 M1).
-    if (n === 1) {
-      const siblings = await WineDefinition.countDocuments(filter, { limit: 2 });
-      if (siblings < 2) continue;
-    }
-    return { producer: hit.producer, wineName: tokens.slice(n).join(' ') };
-  }
-  return null;
-}
-
-/**
- * Find best wine matches for a single import item.
- * Strategy:
- *   1. Try Meilisearch fuzzy search (fast, covers typos)
- *   2. Fallback to MongoDB text search + normalized key lookup
- *   3. Score all candidates with combinedSimilarity
- *
- * `viewer` ({ userId, roles }) gates pendingIdentity rows exactly as the
- * resolver does. It matters here more than anywhere: a CellarTracker row with
- * no producer scores 1.0 against a PENDING row, whose stored producer is ''
- * — so without the gate an import would offer, and then attach bottles to,
- * ANOTHER USER's hidden half-identified wine (security audit). Strategy 3 was
- * the worst of the three: `normalizedKey: /:<name>:/` is unanchored, and the
- * pending namespace `pending~<uid>:<name>:` contains that substring by
- * construction. The creator still matches their OWN pending rows, which is
- * what keeps /validate's preview honest about what /confirm will do (the
- * commit path passes allowPending and resolves to the same row).
- */
-async function findWineMatches(item, viewer = {}) {
-  const candidates = new Map(); // id -> { wine, score }
-  const visible = wineVisibilityFilter(viewer);
-
-  // Strategy 1: Meilisearch search (if available)
-  if (searchService.getIsAvailable()) {
-    try {
-      // Search with combined producer + name for best fuzzy results — then,
-      // if that found nothing worth scoring, with the appellation prefix and
-      // the producer's parenthetical removed (registry backlog 2026-09-06: a
-      // CellarTracker re-import missed 44 known wines on those two habits).
-      const queries = importQueryVariants(item);
-      const searchOpts = { limit: 15 };
-
-      // Add country filter if we can resolve it
-      if (item.country) {
-        const normalizedCountry = normalizeString(item.country);
-        const countryDoc = await Country.findOne({ normalizedName: normalizedCountry }).lean();
-        if (countryDoc) searchOpts.countryId = countryDoc._id.toString();
-      }
-
-      for (const query of queries) {
-        const { ids } = await searchService.search(query, searchOpts);
-        if (ids.length > 0) {
-          // Pending rows are not in the Meili index at all; the clause is here so
-          // the gate holds if that ever changes (all three strategies, one rule).
-          const wines = await WineDefinition.find({ _id: { $in: ids }, ...visible })
-            .populate(['country', 'region', 'grapes'])
-            .lean();
-
-          for (const wine of wines) {
-            const score = scoreCandidate(wine, item);
-            if (score >= FUZZY_THRESHOLD) {
-              candidates.set(wine._id.toString(), { wine, score });
-            }
-          }
-        }
-        if (candidates.size > 0) break;
-      }
-    } catch (err) {
-      console.error('Meilisearch search failed during import, falling back to MongoDB:', err.message);
-    }
-  }
-
-  // Strategy 2: MongoDB text search fallback
-  if (candidates.size < 3) {
-    try {
-      const searchTerms = `${item.producer || ''} ${item.wineName || ''}`.trim();
-      if (searchTerms) {
-        const mongoWines = await WineDefinition.find(
-          { $text: { $search: searchTerms }, ...visible },
-          { score: { $meta: 'textScore' } }
-        )
-          .populate(['country', 'region', 'grapes'])
-          .sort({ score: { $meta: 'textScore' } })
-          .limit(10)
-          .lean();
-
-        for (const wine of mongoWines) {
-          const id = wine._id.toString();
-          if (!candidates.has(id)) {
-            const score = scoreCandidate(wine, item);
-            if (score >= FUZZY_THRESHOLD) {
-              candidates.set(id, { wine, score });
-            }
-          }
-        }
-      }
-    } catch (err) {
-      console.error('MongoDB text search failed during import (text index may not exist):', err.message);
-    }
-  }
-
-  // Strategy 3: Direct normalized name/producer lookup
-  if (candidates.size < 3 && item.producer && item.wineName) {
-    const normalizedProducer = normalizeString(item.producer);
-    const normalizedName = normalizeWineName(item.wineName);
-    const bareProducer = stripProducerBrackets(item.producer);
-    const bareName = stripAppellationPrefix(item.wineName, item.appellation) || stripAppellationPrefix(item.wineName, item.region);
-
-    const keyMatch = {
-      $or: [
-        { normalizedKey: { $regex: `^${escapeRegex(normalizedProducer)}:` } },
-        { normalizedKey: { $regex: `:${escapeRegex(normalizedName)}:` } },
-        // The same two lookups on the appellation-stripped name and the
-        // bracket-free producer (registry backlog 2026-09-06).
-        ...(bareProducer ? [{ normalizedKey: { $regex: `^${escapeRegex(normalizeString(bareProducer))}:` } }] : []),
-        ...(bareName ? [{ normalizedKey: { $regex: `:${escapeRegex(bareName)}:` } }] : []),
-      ]
-    };
-    // $and, not a spread: `visible` is itself an $or for non-curators, and two
-    // $or keys in one object would silently drop the first.
-    const directMatches = await WineDefinition.find(
-      visible.$or ? { $and: [keyMatch, visible] } : { ...keyMatch, ...visible }
-    )
-      .populate(['country', 'region', 'grapes'])
-      .limit(20)
-      .lean();
-
-    for (const wine of directMatches) {
-      const id = wine._id.toString();
-      if (!candidates.has(id)) {
-        const score = scoreCandidate(wine, item);
-        if (score >= FUZZY_THRESHOLD) {
-          candidates.set(id, { wine, score });
-        }
-      }
-    }
-  }
-
-  // Sort by score descending, return top 5. Each match carries the style
-  // verdict (issue #1134 follow-up): where the import row and the candidate
-  // NAME a different Prädikat or sweetness they are two wines from one range,
-  // and no similarity score may auto-link them — a Trocken/Halbtrocken pair
-  // from one vineyard measures 0.9543 through this scorer. Annotated here,
-  // at the single place all three consumers get their matches, so the
-  // >= EXACT_THRESHOLD gates and the client's preselection read one verdict.
-  // colourConflict rides alongside for the same consumers (rowColourConflict).
-  const sorted = [...candidates.values()]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 5)
-    .map((m) => ({
-      ...m,
-      styleConflict: conflictingStyleTerms(item.wineName, m.wine.name),
-      colourConflict: rowColourConflict(item, m.wine),
-    }));
-
-  return sorted;
-}
 
 /**
  * POST /api/bottles/import/validate
@@ -709,11 +87,20 @@ async function findWineMatches(item, viewer = {}) {
  * Body: { cellarId, items: [{ wineName, producer, country, ... }] }
  * Response: { results: [{ index, item, status, matches: [{ wine, score }] }] }
  */
-router.post('/validate', aiBurstLimiter, async (req, res) => {
+// Whether this import asks the AI provider at all (config/importPolicy).
+const importUsesAi = () => aiProvider.isConfigured() && importPolicy.usesAi();
+// The AI burst limit paces AI calls; an import that asks no AI has none to
+// pace, and gets its own per-member limit, sized for registry reads.
+const validateLimiter = (req, res, next) => (importUsesAi() ? aiBurstLimiter : importValidateLimiter)(req, res, next);
+
+router.post('/validate', validateLimiter, async (req, res) => {
   try {
     const { cellarId, items } = req.body;
     // Who the candidate pool is being built FOR — see findWineMatches.
-    const viewer = { userId: req.user.id, roles: req.user.roles };
+    // No roles on purpose: a curator importing their own cellar is a member
+    // here. With their role they would be shown every hidden wine, and their
+    // bottle would land on another member's wine that waits for a check.
+    const viewer = { userId: req.user.id, roles: [] };
 
     if (!cellarId) {
       return res.status(400).json({ error: 'cellarId is required' });
@@ -763,23 +150,17 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     // wines (e.g. single vineyard vs generic Barolo), but for wines the
     // registry ALREADY knows, the AI's canonicalized result would dedup to
     // the same registry wine anyway — so a confident registry match skips the
-    // AI call with an outcome-identical result (audit M-2 cost defense).
+    // AI call: the same outcome, without the AI spend.
     //
     // The dedup-by-wine-key + Pass 1a cascade run regardless of whether AI is
-    // configured: a no-AI self-hosted install still gets ONE shared registry
-    // lookup per unique wine — previously every row of a keyless install fell
-    // through to a sequential per-row findWineMatches in Pass 3, defeating
-    // the cascade's own "zero AI for known wines" intent. Only the AI fan-out
-    // itself (Pass 1b) is gated on availability.
-    const aiConfigured = aiProvider.isConfigured(); // invariant for the whole request
+    // configured: a no-AI self-hosted install also gets ONE shared registry
+    // lookup per unique wine, not a sequential per-row findWineMatches in
+    // Pass 3 — the cascade's "zero AI for known wines" intent holds there too.
+    // Only the AI fan-out itself (Pass 1b) is gated on availability.
+    // False too when the server's import policy turns the look-up off: every
+    // row is then identified by the registry or by the file itself.
+    const aiConfigured = importUsesAi(); // invariant for the whole request
 
-    // A row that names the wine but not the producer (a CellarTracker export
-    // without a Producer column: "Kim Crawford Pinot Gris" in one cell) is
-    // split on a producer the registry already knows BEFORE any lookup, so it
-    // joins the cascade as an ordinary row. The client no longer guesses the
-    // first word (2026-09-12: 285 wines minted under "Louis", "Kim", "19"…);
-    // rows the registry cannot split keep the full display name and go to
-    // the model, which is told the producer is embedded in it.
     // Latch a client disconnect as EARLY as possible — before the split
     // probes and the Pass 1a cascade — so a requester that has gone away
     // stops us spending reads and, below, launching (and debiting) AI calls.
@@ -791,10 +172,17 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     let clientDisconnected = false;
     res.on('close', () => { if (!res.writableEnded) clientDisconnected = true; });
 
+    // A row that names the wine but not the producer (a CellarTracker export
+    // without a Producer column: "Kim Crawford Pinot Gris" in one cell) is
+    // split on a producer the registry already knows BEFORE any lookup, so it
+    // joins the cascade as an ordinary row. The client never guesses the first
+    // word as the producer (a first name or a number would be minted as one);
+    // rows the registry cannot split keep the full display name and go to
+    // the model, which is told the producer is embedded in it.
     // ONE probe per distinct display name, not per row (a 2000-row file of
     // the same six wines is six probes), and a sentinel producer ("Unknown",
     // "-") counts as none — the CT mapper already sends '' for it, generic
-    // CSV/Vivino rows did not (audit 2026-09-14 M2/L4).
+    // CSV/Vivino rows do not.
     const splitByName = new Map(); // normalized display name → split result | null
     for (const pr of preResults) {
       if (clientDisconnected) break;
@@ -835,7 +223,9 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     // (c) complete-data rows skip AI too (see fileCompleteIdentity): the file
     //     itself becomes the identification and Pass 2 treats it exactly like
     //     an AI answer — matchOnly probe, proposal, the lot;
-    // (d) everything else goes to AI exactly as before.
+    // (d) everything else goes to AI — when there is one to ask. With no
+    //     provider, or with the look-up turned off (config/importPolicy), (c)
+    //     takes every row: see fileStatedIdentity.
     //
     // Grape-colour lookup for (c)'s type inference — built lazily, once, and
     // only if some row actually lacks a type column.
@@ -853,12 +243,22 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       grapeColourOf = (grapeName) => byKey.get(normalizeString(String(grapeName || ''))) || null;
       return grapeColourOf;
     };
+    // One registry look-up per distinct appellation, region and producer of
+    // the request, not one per wine: a file is often one producer's range.
+    const derivedCountries = new Map();
+    const derivedCountry = async (identity) => {
+      if (!identity || identity.country) return identity;
+      const key = [identity.appellation, identity.region, identity.producer].map((v) => normalizeString(v || '')).join('|');
+      if (!derivedCountries.has(key)) derivedCountries.set(key, (await withDerivedCountry(identity)).country || null);
+      const country = derivedCountries.get(key);
+      return country ? { ...identity, country } : identity;
+    };
     for (const pr of uniquePrs) {
       if (clientDisconnected) break; // requester gone — stop the cascade, skip AI entirely
       // A row still without a producer after the registry split runs the
       // cascade too: (a) and (c) need a producer and simply return null, but
       // (b)'s query variants were built for exactly this display-name shape
-      // (registry backlog 2026-09-06) and resolve a known wine at >= 0.95
+      // and resolve a known wine at >= 0.95
       // with zero AI. Only an unknown wine then reaches the model.
       // forceAi bypasses the cascade only when there is an AI to reach; with
       // no key configured the shared cascade is the best available outcome.
@@ -892,11 +292,21 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       // A producer the REGISTRY supplied (splitKnownProducerPrefix) is not a
       // file-stated identity: such a row may match (a)/(b) above, but an
       // unknown wine goes to the model rather than being minted from the
-      // guess (audit 2026-09-14 L3).
-      const identity = pr.producerFromRegistry ? null : fileCompleteIdentity(
-        pr.item,
-        needsColourMap ? await getGrapeColourOf() : null
-      );
+      // guess.
+      // With no AI to ask, the file is the identification for every row,
+      // complete or not, and a country it does not state is read from the
+      // registry where the registry is sure (services/importCountry).
+      const colourMap = needsColourMap ? await getGrapeColourOf() : null;
+      // A producer the REGISTRY supplied by splitting the name is a guess the
+      // file never made: with no model to confirm it, the row is identified
+      // by its whole display name and NO producer, which the mint keeps
+      // hidden until a curator has read it.
+      const stated = pr.producerFromRegistry
+        ? { ...pr.item, wineName: `${pr.item.producer} ${pr.item.wineName}`.trim(), producer: '' }
+        : pr.item;
+      const identity = !aiConfigured
+        ? await derivedCountry(fileStatedIdentity(stated, colourMap))
+        : (pr.producerFromRegistry ? null : fileCompleteIdentity(pr.item, colourMap));
       if (identity) {
         pr.aiIdentified = identity;
         pr.aiBypassed = true;
@@ -904,7 +314,7 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     }
 
     // ── Pass 1b: AI fan-out for the remaining unique wines ─────────────────
-    // Guarded by (audit M-2): a per-request fan-out cap, the shared per-user
+    // Guarded by: a per-request fan-out cap, the shared per-user
     // daily AI budget + global daily cap (debited per actual Anthropic call,
     // refunded on transport failure), and a client-disconnect check that
     // stops LAUNCHING new calls once the requester has gone away. All three
@@ -939,9 +349,9 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
             country: pr.item.country,
             // The file's own geography, as hints. Asking the model to place a
             // wine while withholding the appellation the user's export states
-            // was making it infer what we had already been handed — and the
-            // confidence floor then deleted the inference. Precedence still
-            // lives in buildProposedWine; this only stops the blind guess.
+            // makes it infer what we were already handed — and the confidence
+            // floor then deletes the inference. Precedence lives in
+            // buildProposedWine; this only stops the blind guess.
             appellation: pr.item.appellation,
             region: pr.item.region,
           });
@@ -1004,14 +414,14 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       }
     }
 
-    // ── Post-AI hygiene (ticket 6a8162c5) — BEFORE any matching, so the
-    // cleaned values feed Pass 2, the client preview, and /confirm alike. ──
+    // ── Post-AI hygiene — BEFORE any matching, so the cleaned values feed
+    // Pass 2, the client preview, and /confirm alike. ──
     //
     // A) One producer, one country per batch. Rows are identified one at a
     //    time, so an obscure producer can come back with a different guessed
-    //    country per row ("Thomas Allen": South Africa on one, Australia on
-    //    another — both minted, and the different-country guard then keeps
-    //    them apart forever). Rows whose FILE stated a country are anchors
+    //    country per row (South Africa on one, Australia on another — both
+    //    minted, and the different-country guard then keeps them apart
+    //    forever). Rows whose FILE stated a country are anchors
     //    and are never overwritten; when the file is silent, every row of a
     //    producer adopts one country — the anchors' (when they agree), else
     //    the highest-confidence AI row's.
@@ -1025,20 +435,25 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     }
     // Countries compare through the SAME fold the mint uses — alias resolve
     // then normalize — so "USA" and "United States" are one country here
-    // exactly as they become one Country doc there (audit 2026-08-16:
-    // normalizeString alone treated aliases as two countries and the pass
-    // silently no-opped on the very splits it exists to prevent).
+    // exactly as they become one Country doc there (normalizeString alone
+    // treats aliases as two countries, and the pass would silently no-op on
+    // the very splits it exists to prevent).
     const countryKey = (v) =>
       (typeof v === 'string' && v.trim()) ? normalizeString(resolveCountryName(v)) : '';
+    // The file's own country column, when it names a country. "California" or
+    // a region mapped to the wrong column is not an anchor: written back over
+    // the identity it would only fail the mint, and cost the row.
+    const fileCountryKey = (item) =>
+      (countryKey(item.country) && isRecognizedCountry(resolveCountryName(item.country)) ? countryKey(item.country) : '');
     for (const rows of aiRowsByProducer.values()) {
       // The FILE is the anchor, and its STATED VALUE is the anchor value —
-      // not the AI's echo of it (audit 2026-08-16: anchoring on the echo let
-      // an AI that contradicted the file spread the contradiction to the
-      // whole group). Step one: any anchored row whose AI disagrees with its
+      // not the AI's echo of it (anchoring on the echo would let an AI that
+      // contradicts the file spread the contradiction to the whole group).
+      // Step one: any anchored row whose AI disagrees with its
       // own file column is corrected back to the file's value, which is also
       // what /confirm then mints.
       for (const pr of rows) {
-        const fileKey = countryKey(pr.item.country);
+        const fileKey = fileCountryKey(pr.item);
         if (fileKey && countryKey(pr.aiIdentified.country) !== fileKey) {
           pr.aiIdentified.country = pr.item.country;
         }
@@ -1046,7 +461,7 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       const rowKey = (pr) => countryKey(pr.aiIdentified.country);
       const distinct = new Set(rows.map(rowKey).filter(Boolean));
       if (distinct.size === 0) continue; // no row knows a country — nothing to spread
-      const anchors = rows.filter((pr) => countryKey(pr.item.country));
+      const anchors = rows.filter((pr) => fileCountryKey(pr.item));
       let adopted = null;
       if (distinct.size === 1) {
         // Group already agrees — only rows the AI left countryless (which
@@ -1056,13 +471,12 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
         // The file knows best — but only when it names ONE country. Two
         // file-backed countries for one producer is real information
         // (a brand genuinely bottling on two continents): touch nothing.
-        const anchorKeys = new Set(anchors.map((pr) => countryKey(pr.item.country)));
+        const anchorKeys = new Set(anchors.map((pr) => fileCountryKey(pr.item)));
         if (anchorKeys.size !== 1) continue;
         adopted = anchors[0].item.country;
       } else {
         // Highest-confidence row THAT HAS a country decides — a countryless
-        // 0.9 row must not null the adoption and silently no-op the pass
-        // (audit 2026-08-16).
+        // 0.9 row must not null the adoption and silently no-op the pass.
         const withCountry = rows.filter((pr) => rowKey(pr));
         const best = withCountry.reduce((a, b) =>
           ((b.aiIdentified.confidence ?? 0) > (a.aiIdentified.confidence ?? 0) ? b : a));
@@ -1072,10 +486,14 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       const adoptedKey = countryKey(adopted);
       for (const pr of rows) {
         // Never overwrite a row the file itself anchored.
-        if (countryKey(pr.item.country)) continue;
+        if (fileCountryKey(pr.item)) continue;
         const own = rowKey(pr);
         if (own === adoptedKey) continue;
         if (!own) { pr.aiIdentified.country = adopted; continue; } // fill the gap
+        // A row identified from the file alone carries no confidence, and its
+        // country is no guess: the registry derived it from the row's own
+        // appellation or region. Another row of the producer does not move it.
+        if (pr.aiBypassed) continue;
         // A row the model is CONFIDENT about keeps its own country: one
         // producer string can be two wineries on two continents (Domaine
         // Chandon FR vs Bodegas Chandon AR — the guard findOrCreateWine
@@ -1090,22 +508,19 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
     // B) Low-confidence geography never MINTS — but it still MATCHES. The
     //    strip is applied when the PROPOSAL is built in Pass 2, never to
     //    aiIdentified itself: the exact/canonical dedup keys embed the
-    //    appellation, and stripping before matching made precisely the
+    //    appellation, and stripping before matching would make precisely the
     //    low-confidence rows most likely to duplicate lose their registry
-    //    match and mint a twin (audit 2026-08-16 — an anti-fragmentation
-    //    change causing fragmentation). Matching with an uncertain
-    //    appellation is resolution, not assertion; nothing below the floor
-    //    is ever WRITTEN.
+    //    match and mint a twin. Matching with an uncertain appellation is
+    //    resolution, not assertion; nothing below the floor is ever WRITTEN.
 
     // Pass 2: resolve AI-identified items against the registry, deduplicated by
     // wine key. findOrCreateWine internally does fuzzy matching using the
     // AI-refined name/producer, which is more accurate than matching raw import
     // data. matchOnly — /validate is a PREVIEW and must never write to the
-    // shared registry (security audit 2026-08-03 H-1: every cancelled, re-run
-    // or column-remapped validate minted rows, and this route has no demo
-    // gate). When nothing matches, the canonical AI identification rides back
-    // to the client as `aiProposed`; /confirm creates the wine only for rows
-    // the user actually imports.
+    // shared registry (every cancelled, re-run or column-remapped validate
+    // would mint rows). When nothing matches, the canonical AI identification
+    // rides back to the client as `aiProposed`; /confirm creates the wine
+    // only for rows the user actually imports.
     const matchedWineCache = new Map(); // normalizedKey -> { wine } | { proposed } | { error }
     for (const pr of preResults) {
       if (pr.registryWine || !pr.aiIdentified) continue;
@@ -1133,12 +548,12 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
             // findOrCreateWine throws 'Country is required' and the row
             // error would silently cost the user their bottle (the exact
             // shape allowPending exists to prevent, with no escape hatch for
-            // country; audit 2026-08-16). Demote to the no-match flow, where
-            // the user picks an existing wine or files a request instead of
-            // being offered a create that is guaranteed to fail.
+            // country). Demote to the no-match flow, where the user picks an
+            // existing wine or files a request instead of being offered a
+            // create that is guaranteed to fail.
             //
             // Tested against the PROPOSAL, not the AI object: the file's own
-            // country column is a legitimate fallback now, so a row the model
+            // country column is a legitimate fallback, so a row the model
             // could not place but the user could is minted instead of refused.
             const proposedCountry = buildProposedWine(wineData, pr.item).country;
             if (!(typeof proposedCountry === 'string' && proposedCountry.trim())) {
@@ -1311,7 +726,7 @@ router.post('/validate', aiBurstLimiter, async (req, res) => {
       const price = Number(r.item?.price);
       if (!isFinite(price) || price <= 0) continue;
       // A currency the app does not know ("kr", "€ EUR") is told here and
-      // replaced by the import's default on confirm (audit 2026-10-14).
+      // replaced by the import's default on confirm.
       const rawCurrency = typeof r.item?.currency === 'string' ? r.item.currency.trim() : '';
       const currency = currencyOrFallback(rawCurrency, 'USD');
       const m = userMedians[currency];
@@ -1396,16 +811,16 @@ router.post('/confirm', async (req, res) => {
     // Currency to apply when an import item has no Currency column of its
     // own, or one the app does not know. The user's choice on the confirm
     // screen (their profile currency by default): a supported code or an
-    // alias of one, as every other write path demands — this used to accept
-    // any three letters (audit 2026-10-14). Falls back to USD when unset.
+    // alias of one, as every other write path demands — never just any three
+    // letters. Falls back to USD when unset.
     const defaultCurrencyCheck = parseCurrency(rawDefaultCurrency);
     if (!defaultCurrencyCheck.ok) {
       return res.status(400).json({ error: defaultCurrencyCheck.error });
     }
     const defaultCurrency = defaultCurrencyCheck.value || 'USD';
 
-    // Whole-import comment/occasion (support ticket 2026-07-30): typed once on
-    // the confirm screen, they land on every BOTTLE this import creates.
+    // Whole-import comment/occasion: typed once on the confirm screen, they
+    // land on every BOTTLE this import creates.
     // Fill-blank only — a row that carries its own note from the file keeps it
     // (imports never overwrite file data). Wishlist rows are deliberately
     // excluded: "bought at the estate sale" describes bottles owned, not wines
@@ -1413,100 +828,9 @@ router.post('/confirm', async (req, res) => {
     const importNotes = typeof rawImportNotes === 'string' ? stripHtml(rawImportNotes).slice(0, 5000) : '';
     const importOccasion = typeof rawImportOccasion === 'string' ? stripHtml(rawImportOccasion).slice(0, 500) : '';
 
-    // Validate user-supplied per-rack configuration.
-    // Shape: { [rackName]: { skip?, type?, rows?, cols?, typeConfig?: {...}, disabledPositions?: [Number] } }
-    // skip — when true, drop this rack from auto-creation AND placement;
-    //   bottles referencing it land in the cellar without rack placement
-    // type — one of RACK_TYPES (defaults to 'grid' if absent/invalid)
-    // rows/cols — clamped to 1..20
-    // typeConfig — optional shape config (bottlesPerCell, bottlesPerSection,
-    //   moduleRows, moduleCols, backCols), each clamped to model bounds
-    // disabledPositions — global 1-indexed positions marked unusable (e.g.
-    //   Oeno-export cabinets); deduped here, clamped to the created rack's
-    //   capacity at creation time below
-    const rackConfigs = {};
-    const clampInt = (v, min, max) => {
-      const n = parseInt(v, 10);
-      if (isNaN(n)) return undefined;
-      return Math.max(min, Math.min(max, n));
-    };
-    if (rawRackConfigs && typeof rawRackConfigs === 'object') {
-      for (const [name, cfg] of Object.entries(rawRackConfigs)) {
-        if (!cfg || typeof cfg !== 'object') continue;
-
-        // skip:true short-circuits — no rows/cols required since the rack
-        // won't be created and no bottles will be placed.
-        if (cfg.skip === true) {
-          rackConfigs[String(name)] = { skip: true };
-          continue;
-        }
-
-        const rows = clampInt(cfg.rows, 1, 20);
-        const cols = clampInt(cfg.cols, 1, 20);
-        if (!rows || !cols) continue;
-
-        const entry = { rows, cols };
-        if (cfg.type && RACK_TYPES.includes(cfg.type)) entry.type = cfg.type;
-
-        if (cfg.typeConfig && typeof cfg.typeConfig === 'object') {
-          const tc = {};
-          const mr = clampInt(cfg.typeConfig.moduleRows, 1, 10);
-          const mc = clampInt(cfg.typeConfig.moduleCols, 1, 10);
-          const bpc = clampInt(cfg.typeConfig.bottlesPerCell, 1, 20);
-          const bps = clampInt(cfg.typeConfig.bottlesPerSection, 1, 30);
-          const bc = clampInt(cfg.typeConfig.backCols, 0, 20);
-          if (mr !== undefined) tc.moduleRows = mr;
-          if (mc !== undefined) tc.moduleCols = mc;
-          if (bpc !== undefined) tc.bottlesPerCell = bpc;
-          if (bps !== undefined) tc.bottlesPerSection = bps;
-          if (bc !== undefined) tc.backCols = bc;
-          // Cabinet racks only: per-shelf row counts fitted to rows (1..12)
-          // and the two-deep flag. A list shorter than rows grows with 1-row
-          // shelves — at the TOP for bottom-anchored files (Oeno numbers
-          // shelves from the bottom, so "the cabinet has more shelves than
-          // the file shows" means extra shelves above), at the bottom
-          // otherwise (audit 2026-09-15).
-          if (entry.type === 'cabinet') {
-            const raw = Array.isArray(cfg.typeConfig.shelfRows) ? cfg.typeConfig.shelfRows : [];
-            const fitted = raw.slice(0, rows).map((v) => clampInt(v, 1, 12) || 1);
-            const missing = rows - fitted.length;
-            const bottomAnchored = positionAnchor === 'bottom-left' || positionAnchor === 'bottom-right';
-            tc.shelfRows = missing > 0
-              ? (bottomAnchored ? [...Array(missing).fill(1), ...fitted] : [...fitted, ...Array(missing).fill(1)])
-              : fitted;
-            tc.twoDeep = cfg.typeConfig.twoDeep !== false;
-            tc.stagger = cfg.typeConfig.stagger !== false;
-            tc.headToTail = !tc.twoDeep && cfg.typeConfig.headToTail === true;
-            tc.alternate = cfg.typeConfig.alternate === true;
-            // Per-shelf width / pattern, when the file has them (a Cellarion
-            // export); fitted to the shelf count the same way as shelfRows.
-            // A short list grows at the same end as shelfRows above, or a
-            // bottom-anchored file's narrow bottom shelf would be read as a
-            // full-width top one (audit 2026-09-16).
-            const grown = (list) => {
-              const kept = list.slice(0, rows);
-              const gap = rows - kept.length;
-              return gap > 0 && bottomAnchored ? [...Array(gap).fill(undefined), ...kept] : kept;
-            };
-            if (Array.isArray(cfg.typeConfig.shelfCols)) tc.shelfCols = cabinetShelfCols(rows, cols, { shelfCols: grown(cfg.typeConfig.shelfCols) });
-            if (Array.isArray(cfg.typeConfig.shelfAlternate)) tc.shelfAlternate = cabinetShelfAlternate(rows, { alternate: tc.alternate, shelfAlternate: grown(cfg.typeConfig.shelfAlternate) });
-            if (Array.isArray(cfg.typeConfig.shelfSideways)) tc.shelfSideways = cabinetShelfSideways(rows, { shelfSideways: grown(cfg.typeConfig.shelfSideways) });
-          }
-          if (Object.keys(tc).length > 0) entry.typeConfig = tc;
-        }
-
-        if (Array.isArray(cfg.disabledPositions)) {
-          const dp = [...new Set(
-            cfg.disabledPositions
-              .map(p => parseInt(p, 10))
-              .filter(p => !isNaN(p) && p >= 1)
-          )];
-          if (dp.length > 0) entry.disabledPositions = dp;
-        }
-
-        rackConfigs[String(name)] = entry;
-      }
-    }
+    // The per-rack configuration the user chose in the review, validated
+    // (utils/rackImport).
+    const rackConfigs = sanitizeRackConfigs(rawRackConfigs, { positionAnchor, rackTypes: RACK_TYPES });
 
     // Verify cellar access
     const cellar = await Cellar.findById(cellarId);
@@ -1529,63 +853,10 @@ router.post('/confirm', async (req, res) => {
       await getOrCreateDailySnapshot().catch(err => console.error('Failed to fetch daily exchange rate snapshot:', err.message));
     }
 
-    // Auto-create any racks referenced in the import that don't already exist
-    // in this cellar. User-supplied rackConfigs take precedence over inferred
-    // dimensions. Runs once up-front so the bottle-placement step below can
-    // rely on every rack being present.
-    const createdRacks = [];
-    try {
-      const rackPlan = planRackCreations(items);
-      if (rackPlan.size > 0) {
-        const existing = await Rack.find({
-          cellar: cellarId,
-          name: { $in: Array.from(rackPlan.keys()) },
-          deletedAt: null
-        }).select('name').lean();
-        const existingNames = new Set(existing.map(r => r.name));
-
-        for (const [name, spec] of rackPlan.entries()) {
-          if (existingNames.has(name)) continue;
-          const override = rackConfigs[name];
-          // User opted out of creating this rack — bottles will be imported
-          // into the cellar without placement (handled in the placement loop).
-          if (override?.skip) continue;
-          const rows = override?.rows || spec.rows;
-          const cols = override?.cols || spec.cols;
-          const chosenType = override?.type || spec.type;
-          const safeType = RACK_TYPES.includes(chosenType) ? chosenType : 'grid';
-          const rackData = {
-            cellar: cellarId,
-            user: cellar.user,
-            name,
-            type: safeType,
-            rows,
-            cols
-          };
-          if (override?.typeConfig) rackData.typeConfig = override.typeConfig;
-          // A cabinet is always stored with a list that matches its shelf count
-          // (the update route's shape gate would otherwise reject every later
-          // rename/group/zone edit — audit 2026-09-15).
-          if (safeType === 'cabinet') {
-            rackData.typeConfig = fitCabinetTypeConfig(rows, cols, rackData.typeConfig);
-          }
-          const rack = new Rack(rackData);
-          // Disabled positions beyond the created geometry address cells that
-          // don't exist — drop them rather than storing dead entries.
-          if (override?.disabledPositions?.length) {
-            const rackMax = getMaxPosition(rack);
-            rack.disabledPositions = override.disabledPositions.filter(p => p <= rackMax);
-          }
-          await rack.save();
-          createdRacks.push({ name, type: safeType, rows, cols, typeConfig: override?.typeConfig });
-          // cellarId: an editor's import changes the OWNER's cellar, so the
-          // owner's caches (offline copy, search, stats) must move too.
-          logAudit(req, 'rack.create', { type: 'rack', id: rack._id, cellarId: cellar._id }, { source: 'import', name });
-        }
-      }
-    } catch (err) {
-      console.error('Failed to auto-create racks during import (non-fatal):', err.message);
-    }
+    // Create the racks the file names that this cellar does not have yet.
+    // Before the bottles, so the placement step below finds every rack
+    // (services/importRacks).
+    const createdRacks = await createImportRacks({ req, cellar, cellarId, items, rackConfigs });
 
     let created = 0;
     // Split of `created` for the done-screen breakdown: active bottles vs
@@ -1615,13 +886,20 @@ router.post('/confirm', async (req, res) => {
     // What each confirmed AI proposal resolved to, by row index, for the
     // import archive below: 'created' when findOrCreateWine minted the wine
     // for this row, 'matched' when it found an existing one or the row repeats
-    // a wine this batch already resolved.
+    // a wine this batch already resolved; 'request' when the proposal
+    // landed in the near-match zone and the bottle was filed under a
+    // wine request instead.
     const aiOutcomes = new Map();
     // Wines this batch minted with an incomplete identity (no usable producer,
     // or a geography in the producer column — the classic one-column-off
     // mapping). Their BOTTLES imported normally; only the registry entry waits
     // on a curator. Reported once, as a plain line on the done screen.
     let pendingIdentityCount = 0;
+    // Wines this batch minted that wait for a curator's check before anyone
+    // else sees them (config/importPolicy.checksNewWines). Decided once per
+    // request, so one import is not split by a setting changed halfway.
+    const checkNewWines = importPolicy.checksNewWines();
+    let uncheckedCount = 0;
     // Collected rack-placement intents from this batch; processed per-rack
     // after the main loop so multiple bottles claiming the same slot can
     // overflow cleanly into adjacent free slots.
@@ -1647,10 +925,13 @@ router.post('/confirm', async (req, res) => {
 
       try {
         let wineDoc = null;
+        // Set when a confirmed AI proposal lands in the near-match zone: the
+        // identity the bottle is filed under as a wine request (see below).
+        let nearMatchRequest = null;
 
         // AI-identified NEW wine, confirmed by the user at review. This is the
         // single place the import flow may write to the shared registry —
-        // /validate is read-only (matchOnly) since the 2026-08-03 H-1 fix.
+        // /validate is read-only (matchOnly).
         // findOrCreateWine still matches first, so a wine minted meanwhile (a
         // parallel import, another user) dedupes instead of duplicating.
         if (!item.wineDefinition && !item.requestWine && item.aiWine) {
@@ -1661,11 +942,11 @@ router.post('/confirm', async (req, res) => {
           // findOrCreateWine .trim()s name/producer before consulting any
           // option — a non-string must become a row error here, not a throw.
           const str = (v) => (typeof v === 'string' && v.trim() ? v : undefined);
-          // Name only. A row whose producer the file/AI could not supply used
-          // to die here — the strict mint gate 400'd, the catch turned it into
-          // a row error, and the user SILENTLY LOST the bottle. With
-          // allowPending the bottle lands and the wine goes to the somm queue,
-          // which is the exact friction this feature exists to remove.
+          // Name only. A row whose producer the file/AI could not supply must
+          // not die here: the strict mint gate would 400, the catch would turn
+          // it into a row error, and the user would SILENTLY LOSE the bottle.
+          // With allowPending the bottle lands and the wine goes to the somm
+          // queue.
           if (typeof ai !== 'object' || !str(ai.name)) {
             errors.push({ index: i, reason: 'AI wine data is missing its name' });
             continue;
@@ -1685,31 +966,53 @@ router.post('/confirm', async (req, res) => {
               grapes: sanitizeGrapeNames(ai.grapes),
             }, req.user.id, {
               createdVia: 'import', allowPending: true,
+              ...(checkNewWines ? { unchecked: true } : {}),
               provenance: computeIdentityProvenance(item, ai),
               // The file's Type/Category named a spirit: a wine this row
               // mints is born non-wine flagged (see below).
               ...(item.nonWineHint === true ? { nonWine: true } : {}),
             });
             // findOrCreateWine can return { wine: null, candidates } — the soft
-            // zone. Unguarded, `wine._id` two lines down threw and took the
-            // whole /confirm batch with it (audit L-7). Skip the row and report
-            // it, which is what every other unresolvable row here does.
+            // zone: similar wines exist, none close enough to be this one.
+            // Unguarded, `wine._id` would throw and take the whole /confirm
+            // batch with it, and skipping the row as an error would LOSE the
+            // bottle — typically a Syrah cuvée sitting next to the Grenache
+            // one the same file had just minted. Instead the bottle lands on
+            // a pending wine request under the proposal the member confirmed,
+            // and a curator links it to one of the near matches or creates
+            // the wine — the same path a row the member marked "request"
+            // takes. The file's geography wins over the AI's guess as the
+            // curator's hints.
             if (!resolved) {
-              errors.push({ index: i, reason: 'Could not resolve this wine in the registry — very similar wines already exist' });
-              continue;
+              nearMatchRequest = {
+                wineName: ai.name.trim(),
+                producer: (str(ai.producer) || '').trim(),
+                grapes: ai.grapes,
+                hints: pickImportHints({
+                  country: item.country || str(ai.country),
+                  region: item.region || str(ai.region),
+                  appellation: item.appellation || str(ai.appellation),
+                  type: item.type || str(ai.type),
+                }),
+              };
             }
             wine = resolved;
-            aiWineCache.set(aiKey, wine);
+            if (wine) aiWineCache.set(aiKey, wine);
             if (created) {
               outcome = 'created';
-              if (wine.pendingIdentity) pendingIdentityCount++;
-              // Same action name as the MCP/admin/find-or-create surfaces so
-              // registry writes read as one audit stream (2026-08-03 M-1).
+              // A wine waiting for a check is pending too; "could not be
+              // identified" is only the one with no producer.
+              const incomplete = wine.pendingIdentity && !wine.producer;
+              if (incomplete) pendingIdentityCount++;
+              else if (wine.uncheckedIdentity) uncheckedCount++;
+              // Same action name as the MCP tools and services/wineCommit, so
+              // registry writes read as one audit stream.
               logAudit(req, 'wine.create', { type: 'wine', id: wine._id },
                 { via: 'import', name: wine.name, producer: wine.producer || null,
-                  ...(wine.pendingIdentity ? { pendingIdentity: true } : {}),
+                  ...(incomplete ? { pendingIdentity: true } : {}),
+                  ...(wine.uncheckedIdentity ? { unchecked: true } : {}),
                   // What the CSV actually said, when the gate refused it
-                  // (audit MED-1) — the pending row itself stores ''.
+                  // — the pending row itself stores ''.
                   ...(producerRejected
                     ? { rejectedProducer: producerRejected.producer, rejectedByCheck: producerRejected.check }
                     : {}) });
@@ -1730,12 +1033,16 @@ router.post('/confirm', async (req, res) => {
               }
             }
           }
-          aiOutcomes.set(i, outcome);
-          // Hand the resolved doc straight to the bottle-creation flow below —
-          // item.wineDefinition keeps the wishlist branch working, wineDoc
-          // skips the redundant findById re-fetch.
-          item.wineDefinition = wine._id;
-          wineDoc = wine;
+          if (nearMatchRequest) {
+            aiOutcomes.set(i, 'request');
+          } else {
+            aiOutcomes.set(i, outcome);
+            // Hand the resolved doc straight to the bottle-creation flow below —
+            // item.wineDefinition keeps the wishlist branch working, wineDoc
+            // skips the redundant findById re-fetch.
+            item.wineDefinition = wine._id;
+            wineDoc = wine;
+          }
         }
 
         // Wishlist destination (e.g. a Vivino scan-history import sent to
@@ -1751,7 +1058,7 @@ router.post('/confirm', async (req, res) => {
             errors.push({ index: i, reason: 'Invalid wine definition ID' });
             continue;
           }
-          // Audit 2026-09 D02-3: the registry's pendingIdentity visibility
+          // The registry's pendingIdentity visibility
           // rule applies here as everywhere else (services/wineVisibility.js).
           const wishWine = await findVisibleWine(item.wineDefinition, { userId: req.user.id, roles: req.user.roles, noDrafts: true });
           if (!wishWine) {
@@ -1807,31 +1114,37 @@ router.post('/confirm', async (req, res) => {
           drinkTo = undefined;
         }
 
-        if (item.requestWine) {
+        if (item.requestWine || nearMatchRequest) {
           // No match — create a pending WineRequest and bottle without wineDefinition.
-          // wineName is REQUIRED, not wineName-or-producer: the old fallback
-          // filed the PRODUCER as the wine's name, and one broken export did
-          // that 131 times in one import — junk requests no curator can
-          // resolve, since many distinct cuvées sit behind one producer
-          // string. The frontend mapper now skips nameless rows before they
-          // get here; this is the API-side mirror for other clients.
-          if (!item.wineName || !String(item.wineName).trim()) {
+          // A near-match AI proposal (above) arrives here with its own identity.
+          // wineName is REQUIRED, not wineName-or-producer: a fallback would
+          // file the PRODUCER as the wine's name — junk requests no curator
+          // can resolve, since many distinct cuvées sit behind one producer
+          // string. The frontend mapper skips nameless rows before they get
+          // here; this is the API-side mirror for other clients.
+          const requestIdentity = nearMatchRequest || {
+            wineName: item.wineName,
+            producer: item.producer,
+            grapes: item.grapes,
+            hints: pickImportHints(item),
+          };
+          if (!requestIdentity.wineName || !String(requestIdentity.wineName).trim()) {
             errors.push({ index: i, reason: 'A wine name is required to request a wine' });
             continue;
           }
 
           // One request per user + wine + producer, REUSED across imports
-          // (a re-import used to mint a second pending request for every
+          // (a re-import must not mint a second pending request for every
           // wine still waiting), carrying the file's geography/type as hints
           // for the curator. Import-supplied grape names ride along as
           // suggestions — the admin decides which taxonomy grapes the new
           // wine definition gets (imports never write taxonomy on this path).
           const { wineRequest } = await findOrCreatePendingRequest({
             userId: req.user.id,
-            wineName: item.wineName,
-            producer: item.producer,
-            suggestedGrapes: sanitizeGrapeNames(item.grapes),
-            hints: pickImportHints(item),
+            wineName: requestIdentity.wineName,
+            producer: requestIdentity.producer,
+            suggestedGrapes: sanitizeGrapeNames(requestIdentity.grapes),
+            hints: requestIdentity.hints,
             cache: pendingRequestCache,
           });
 
@@ -2030,80 +1343,9 @@ router.post('/confirm', async (req, res) => {
       }
     }
 
-    // Per-rack two-pass placement: for each rack referenced in this import,
-    // assign each item to its requested slot first (or, for shelf racks, the
-    // first slot of the requested shelf), then overflow extras into the
-    // nearest empty slot on the same rack.
-    let placedCount = 0;
-    let overflowedCount = 0;
-    const unplacedDetails = []; // [{ sourceIndex, rackName, requestedPosition, reason }]
-    if (pendingPlacements.length > 0) {
-      // Group by rackName
-      const byRack = new Map();
-      for (const p of pendingPlacements) {
-        if (!byRack.has(p.rackName)) byRack.set(p.rackName, []);
-        byRack.get(p.rackName).push(p);
-      }
-
-      for (const [rackName, group] of byRack.entries()) {
-        try {
-          const rack = await Rack.findOne({ cellar: cellarId, name: rackName, deletedAt: null });
-          if (!rack) {
-            for (const p of group) {
-              unplacedDetails.push({ sourceIndex: p.sourceIndex, rackName, requestedPosition: null, reason: 'Rack not found' });
-            }
-            continue;
-          }
-
-          const { placements, unplaced } = placeBottlesInRack(
-            {
-              type: rack.type,
-              rows: rack.rows,
-              cols: rack.cols,
-              // Pass typeConfig as a plain object — for Mongoose subdocs the
-              // .toObject() shape is what the helper expects.
-              typeConfig: rack.typeConfig?.toObject ? rack.typeConfig.toObject() : rack.typeConfig,
-              slots: rack.slots,
-              maxPosition: getMaxPosition(rack),
-              disabledPositions: rack.disabledPositions
-            },
-            group,
-            positionAnchor
-          );
-
-          for (const pl of placements) {
-            rack.slots.push({ position: pl.position, bottle: pl.bottle });
-          }
-          for (const u of unplaced) {
-            unplacedDetails.push({ ...u, rackName });
-          }
-
-          // Count placements only AFTER the save succeeds — a swallowed save
-          // failure (e.g. VersionError from a concurrent rack edit) used to
-          // report bottles as placed that never persisted.
-          if (placements.length > 0) {
-            try {
-              await rack.save();
-              for (const pl of placements) {
-                placedCount++;
-                if (pl.overflowed) overflowedCount++;
-              }
-            } catch (err) {
-              console.error(`Failed to save rack ${rackName} during import:`, err.message);
-              for (const pl of placements) {
-                const src = group.find(p => String(p.bottleId) === String(pl.bottle));
-                unplacedDetails.push({ sourceIndex: src?.sourceIndex ?? null, rackName, requestedPosition: pl.position, reason: `Rack save failed: ${err.message}` });
-              }
-            }
-          }
-        } catch (err) {
-          console.error(`Failed placement for rack ${rackName}:`, err.message);
-          for (const p of group) {
-            unplacedDetails.push({ sourceIndex: p.sourceIndex, rackName, requestedPosition: null, reason: err.message });
-          }
-        }
-      }
-    }
+    // Place the bottles in their racks: the slot the file gives, or the
+    // nearest free one on the same rack (services/importRacks).
+    const { placedCount, overflowedCount, unplacedDetails } = await placeImportedBottles({ cellarId, pendingPlacements, positionAnchor });
 
     // cellarId as well as id: that is what moves the owner's data version
     // when an editor of a shared cellar imports (services/audit).
@@ -2115,7 +1357,7 @@ router.post('/confirm', async (req, res) => {
       wishlistCreated,
       skipped: skipped.length,
       errors: errors.length,
-      // WHY rows failed, not just how many (2026-08-21). A real import
+      // WHY rows failed, not just how many. A real import
       // rejected 15 of 46 rows at 06:05; the user fixed their file and re-ran
       // the 15 six minutes later. The audit recorded the COUNT and threw the
       // reasons away, so afterwards the cause could only be guessed at — four
@@ -2139,55 +1381,35 @@ router.post('/confirm', async (req, res) => {
       // action: how many registry rows this import left for curation is part
       // of the same event, and splitting it would break the one-line-per-import
       // reading of the audit stream.
-      pendingIdentity: pendingIdentityCount
+      pendingIdentity: pendingIdentityCount,
+      ...(uncheckedCount ? { unchecked: uncheckedCount } : {})
     });
 
     // Archive what the file contained, identity columns only, for 30 days.
-    //
-    // NOT awaited, deliberately — the same fire-and-forget shape as logAudit
-    // above. The import is finished and audited by this point; a diagnostic
-    // copy must never delay the user's response, and a slow or failing write
-    // must never turn a successful import into an error. (Awaiting it also
-    // made every /confirm test hang on Mongoose's buffer timeout, which is
-    // the same stall a real connection hiccup would cause in production.)
-    // The rows are projected, not stored raw — see IDENTITY_FIELDS.
-    try {
-      const rows = items.slice(0, ARCHIVE_ROW_CAP).map((item, i) => archiveRow(
-        item,
-        item.requestWine ? 'request'
-          // The import client sends a confirmed AI proposal as `aiWine`
-          // (utils/importPayload); the loop above recorded what it resolved
-          // to. One it never resolved (the near-match zone, a missing name, a
-          // bad vintage) has no wineDefinition: the loop fills that in only
-          // on a row it resolved.
-          : (aiOutcomes.get(i)
-            || (item.wineDefinition ? 'matched' : (item.aiWine ? 'unresolved' : 'other')))
-      ));
-      ImportArchive.create({
-        user: req.user.id,
-        cellar: cellarId,
-        fileName: typeof req.body.fileName === 'string' ? req.body.fileName.slice(0, 260) : undefined,
-        detectedFormat: typeof req.body.detectedFormat === 'string' ? req.body.detectedFormat.slice(0, 40) : undefined,
-        detectedEncoding: typeof req.body.detectedEncoding === 'string' ? req.body.detectedEncoding.slice(0, 40) : undefined,
-        importWarnings: sanitizeImportWarnings(req.body.importWarnings),
-        rows,
-        rowCount: items.length,
-        rowsTruncated: items.length > ARCHIVE_ROW_CAP,
-        summary: {
-          created, createdActive, createdHistory, wishlistCreated,
-          ...(createdOnOrder ? { createdOnOrder } : {}),
-          skipped: skipped.length, errors: errors.length,
-          ...(errors.length ? { errorReasons: summariseReasons(errors) } : {}),
-          pendingIdentity: pendingIdentityCount,
-        },
-        retainUntil: new Date(Date.now() + IMPORT_ARCHIVE_DAYS * 24 * 60 * 60 * 1000),
-      }).catch((err) => {
-        console.warn('[import] archive write failed (non-fatal):', err.message);
-      });
-    } catch (err) {
-      // Projection/build failure — the create above never launched.
-      console.warn('[import] archive build failed (non-fatal):', err.message);
-    }
+    // Not awaited and never failing: the import is finished and audited by
+    // this point (services/importArchive.writeImportArchive).
+    writeImportArchive({
+      userId: req.user.id,
+      cellarId,
+      meta: req.body,
+      items,
+      // The import client sends a confirmed AI proposal as `aiWine`
+      // (utils/importPayload); the loop above recorded what it resolved
+      // to ('request' for the near-match zone). One it never resolved (a
+      // missing name, a bad vintage) has no wineDefinition: the loop fills
+      // that in only on a row it resolved.
+      outcomeOf: (item, i) => (item.requestWine ? 'request'
+        : (aiOutcomes.get(i)
+          || (item.wineDefinition ? 'matched' : (item.aiWine ? 'unresolved' : 'other')))),
+      summary: () => ({
+        created, createdActive, createdHistory, wishlistCreated,
+        ...(createdOnOrder ? { createdOnOrder } : {}),
+        skipped: skipped.length, errors: errors.length,
+        ...(errors.length ? { errorReasons: summariseReasons(errors) } : {}),
+        pendingIdentity: pendingIdentityCount,
+        ...(uncheckedCount ? { unchecked: uncheckedCount } : {}),
+      }),
+    });
 
     res.json({
       created,
@@ -2203,7 +1425,9 @@ router.post('/confirm', async (req, res) => {
       placed: placedCount,
       overflowed: overflowedCount,
       unplaced: unplacedDetails,
-      pendingIdentityCount
+      pendingIdentityCount,
+      // Only when some wines wait for a check: the shape is otherwise unchanged.
+      ...(uncheckedCount ? { uncheckedCount } : {})
     });
   } catch (error) {
     console.error('Import confirm error:', error);
@@ -2219,233 +1443,9 @@ router.post('/confirm', async (req, res) => {
 // PUT    /api/bottles/import/sessions/:id      – update selections/manualWines
 // DELETE /api/bottles/import/sessions/:id      – delete session
 
-/**
- * POST /api/bottles/import/sessions
- *
- * Creates (or replaces) the user's draft session for a cellar.
- * One draft per user+cellar — the old one is deleted before creating the new one
- * so stale sessions don't accumulate.
- */
-router.post('/sessions', async (req, res) => {
-  try {
-    const { cellarId, fileName, detectedFormat, results, selections, manualWines, positionAnchor, rackConfigs, defaultCurrency, importWarnings, detectedEncoding, ctTable, ctTextFallback } = req.body;
-
-    if (!cellarId || !mongoose.Types.ObjectId.isValid(cellarId)) {
-      return res.status(400).json({ error: 'Valid cellarId is required' });
-    }
-    if (!Array.isArray(results) || results.length === 0) {
-      return res.status(400).json({ error: 'results array is required' });
-    }
-
-    const cellar = await Cellar.findById(cellarId);
-    if (!cellar || cellar.deletedAt) {
-      return res.status(404).json({ error: 'Cellar not found' });
-    }
-    // No role answers like a missing cellar (no existence oracle), as
-    // middleware/cellarAccess does; a viewer sees the cellar but cannot import.
-    const role = getCellarRole(cellar, req.user.id);
-    if (!role) {
-      return res.status(404).json({ error: 'Cellar not found' });
-    }
-    if (role === 'viewer') {
-      return res.status(403).json({ error: 'Not authorized to import bottles to this cellar' });
-    }
-
-    // Replace any existing draft for this user+cellar
-    await ImportSession.deleteMany({ cellar: cellarId, user: req.user.id, status: 'draft' });
-
-    const session = new ImportSession({
-      cellar: cellarId,
-      user: req.user.id,
-      fileName,
-      detectedFormat,
-      results,
-      selections: selections || {},
-      manualWines: manualWines || {},
-      positionAnchor: positionAnchor || 'top-left',
-      rackConfigs: rackConfigs || {},
-      defaultCurrency: defaultCurrency || 'USD',
-      importWarnings: sanitizeImportWarnings(importWarnings),
-      detectedEncoding: detectedEncoding || undefined,
-      ctTable: ctTable || undefined,
-      ctTextFallback: Array.isArray(ctTextFallback) ? ctTextFallback : []
-    });
-    await session.save();
-
-    res.status(201).json({ sessionId: session._id });
-  } catch (err) {
-    console.error('Create import session error:', err);
-    res.status(500).json({ error: 'Failed to save session' });
-  }
-});
-
-/**
- * GET /api/bottles/import/sessions?cellarId=...
- *
- * Lists draft sessions for the authenticated user in a cellar.
- */
-router.get('/sessions', async (req, res) => {
-  try {
-    const { cellarId } = req.query;
-    if (!cellarId || !mongoose.Types.ObjectId.isValid(cellarId)) {
-      return res.status(400).json({ error: 'Valid cellarId is required' });
-    }
-
-    const cellar = await Cellar.findById(cellarId);
-    if (!cellar || cellar.deletedAt) {
-      return res.status(404).json({ error: 'Cellar not found' });
-    }
-    // No role answers like a missing cellar (no existence oracle), as
-    // middleware/cellarAccess does. A viewer may list their own drafts.
-    if (!getCellarRole(cellar, req.user.id)) {
-      return res.status(404).json({ error: 'Cellar not found' });
-    }
-
-    const sessions = await ImportSession.find({
-      cellar: cellarId,
-      user: req.user.id,
-      status: 'draft'
-    })
-      .select('fileName detectedFormat createdAt updatedAt')
-      .sort({ updatedAt: -1 })
-      .lean();
-
-    res.json({ sessions });
-  } catch (err) {
-    console.error('List import sessions error:', err);
-    res.status(500).json({ error: 'Failed to list sessions' });
-  }
-});
-
-/**
- * GET /api/bottles/import/sessions/:id
- *
- * Loads a draft session.  For any item whose selection is 'request', re-runs wine
- * matching — if a wine has since been added to the library (e.g. admin resolved the
- * request), the new match is returned in `refreshed` so the frontend can update the
- * selection automatically.
- */
-router.get('/sessions/:id', async (req, res) => {
-  try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-
-    const session = await ImportSession.findById(req.params.id).lean();
-    if (!session || session.status !== 'draft') {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-    if (session.user.toString() !== req.user.id) {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    // Re-match items that were marked 'request' to detect wines added since last save
-    const refreshed = {}; // { [index]: match object }
-    const requestedIndices = Object.entries(session.selections || {})
-      .filter(([, sel]) => sel === 'request')
-      .map(([idx]) => Number(idx));
-
-    for (const idx of requestedIndices) {
-      const result = (session.results || []).find(r => r.index === idx);
-      if (!result?.item) continue;
-      try {
-        const matches = await findWineMatches(result.item, { userId: req.user.id, roles: req.user.roles });
-        // Same styleConflict + colourConflict gates as Pass 1a: this path
-        // silently re-points a row the user marked 'request', so a range
-        // sibling or the other colour of a pair must never pass.
-        if (matches.length > 0 && matches[0].score >= EXACT_THRESHOLD && !matches[0].styleConflict && !matches[0].colourConflict) {
-          const m = matches[0];
-          refreshed[idx] = {
-            wineId: m.wine._id,
-            name: m.wine.name,
-            producer: m.wine.producer,
-            country: m.wine.country?.name || null,
-            region: m.wine.region?.name || null,
-            appellation: m.wine.appellation || null,
-            type: m.wine.type,
-            score: Math.round(m.score * 100) / 100
-          };
-        }
-      } catch (err) {
-        console.error('Failed to re-match import session item (non-fatal):', err.message);
-      }
-    }
-
-    res.json({ session, refreshed });
-  } catch (err) {
-    console.error('Load import session error:', err);
-    res.status(500).json({ error: 'Failed to load session' });
-  }
-});
-
-/**
- * PUT /api/bottles/import/sessions/:id
- *
- * Updates selections and/or manualWines for an existing draft session.
- */
-router.put('/sessions/:id', async (req, res) => {
-  try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-
-    const session = await ImportSession.findById(req.params.id);
-    if (!session || session.status !== 'draft') {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-    if (session.user.toString() !== req.user.id) {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    const { results, selections, manualWines, positionAnchor, rackConfigs, defaultCurrency, importWarnings, detectedEncoding, ctTable, ctTextFallback } = req.body;
-    // Results change when a per-row AI look-up rewrites a row — persist them
-    // so a resumed session doesn't show stale "No match found" rows whose
-    // selection references a wine absent from the stored matches.
-    if (Array.isArray(results)) session.results = results;
-    if (selections !== undefined) session.selections = selections;
-    if (manualWines !== undefined) session.manualWines = manualWines;
-    if (positionAnchor !== undefined) session.positionAnchor = positionAnchor;
-    if (rackConfigs !== undefined) session.rackConfigs = rackConfigs;
-    if (defaultCurrency !== undefined) session.defaultCurrency = defaultCurrency;
-    // Parse-time notices/metadata — persisted so the ct-truncated banner (and
-    // the encoding/table/fallback notes) survive a resume.
-    if (importWarnings !== undefined) session.importWarnings = sanitizeImportWarnings(importWarnings);
-    if (detectedEncoding !== undefined) session.detectedEncoding = detectedEncoding;
-    if (ctTable !== undefined) session.ctTable = ctTable;
-    if (ctTextFallback !== undefined) session.ctTextFallback = ctTextFallback;
-    await session.save();
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('Update import session error:', err);
-    res.status(500).json({ error: 'Failed to update session' });
-  }
-});
-
-/**
- * DELETE /api/bottles/import/sessions/:id
- *
- * Deletes a session (called after a successful import).
- */
-router.delete('/sessions/:id', async (req, res) => {
-  try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-
-    const session = await ImportSession.findById(req.params.id);
-    if (!session) return res.status(404).json({ error: 'Session not found' });
-    if (session.user.toString() !== req.user.id) {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    await session.deleteOne();
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('Delete import session error:', err);
-    res.status(500).json({ error: 'Failed to delete session' });
-  }
-});
+// The draft sessions (save a reviewed import, resume it later) have their
+// own file; mounted here, after this router's auth.
+router.use(require('./importSessions'));
 
 module.exports = router;
 // Exported for its own unit test: this function decides what geography enters
@@ -2455,9 +1455,12 @@ module.exports = router;
 module.exports.buildProposedWine = buildProposedWine;
 module.exports.summariseReasons = summariseReasons;
 // Exported for tests: the provenance rules must be pinnable without standing
-// up a full import (somm ticket 6a958dbc).
+// up a full import.
 module.exports.computeIdentityProvenance = computeIdentityProvenance;
 // Exported for the same reason as buildProposedWine: it is the OTHER rule that
 // decides what enters the shared registry, and the two must agree about a
-// Prädikat in the appellation column (somm ticket 6a966386).
+// Prädikat in the appellation column.
 module.exports.fileCompleteIdentity = fileCompleteIdentity;
+// The candidate finder, for the style-guard test (the guard must read a
+// candidate's recorded label sweetness, which only a populated load carries).
+module.exports.findWineMatches = findWineMatches;

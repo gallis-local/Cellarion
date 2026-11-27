@@ -34,7 +34,7 @@ jest.mock('../models/WishlistItem', () => ({
 // Demo tokens make requireAuth confirm the account still exists.
 jest.mock('../models/User', () => ({ exists: jest.fn(async () => ({ _id: 'demo1' })) }));
 // The by-id path now checks the wine is visible to the caller before filing a
-// wish — it used to take the id on trust (security audit M-4).
+// wish — it used to take the id on trust.
 jest.mock('../models/WineDefinition', () => ({ findOne: jest.fn() }));
 
 const express = require('express');
@@ -143,7 +143,7 @@ describe('POST /api/wishlist — newWine mints at commit', () => {
     expect(findOrCreateWine.mock.calls[0][2]).toEqual({
       // allowPending: a wishlist add is a commit path too — an incomplete
       // identity is filed for curation instead of refusing the add.
-      confirmCreate: false, skipSiblingMatch: false, createdVia: 'ui', allowPending: true, draft: false,
+      confirmCreate: false, skipSiblingMatch: false, createdVia: 'ui', allowPending: true, draft: false, nonWine: false,
     });
     expect(logAudit).toHaveBeenCalledWith(expect.anything(), 'wine.create',
       { type: 'wine', id: WINE_ID }, { via: 'ui', name: 'Kaefferkopf', producer: 'Cave de Kaysersberg' });
@@ -223,5 +223,17 @@ describe('POST /api/wishlist — private drafts are for bottles', () => {
     expect(status).toBe(400);
     expect(body.error).toMatch(/private draft/);
     expect(findOrCreateWine).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/wishlist: notes that are not text', () => {
+  test.each([
+    ['a number', 5],
+    ['an object', { $gt: '' }],
+  ])('notes that are %s are a 400 and nothing is created', async (name, notes) => {
+    const { status, body } = await post({ wineDefinitionId: WINE_ID, notes });
+    expect(status).toBe(400);
+    expect(body.error).toBe('Notes must be text');
+    expect(WishlistItem.create).not.toHaveBeenCalled();
   });
 });

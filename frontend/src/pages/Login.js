@@ -8,7 +8,7 @@ import { stashPostLoginRedirect, takePostLoginRedirect, isSafeInternalPath } fro
 import { stashSignupSourceForSso } from '../utils/signupSource';
 // Checked before submitting, so a newcomer learns the rules in their own
 // language, not from an English server refusal afterwards.
-import { USERNAME_RULE, PASSWORD_POLICY } from '../utils/accountRules';
+import { USERNAME_RULE, PASSWORD_POLICY, EMAIL_RULE } from '../utils/accountRules';
 import './Login.css';
 import AuthLogo from '../components/AuthLogo';
 
@@ -62,8 +62,8 @@ function Login() {
   const { t } = useTranslation();
   const { login, register } = useAuth();
   const navigate = useNavigate();
-  // Where ProtectedRoute sent them from, when a deep link bounced them here
-  // (issue #1165), or the community page whose sign-in link they followed.
+  // Where ProtectedRoute sent them from, when a deep link bounced them here,
+  // or the community page whose sign-in link they followed.
   // Router state set by the app itself, never read from the URL.
   const location = useLocation();
   const appVersion = useVersion();
@@ -97,6 +97,11 @@ function Login() {
     if (mode === 'register') {
       if (!USERNAME_RULE.test(username)) {
         setError(t('auth.usernameRuleError', 'Usernames are 3–30 characters and may use letters, numbers, dots, underscores and hyphens — no spaces.'));
+        return;
+      }
+      // The server lowercases the address before it checks it; check the same thing.
+      if (!EMAIL_RULE.test(email.toLowerCase())) {
+        setError(t('auth.emailRuleError', 'Enter a whole email address, such as anna@example.com.'));
         return;
       }
       if (!PASSWORD_POLICY.test(formData.password)) {
@@ -414,7 +419,7 @@ function Login() {
           <div className="form-group">
             <label htmlFor={usernameId}>{mode === 'login' ? t('auth.usernameOrEmail') : t('auth.usernameLabel')}</label>
             {/* Autocomplete hints let password managers fill and save the
-                right fields (Chrome asks for them; support ticket 2026-10-14). */}
+                right fields (Chrome asks for them). */}
             <input
               id={usernameId}
               type="text"

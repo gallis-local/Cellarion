@@ -1,6 +1,6 @@
 import { JSON_HEADERS } from './apiConstants';
 
-// Public key vocabulary + values (#985 Slice B).
+// Public key vocabulary + values.
 // Mirrors backend routes/registryData.js + routes/admin/registryData.js.
 
 // `lang` is what the UI is showing; the server answers with each key's
@@ -51,6 +51,22 @@ export const setRegistryKeyTranslations = (apiFetch, keyId, translations) =>
     method: 'PUT',
     headers: JSON_HEADERS,
     body: JSON.stringify({ translations }),
+  });
+
+// Redefine a live key ({ type?, unit?, enumOptions? }). A 409 names the
+// values that would not fit the new definition.
+export const updateRegistryKey = (apiFetch, keyId, definition) =>
+  apiFetch(`/api/admin/registry-data/keys/${keyId}`, {
+    method: 'PATCH',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(definition),
+  });
+
+// Take an accepted key out of the vocabulary. A key that holds values is a
+// 409 saying how many, unless removeValues takes them off with it.
+export const removeRegistryKey = (apiFetch, keyId, { removeValues = false } = {}) =>
+  apiFetch(`/api/admin/registry-data/keys/${keyId}${removeValues ? '?removeValues=true' : ''}`, {
+    method: 'DELETE',
   });
 
 // asWineDefault: publish a vintage-specific suggestion as the wine-wide

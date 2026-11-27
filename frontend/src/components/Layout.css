@@ -297,11 +297,16 @@
 .mobile-menu {
   background: var(--color-surface);
   border-top: 1px solid var(--color-border);
-  /* The navbar above is 60px PLUS the status-bar inset (see .navbar), so
-     subtracting a bare 60px left this menu taller than the space it has —
-     about 50px too tall on a notched iPhone, which pushed the last item
-     (Logout) off the bottom (issue #1146). */
+  /* As tall as the room under the navbar, never taller: a menu that is
+     taller than the screen keeps its last rows (the account and Logout)
+     below it, out of reach. Two things decide that room:
+     - the navbar is 60px PLUS the status-bar inset (see .navbar);
+     - the VISIBLE height (dvh). In a phone browser 100vh is the height with
+       the address bar hidden, so while the bar shows, 100vh is more than
+       the screen. An installed app has no address bar, so it never showed
+       there. The 100vh line is for browsers without dvh. */
   max-height: calc(100vh - 60px - env(safe-area-inset-top));
+  max-height: calc(100dvh - 60px - env(safe-area-inset-top));
   overflow-y: auto;
   /* Stop the scroll gesture chaining to the page behind once this container
      reaches its end. Without it, reaching Logout on a full admin menu took
@@ -383,6 +388,31 @@
 }
 
 /* ══════════════════════════════════════════════
+   Narrow desktop / tablet
+   ══════════════════════════════════════════════ */
+/* Squeezed between the logo and the fixed-width right section, the links
+   wrapped into four or five short rows while the right section kept all its
+   width. Below this width the brand and the right section share the first
+   row and the links get a full-width row of their own underneath. */
+@media (min-width: 769px) and (max-width: 1200px) {
+  .navbar-inner {
+    flex-wrap: wrap;
+    row-gap: 0.25rem;
+  }
+
+  .navbar-links {
+    order: 1;
+    flex-basis: 100%;
+    /* Pull the first link's padding out so its text lines up with the logo */
+    margin-left: -0.75rem;
+  }
+
+  .brand-logo-img {
+    height: 52px;
+  }
+}
+
+/* ══════════════════════════════════════════════
    Mobile Styles
    ══════════════════════════════════════════════ */
 @media (max-width: 768px) {
@@ -426,8 +456,8 @@
        ADDED to the height — with height: var(--bottom-nav-height) alone the
        ~34px home-indicator inset of an installed iOS PWA was carved OUT of the
        64px, squeezing the items into ~29px: icons overflowed through the
-       border-top (the "stray line") and labels sat on the home indicator
-       (issue #861). In a Safari tab the inset is 0 and nothing changes. The
+       border-top (the "stray line") and labels sat on the home indicator.
+       In a Safari tab the inset is 0 and nothing changes. The
        content box stays exactly --bottom-nav-height, and the total matches
        every calc(var(--bottom-nav-height) + env(safe-area-inset-bottom))
        offset elsewhere. */

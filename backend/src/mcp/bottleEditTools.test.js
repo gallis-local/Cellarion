@@ -35,14 +35,14 @@ jest.mock('../models/McpActionLog', () => ({
 }));
 jest.mock('../utils/rackGeometry', () => ({ getMaxPosition: jest.fn(() => 12) }));
 jest.mock('../services/search', () => ({
-  getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn(),
+  getIsAvailable: jest.fn(() => false), search: jest.fn(),
 }));
 jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), buildEmptyStats: jest.fn() }));
 jest.mock('../services/vectorStore', () => ({ getPoints: jest.fn(), searchSimilar: jest.fn() }));
 jest.mock('../config/aiConfig', () => ({ get: jest.fn(() => ({ vectorIndex: 'v1' })) }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../services/findOrCreateWine', () => ({ findOrCreateWine: jest.fn() }));
-jest.mock('../services/wineVisibility', () => ({ findVisibleWine: jest.fn(), wineVisibilityFilter: jest.fn(() => ({})) }));
+jest.mock('../services/wineVisibility', () => ({ findVisibleWine: jest.fn(), wineVisibilityFilter: jest.fn(() => ({})), CURATION_ROLES: ['somm', 'admin'] }));
 jest.mock('../services/imageOps', () => ({
   ingestBottleImage: jest.fn(), setBottleDefaultImage: jest.fn(), deleteOwnImage: jest.fn(),
 }));

@@ -1,5 +1,5 @@
 /**
- * SAME-WINE fragmentation detectors (curator ticket d4a0e96b, 2026-08-10).
+ * SAME-WINE fragmentation detectors.
  *
  * Every existing duplicate net keys off the wine NAME in some form —
  * canonicalKey, normalizedKey, the fuzzy cluster scan. When one wine is split
@@ -33,7 +33,7 @@
 const WineDefinition = require('../models/WineDefinition');
 const Bottle = require('../models/Bottle');
 const WineVintageProfile = require('../models/WineVintageProfile');
-const WineNotDuplicate = require('../models/WineNotDuplicate');
+const { loadNotDuplicates } = require('./notDuplicateStore');
 const {
   normalizeProducerKey,
   normalizeAppellationKey,
@@ -54,8 +54,8 @@ const MIN_PRODUCER_KEY_LEN = 5;
 
 // The edit-distance window scales with key length: 2 edits is the ceiling for
 // ordinary keys, but a garbled long name drifts further — "Grenoble
-// Guillaume" is a real prod misread of "Vignoble Guillaume" (ticket d4a0e96b)
-// at distance 3, which a flat ≤2 window misses. Three edits inside a ≥8-char
+// Guillaume" is a real prod misread of "Vignoble Guillaume" at distance 3,
+// which a flat ≤2 window misses. Three edits inside a ≥8-char
 // key is still a smaller relative distortion than two inside a 5-char one,
 // and the queue sorts distance-ascending so the wider tail lists last.
 const LONG_KEY_LEN = 8;
@@ -110,8 +110,8 @@ async function collectVintageEvidence(ids) {
  * too noisy — every estate's whole range would group), and so are empty
  * producer keys (all-stopword producers like "Domaine" would lump unrelated
  * estates into one bucket). Groups where the admin has dismissed EVERY member
- * pair as not-a-duplicate stop resurfacing — the same suppression, store and
- * keying (WineNotDuplicate {wineA, wineB}, smaller hex first) as the
+ * pair as not-a-duplicate stop resurfacing — the same suppression and store
+ * (services/notDuplicateStore) as the
  * canonical-collisions queue, so one "Not duplicates" click silences a group
  * across all three queues.
  *
@@ -123,7 +123,7 @@ async function collectVintageEvidence(ids) {
  */
 async function sameProducerAppellationGroups({ limit = 50, offset = 0 } = {}) {
   // Quarantined non-wines are excluded, same contract as every other
-  // duplicate pool (code audit 2026-07-27, H3).
+  // duplicate pool.
   const wines = await WineDefinition.find({ nonWine: { $ne: true }, pendingIdentity: { $ne: true } })
     .select('name producer appellation')
     .lean();
@@ -141,12 +141,11 @@ async function sameProducerAppellationGroups({ limit = 50, offset = 0 } = {}) {
   const candidates = [...byKey.entries()].filter(([, arr]) => arr.length >= 2);
 
   // Suppress groups whose every pair an admin already judged distinct.
-  const notDup = await WineNotDuplicate.find({}).select('wineA wineB').lean();
-  const dismissed = new Set(notDup.map(d => `${d.wineA}|${d.wineB}`));
+  const dismissed = await loadNotDuplicates();
   const active = candidates.filter(([, arr]) => {
     for (let i = 0; i < arr.length; i++) {
       for (let j = i + 1; j < arr.length; j++) {
-        if (!dismissed.has(pairKey(arr[i]._id, arr[j]._id))) return true;
+        if (!dismissed.has(arr[i]._id, arr[j]._id)) return true;
       }
     }
     return false;
@@ -190,7 +189,7 @@ async function sameProducerAppellationGroups({ limit = 50, offset = 0 } = {}) {
   // Within disjoint, groups where ≥2 members actually CARRY vintage evidence
   // outrank vacuously-disjoint ones (no bottles, no profiles — common for
   // seeded/import rows, which would otherwise flood page 1 with groups whose
-  // "no shared vintage" badge rests on no data at all; audit 2026-08-10).
+  // "no shared vintage" badge rests on no data at all).
   const tier = (g) => {
     if (!g.disjoint) return 0;
     return g.wines.filter((w) => w.vintages.length > 0).length >= 2 ? 2 : 1;
@@ -307,10 +306,10 @@ async function nearProducerPairs({ limit = 50, offset = 0 } = {}) {
 
 /**
  * Detector 3 — one producer, one name a strict token-PREFIX of another
- * (ticket 6a800f39: a 226-row import minted "Vat 8" and "Vat 8 Shiraz
- * Cabernet" seconds apart — same wine, two records — and nothing fired:
- * detector 1 buries the pair inside the estate's whole same-appellation
- * range, and every name-keyed net sees two genuinely different strings).
+ * ("Vat 8" and "Vat 8 Shiraz Cabernet" — same wine, two records — fire
+ * nothing else: detector 1 buries the pair inside the estate's whole
+ * same-appellation range, and every name-keyed net sees two genuinely
+ * different strings).
  *
  * The signal is the containment itself: an import file writes the same wine
  * short on one row and long on another ("Vat 1" / "Vat 1 Semillon",
@@ -327,7 +326,7 @@ async function nearProducerPairs({ limit = 50, offset = 0 } = {}) {
  * is a REVIEW queue like its siblings, with detector 1's vintage-axis
  * discriminator: fragments of one wine split its vintages (disjoint sorts
  * first), a real pair of cuvées overlaps most years. Pair dismissals use the
- * same WineNotDuplicate store and keying as detector 1, so one "Not
+ * same store (services/notDuplicateStore) as detector 1, so one "Not
  * duplicates" click silences the pair across every queue.
  *
  * @returns {Promise<{pairs: Array, total: number, scannedCount: number,
@@ -371,14 +370,12 @@ async function nameSubsetPairs({ limit = 50, offset = 0 } = {}) {
 
   // Same suppression store and keying as detector 1 — pair-level, so the
   // existing dismiss endpoint works verbatim on [short, long].
-  const notDup = await WineNotDuplicate.find({}).select('wineA wineB').lean();
-  const dismissed = new Set(notDup.map((d) => `${d.wineA}|${d.wineB}`));
-  const active = rawPairs.filter((p) => !dismissed.has(pairKey(p.short._id, p.long._id)));
+  const dismissed = await loadNotDuplicates();
+  const active = rawPairs.filter((p) => !dismissed.has(p.short._id, p.long._id));
 
   // The health job asks only for the count (limit: 0) — total is known here,
   // and everything below (the Bottle aggregate, entry building, the sort) is
-  // presentation. Computing it weekly just to slice(0, 0) was pure waste
-  // (audit 2026-08-16).
+  // presentation, and computing it only to slice(0, 0) would be pure waste.
   if (limit === 0) {
     return { pairs: [], total: active.length, scannedCount: wines.length, skippedBuckets };
   }

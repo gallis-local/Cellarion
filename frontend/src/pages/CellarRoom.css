@@ -375,6 +375,25 @@
   font-size: 0.85rem;
 }
 
+/* producer · vintage, the same separator as the bottle cards: after the
+   producer, so a wrapped vintage never starts its line with a dot. Plain
+   inline text, not flex, so a long producer wraps like text and the vintage
+   follows on its last line. The real space between the spans (in the JSX)
+   keeps them apart for screen readers, which skip the dot; the right margin
+   subtracts that space so the dot sits evenly. */
+.room-bottle-producer > span:not(:last-child)::after {
+  content: '·';
+  content: '·' / '';
+  margin-left: 0.35rem;
+  margin-right: calc(0.35rem - 0.25em);
+}
+
+/* Only the vintage (the second span): a producer without a vintage is the
+   last child too, and must still be able to wrap. */
+.room-bottle-producer > span + span {
+  white-space: nowrap;
+}
+
 .room-bottle-meta {
   display: flex;
   align-items: center;
@@ -396,6 +415,7 @@
 .room-bottle-type.type-sparkling { background: #e8f8f0; color: #508040; }
 .room-bottle-type.type-dessert { background: #f8f0e0; color: #8a5020; }
 .room-bottle-type.type-fortified { background: #f0e8e0; color: #7a4020; }
+.room-bottle-type.type-other { background: #ececec; color: #666; }
 
 .room-bottle-region {
   margin: 0.15rem 0;
@@ -494,6 +514,7 @@
 .room-slot-type-dot.type-sparkling { background: #88A848; }
 .room-slot-type-dot.type-dessert { background: #A06020; }
 .room-slot-type-dot.type-fortified { background: #7A3810; }
+.room-slot-type-dot.type-other { background: #9A9A9A; }
 
 .room-slot-empty {
   font-size: 0.8rem;

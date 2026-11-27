@@ -1,6 +1,6 @@
 /**
- * services/wineDraftOps — the private-draft lifecycle (support ticket
- * 2026-09-12). Mocked models; the resolver, the promotion follow-through and
+ * services/wineDraftOps — the private-draft lifecycle.
+ * Mocked models; the resolver, the promotion follow-through and
  * the visibility rule are mocked at their module boundary so each assertion
  * is about THIS module's decisions:
  *   - edits stay in the draft key namespace and restart the clock
@@ -31,11 +31,11 @@ jest.mock('./pendingWineOps', () => ({
 jest.mock('./wineVisibility', () => ({ findVisibleWine: jest.fn() }));
 jest.mock('./findOrCreateWine', () => ({ findOrCreateWine: jest.fn(), findOrCreateRegion: jest.fn() }));
 jest.mock('./crossFieldScan', () => ({ detectBlockingProducerIssue: jest.fn(async () => null) }));
-jest.mock('./search', () => ({ removeWine: jest.fn(), bulkIndexBottles: jest.fn(() => Promise.resolve()) }));
+jest.mock('./search', () => ({ removeWine: jest.fn() }));
 jest.mock('./imageProcessor', () => ({ unlinkImageFiles: jest.fn(async () => {}) }));
 jest.mock('../utils/vintageProfile', () => ({ ensurePendingVintageProfile: jest.fn(async () => {}) }));
-// The admin merge's reference re-pointer — attach delegates to it (audit 2026-09-12).
-jest.mock('../routes/admin/wines', () => ({ reassignWineRefs: jest.fn(async () => 2) }));
+// The admin merge's reference re-pointer — attach delegates to it.
+jest.mock('./wineMergeOps', () => ({ reassignWineRefs: jest.fn(async () => 2) }));
 
 const WineDefinition = require('../models/WineDefinition');
 const Bottle = require('../models/Bottle');
@@ -53,7 +53,7 @@ const { findVisibleWine } = require('./wineVisibility');
 const { findOrCreateWine } = require('./findOrCreateWine');
 const { detectBlockingProducerIssue } = require('./crossFieldScan');
 const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
-const { reassignWineRefs } = require('../routes/admin/wines');
+const { reassignWineRefs } = require('./wineMergeOps');
 const ops = require('./wineDraftOps');
 
 const ME = 'aaaaaaaaaaaaaaaaaaaaaaaa';
@@ -287,7 +287,7 @@ describe('publishDraft', () => {
     expect(WineDefinition.findOne).toHaveBeenCalledWith({ normalizedKey: 'cave de kaysersberg:kaefferkopf:alsace', _id: { $ne: WINE } });
     expect(runPromotionFollowThrough).not.toHaveBeenCalled();
     // The expiry job and the erasure path reuse this object for the attach
-    // that follows — every pre-save mutation is undone (audit 2026-09-12).
+    // that follows — every pre-save mutation is undone.
     expect(w).toMatchObject({ draft: true, normalizedKey: 'draft~x', draftExpiresAt: new Date('2026-09-19T00:00:00Z') });
   });
 
@@ -327,7 +327,7 @@ describe('attachDraftBottles', () => {
     expect(findVisibleWine).toHaveBeenCalledWith(TARGET, expect.objectContaining({ userId: ME, noDrafts: true }));
     // Scans first (never moved onto the target), then the full re-point —
     // price tracking, personal data, restock alerts, journal pairings and the
-    // rest follow the bottles exactly as in an admin merge (audit 2026-09-12).
+    // rest follow the bottles exactly as in an admin merge.
     expect(BottleImage.find).toHaveBeenCalledWith({ wineDefinition: WINE, kind: 'label-scan' });
     expect(BottleImage.deleteMany).toHaveBeenCalledWith({ _id: { $in: ['scan1'] } });
     expect(reassignWineRefs).toHaveBeenCalledWith(WINE, TARGET);

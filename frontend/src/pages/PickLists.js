@@ -7,10 +7,10 @@ import BetaBadge from '../components/BetaBadge';
 import './PickList.css';
 
 /**
- * Pick lists (early access, flag pickLists; forum request 2026-10-13): the
- * member's named lists of bottles to fetch — "Saturday dinner", "Drink next".
- * Bottles are added from the cellar's Select mode or a bottle's ⋮ menu; each
- * list shows where every bottle sits.
+ * Pick lists (early access, flag pickLists): the member's named lists of
+ * bottles to fetch — "Saturday dinner", "Drink next". Bottles are added from
+ * the cellar's Select mode, a vintage page or a bottle's ⋮ menu; each list
+ * shows where every bottle sits.
  */
 export default function PickLists() {
   const { t } = useTranslation();
@@ -47,7 +47,7 @@ export default function PickLists() {
       navigate(`/pick-lists/${data.list.id}`);
     } catch (err) {
       // A dropped connection throws a TypeError with the browser's own text
-      // ("Failed to fetch"), not a message for the user (audit 2026-10-14).
+      // ("Failed to fetch"), not a message for the user.
       setError(err instanceof TypeError ? t('common.networkError', 'Network error') : err.message);
       setCreating(false);
     }
@@ -55,11 +55,15 @@ export default function PickLists() {
 
   return (
     <div className="pick-lists-page">
-      <h1>{t('pickLists.title', 'Pick lists')}</h1>
+      <div className="page-header">
+        <div>
+          <h1>{t('pickLists.title', 'Pick lists')}</h1>
+          <p className="page-subtitle">
+            {t('pickLists.intro', 'A pick list is the bottles you are about to fetch — for a dinner, a tasting, or what to drink next — with the cellar, rack and slot of each, in the order you walk past them. To add bottles, tap Select in your cellar, pick them and choose Pick list, or use ⋮ on a bottle\'s page.')}
+          </p>
+        </div>
+      </div>
       <BetaBadge feature="pickLists" note={t('pickLists.betaNote', 'Pick lists are in early access.')} />
-      <p className="pick-lists-intro">
-        {t('pickLists.intro', 'A pick list is the bottles you are about to fetch — for a dinner, a tasting, or what to drink next — with the cellar, rack and slot of each, in the order you walk past them. To add bottles, tap Select in your cellar, pick them and choose Pick list, or use ⋮ on a bottle\'s page.')}
-      </p>
 
       {error && <p className="error-message" role="alert">{error}</p>}
 

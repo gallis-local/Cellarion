@@ -4,14 +4,15 @@ const { requireAuth, requireRole } = require('../../middleware/auth');
 const WineRequest = require('../../models/WineRequest');
 const WineDefinition = require('../../models/WineDefinition');
 const { generateWineKey, normalizeAppellation, normalizeString } = require('../../utils/normalize');
+const { assignClassification } = require('../../services/classificationOps');
 const { canonicalizeWineName } = require('../../utils/producerPrefix');
 const Country = require('../../models/Country');
 const { findOrCreateWine } = require('../../services/findOrCreateWine');
 const { resolveCanonicalAppellation } = require('../../services/appellationResolve');
 const searchService = require('../../services/search');
-const { logAudit } = require('../../services/audit');
+const { logAudit, logger } = require('../../services/audit');
 const { submitUrls } = require('../../services/indexNow');
-const { completeRequestResolve, completeRequestReject } = require('../../services/wineRequestOps');
+const { claimRequest, releaseRequestClaim, completeRequestResolve, completeRequestReject } = require('../../services/wineRequestOps');
 const { incrementCred } = require('../../utils/cellarCred');
 const { parsePagination } = require('../../utils/pagination');
 const { isValidId } = require('../../utils/validation');
@@ -19,11 +20,34 @@ const { validateImageRef } = require('../../services/accountOps');
 const { WINE_COLOURS, colourTypeConflict } = require('../../utils/wineColour');
 
 const router = express.Router();
+const asyncHandler = require('../../utils/asyncHandler');
 
 // All routes require admin role
 router.use(requireAuth, requireRole('admin'));
 
 // GET /api/admin/wine-requests - List all wine requests
+// Inline photos (data: URLs of up to 500,000 characters each) stay out of the
+// list: a page of fifty wines a self-hosted install contributed would
+// otherwise be many megabytes. A link is short and stays; an inline photo is
+// flagged and read on its own (GET /:id/photos) when the request is opened.
+// Worked out in the database, so the photos never leave it for a list.
+const isInline = (field) => ({ $eq: [{ $substrCP: [{ $ifNull: [`$${field}`, ''] }, 0, 5] }, 'data:'] });
+async function listPictures(ids) {
+  if (!ids.length) return new Map();
+  const rows = await WineRequest.aggregate([
+    { $match: { _id: { $in: ids } } },
+    {
+      $project: {
+        hasInlineImage: isInline('image'),
+        hasInlineBackImage: isInline('backImage'),
+        image: { $cond: [isInline('image'), null, { $ifNull: ['$image', null] }] },
+        backImage: { $cond: [isInline('backImage'), null, { $ifNull: ['$backImage', null] }] },
+      },
+    },
+  ]);
+  return new Map(rows.map((r) => [String(r._id), r]));
+}
+
 router.get('/', async (req, res) => {
   try {
     const { status } = req.query;
@@ -46,6 +70,7 @@ router.get('/', async (req, res) => {
 
     const [requests, total] = await Promise.all([
       WineRequest.find(filter)
+        .select('-image -backImage')
         .populate('user', 'username email')
         .populate({
           path: 'linkedWineDefinition',
@@ -58,10 +83,22 @@ router.get('/', async (req, res) => {
       WineRequest.countDocuments(filter)
     ]);
 
+    const pictures = await listPictures(requests.map((r) => r._id));
+    const rows = requests.map((r) => {
+      const p = pictures.get(String(r._id)) || {};
+      return {
+        ...r.toJSON(),
+        image: p.image ?? null,
+        backImage: p.backImage ?? null,
+        hasInlineImage: !!p.hasInlineImage,
+        hasInlineBackImage: !!p.hasInlineBackImage,
+      };
+    });
+
     res.json({
-      count: requests.length,
+      count: rows.length,
       total,
-      requests
+      requests: rows
     });
   } catch (error) {
     console.error('Get wine requests error:', error);
@@ -69,13 +106,23 @@ router.get('/', async (req, res) => {
   }
 });
 
+// GET /api/admin/wine-requests/:id/photos — the request's two photos in full,
+// for the request an admin opened: the list carries only a flag for an
+// inline one (listPictures).
+router.get('/:id/photos', asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
+  const row = await WineRequest.findById(req.params.id).select('image backImage').lean();
+  if (!row) return res.status(404).json({ error: 'Wine request not found' });
+  res.json({ image: row.image || null, backImage: row.backImage || null });
+}));
+
 // PUT /api/admin/wine-requests/:id/resolve - Resolve wine request
 router.put('/:id/resolve', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
     const { wineDefinitionId, createNew, wineData, adminNotes, applyGrapes } = req.body;
 
-    const wineRequest = await WineRequest.findById(req.params.id);
+    let wineRequest = await WineRequest.findById(req.params.id);
     if (!wineRequest) {
       return res.status(404).json({ error: 'Wine request not found' });
     }
@@ -83,6 +130,25 @@ router.put('/:id/resolve', async (req, res) => {
     if (wineRequest.status !== 'pending') {
       return res.status(400).json({ error: 'Wine request has already been resolved' });
     }
+
+    // Take the request before anything else happens to it. A second decision
+    // (another admin, a double click, the bridge sync) is refused here, not
+    // after it has created a wine of its own.
+    const claim = await claimRequest(wineRequest._id);
+    if (claim.refused === 'decided') {
+      return res.status(400).json({ error: 'Wine request has already been resolved' });
+    }
+    if (claim.refused) {
+      return res.status(409).json({ error: 'Someone else is deciding this wine request right now. Reload and try again in a moment.' });
+    }
+    wineRequest = claim.request;
+    // Given back when the answer goes out without a decision (a refusal, a
+    // failure), so the request can be decided again at once.
+    let decided = false;
+    res.on('finish', () => {
+      if (decided) return;
+      releaseRequestClaim(wineRequest._id).catch((err) => logger.warn({ err, requestId: String(wineRequest._id) }, 'wine request claim not released'));
+    });
 
     let linkedWine;
 
@@ -107,11 +173,10 @@ router.put('/:id/resolve', async (req, res) => {
       }
     } else if (createNew && wineData) {
       // Create new wine definition — through the same canonicalization + dedup
-      // probe as every other write surface (this branch used to bypass all of
-      // it and also skipped the appellation tier-strip; dup analysis
-      // 2026-07-22 RC4). A likely duplicate returns 409 with candidates so the
-      // admin links the request to the existing wine instead — or resubmits
-      // with confirmCreate:true after an explicit "create anyway".
+      // probe as every other write surface, appellation tier-strip included.
+      // A likely duplicate returns 409 with candidates so the admin links the
+      // request to the existing wine instead — or resubmits with
+      // confirmCreate:true after an explicit "create anyway".
       const { name, producer, country, region, appellation, grapes, type, colour, image, useRequestPhoto, addBackPhoto } = wineData;
 
       if (!name || !producer || !country) {
@@ -136,10 +201,9 @@ router.put('/:id/resolve', async (req, res) => {
       }
 
       // Image: an explicitly blank field means "no image" — it must NOT fall
-      // back to the requester's value (audit 2026-09 F06-1). Whatever is
-      // stored has to pass the http(s) / own-upload check, so a
-      // protocol-relative or javascript: reference can never reach
-      // WineDefinition.image through an approval.
+      // back to the requester's value. Whatever is stored has to pass the
+      // http(s) / own-upload check, so a protocol-relative or javascript:
+      // reference can never reach WineDefinition.image through an approval.
       //
       // A photo the requester attached is stored inline on the request. It is
       // never copied into the wine record (half a megabyte of text in every
@@ -165,7 +229,7 @@ router.put('/:id/resolve', async (req, res) => {
           return res.status(400).json({ error: 'The photo on the request could not be read. Approve without it, or give a picture link.' });
         }
       }
-      // The back label (#1460) can join the new wine's PUBLIC photos — a
+      // The back label can join the new wine's PUBLIC photos — a
       // gallery photo marked as the back, never the wine's picture. On unless
       // the admin unticks it (addBackPhoto: false), like the front photo; an
       // inline photo only — a link is left on the request, nothing is fetched.
@@ -185,7 +249,7 @@ router.put('/:id/resolve', async (req, res) => {
       // WineDefinition itself rather than going through findOrCreateWine, so
       // the resolver has to be called explicitly or an approved request mints
       // a spelling variant of an already-curated appellation.
-      // A bare Prädikat is not a place — same rule as findOrCreateWine (audit 2026-09-07).
+      // A bare Prädikat is not a place — same rule as findOrCreateWine.
       const pradikatSplit = splitPradikatFromAppellation(appellation, req.body.classification, cleanName);
       const cleanAppellation = await resolveCanonicalAppellation(
         normalizeAppellation(pradikatSplit.appellation)
@@ -216,9 +280,9 @@ router.put('/:id/resolve', async (req, res) => {
         }
       }
 
-      // Same producer gate as the mint chokepoint and the admin POST
-      // (release-audit MED-3): approval builds the row directly and must not
-      // be the one surface that still publishes a place as a producer.
+      // Same producer gate as the mint chokepoint and the admin POST:
+      // approval builds the row directly and must not be the one surface
+      // that publishes a place as a producer.
       {
         const { detectBlockingProducerIssue } = require('../../services/crossFieldScan');
         const blocked = await detectBlockingProducerIssue({ name: cleanName, producer: cleanProducer, appellation: cleanAppellation || '' });
@@ -232,8 +296,8 @@ router.put('/:id/resolve', async (req, res) => {
       // Adopt the registry's existing spelling for this producer, mirroring
       // the mint chokepoint (same-string majority + same-country decoration
       // variants). Approval builds the row directly, so without this the
-      // approve button was one of the surfaces that could still mint a
-      // display split. Fail-open — ambiguity stores the typed spelling.
+      // approve button could mint a display split. Fail-open — ambiguity
+      // stores the typed spelling.
       const { resolveCanonicalProducerSpelling } = require('../../services/producerSpelling');
       const producerToStore = await resolveCanonicalProducerSpelling(
         cleanProducer, normalizeString(cleanProducer), { countryId: String(country) }
@@ -241,15 +305,20 @@ router.put('/:id/resolve', async (req, res) => {
 
       const normalizedKey = generateWineKey(cleanName, producerToStore, cleanAppellation);
 
+      // The write rule (services/classificationOps), lenient: the request
+      // is a member's words — a tier the taxonomy lacks stays as the string.
+      const classificationFields = {};
+      await assignClassification(classificationFields, { classification: pradikatSplit.classification, countryId: country });
+
       linkedWine = new WineDefinition({
         name: cleanName,
         producer: producerToStore,
         country,
         region: region || null,
         appellation: cleanAppellation,
-        classification: pradikatSplit.classification || undefined,
+        ...classificationFields,
         grapes: grapes || [],
-        type: type || null, // no guessed red (ticket 6a85ad44)
+        type: type || null, // no guessed red
         // Sparkling/dessert/fortified only; the model hook drops anything else
         // and infers rosé from the name when this is empty.
         colour: WINE_COLOURS.includes(colour) ? colour : null,
@@ -329,10 +398,10 @@ router.put('/:id/resolve', async (req, res) => {
       // The back label joins the gallery: ingested like a member's upload and
       // published at birth (the admin approved it by leaving the box ticked),
       // marked as the back so a reader can tell the faces apart. Born approved
-      // — approving it after the hand-off raced the background-removal worker,
-      // which then settled it 'processed' and out of every gallery (release
-      // audit 2026-10-09, H1). Not the official picture: assignedToWine stays
-      // false. Only for a wine created here, and best-effort, like the front.
+      // — approving it after the hand-off would race the background-removal
+      // worker, which could settle it 'processed' and out of every gallery.
+      // Not the official picture: assignedToWine stays false. Only for a wine
+      // created here, and best-effort, like the front.
       if (addBack && createdHere) {
         try {
           const keepBackground = await hasTransparency(backPhoto);
@@ -365,11 +434,13 @@ router.put('/:id/resolve', async (req, res) => {
     // and notify the requester (not for a bridge request its install follows:
     // the install tells its own user) — shared with the Registry Bridge request sync
     // (services/wineRequestOps), so both finish a request the same way.
-    // Null: decided meanwhile (another admin, or the bridge sync) — nothing written.
-    const resolved = await completeRequestResolve(wineRequest, linkedWine, { resolvedBy: req.user.id, adminNotes });
+    // Null: no longer pending. This resolve holds the request, so only a
+    // request that left the queue another way (its cellar was deleted) gets here.
+    const resolved = await completeRequestResolve(wineRequest, linkedWine, { resolvedBy: req.user.id, adminNotes, holdsClaim: true });
     if (!resolved) {
       return res.status(400).json({ error: 'Wine request has already been resolved' });
     }
+    decided = true;
 
     // Award Cellar Cred to the submitting user
     const credEvent = wineRequest.requestType === 'grape_suggestion' ? 'grape_suggestion_approved' : 'wine_request_approved';
@@ -407,11 +478,11 @@ router.put('/:id/reject', async (req, res) => {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
     const { adminNotes } = req.body;
 
-    if (!adminNotes || !adminNotes.trim()) {
+    if (typeof adminNotes !== 'string' || !adminNotes.trim()) {
       return res.status(400).json({ error: 'Admin notes are required when rejecting a request' });
     }
 
-    const wineRequest = await WineRequest.findById(req.params.id);
+    let wineRequest = await WineRequest.findById(req.params.id);
     if (!wineRequest) {
       return res.status(404).json({ error: 'Wine request not found' });
     }
@@ -420,13 +491,33 @@ router.put('/:id/reject', async (req, res) => {
       return res.status(400).json({ error: 'Wine request has already been resolved' });
     }
 
+    // Take the request before anything else happens to it. A second decision
+    // (another admin, a double click, the bridge sync) is refused here, not
+    // after it has created a wine of its own.
+    const claim = await claimRequest(wineRequest._id);
+    if (claim.refused === 'decided') {
+      return res.status(400).json({ error: 'Wine request has already been resolved' });
+    }
+    if (claim.refused) {
+      return res.status(409).json({ error: 'Someone else is deciding this wine request right now. Reload and try again in a moment.' });
+    }
+    wineRequest = claim.request;
+    // Given back when the answer goes out without a decision (a refusal, a
+    // failure), so the request can be decided again at once.
+    let decided = false;
+    res.on('finish', () => {
+      if (decided) return;
+      releaseRequestClaim(wineRequest._id).catch((err) => logger.warn({ err, requestId: String(wineRequest._id) }, 'wine request claim not released'));
+    });
+
     // Detach the waiting bottles BEFORE the status flip, mark rejected with the
     // reason and notify the requester — shared with the Registry Bridge
-    // request sync (services/wineRequestOps). Null: decided meanwhile.
-    const rejected = await completeRequestReject(wineRequest, { resolvedBy: req.user.id, adminNotes });
+    // request sync (services/wineRequestOps). Null: no longer pending.
+    const rejected = await completeRequestReject(wineRequest, { resolvedBy: req.user.id, adminNotes, holdsClaim: true });
     if (!rejected) {
       return res.status(400).json({ error: 'Wine request has already been resolved' });
     }
+    decided = true;
     const { bottlesDetached } = rejected;
 
     await wineRequest.populate([

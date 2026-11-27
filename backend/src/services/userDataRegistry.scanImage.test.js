@@ -13,7 +13,7 @@
  *   Without that, a curated (or still-pending) wine is left pointing at a row
  *   that no longer exists, and the pending queue 404s on it forever.
  */
-jest.mock('./search', () => ({ removeBottles: jest.fn(), indexDiscussion: jest.fn() }));
+jest.mock('./search', () => ({ indexDiscussion: jest.fn() }));
 jest.mock('../models/BottleImage', () => ({
   find: jest.fn(),
   deleteMany: jest.fn().mockResolvedValue({}),
@@ -63,7 +63,7 @@ test('the export labels every image with its kind (bottle vs label-scan)', async
   ]);
 });
 
-// Ticket 6a865f60: a report is the user's own words about someone else's photo,
+// A report is the user's own words about someone else's photo,
 // so portability covers it — but the photo is not theirs and must not ride
 // along. The image is named by id only.
 test('the export includes reports the user filed, WITHOUT the reported photo', async () => {
@@ -105,7 +105,7 @@ test('erasure unlinks the files, deletes the docs, and NULLS every wine pointing
   expect(BottleImage.deleteMany).toHaveBeenCalledWith({ uploadedBy: USER, ...OWN_PHOTO });
   // The dangling-pointer fix: keyed on the DELETED IDS, not the user, because a
   // wine created by someone else can legitimately carry this user's scan.
-  // scanFieldConflicts goes with the pointer (release-audit L-4): the
+  // scanFieldConflicts goes with the pointer: the
   // front/back disagreement record is a statement about those photos and must
   // not outlive them — same rule the retention sweep applies.
   expect(WineDefinition.updateMany).toHaveBeenCalledWith(

@@ -18,11 +18,11 @@ import {
 import './AnalyticsTable.css';
 
 /**
- * The self-service analytics table (#987 Phase 1) — a third view mode on the
- * cellar page. Columns come from the field catalogue (including the user's
- * own typed personal keys and the public registry vocabulary), filters and
- * sorting run server-side through /api/analytics/query, and the CSV export
- * is exactly the current query.
+ * The self-service analytics table — a third view mode on the cellar page.
+ * Columns come from the field catalogue (including the user's own typed
+ * personal keys and the public registry vocabulary), filters and sorting run
+ * server-side through /api/analytics/query, and the CSV export is exactly the
+ * current query.
  *
  * The scope pill is a design requirement, not decoration: whether consumed
  * bottles count changes nearly every number, so the active scope must be
@@ -124,15 +124,15 @@ export default function AnalyticsTable({ cellarId }) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [scopeOpen, setScopeOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
-  // Grouped mode (R-B): when on, the table pivots — 1-2 dimensions, count
-  // always as the first measure, up to two more picked from measure-capable
-  // fields. Off = the flat rows table.
+  // Grouped mode: when on, the table pivots — 1-2 dimensions, count always
+  // as the first measure, up to two more picked from measure-capable fields.
+  // Off = the flat rows table.
   const [grouping, setGrouping] = useState({ on: false, dim1: 'wine.type', dim2: '', measures: [] });
-  // R-C: how the grouped result renders — the table stays the default.
+  // How the grouped result renders — the table stays the default.
   const [chartType, setChartType] = useState('table'); // 'table' | 'bar' | 'donut' | 'line'
   const [chartMeasure, setChartMeasure] = useState(0);
-  // Saved views + preset stars (saved-views slice): the Views menu leads with
-  // the user's starred set; own views are applied exactly like presets.
+  // Saved views + preset stars: the Views menu leads with the user's starred
+  // set; own views are applied exactly like presets.
   const [views, setViews] = useState({ own: [], starredPresets: [] });
   const [viewsOpen, setViewsOpen] = useState(false);
   const [dashboards, setDashboards] = useState([]);
@@ -153,7 +153,7 @@ export default function AnalyticsTable({ cellarId }) {
     return [...grouped.entries()].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]));
   }, [catalogue]);
 
-  // Follow in-place navigation between cellars (audit F6): the component
+  // Follow in-place navigation between cellars: the component
   // stays mounted when only the route param changes, so the scope must track
   // the prop or the table keeps showing the previous cellar's bottles under
   // the new cellar's header.
@@ -304,7 +304,7 @@ export default function AnalyticsTable({ cellarId }) {
       const res = await saveView(apiFetch, {
         name: name.trim(),
         viz: grouping.on ? chartType : 'table',
-        query: widgetQuery(), // page position never belongs in a saved view (audit F4)
+        query: widgetQuery(), // page position never belongs in a saved view
       });
       const body = await res.json();
       if (!res.ok) setError(body.error || t('analytics.saveFailed', 'Could not save'));
@@ -335,15 +335,14 @@ export default function AnalyticsTable({ cellarId }) {
   };
 
   const removeOwnView = async (view) => {
-    // Audit F6: one misclick used to destroy a view irrecoverably.
+    // A deleted view cannot be recovered, so one misclick must not do it.
     if (!window.confirm(t('analytics.deleteViewConfirm', 'Delete the view "{{name}}"?', { name: view.name }))) return;
     const res = await deleteView(apiFetch, view.id).catch(() => null);
     if (res && res.ok) setViews((v) => ({ ...v, own: v.own.filter((x) => x.id !== view.id) }));
   };
 
-  // The stored widget query must not carry the table's PAGE position (audit
-  // F4: a pinned list opened at offset 150 showed a mid-list slice or a
-  // false empty state on the dashboard).
+  // The stored widget query must not carry the table's PAGE position: a
+  // pinned list would open on the dashboard mid-list, or falsely empty.
   const widgetQuery = () => {
     const { limit, offset, ...rest } = query;
     return rest;
@@ -352,11 +351,11 @@ export default function AnalyticsTable({ cellarId }) {
   const pinToDashboard = async () => {
     const title = pinTitle.trim().slice(0, 80);
     if (!title) return;
-    // Viz stays honest (UX-1): a grouped view looked at as a table pins as a
+    // Viz stays honest: a grouped view looked at as a table pins as a
     // table widget; nothing is coerced to bars.
     const widget = { title, viz: grouping.on ? chartType : 'table', size: 'half', query: widgetQuery() };
     try {
-      // Fresh dashboard list FIRST (audit F3): pinning onto a mount-time
+      // Fresh dashboard list FIRST: pinning onto a mount-time
       // snapshot replaced the whole widgets array and silently deleted
       // anything another tab had added since.
       const dashRes = await listDashboards(apiFetch);
@@ -367,7 +366,7 @@ export default function AnalyticsTable({ cellarId }) {
         const target = fresh.find((d) => d.id === pinDash);
         res = await updateDashboard(apiFetch, pinDash, { widgets: [...(target.widgets || []), widget] });
       } else {
-        // New board with a USER-EDITABLE name (audit F1: the hardcoded
+        // New board with a USER-EDITABLE name (the hardcoded
         // 'My cellar' 409'd forever once such a board existed — now a
         // collision is an error the user can fix by typing another name).
         const name = pinBoardName.trim().slice(0, 60) || t('analytics.defaultBoardName', 'My cellar');

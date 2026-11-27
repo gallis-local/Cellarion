@@ -189,8 +189,8 @@
   background: var(--color-surface);
   padding: 20px;
   /* A flex child defaults to min-width:auto, so an unbreakable token in the
-     subject ("suggest_wine_correction") widened the panel past the phone
-     screen and clipped the badges and every line below (Johan, 2026-09-07). */
+     subject ("suggest_wine_correction") would widen the panel past the phone
+     screen and clip the badges and every line below. */
   min-width: 0;
   overflow-wrap: anywhere;
   /* Target of the phone scroll-into-view in AdminSupportTickets.js. The navbar
@@ -274,7 +274,7 @@
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   /* Themed surface/text — without these the UA-default white box + black text
-     stayed light-on-dark in dark mode (grand-audit M19). */
+     stayed light-on-dark in dark mode. */
   background: var(--color-input-bg, var(--color-surface));
   color: var(--color-text);
   font-size: 0.9rem;

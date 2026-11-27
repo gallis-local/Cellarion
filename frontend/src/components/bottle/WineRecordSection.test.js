@@ -63,7 +63,7 @@ beforeEach(() => {
 const renderSection = (props = {}) =>
   render(<WineRecordSection wine={WINE} canSuggest apiFetch={vi.fn()} {...props} />);
 
-// Per-row actions live behind ONE section-level toggle (Johan, 2026-08-17):
+// Per-row actions live behind ONE section-level toggle:
 // most users never file a fix, so the default record must read clean.
 const enterSuggestMode = () => fireEvent.click(screen.getByText('Suggest a fix'));
 
@@ -71,10 +71,11 @@ test('shows the full record with blanks rendered as "not recorded", never hidden
   renderSection();
   expect(screen.getByText('Cloudy Bay')).toBeInTheDocument();
   expect(screen.getByText('Marlborough')).toBeInTheDocument();
-  // appellation + classification are blank → two visible gaps
-  expect(await screen.findAllByText('not recorded')).toHaveLength(2);
+  // appellation, classification and sweetness are blank → three visible gaps
+  expect(await screen.findAllByText('not recorded')).toHaveLength(3);
   expect(screen.getByText('Appellation')).toBeInTheDocument();
   expect(screen.getByText('Classification')).toBeInTheDocument();
+  expect(screen.getByText('Sweetness')).toBeInTheDocument();
 });
 
 test('per-row actions hide until the single section toggle is pressed, and hide again on Done', async () => {
@@ -148,7 +149,7 @@ test('public data fields render with values and blanks — never with who contri
 
   expect(await screen.findByText('More data')).toBeInTheDocument();
   expect(screen.getByText('13.5 %')).toBeInTheDocument();
-  // The contributor is stored, never shown (Johan, 2026-09-18). The fixture
+  // The contributor is stored, never shown. The fixture
   // still carries a name on purpose: a server that sent one would not get it
   // rendered either.
   expect(screen.queryByText(/Kurt/)).not.toBeInTheDocument();
@@ -162,6 +163,65 @@ test('public data fields render with values and blanks — never with who contri
   await waitFor(() => expect(suggestWineValue).toHaveBeenCalledWith(expect.any(Function), 'w1', {
     keyId: 'k2', value: true,
   }));
+});
+
+// A blank public figure is an invitation, not an error: it offers a quiet Add
+// without the fix mode, which reads like reporting something wrong.
+describe('Add on an empty public row, without suggest mode', () => {
+  const ABV = { _id: 'k1', name: 'ABV', type: 'decimal', unit: '%', enumOptions: null };
+  const ORGANIC = { _id: 'k2', name: 'Organic', type: 'boolean', unit: null, enumOptions: null };
+  const CLOSURE = { _id: 'k3', name: 'Closure', type: 'enum', unit: null, enumOptions: ['cork', 'screwcap'] };
+
+  test('only a blank, unclaimed row offers it, and it opens the value form directly', async () => {
+    getWinePublicData.mockResolvedValue(ok({
+      fields: [
+        { key: ABV, value: 13.5, mySuggestion: null, hasPendingSuggestion: false },
+        { key: ORGANIC, value: null, mySuggestion: null, hasPendingSuggestion: false },
+        { key: CLOSURE, value: null, mySuggestion: null, hasPendingSuggestion: true },
+      ],
+    }));
+    suggestWineValue.mockResolvedValue(ok({ value: { _id: 'v1', status: 'suggested' } }));
+    renderSection({ vintage: '2019' });
+    await screen.findByText('More data');
+
+    // Not in suggest mode, and no per-row fix action anywhere on the record.
+    expect(screen.getByText('Suggest a fix')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Suggest a fix for Producer')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Suggest a value for ABV')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Suggest a value for Closure')).not.toBeInTheDocument();
+    const add = screen.getByLabelText('Suggest a value for Organic');
+    expect(add).toHaveTextContent(/^Add$/);
+
+    fireEvent.click(add);
+    expect(await screen.findByText('Suggest a value: Organic')).toBeInTheDocument();
+    // Same form as the fix mode's: this vintage is the default slot.
+    expect(screen.getByLabelText(/applies to 2019 only/)).toBeChecked();
+    fireEvent.change(screen.getByLabelText('Value'), { target: { value: 'true' } });
+    fireEvent.click(screen.getByText('Send suggestion'));
+    await waitFor(() => expect(suggestWineValue).toHaveBeenCalledWith(expect.any(Function), 'w1', {
+      keyId: 'k2', value: true, vintage: '2019',
+    }));
+  });
+
+  test('in suggest mode the row keeps its one "Add value" action', async () => {
+    getWinePublicData.mockResolvedValue(ok({
+      fields: [{ key: ORGANIC, value: null, mySuggestion: null, hasPendingSuggestion: false }],
+    }));
+    renderSection();
+    await screen.findByLabelText('Suggest a value for Organic');
+    enterSuggestMode();
+    expect(screen.getAllByLabelText('Suggest a value for Organic')).toHaveLength(1);
+    expect(screen.getByLabelText('Suggest a value for Organic')).toHaveTextContent('Add value');
+  });
+
+  test('a reader who cannot suggest sees the blank and nothing to press', async () => {
+    getWinePublicData.mockResolvedValue(ok({
+      fields: [{ key: ORGANIC, value: null, mySuggestion: null, hasPendingSuggestion: false }],
+    }));
+    renderSection({ canSuggest: false });
+    expect(await screen.findByText('Organic')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Suggest a value for Organic')).not.toBeInTheDocument();
+  });
 });
 
 test('my pending public suggestion shows the pending marker', async () => {
@@ -190,11 +250,9 @@ test('server rejection (e.g. daily limit) surfaces in the modal', async () => {
   expect(await screen.findByText(/suggestion limit/)).toBeInTheDocument();
 });
 
-// Display names (2026-09-09). The day after the vocabulary got its first
-// German-speaking contributor, "Alkoholgehalt" was proposed as a new key: it
-// is ABV, and he could not have known, because the only key on his bottle
-// page was named in a language he was not reading in. A key now carries the
-// reader's name in `displayName`; `name` stays the identifier.
+// Display names. A key named only in a language the reader does not read in
+// gets proposed again under a new name ("Alkoholgehalt" for ABV). A key
+// carries the reader's name in `displayName`; `name` stays the identifier.
 describe('key display names', () => {
   test('a translated key is labelled in the reader\'s language, and the suggest action uses that label', async () => {
     getWinePublicData.mockResolvedValue(ok({
@@ -224,10 +282,9 @@ describe('key display names', () => {
   });
 });
 
-// Type and grapes are part of the record (support ticket 2026-09-17). Grapes
-// used to be a section of their own whose only action — a free-text "suggest
-// grapes" box — appeared while the list was EMPTY, so a wrong or incomplete
-// list could not be corrected at all.
+// Type and grapes are part of the record. Grapes can be corrected like any
+// other field, also when the list is filled in — not only suggested while it
+// is EMPTY — so a wrong or incomplete list can be fixed.
 describe('type and grapes', () => {
   const openGrapesForm = async () => {
     enterSuggestMode();
@@ -426,11 +483,11 @@ test('another surface can send the reader here in suggest mode', async () => {
   expect(await screen.findByLabelText('Suggest a fix for Producer')).toBeInTheDocument();
 });
 
-// ── Pre-deploy audit 2026-09-18 ─────────────────────────────────────────────
-describe('audit 2026-09-18', () => {
+// ── Suggest-mode state across remounts, wine changes and filings ────────────
+describe('suggest-mode state across remounts, wine changes and filings', () => {
   // The page keeps the counter for the whole visit and this section remounts
-  // whenever the edit form has been shown: acting on the MOUNTED value re-opened
-  // suggest mode and scrolled the page after every later edit.
+  // whenever the edit form has been shown: acting on the MOUNTED value would
+  // re-open suggest mode and scroll the page after every later edit.
   test('the hand-off signal is an event: a value already set at mount does nothing, a change acts', async () => {
     const { rerender } = renderSection({ suggestSignal: 1 });
     await screen.findAllByText('not recorded');
@@ -441,8 +498,8 @@ describe('audit 2026-09-18', () => {
     expect(await screen.findByLabelText('Suggest a fix for Producer')).toBeInTheDocument();
   });
 
-  // The bottle page stays mounted from bottle to bottle. A failed refetch used
-  // to leave wine A's pending lines — and A's review slot — on wine B.
+  // The bottle page stays mounted from bottle to bottle. A failed refetch must
+  // not leave wine A's pending lines — or A's review slot — on wine B.
   test('nothing that belongs to one wine survives a change of wine, even when the refetch fails', async () => {
     getMyWineProposals.mockResolvedValueOnce(ok({
       proposals: [{ status: 'pending', proposedFields: { producer: 'Cloudy Bay Vineyards' } }],
@@ -460,8 +517,8 @@ describe('audit 2026-09-18', () => {
   });
 
   // My earlier suggestion was decided while this page was open, so the next
-  // filing is a FRESH proposal. Merging the stale local fields back in kept
-  // showing the decided one as pending.
+  // filing is a FRESH proposal. Merging the stale local fields back in would
+  // keep showing the decided one as pending.
   test('a fresh filing replaces my stale pending fields instead of inheriting them', async () => {
     getMyWineProposals.mockResolvedValue(ok({
       proposals: [{ status: 'pending', proposedFields: { producer: 'Cloudy Bay Vineyards' } }],
@@ -504,8 +561,8 @@ describe('audit 2026-09-18', () => {
   });
 });
 
-// Support ticket 2026-09-17 ("Colour Sparkling/Rosè"): sparkling, dessert and
-// fortified say nothing about colour, so the record carries one for them.
+// Sparkling, dessert and fortified say nothing about colour, so the record
+// carries one for them.
 describe('colour of a sparkling, dessert or fortified wine', () => {
   const SPARKLING = { ...WINE, _id: 'w-mm', producer: 'Maso Martis', name: 'Rosé Extra Brut', type: 'sparkling', colour: null };
 
@@ -587,7 +644,7 @@ describe('colour of a sparkling, dessert or fortified wine', () => {
     }));
   });
 
-  // Audit 2026-09-19 ────────────────────────────────────────────────────────
+  // Type fixes and the chosen colour ──────────────────────────────────────
   const openTypeFix = async (wine) => {
     renderSection({ wine });
     await screen.findAllByText('not recorded');

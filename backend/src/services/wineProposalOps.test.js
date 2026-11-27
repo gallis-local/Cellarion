@@ -108,6 +108,50 @@ describe('createFieldCorrection validation', () => {
     expect((await ops.createFieldCorrection(ME, { ...GOOD, fields: { producer: '   ' } })).code).toBe('invalid');
   });
 
+  test('a regulatory mark is no classification: alone it is nothing changed, beside a tier it is dropped', async () => {
+    expect((await ops.createFieldCorrection(ME, { ...GOOD, fields: { classification: 'DOCG' } })).code).toBe('invalid');
+    const res = await ops.createFieldCorrection(ME, { ...GOOD, fields: { classification: 'Riserva DOCG' } });
+    expect(res.ok).toBe(true);
+    expect(WineCorrectionProposal.create.mock.calls[0][0].proposedFields).toEqual({ classification: 'Riserva' });
+  });
+
+  test('with the taxonomy loaded, a tier files under its canonical name and an unknown word is refused at once', async () => {
+    const cls = require('./classificationOps');
+    cls.primeClassificationCache([{ _id: 's1', name: 'Spätlese', kind: 'ripeness', country: null, synonyms: ['Spatlese'] }]);
+    try {
+      const res = await ops.createFieldCorrection(ME, { ...GOOD, fields: { classification: 'spatlese' } });
+      expect(res.ok).toBe(true);
+      expect(WineCorrectionProposal.create.mock.calls[0][0].proposedFields).toEqual({ classification: 'Spätlese' });
+      const bad = await ops.createFieldCorrection(ME, { ...GOOD, fields: { classification: 'Grand Vin' } });
+      expect(bad.code).toBe('invalid');
+      expect(bad.message).toMatch(/"Grand Vin" is not in the registry/);
+    } finally {
+      cls.primeClassificationCache(null);
+    }
+  });
+
+  test('a word two systems share files as the tier of the wine\'s own country', async () => {
+    // Seed order: VDP Ortswein (Germany, spelled "Ortswein" too) comes before
+    // Austria's Ortswein, so without the country the word lands on Germany's.
+    const cls = require('./classificationOps');
+    cls.primeClassificationCache([
+      { _id: 'de1', name: 'VDP Ortswein', kind: 'vineyard_rank', country: 'cDE', synonyms: ['Ortswein'] },
+      { _id: 'at1', name: 'Ortswein', kind: 'vineyard_rank', country: 'cAT', synonyms: [] },
+      { _id: 's1', name: 'Spätlese', kind: 'ripeness', country: null, synonyms: [] },
+    ]);
+    try {
+      findVisibleWine.mockResolvedValue({ ...wineDoc, country: { _id: 'cAT', name: 'Austria' } });
+      expect((await ops.createFieldCorrection(ME, { ...GOOD, fields: { classification: 'Ortswein, Spätlese' } })).ok).toBe(true);
+      expect(WineCorrectionProposal.create.mock.calls[0][0].proposedFields).toEqual({ classification: 'Ortswein, Spätlese' });
+
+      findVisibleWine.mockResolvedValue({ ...wineDoc, country: { _id: 'cDE', name: 'Germany' } });
+      expect((await ops.createFieldCorrection(ME, { ...GOOD, fields: { classification: 'Ortswein' } })).ok).toBe(true);
+      expect(WineCorrectionProposal.create.mock.calls[1][0].proposedFields).toEqual({ classification: 'VDP Ortswein' });
+    } finally {
+      cls.primeClassificationCache(null);
+    }
+  });
+
   test('discussion ban blocks the write before any query', async () => {
     mockUser('newcomer', true);
     const res = await ops.createFieldCorrection(ME, GOOD);
@@ -173,6 +217,7 @@ describe('creation', () => {
         type: null,
         colour: null,
         grapes: null,
+        sweetnessStyle: null,
       },
     }));
     expect(logAudit).toHaveBeenCalledWith(null, 'wine_proposal.user_create',
@@ -180,7 +225,7 @@ describe('creation', () => {
       expect.objectContaining({ via: 'web', tier: 'newcomer', fields: ['appellation'] }));
   });
 
-  // Support ticket 2026-09-06: type and grapes are correctable by any user,
+  // Type and grapes are correctable by any user,
   // exactly as through the sommelier tool — resolved at filing, canonical names stored.
   test('grapes are resolved against the taxonomy at filing and stored as canonical names', async () => {
     resolveGrapeIdsStrict.mockResolvedValue({ ok: true, ids: ['g1', 'g2'], names: ['Pinot Noir', 'Müller-Thurgau'], substitutions: [{ from: 'Riesling-Sylvaner', to: 'Müller-Thurgau' }] });
@@ -208,8 +253,7 @@ describe('creation', () => {
   });
 
   // Joined, not an array: the admin modal compares the snapshot against its
-  // liveIdentity (joined names) to flag drift — an array read as permanent drift
-  // (audit 2026-09-12 L-2).
+  // liveIdentity (joined names) to flag drift — an array read as permanent drift.
   test('the snapshot records the live type and JOINED grape names, the shape the admin diff compares', async () => {
     findVisibleWine.mockResolvedValue({ ...wineDoc, type: 'white', grapes: [{ name: 'Chardonnay' }, { name: 'Pinot Blanc' }] });
     await ops.createFieldCorrection(ME, GOOD);
@@ -242,7 +286,7 @@ describe('creation', () => {
   });
 });
 
-// Support ticket 2026-09-17 ("Colour Sparkling/Rosè"): sparkling, dessert and
+// Sparkling, dessert and
 // fortified say nothing about colour, so a suggestion can carry one — judged
 // against the type the suggestion leaves the wine with.
 describe('colour', () => {
@@ -293,10 +337,10 @@ describe('colour', () => {
   });
 });
 
-// Support ticket 2026-09-12: the one-pending rule is per WINE, and the user's
-// own suggestion was what blocked their follow-up. Own pending → amend; someone
-// else's → conflict that says so. Audit 2026-09-12 H-1: the amendment is ONE
-// atomic update pinned to the pending row, never a hydrated save().
+// The one-pending rule is per WINE, so the user's own suggestion must not
+// block their follow-up. Own pending → amend; someone else's → conflict that
+// says so. The amendment is ONE atomic update pinned to the pending row,
+// never a hydrated save().
 describe('amending the caller\'s own pending suggestion', () => {
   const dup = () => Object.assign(new Error('dup'), { code: 11000 });
 
@@ -434,7 +478,7 @@ describe('pendingForWine', () => {
 });
 
 // The web bottle page reads the wine's review slot BEFORE a correction is
-// typed (support ticket 2026-09-17) — behind the same visibility rule as
+// typed — behind the same visibility rule as
 // filing, so a hidden wine's queue state reads as "nothing pending".
 describe('pendingForViewer', () => {
   const chain = (doc) => ({ select: jest.fn().mockReturnValue({ lean: jest.fn().mockResolvedValue(doc) }) });
@@ -459,10 +503,10 @@ describe('pendingForViewer', () => {
   });
 });
 
-// A variety the taxonomy lacks (support ticket 2026-09-17). The web grape
-// picker can only produce an unknown name through its explicit "add as a new
-// variety" action, and says so in `fields.newGrapes`; everything else about
-// an unknown name stays exactly as strict as before.
+// A variety the taxonomy lacks. The web grape picker can only produce an
+// unknown name through its explicit "add as a new variety" action, and says
+// so in `fields.newGrapes`; everything else about an unknown name stays
+// strict.
 describe('a deliberately-new grape variety', () => {
   const file = (fields) => ops.createFieldCorrection(ME, { ...GOOD, fields });
 

@@ -1,5 +1,5 @@
 /**
- * Weekly registry-health check (strategy 2026-07-29, R6).
+ * Weekly registry-health check.
  *
  * Pins the alerting contract: first run writes a baseline and stays silent;
  * an increase notifies every admin ONCE and re-baselines (no weekly re-alert
@@ -234,7 +234,7 @@ describe('runRegistryHealthCheck', () => {
   });
 });
 
-describe('the ticket-6a800f39 metrics (v-next)', () => {
+describe('the curation-queue metrics (name subsets, suspect, core-unverified, held)', () => {
   test('nameSubsetPairs counts the admin name-subsets queue via the same function', async () => {
     nameSubsetPairs.mockResolvedValue({ pairs: [], total: 5, scannedCount: 100, skippedBuckets: 0 });
     const m = await computeMetrics();
@@ -252,6 +252,9 @@ describe('the ticket-6a800f39 metrics (v-next)', () => {
     const suspectCall = WineDefinition.countDocuments.mock.calls.find(
       (c) => c[0] && c[0]['aiProfile.producerSuspect'] === true);
     expect(suspectCall).toBeTruthy();
+    // Outstanding by the admin queue's rule, so the count and the queue agree:
+    // a flagged producer counts until someone rules on the flag.
+    expect(suspectCall[0].$expr).toBe(require('../utils/profileReview').REVIEW_QUEUE_OUTSTANDING_EXPR);
     const lowConfCall = WineDefinition.countDocuments.mock.calls.find(
       (c) => c[0] && c[0].$or && !c[0]['aiProfile.producerSuspect']);
     expect(JSON.stringify(lowConfCall[0].$or)).not.toMatch(/producerSuspect/);
@@ -273,7 +276,7 @@ describe('the ticket-6a800f39 metrics (v-next)', () => {
     expect(coreCall[0]['aiProfile.source']).toEqual({ $ne: 'curator' });
   });
 
-  test('heldProfiles is its OWN key; lowConfidenceQueue counts PUBLISHED rows only (gate 2026-08-18)', async () => {
+  test('heldProfiles is its OWN key; lowConfidenceQueue counts PUBLISHED rows only', async () => {
     const m = await computeMetrics();
     expect(m).toHaveProperty('heldProfiles');
     expect(METRIC_LABELS.heldProfiles).toBeTruthy();

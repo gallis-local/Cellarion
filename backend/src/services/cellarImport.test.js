@@ -5,9 +5,6 @@ jest.mock('./search', () => ({
   getIsAvailable: () => false,
   search: async () => ({ ids: [] }),
   indexWine: () => {},
-  indexBottle: async () => {},
-  bulkIndexBottles: () => {},
-  removeBottle: async () => {},
 }));
 
 // attachMaturity is the only DB-touching helper under test here; mock the model
@@ -263,6 +260,12 @@ describe('buildBottle drink window + occasion', () => {
     expect(bottle.occasion).toBe('For my 50th');
   });
 
+  test('an occasion longer than a bottle keeps is cut to 500 characters, so the bottle still validates', () => {
+    const bottle = build({ vintage: '2018', occasion: 'A'.repeat(620) });
+    expect(bottle.occasion).toHaveLength(500);
+    expect(bottle.validateSync()?.errors?.occasion).toBeUndefined();
+  });
+
   test('drops an inverted window whole (mirrors routes/import.js)', () => {
     const bottle = build({ vintage: '2018', drinkFrom: 2040, drinkTo: 2030 });
     expect(bottle.drinkFrom).toBeUndefined();
@@ -332,7 +335,7 @@ describe('attachMaturity', () => {
       expect.objectContaining({ vintage: '2018', status: 'reviewed', profileId: 'p9' }));
   });
 
-  // Security audit 2026-09-02 (D09-4): any registered user could write a
+  // Any registered user could write a
   // sommelier-status drink window into the shared registry from a plain JSON
   // file, and every other user of that wine+vintage saw it as curated.
   test("an ordinary importer's window becomes a PENDING suggestion, never a reviewed profile", async () => {
@@ -592,7 +595,7 @@ describe('attachImages sanitization (SECURITY_AUDIT L-13)', () => {
   });
 });
 
-describe('rack group round trip (support ticket 2026-09-06)', () => {
+describe('rack group round trip', () => {
   test('parseCellarExport keeps a rack\'s group so createRacks can restore it', () => {
     const out = parseCellarExport({ cellars: [{ cellarName: 'C', racks: [{ name: 'Left', type: 'grid', rows: 2, cols: 6, group: 'Basement' }], bottles: [] }] });
     expect(out.cellars[0].racks[0]).toMatchObject({ name: 'Left', group: 'Basement' });

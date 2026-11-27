@@ -15,6 +15,12 @@ try {
 
 const SIMILARITY_THRESHOLD = 0.78;
 const TOP_K = 10;
+// A drink logged after the fact for a day longer ago than this gets no
+// restock suggestion: the notification says "you just finished", and a
+// drinking history typed in from another app (dozens of bottles from past
+// years) would otherwise send one for each of them.
+const RECENT_DRINK_DAYS = 30;
+const RECENT_DRINK_MS = RECENT_DRINK_DAYS * 24 * 60 * 60 * 1000;
 
 /**
  * Background check after a bottle is consumed.
@@ -28,7 +34,7 @@ const TOP_K = 10;
  * storedVectorOnly: compare with the wine's STORED vector and skip the check
  * when it has none — never a paid embedding call. Set for every consume made
  * with an API or OAuth token (Home Assistant, a connected AI): nothing a
- * token can reach may spend AI money (Johan, 2026-10-21). A wine without a
+ * token can reach may spend AI money. A wine without a
  * vector simply gets no restock suggestion from that consume.
  */
 async function runCheck(userId, bottleId, cellarId, { storedVectorOnly = false } = {}) {
@@ -46,6 +52,7 @@ async function runCheck(userId, bottleId, cellarId, { storedVectorOnly = false }
       .lean();
 
     if (!bottle?.wineDefinition) return;
+    if (bottle.consumedAt && Date.now() - new Date(bottle.consumedAt).getTime() > RECENT_DRINK_MS) return;
 
     const wine = bottle.wineDefinition;
     const vintage = bottle.vintage || 'NV';
@@ -97,7 +104,7 @@ async function runCheck(userId, bottleId, cellarId, { storedVectorOnly = false }
     });
     // Only wines the registry shows: a quarantined non-wine, a pending row
     // or a canary keeps its vectors but must not be named as a similar wine
-    // in the alert (audit 2026-10-14).
+    // in the alert.
     const hitIds = hits.map(h => h.wineDefinitionId);
     const similarWineIds = hitIds.length
       ? (await WineDefinition.distinct('_id', {
@@ -176,9 +183,9 @@ async function resolveRestockAlerts(userId, wineDefinitionId, bottleId) {
 
 // Checks run one at a time, in order. Each one compares vectors, and a bulk
 // "mark as drunk" (the REST bulk route, or an agent consuming bottle after
-// bottle) must not start dozens at once — 60 in parallel once ran the
-// process out of memory (review 2026-09-27). A best-effort notification, so
-// a runaway queue sheds new checks instead of growing without bound.
+// bottle) must not start dozens at once: enough of them in parallel run the
+// process out of memory. A best-effort notification, so a runaway queue
+// sheds new checks instead of growing without bound.
 const MAX_QUEUED = 500;
 let queue = Promise.resolve();
 let queued = 0;

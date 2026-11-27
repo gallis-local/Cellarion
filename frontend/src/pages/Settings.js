@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { useTranslation, Trans } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import useVersion from '../hooks/useVersion';
@@ -7,7 +7,7 @@ import { updateProfile } from '../api/profiles';
 import { changePassword } from '../api/auth';
 import { CURRENCIES } from '../config/currencies';
 import { findLanguage } from '../config/locales';
-import { PLANS } from '../config/plans';
+import { planName, planDescription } from '../config/plans';
 import { SCALE_META, VALID_SCALES } from '../utils/ratingUtils';
 import { isPushSupported, getPushPermissionState, subscribeToPush, unsubscribeFromPush, getCurrentEndpoint, getDeviceStatus, sendTestPush } from '../utils/pushSubscription';
 import { downloadBlobObject } from '../utils/downloadBlob';
@@ -26,12 +26,12 @@ import { journalPromptOptedOut, setJournalPromptOptOut } from '../components/Jou
 import OfflineSettings from '../components/OfflineSettings';
 import EarlyAccessSettings from '../components/EarlyAccessSettings';
 import SettingsGroup from '../components/SettingsGroup';
+import { confirmWordFrom, matchesConfirmWord } from '../utils/confirmWord';
 import './Settings.css';
 
 function Settings() {
   const { t, i18n } = useTranslation();
-  const { user, apiFetch, updatePreferences, setUser, logout } = useAuth();
-  const navigate = useNavigate();
+  const { user, apiFetch, updatePreferences, setUser } = useAuth();
   const appVersion = useVersion();
   const [currency, setCurrency] = useState(user?.preferences?.currency || 'USD');
   // Matched to a locale this build actually has: a stored regional tag (pt-BR)
@@ -44,6 +44,7 @@ function Settings() {
     return findLanguage(stored)?.code || 'en';
   });
   const [ratingScale, setRatingScale] = useState(user?.preferences?.ratingScale || '5');
+  const [temperatureUnit, setTemperatureUnit] = useState(user?.preferences?.temperatureUnit === 'F' ? 'F' : 'C');
   const [rackNavigation, setRackNavigation] = useState(user?.preferences?.rackNavigation || 'auto');
   const [restockScope, setRestockScope] = useState(user?.preferences?.restockScope || 'all');
   // Device-local (localStorage) — applies immediately, no save button needed.
@@ -103,7 +104,6 @@ function Settings() {
   const pushDenied = getPushPermissionState() === 'denied';
 
   // Per-device push state
-  const [currentEndpoint, setCurrentEndpoint] = useState(null);
   const [deviceStatus, setDeviceStatus] = useState({ totalDevices: 0, thisDeviceRegistered: false });
   const [deviceLoading, setDeviceLoading] = useState(false);
   const [testSending, setTestSending] = useState(false);
@@ -121,7 +121,6 @@ function Settings() {
   // Fetch current device push status
   const refreshDeviceStatus = useCallback(async () => {
     const ep = await getCurrentEndpoint();
-    setCurrentEndpoint(ep);
     const status = await getDeviceStatus(apiFetch, ep);
     setDeviceStatus(status);
   }, [apiFetch]);
@@ -210,6 +209,10 @@ function Settings() {
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState(null);
+  // The word to type is the one the instruction shows in the user's language;
+  // DELETE is accepted as well.
+  const deleteWord = confirmWordFrom(t('settings.danger.typeToConfirm', 'Type <strong>DELETE</strong> to confirm:'), 'DELETE');
+  const deleteConfirmed = matchesConfirmWord(deleteConfirmText, [deleteWord, 'DELETE']);
 
   // Data export state (full GDPR data dump)
   const [exporting, setExporting] = useState(false);
@@ -218,6 +221,7 @@ function Settings() {
   // Deletion scheduled state
   const isDeletionScheduled = !!user?.deletionScheduledFor;
   const [cancelling, setCancelling] = useState(false);
+  const [cancelDeletionError, setCancelDeletionError] = useState(null);
 
   const handleProfileSave = async (e) => {
     e.preventDefault();
@@ -292,10 +296,10 @@ function Settings() {
     setSaving(true);
     setError(null);
     setSaved(false);
-    const result = await updatePreferences({ currency, language, ratingScale, rackNavigation, restockScope });
+    const result = await updatePreferences({ currency, language, ratingScale, rackNavigation, restockScope, temperatureUnit });
     setSaving(false);
     if (result.success) {
-      i18n.changeLanguage(language);
+      chooseLanguage(language);
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
     } else {
@@ -304,7 +308,7 @@ function Settings() {
   };
 
   const handleDeleteAccount = async () => {
-    if (deleteConfirmText !== 'DELETE') return;
+    if (!deleteConfirmed) return;
     setDeleting(true);
     setDeleteError(null);
     try {
@@ -342,15 +346,20 @@ function Settings() {
     }
   };
 
+  // A cancel that did not go through must say so: the notice above keeps
+  // counting down to the day the account is erased.
   const handleCancelDeletion = async () => {
     setCancelling(true);
+    setCancelDeletionError(null);
     try {
       const res = await apiFetch('/api/users/me/cancel-deletion', { method: 'POST' });
-      if (res.ok) {
-        setUser({ ...user, deletionScheduledFor: null, deletionRequestedAt: null });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw httpError(res, data, t('settings.danger.cancelFailed'));
       }
-    } catch {
-      // silent fail
+      setUser({ ...user, deletionScheduledFor: null, deletionRequestedAt: null });
+    } catch (err) {
+      setCancelDeletionError(friendlyError(err, t));
     } finally {
       setCancelling(false);
     }
@@ -358,7 +367,7 @@ function Settings() {
 
   const planKey = user?.plan || 'free';
   const planExpiresAt = user?.planExpiresAt || null;
-  const planLabel = PLANS[planKey]?.label || planKey;
+  const planLabel = planName(planKey, t);
   const planExpired = planExpiresAt && Date.now() > new Date(planExpiresAt).getTime();
 
   function formatExpiry(expiresAt) {
@@ -371,7 +380,7 @@ function Settings() {
 
   return (
     <div className="settings-page">
-      <div className="settings-header">
+      <div className="page-header">
         <h1>{t('settings.title')}</h1>
       </div>
 
@@ -528,7 +537,7 @@ function Settings() {
         <h2 className="settings-section-title">{t('settings.plan.title')}</h2>
         <div className="settings-plan-row">
           <span className={`settings-plan-badge settings-plan-badge--${planKey}`}>{planLabel}</span>
-          <span className="settings-plan-desc">{PLANS[planKey]?.description}</span>
+          <span className="settings-plan-desc">{planDescription(planKey, t)}</span>
         </div>
         <p className="settings-hint">
           {planExpired
@@ -735,6 +744,22 @@ function Settings() {
           </div>
 
           <div className="form-group">
+            <label htmlFor="temperature-unit-select">{t('settings.temperatureUnit', 'Temperature')}</label>
+            <p className="settings-hint">
+              {t('settings.temperatureUnitHint', 'How temperatures are shown: the serving advice on a bottle and your cellar\'s climate readings.')}
+            </p>
+            <select
+              id="temperature-unit-select"
+              className="input settings-select"
+              value={temperatureUnit}
+              onChange={e => setTemperatureUnit(e.target.value)}
+            >
+              <option value="C">{t('settings.temperatureUnitC', 'Celsius (°C)')}</option>
+              <option value="F">{t('settings.temperatureUnitF', 'Fahrenheit (°F)')}</option>
+            </select>
+          </div>
+
+          <div className="form-group">
             <label htmlFor="language-select">{t('settings.language')}</label>
             <p className="settings-hint">
               {t('settings.languageHint')}
@@ -822,7 +847,7 @@ function Settings() {
         </form>
       </div>
 
-      {/* ── Offline mode (#1355) ── */}
+      {/* ── Offline mode ── */}
       <OfflineSettings />
 
       </SettingsGroup>
@@ -934,6 +959,7 @@ function Settings() {
             >
               {cancelling ? t('settings.danger.cancelling', 'Cancelling...') : t('settings.danger.cancelDeletion', 'Cancel deletion')}
             </button>
+            {cancelDeletionError && <div className="alert alert-error" role="alert" style={{ marginTop: '0.75rem' }}>{cancelDeletionError}</div>}
           </div>
         ) : (
           <>
@@ -956,7 +982,7 @@ function Settings() {
                   className="input"
                   value={deleteConfirmText}
                   onChange={e => setDeleteConfirmText(e.target.value)}
-                  placeholder="DELETE"
+                  placeholder={deleteWord}
                   autoFocus
                 />
                 {deleteError && <div className="alert alert-error">{deleteError}</div>}
@@ -964,7 +990,7 @@ function Settings() {
                   <button
                     className="btn btn-danger"
                     onClick={handleDeleteAccount}
-                    disabled={deleteConfirmText !== 'DELETE' || deleting}
+                    disabled={!deleteConfirmed || deleting}
                   >
                     {deleting ? t('settings.danger.scheduling', 'Scheduling...') : t('settings.danger.scheduleBtn', 'Schedule account deletion')}
                   </button>

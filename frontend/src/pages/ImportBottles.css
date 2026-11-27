@@ -882,13 +882,34 @@
 
 /* ── Review Footer ───────────────────────────────────────────────────────── */
 
+/* The Import button stays in view while a long review list scrolls; at the
+   bottom of hundreds of rows it was easy never to reach. */
 .review-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  background: var(--color-bg);
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 1rem;
   padding: 1rem 0;
   border-top: 1px solid var(--color-border);
+}
+
+/* The layout's main area clips sideways overflow with overflow-x: hidden,
+   which makes it a scroll container: the sticky footer would then stick to
+   <main> (which never scrolls) instead of the window. clip cuts the overflow
+   the same way without being a scroll container (as on /developers). */
+.main-content:has(.import-review) {
+  overflow-x: clip;
+  overflow-y: visible;
+}
+
+.review-not-imported {
+  font-size: 0.9rem;
+  color: var(--color-text-muted);
+  margin: -0.75rem 0 1.25rem;
 }
 
 .review-warning {
@@ -1177,6 +1198,8 @@
   .review-footer {
     flex-direction: column;
     align-items: stretch;
+    /* Above the bottom tab bar, not under it. */
+    bottom: calc(var(--bottom-nav-height) + env(safe-area-inset-bottom, 0px));
   }
 
   .done-stats {
@@ -1229,6 +1252,15 @@
   background: var(--color-warning-bg);
   border-left-color: var(--color-accent);
   color: var(--color-accent);
+}
+
+/* The untranslated detail under the translated sentence: plain text, no box. */
+.ai-info-details p.ai-info-explanation {
+  margin-top: 0.25rem;
+  padding: 0 0.6rem;
+  background: none;
+  border-left: none;
+  color: var(--color-text-muted);
 }
 
 .ai-debug-details {
@@ -1732,11 +1764,11 @@
   color: #bf8a2e;
 }
 
-/* Import review: a row whose file had no vintage (audit ticket 2026-09-05) */
+/* Import review: a row whose file had no vintage */
 .review-vintage-input { width: 5.5em; padding: 2px 6px; font: inherit; font-size: 0.85em; border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface); color: var(--color-text); }
 .import-flag { color: var(--color-warning, #b8860b); font-weight: 600; cursor: help; }
 
-/* A typed vintage that is not a real year (audit 2026-09-07). */
+/* A typed vintage that is not a real year. */
 .review-vintage-input[aria-invalid="true"] { border-color: var(--color-danger); outline: 1px solid var(--color-danger); }
 
 /* "Not delivered yet" — the whole import comes in on order */

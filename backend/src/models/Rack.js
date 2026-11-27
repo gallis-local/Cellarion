@@ -3,7 +3,11 @@ const mongoose = require('mongoose');
 // 'cabinet' = a wine fridge / climate cabinet: shelves top to bottom, each a
 // bay holding typeConfig.shelfRows[i] rows of `cols` bottles, optionally two
 // deep (neck to neck). Geometry + position contract: utils/rackGeometry.js.
-const RACK_TYPES = ['grid', 'x-rack', 'hex', 'triangle', 'stack', 'cube', 'shelf', 'cabinet'];
+// 'wall' = one rack built from boxes on a grid of rows × cols cells, each
+// box with its own content (typeConfig.boxes). Counting, numbering and the
+// rules of an edit: utils/wallGeometry.js.
+const RACK_TYPES = ['grid', 'x-rack', 'hex', 'triangle', 'stack', 'cube', 'shelf', 'cabinet', 'wall'];
+const { BOX_KINDS, WALL_MAX_PER_SECTION, WALL_MAX_BOX_DIM } = require('../utils/wallGeometry');
 
 const slotSchema = new mongoose.Schema({
   position: { type: Number, required: true },
@@ -19,6 +23,22 @@ const zoneSchema = new mongoose.Schema({
   color:     { type: String, trim: true, maxlength: 20 },
   positions: { type: [Number], default: [] },
 }, { _id: false });
+
+// One box of a wall rack. It keeps its _id for life: an edit of the wall
+// follows a box by that id to keep its bottles in it (wallGeometry.planWallEdit).
+// x, y, w and h are in wall cells; perSection is what one pile of an x, a
+// slash, a backslash or a bin holds; rows and cols are a rack's or the
+// shelves' own.
+const wallBoxSchema = new mongoose.Schema({
+  x:          { type: Number, required: true, min: 0, max: 19 },
+  y:          { type: Number, required: true, min: 0, max: 19 },
+  w:          { type: Number, required: true, min: 1, max: 20 },
+  h:          { type: Number, required: true, min: 1, max: 20 },
+  kind:       { type: String, enum: BOX_KINDS, required: true },
+  perSection: { type: Number, min: 1, max: WALL_MAX_PER_SECTION },
+  rows:       { type: Number, min: 1, max: WALL_MAX_BOX_DIM },
+  cols:       { type: Number, min: 1, max: WALL_MAX_BOX_DIM },
+});
 
 const rackModuleSchema = new mongoose.Schema({
   type:       { type: String, enum: RACK_TYPES, required: true },
@@ -55,8 +75,8 @@ const rackModuleSchema = new mongoose.Schema({
     // first level's front row holds `cols`, its back row (in the gaps between
     // those bottles) one fewer, the level above nests in its grooves so its
     // front row holds one fewer and its back row `cols` again, and so on
-    // (6 / 5 in front of 5 / 6: a Liebherr GrandCru's wooden shelf, support
-    // ticket 2026-09-15). UNLIKE twoDeep and stagger this CHANGES capacity
+    // (6 / 5 in front of 5 / 6: a Liebherr GrandCru's wooden shelf).
+    // UNLIKE twoDeep and stagger this CHANGES capacity
     // and the position numbering (utils/rackGeometry.cabinetRowWidth), so
     // the UI offers it at creation only and the update route's resize guard
     // blocks a shrink past placed bottles. Implies stagger when drawn.
@@ -65,13 +85,13 @@ const rackModuleSchema = new mongoose.Schema({
     // a shelf narrower than the cabinet (1..cols) and a shelf that alternates
     // or not on its own — so one cabinet holds the Liebherr GrandCru 5001's
     // 4-wide staggered top and bottom shelves between its 6-wide honeycomb
-    // ones (support ticket 2026-08-31). A missing entry means the cabinet's
+    // ones. A missing entry means the cabinet's
     // own cols / alternate. Shape, like shelfRows: creation-only in the UI.
     shelfCols: { type: [Number], default: undefined },
     shelfAlternate: { type: [Boolean], default: undefined },
     // (No shelfSideways here: a module is never a cabinet, and nothing
-    // validates a module's typeConfig — declared, any strings were stored;
-    // left out, Mongoose drops the key. Release audit 2026-10-13.)
+    // validates a module's typeConfig — declared, it would store any string;
+    // left out, Mongoose drops the key.)
     // Hex racks only: mirror the row sequence top-to-bottom. Pure reversal —
     // never changes total slot count (see rackSchema.typeConfig.hexFlip below).
     hexFlip: { type: Boolean, default: false },
@@ -92,7 +112,7 @@ const rackSchema = new mongoose.Schema({
   // that a room needs ("Basement" holds several racks; the fridge and the
   // cooler are one each). A label, not a collection: the racks page sections
   // by it, the bottle filter scopes to it, the connector and analytics report
-  // it (support ticket 2026-09-06, discussion #1228). null = ungrouped.
+  // it. null = ungrouped.
   group:     { type: String, trim: true, maxlength: 40, default: null },
   // Simple rack fields (used when isModular is false)
   type:      { type: String, enum: RACK_TYPES, default: 'grid' },
@@ -129,8 +149,8 @@ const rackSchema = new mongoose.Schema({
     // first level's front row holds `cols`, its back row (in the gaps between
     // those bottles) one fewer, the level above nests in its grooves so its
     // front row holds one fewer and its back row `cols` again, and so on
-    // (6 / 5 in front of 5 / 6: a Liebherr GrandCru's wooden shelf, support
-    // ticket 2026-09-15). UNLIKE twoDeep and stagger this CHANGES capacity
+    // (6 / 5 in front of 5 / 6: a Liebherr GrandCru's wooden shelf).
+    // UNLIKE twoDeep and stagger this CHANGES capacity
     // and the position numbering (utils/rackGeometry.cabinetRowWidth), so
     // the UI offers it at creation only and the update route's resize guard
     // blocks a shrink past placed bottles. Implies stagger when drawn.
@@ -139,7 +159,7 @@ const rackSchema = new mongoose.Schema({
     // a shelf narrower than the cabinet (1..cols) and a shelf that alternates
     // or not on its own — so one cabinet holds the Liebherr GrandCru 5001's
     // 4-wide staggered top and bottom shelves between its 6-wide honeycomb
-    // ones (support ticket 2026-08-31). A missing entry means the cabinet's
+    // ones. A missing entry means the cabinet's
     // own cols / alternate. Shape, like shelfRows: creation-only in the UI.
     shelfCols: { type: [Number], default: undefined },
     shelfAlternate: { type: [Boolean], default: undefined },
@@ -153,8 +173,7 @@ const rackSchema = new mongoose.Schema({
     // first (they rest on the bottles behind the one across: 1 + 4 with 3 on
     // top), which changes capacity and numbering (utils/rackGeometry
     // .cabinetRowWidth). So the update route refuses that one change on a
-    // loaded cabinet; every other switch keeps the bottles in place
-    // (support forum 2026-10-13, 2026-10-14).
+    // loaded cabinet; every other switch keeps the bottles in place.
     shelfSideways: { type: [{ type: String, enum: ['', 'front', 'all'] }], default: undefined },
     // Grid racks only: 1-indexed row numbers with headroom for a top layer
     // of bottles resting in the gaps (cols across + cols-1 on top).
@@ -184,7 +203,11 @@ const rackSchema = new mongoose.Schema({
     // UI offers it at creation only, and the update route's resize guard
     // (getMaxPosition recompute) blocks a shrink past placed bottles.
     // Composes with hexFlip, which still decides WHICH rows are offset.
-    hexEqualRows: { type: Boolean, default: false }
+    hexEqualRows: { type: Boolean, default: false },
+    // Wall racks only: the boxes of the wall. Validated in
+    // utils/wallGeometry.validateWallConfig; `default: undefined` so other
+    // racks don't store an empty array.
+    boxes: { type: [wallBoxSchema], default: undefined }
   },
   // Modular rack fields (used when isModular is true)
   isModular: { type: Boolean, default: false },
@@ -204,17 +227,17 @@ const rackSchema = new mongoose.Schema({
 
 rackSchema.index({ cellar: 1, name: 1 }, { unique: true, partialFilterExpression: { deletedAt: null } });
 rackSchema.index({ rfidTag: 1 }, { unique: true, sparse: true });
-// One slot per bottle, DB-ENFORCED across racks (prior-audit M4): the
-// invariant spans multiple rack documents, so per-document optimistic
-// concurrency can't see two racks each admitting the same bottle at the same
-// moment — a unique MULTIKEY index can (the loser's save gets E11000, mapped
-// to a 409 in services/rackOps.js). Notes: multikey uniqueness applies ACROSS
-// documents (same-doc duplicates stay procedural + __v-guarded); the partial
-// filter keeps slot-less racks out of the index (an empty array indexes as a
-// null key, and two empty racks must not collide); soft-deleted racks are
-// harmless — rack deletion empties slots first (routes/racks.js). If this
-// index fails to build on an existing deployment, legacy duplicate placements
-// exist — find them with scripts/find-duplicate-rack-placements.js.
+// One slot per bottle, DB-ENFORCED across racks: the invariant spans multiple
+// rack documents, so per-document optimistic concurrency can't see two racks
+// each admitting the same bottle at the same moment — a unique MULTIKEY index
+// can (the loser's save gets E11000, mapped to a 409 in services/rackOps.js).
+// Notes: multikey uniqueness applies ACROSS documents (same-doc duplicates
+// stay procedural + __v-guarded); the partial filter keeps slot-less racks
+// out of the index (an empty array indexes as a null key, and two empty racks
+// must not collide); soft-deleted racks are harmless — rack deletion empties
+// slots first (routes/racks.js). If this index fails to build on an existing
+// deployment, duplicate placements exist — find them with
+// scripts/find-duplicate-rack-placements.js.
 rackSchema.index(
   { 'slots.bottle': 1 },
   { unique: true, partialFilterExpression: { 'slots.bottle': { $exists: true } } }

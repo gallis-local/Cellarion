@@ -1,6 +1,5 @@
 /**
- * search_bottles → wine detail + resolved maturity on every row (support
- * tickets 6aad5481 + 6aad5c67).
+ * search_bottles → wine detail + resolved maturity on every row.
  *
  * Pins: grapes/region/country on the wine object; `maturity` reports the
  * window that governs the bottle (own override first, else the curated
@@ -20,7 +19,14 @@ const chain = (result) => {
 jest.mock('../models/Cellar', () => ({ find: jest.fn(), findById: jest.fn() }));
 jest.mock('../models/Bottle', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../models/WineVintageProfile', () => ({ find: jest.fn() }));
-jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), searchBottles: jest.fn() }));
+// The sweetness category has its own load of the wine, checked on real rows in
+// routes/sweetnessCategory.surfaces.mongo.test.js. No database here, so it is
+// stood in for: nothing read.
+jest.mock('../services/sweetnessCategory', () => ({
+  ...jest.requireActual('../services/sweetnessCategory'),
+  readSweetnessCategories: jest.fn(async () => new Map()),
+}));
+jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false) }));
 jest.mock('../services/photoState', () => ({
   photosForBottle: jest.fn(), photoPresence: jest.fn(async () => new Map()),
 }));

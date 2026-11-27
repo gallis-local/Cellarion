@@ -2,7 +2,7 @@
  * mapRow — the LWIN CSV row mapper, and specifically its DISPLAY_NAME
  * fallback. The old fallback trusted a 2-part split ("Bordeaux, Château
  * Margaux") and wrote the REGION into the producer field ~45 times across
- * four prod import waves (registry audit 2026-07-26, RC-2); it also truncated
+ * four prod import waves; it also truncated
  * "…Côtes de Bordeaux" names mid-appellation. These tests pin the repaired
  * rules: 3+ parts = trust producer+name, 2 parts = name only, 1 part = name
  * only — a missing producer is skipped-and-reported downstream, never minted.
@@ -72,6 +72,13 @@ describe('mapRow (lwin) — appellation tier strip', () => {
     expect(mapRow(lwinRow({ SUB_REGION: 'DO Alicante' }), 'lwin').appellation).toBe('Alicante');
     expect(mapRow(lwinRow({ SUB_REGION: 'NA' }), 'lwin').appellation).toBeNull();
   });
+
+  test('a production method on its own is no appellation, in both formats (#1696)', () => {
+    expect(mapRow(lwinRow({ SUB_REGION: 'Méthode Traditionnelle' }), 'lwin').appellation).toBeNull();
+    expect(mapRow({ Producer: 'Pongrácz', Wine: 'Blanc de Blancs', Appellation: 'Méthode Cap Classique', WineType: 'Sparkling' }, 'simple').appellation).toBeNull();
+    // A legal name that ends in the method keeps it.
+    expect(mapRow(lwinRow({ SUB_REGION: 'Oltrepò Pavese Metodo Classico' }), 'lwin').appellation).toBe('Oltrepò Pavese Metodo Classico');
+  });
 });
 
 // mapRow is sync, so it can only TIER-STRIP; the curated-registry resolve
@@ -106,7 +113,7 @@ describe('resolveImportAppellation', () => {
   });
 });
 
-// Audit 2026-09-19: LWIN states COLOUR beside SUB_TYPE, and the bulk upsert
+// LWIN states COLOUR beside SUB_TYPE, and the bulk upsert
 // never reaches the model hook — a sparkling rosé kept its style and lost its
 // colour. The colour is mapped only for the style types (utils/wineColour).
 describe('mapRow — colour of a sparkling, dessert or fortified row', () => {
@@ -133,5 +140,15 @@ describe('mapRow — colour of a sparkling, dessert or fortified row', () => {
     const row = { Producer: 'Maso Martis', Wine: 'Rosé Extra Brut', Country: 'Italy', WineType: 'sparkling' };
     expect(mapRow(row, 'simple').colour).toBe('rosé');
     expect(mapRow({ ...row, WineType: 'rose' }, 'simple').colour).toBeNull();
+  });
+});
+
+describe('mapRow — classification (audit 2026-10-26)', () => {
+  test('a regulatory mark is no classification on either format', () => {
+    expect(mapRow(lwinRow({ PRODUCER_NAME: 'Azelia', WINE: 'Barolo', CLASSIFICATION: 'DOCG' }), 'lwin').classification).toBeNull();
+    expect(mapRow(lwinRow({ PRODUCER_NAME: 'Azelia', WINE: 'Barolo', CLASSIFICATION: 'Riserva DOCG' }), 'lwin').classification).toBe('Riserva');
+    const simple = mapRow({ Producer: 'Azelia', Wine: 'Barolo', Country: 'Italy', Region: 'Piedmont', Appellation: 'Barolo DOCG', WineType: 'Red', Classification: 'DOCG' }, 'simple');
+    expect(simple.classification).toBeNull();
+    expect(simple.appellation).toBe('Barolo');
   });
 });

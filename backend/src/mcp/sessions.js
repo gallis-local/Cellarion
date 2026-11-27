@@ -1,4 +1,4 @@
-// Stateful MCP sessions (plan §4 — the proactive sommelier). The default
+// Stateful MCP sessions (the proactive sommelier). The default
 // /api/mcp mode stays stateless (fresh server per POST), but a client that
 // echoes the Mcp-Session-Id from initialize gets a LIVE session: the same
 // server instance across requests, a standalone GET/SSE stream, and
@@ -19,9 +19,7 @@ const eventBus = require('../services/eventBus');
 
 const MAX_SESSIONS_PER_USER = 3;
 // A session holds a live server with its tool registrations, so this cap is
-// tighter than the event bus's stream cap. 400 is twice the old value — the
-// measured growth (usage check 2026-10-09) put the old 200 within reach at
-// about fifteen times today's users. Above it, new sessions fall back to
+// tighter than the event bus's stream cap. Above it, new sessions fall back to
 // stateless (no pushes), nothing breaks. MCP_MAX_SESSIONS overrides.
 const MAX_SESSIONS_GLOBAL = Math.max(1, parseInt(process.env.MCP_MAX_SESSIONS, 10) || 400);
 // Sliding idle TTL — refreshed by any request AND by every delivered push, so
@@ -35,8 +33,8 @@ const SWEEP_EVERY_MS = 60 * 1000;
 const sessions = new Map(); // sessionId -> session
 // Unrouted sessions whose transport is kept open for a request still being
 // served on it (see destroySession). Revocation and the sweeper scan this
-// too — a draining session must never outlive its credential, or a hung
-// handler (post-ship audit 2026-09-12, M1).
+// too — a draining session must never outlive its credential, nor be kept
+// open by a hung handler.
 const draining = new Map(); // sessionId -> session
 let perUserCounts = new Map(); // userIdString -> n
 let sweepTimer = null;
@@ -158,9 +156,9 @@ const IMMEDIATE_REASONS = new Set(['user_dropped', 'token_revoked', 'client_dele
  * A request is being served on this session. Housekeeping (cap eviction,
  * TTL sweep) must not close the transport under it: a client whose
  * response stream dies mid-call is told "session expired" for a write the
- * server has already committed (support ticket 2026-09-12 — a support
- * ticket filed twice would have been the result). Call endRequest in a
- * finally.
+ * server has already committed, and a retry without an idempotency_key files
+ * the same write twice.
+ * Call endRequest in a finally.
  */
 function beginRequest(session) {
   if (!session) return;
@@ -251,6 +249,5 @@ function sessionCounts() {
 module.exports = {
   createSession, getSession, destroySession, closeAllSessions, sessionCounts,
   beginRequest, endRequest,
-  dropUserSessions, dropTokenSessions,
   MAX_SESSIONS_PER_USER, MAX_SESSIONS_GLOBAL, IDLE_TTL_MS, ABSOLUTE_TTL_MS, DRAIN_MAX_MS,
 };

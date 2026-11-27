@@ -1,18 +1,19 @@
-// undo_last reversals for the Phase-2c structural actions (create_cellar,
-// create_rack, place_bottle, unplace_bottle, move_bottle). Kept out of
-// consume.js to hold that file's size down. Every reversal:
+// undo_last reversals for the structural actions (create_cellar, create_rack,
+// place_bottle, unplace_bottle, move_bottle, auto_arrange). Kept apart from
+// revert.js (the dispatcher) to hold its size down. Every reversal:
 //   - re-checks access (a lost role/ownership since the action = refuse),
 //   - claims the ledger row atomically BEFORE mutating (McpActionLog has no
 //     optimistic concurrency; plain save is not a guard),
 //   - records a viaUndo:true row so sequential undos walk backward.
-const mongoose = require('mongoose');
 const Cellar = require('../models/Cellar');
 const Rack = require('../models/Rack');
 const Bottle = require('../models/Bottle');
 const McpActionLog = require('../models/McpActionLog');
 const { logAudit } = require('../services/audit');
 const { getMaxPosition } = require('../utils/rackGeometry');
-const { placeBottleInRack, clearRackSlot, moveBottleToCellar } = require('../services/rackOps');
+const {
+  placeBottleInRack, clearRackSlot, MOVE_MIN_ROLE, findMoveDestination, moveBottleToCellar,
+} = require('../services/rackOps');
 const { resolveBottleAccess, resolveCellarAccess } = require('./toolUtil');
 
 /** Atomic single-use claim on the ledger row. */
@@ -24,7 +25,7 @@ async function claim(last) {
 }
 
 /**
- * Release a claim so a failed structural undo stays retryable (MCP-audit H3).
+ * Release a claim so a failed structural undo stays retryable.
  * Every branch here claims BEFORE the mutating rackOps call, and that call can
  * still fail after the pre-claim checks pass — a concurrent placement (the
  * unique slots.bottle index → E11000), a VersionError, or a slot disabled since
@@ -119,12 +120,11 @@ async function undoStructural(last, ctx, { ok, fail, logAction }) {
     const pos = last.detail?.position;
     // Verify EVERYTHING before claiming (the move branch's discipline), so a
     // reversal that would fail doesn't burn the ledger row:
-    //  - the bottle must still be active (grand-audit M2: without this, a
-    //    bottle consumed via the web since the unplace would be re-slotted,
-    //    breaking "consume frees the slot" — dead bottle in fill counts/3D);
+    //  - the bottle must still be active (without this, a bottle consumed via
+    //    the web since the unplace would be re-slotted, breaking "consume
+    //    frees the slot" — dead bottle in fill counts/3D);
     //  - it must still live in this rack's cellar;
-    //  - the position must still exist (rack resized smaller since — the
-    //    previously-computed-but-unused maxPos check);
+    //  - the position must still exist (the rack may have shrunk since);
     //  - the slot must be free.
     const bottle = await Bottle.findById(bottleId);
     if (!bottle) return fail('conflict', 'That bottle no longer exists; nothing was changed.');
@@ -180,10 +180,11 @@ async function undoStructural(last, ctx, { ok, fail, logAction }) {
   }
 
   if (last.action === 'move') {
-    // Reverse = move the bottle back to its origin cellar (must still be owned
-    // and the bottle still active). Arrives unplaced, same as any move.
+    // Reverse = move the bottle back to its origin cellar, under the rule of
+    // any move: the user still owns or edits both cellars, and the bottle is
+    // still active. Arrives unplaced and goes back to the origin's owner.
     const fromId = last.detail?.fromCellarId;
-    const access = await resolveBottleAccess(ctx.user.id, last.bottle, 'owner');
+    const access = await resolveBottleAccess(ctx.user.id, last.bottle, MOVE_MIN_ROLE);
     if (!access) return fail('conflict', 'That bottle is no longer accessible; nothing was changed.');
     if (String(access.bottle.cellar) !== String(last.detail?.toCellarId)) {
       return fail('conflict', 'That bottle has moved again since; undo it manually. Nothing was changed.');
@@ -193,8 +194,8 @@ async function undoStructural(last, ctx, { ok, fail, logAction }) {
     if (access.bottle.status !== 'active' && access.bottle.status !== 'ordered') {
       return fail('conflict', 'That bottle has been consumed since the move; nothing was changed.');
     }
-    const origin = await Cellar.findOne({ _id: fromId, user: ctx.user.id, deletedAt: null });
-    if (!origin) return fail('conflict', 'The origin cellar is gone or no longer yours; nothing was changed.');
+    const origin = await findMoveDestination(ctx.user.id, fromId);
+    if (!origin) return fail('conflict', 'The origin cellar is gone, or you no longer own or edit it; nothing was changed.');
     if (!(await claim(last))) return fail('conflict', 'That action is already being undone.');
     const bottle = await Bottle.findById(access.bottle._id);
     const result = await moveBottleToCellar(bottle, access.cellar, origin, ctx.req);

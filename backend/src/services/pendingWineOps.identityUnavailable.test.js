@@ -19,7 +19,6 @@ jest.mock('../models/Country', () => ({ findOne: jest.fn() }));
 jest.mock('./crossFieldScan', () => ({ detectCrossFieldForValues: jest.fn().mockResolvedValue(null) }));
 jest.mock('./search', () => ({
   indexWine: jest.fn().mockResolvedValue(undefined),
-  bulkIndexBottles: jest.fn().mockResolvedValue(undefined),
 }));
 jest.mock('./embeddingJob', () => ({ reembedActiveVintages: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('./enrichmentJob', () => ({ enrichWineById: jest.fn().mockResolvedValue(undefined) }));
@@ -112,7 +111,7 @@ describe('applying it', () => {
     expect(ensurePendingVintageProfile).not.toHaveBeenCalled();
   });
 
-  // Audit 2026-09-27 M6: every fix changes what the bottles' owners see in
+  // Every fix changes what the bottles' owners see in
   // their statistics and bottle lists — promoted or not — so their data
   // version moves (the read caches otherwise keep the old answer for up to
   // 30 minutes). Fire-and-forget: the fix never waits on it.
@@ -167,21 +166,22 @@ describe('the queue listing', () => {
     primeCounts();
     await queryPendingWines({});
     expect(WineDefinition.find.mock.calls[0][0]).toEqual({
-      pendingIdentity: true, identityUnavailable: { $ne: true }, draft: { $ne: true },
+      pendingIdentity: true, identityUnavailable: { $ne: true }, draft: { $ne: true }, nonWine: { $ne: true },
     });
   });
 
   test('…and one flag shows them again, so the record can be reversed', async () => {
     primeCounts();
     await queryPendingWines({ includeUnavailable: true });
-    expect(WineDefinition.find.mock.calls[0][0]).toEqual({ pendingIdentity: true, draft: { $ne: true } });
+    // A quarantined (Other) row is never curation work, whichever view is asked for.
+    expect(WineDefinition.find.mock.calls[0][0]).toEqual({ pendingIdentity: true, draft: { $ne: true }, nonWine: { $ne: true } });
   });
 
   test('the work figure excludes them and they are counted separately', async () => {
     primeCounts();
     await queryPendingWines({});
     const counted = WineDefinition.countDocuments.mock.calls.map(c => c[0]);
-    expect(counted).toContainEqual({ pendingIdentity: true, identityUnavailable: { $ne: true }, draft: { $ne: true } });
-    expect(counted).toContainEqual({ pendingIdentity: true, identityUnavailable: true, draft: { $ne: true } });
+    expect(counted).toContainEqual({ pendingIdentity: true, identityUnavailable: { $ne: true }, draft: { $ne: true }, nonWine: { $ne: true } });
+    expect(counted).toContainEqual({ pendingIdentity: true, identityUnavailable: true, draft: { $ne: true }, nonWine: { $ne: true } });
   });
 });

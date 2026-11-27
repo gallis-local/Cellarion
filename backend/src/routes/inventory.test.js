@@ -40,13 +40,27 @@ jest.mock('../models/ApiToken', () => {
 });
 jest.mock('../models/User', () => ({ findById: jest.fn(), find: jest.fn() }));
 jest.mock('../models/Cellar', () => ({ find: jest.fn() }));
-jest.mock('../models/Bottle', () => ({ find: jest.fn() }));
+jest.mock('../models/Bottle', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../models/Rack', () => ({ find: jest.fn() }));
 jest.mock('../models/WineDefinition', () => ({ find: jest.fn() }));
 jest.mock('../models/WineVintageProfile', () => ({ find: jest.fn() }));
 jest.mock('../models/PersonalDataEntry', () => ({ find: jest.fn() }));
 // routes/cellars is heavy and only lends its image resolver (as in offline.test).
-jest.mock('./cellars', () => ({ attachBottleImageUrls: jest.fn() }));
+jest.mock('../services/bottleImageUrls', () => ({ attachBottleImageUrls: jest.fn() }));
+// The sweetness category is read from real rows in
+// routes/sweetnessCategory.surfaces.mongo.test.js. Here its reader is stood in
+// for with one fixed reading for every wine, so what the route sends shows
+// that it hands the reading on as it got it.
+jest.mock('../services/sweetnessCategory', () => ({
+  attachSweetnessCategories: jest.fn(async (wines) => {
+    for (const w of wines) {
+      if (!w || typeof w !== 'object') continue;
+      w.sweetnessCategory = 'off-dry';
+      w.sweetnessCategoryBasis = 'style';
+    }
+    return wines;
+  }),
+}));
 
 const express = require('express');
 const http = require('http');
@@ -59,7 +73,7 @@ const Rack = require('../models/Rack');
 const WineDefinition = require('../models/WineDefinition');
 const WineVintageProfile = require('../models/WineVintageProfile');
 const PersonalDataEntry = require('../models/PersonalDataEntry');
-const { attachBottleImageUrls } = require('./cellars');
+const { attachBottleImageUrls } = require('../services/bottleImageUrls');
 const { bumpDataVersion } = require('../services/dataVersion');
 const inventoryRouter = require('./inventory');
 
@@ -89,13 +103,15 @@ const CELLARS = [
 const COUNTRIES = [{ _id: id('f1'), name: 'Italy', description: 'Long country text' }];
 const REGIONS = [{ _id: id('f2'), name: 'Piedmont', description: 'Long region text' }];
 const GRAPES = [{ _id: id('f3'), name: 'Nebbiolo', description: 'Long grape text', regionalNames: [] }];
+// A label sweetness term (the fixture is a fixture: a Barolo label prints none).
+const TERMS = [{ _id: id('f4'), name: 'secco', scale: 'still', band: 'dry', regulated: true, description: 'Long term text' }];
 const W1 = id('d1');
 const W2 = id('d2');
 const W3 = id('d3');
 const WINES = [
   {
     _id: W1, name: 'Barolo', producer: 'Mascarello', type: 'red', colour: null, country: id('f1'), region: id('f2'),
-    appellation: 'Barolo', classification: 'DOCG', grapes: [id('f3')], image: '/api/uploads/processed/w1img.webp',
+    appellation: 'Barolo', classification: 'DOCG', labelSweetness: id('f4'), grapes: [id('f3')], image: '/api/uploads/processed/w1img.webp',
     aiProfile: {
       body: 'full', tannin: 'high', acidity: 'high', sweetness: 'dry',
       flavors: ['tar', 'rose'], foodPairings: ['truffle'],
@@ -124,7 +140,10 @@ const BOTTLES = [
     createdAt: new Date('2025-01-02T10:00:00Z'), openedAt: null, location: 'Basement, box 3', drinkFrom: 2024, drinkTo: 2040,
     defaultImage: null, ...HEAVY,
   },
-  { _id: B(2), cellar: C_OWN, wineDefinition: W1, vintage: '2016', status: 'drank', createdAt: new Date(), ...HEAVY },
+  {
+    _id: B(2), cellar: C_OWN, wineDefinition: W1, vintage: '2016', status: 'drank', createdAt: new Date(), ...HEAVY,
+    consumedAt: new Date('2026-10-30T19:00:00Z'), consumedReason: 'drank', consumedRating: 18, consumedRatingScale: '20',
+  },
   { _id: B(3), cellar: C_OWN, wineDefinition: W2, vintage: '2020', status: 'ordered', createdAt: new Date() },
   // A legacy row with no status still counts as in the cellar.
   { _id: B(4), cellar: C_SHARED, wineDefinition: W2, vintage: '2018', createdAt: new Date('2025-03-01T00:00:00Z') },
@@ -207,6 +226,8 @@ function project(doc, select, coll) {
   loads.push([coll, select]);
   const out = { _id: doc._id };
   for (const p of select.split(/\s+/).filter(Boolean)) {
+    // The one exclusion Mongo allows beside an inclusion list: leaving the id out.
+    if (p === '-_id') { delete out._id; continue; }
     if (p.startsWith('-')) throw new Error(`the stand-in supports inclusion projections only (${coll}: ${p})`);
     pick(doc, p.split('.'), out);
   }
@@ -214,7 +235,9 @@ function project(doc, select, coll) {
 }
 const REFS = {
   wineDefinition: ['wines', WINES], pendingWineRequest: ['wineRequests', REQUESTS], country: ['countries', COUNTRIES],
-  region: ['regions', REGIONS], grapes: ['grapes', GRAPES], key: ['personalDataKeys', KEYS], author: ['users', USERS],
+  region: ['regions', REGIONS], grapes: ['grapes', GRAPES], labelSweetness: ['sweetnessTerms', TERMS], key: ['personalDataKeys', KEYS], author: ['users', USERS],
+  // A ref inside a subdocument: the sweetness style's term.
+  'sweetnessStyle.term': ['sweetnessTerms', TERMS],
 };
 function populate(rows, spec, selectArg) {
   const specs = Array.isArray(spec) ? spec : typeof spec === 'string' ? [{ path: spec, select: selectArg }] : [spec];
@@ -228,6 +251,12 @@ function populate(rows, spec, selectArg) {
         const doc = project(structuredClone(found), s.select, coll);
         return s.populate ? populate([doc], s.populate)[0] : doc;
       };
+      // A dotted path populates the ref inside the subdocument (a copy of it).
+      const [head, tail] = s.path.split('.');
+      if (tail) {
+        if (out[head] && typeof out[head] === 'object' && out[head][tail] != null) out[head] = { ...out[head], [tail]: resolve(out[head][tail]) };
+        continue;
+      }
       const v = out[s.path];
       if (Array.isArray(v)) out[s.path] = v.map(resolve).filter(Boolean);
       else if (v != null) out[s.path] = resolve(v);
@@ -239,13 +268,15 @@ function fakeFind(coll, docs) {
   return (query = {}) => {
     const rows = docs.filter((d) => matches(d, query));
     let select = null;
+    let limit = Infinity;
     const pops = [];
     const q = {
       select: (s) => { select = s; return q; },
       populate: (spec, s2) => { pops.push([spec, s2]); return q; },
       sort: () => q,
+      limit: (n) => { limit = n; return q; },
       lean: async () => {
-        let out = rows.map((r) => project(structuredClone(r), select, coll));
+        let out = rows.slice(0, limit).map((r) => project(structuredClone(r), select, coll));
         for (const [spec, s2] of pops) out = populate(out, spec, s2);
         return out;
       },
@@ -288,6 +319,7 @@ beforeEach(() => {
   User.find.mockImplementation(fakeFind('users', USERS));
   Cellar.find.mockImplementation(fakeFind('cellars', CELLARS));
   Bottle.find.mockImplementation(fakeFind('bottles', BOTTLES));
+  Bottle.countDocuments.mockImplementation(async (query) => BOTTLES.filter((d) => matches(d, query)).length);
   Rack.find.mockImplementation(fakeFind('racks', RACKS));
   WineDefinition.find.mockImplementation(fakeFind('wines', WINES));
   WineVintageProfile.find.mockImplementation(fakeFind('profiles', PROFILES));
@@ -300,7 +332,7 @@ beforeEach(() => {
   })));
 });
 
-const get = (auth, headers = {}) => fetch(`${base}/api/inventory`, {
+const get = (auth, headers = {}, query = '') => fetch(`${base}/api/inventory${query}`, {
   headers: { ...(auth ? { Authorization: `Bearer ${auth}` } : {}), ...headers },
 });
 
@@ -340,9 +372,9 @@ describe('a read token gets the inventory', () => {
     const body = await (await get(READ)).json();
     const b1 = body.bottles.find((b) => b.id === B(1));
     expect(b1).toEqual({
-      id: B(1), wine: W1, pending: null, cellar: C_OWN, vintage: '2015', size: '750ml', price: 450, currency: 'SEK',
+      id: B(1), wine: W1, pending: null, cellar: C_OWN, status: 'active', vintage: '2015', size: '750ml', price: 450, currency: 'SEK',
       rating: 4, ratingScale: '5', notes: 'Decant 2h', purchaseDate: '2024-05-01', purchaseLocation: 'Systembolaget',
-      addedAt: '2025-01-02T10:00:00.000Z', opened: false,
+      addedAt: '2025-01-02T10:00:00.000Z', opened: false, consumed: null,
       maturity: 'peak',
       window: { drinkFrom: 2024, peakFrom: null, peakUntil: null, drinkTo: 2040 },
       location: { rack: id('r1'), rackName: 'Fridge', position: 14, shelf: 2, row: 2, col: 2 },
@@ -351,8 +383,9 @@ describe('a read token gets the inventory', () => {
       personal: [{ key: 'Closure', type: 'enum', unit: null, value: 'cork', level: 'bottle', by: 'maria' }],
     });
     expect(body.wines[W1]).toEqual({
-      name: 'Barolo', producer: 'Mascarello', type: 'red', colour: null, country: 'Italy', region: 'Piedmont',
-      appellation: 'Barolo', classification: 'DOCG', grapes: ['Nebbiolo'],
+      name: 'Barolo', displayName: 'Barolo secco', producer: 'Mascarello', type: 'red', category: 'wine', colour: null, country: 'Italy', region: 'Piedmont',
+      appellation: 'Barolo', classification: 'DOCG', labelSweetness: { name: 'secco', band: 'dry', scale: 'still', regulated: true }, sweetnessStyle: null,
+      sweetnessCategory: 'off-dry', sweetnessCategoryBasis: 'style', grapes: ['Nebbiolo'],
       image: '/api/uploads/thumbs/processed/w1img.webp.webp',
       profile: { body: 'full', acidity: 'high', sweetness: 'dry', tannin: 'high', flavors: ['tar', 'rose'], foodPairings: ['truffle'] },
     });
@@ -412,6 +445,40 @@ describe('a read token gets the inventory', () => {
     expect(wineLoads).not.toMatch(/description|producerNote|producerSuspect|heldReason|source|verifiedBy|scanImage/);
   });
 
+  test('include=consumed adds the bottles that left, in the same shape; on order stays out', async () => {
+    const body = await (await get(READ, {}, '?include=consumed')).json();
+    expect(body.bottles.map((b) => b.id).sort()).toEqual([B(1), B(2), B(4), B(7)].sort());
+    // How many left in all, and that this answer holds them all; only with the parameter.
+    expect(Object.keys(body)).toEqual(['schema', 'generatedAt', 'cellars', 'racks', 'wines', 'bottles', 'consumedTotal', 'consumedTruncated']);
+    expect(body).toMatchObject({ consumedTotal: 1, consumedTruncated: false });
+    const b2 = body.bottles.find((b) => b.id === B(2));
+    expect(b2).toMatchObject({
+      id: B(2), wine: W1, cellar: C_OWN, status: 'drank', vintage: '2016', maturity: null, location: null,
+      consumed: { at: '2026-10-30T19:00:00.000Z', rating: 18, ratingScale: '20', note: 'SECRET-CONSUMED' },
+    });
+    // The bottles still in the cellar are exactly as without the parameter.
+    const plain = await (await get(READ)).json();
+    const still = (inv) => inv.bottles.filter((b) => b.status === 'active').map((b) => ({ ...b }));
+    expect(still(body)).toEqual(plain.bottles);
+    // Only this build loads the consumption record, and still nothing heavy.
+    const bottleLoads = loads.filter(([c]) => c === 'bottles').map(([, s]) => s);
+    expect(bottleLoads.some((s) => s.includes('consumedNote'))).toBe(true);
+    for (const s of bottleLoads) for (const heavy of ['cellarHistory', 'pours', 'barcode', 'purchaseUrl']) expect(s).not.toContain(heavy);
+  });
+
+  test('include: a list, repeated or with spaces, works; an unknown value is a 400 that reads nothing', async () => {
+    expect((await get(READ, {}, '?include=consumed,%20consumed')).status).toBe(200);
+    expect((await get(READ, {}, '?include=consumed&include=consumed')).status).toBe(200);
+    jest.clearAllMocks();
+    ApiToken.findOne.mockImplementation(async (q) => TOKENS[q.tokenHash] || null);
+    User.findById.mockImplementation((uid) => ({ select: async () => USERS.find((u) => u._id === String(uid)) || null }));
+    const res = await get(READ, {}, '?include=ordered');
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'Unknown include value "ordered". Supported: consumed.' });
+    expect(Cellar.find).not.toHaveBeenCalled();
+    expect(Bottle.find).not.toHaveBeenCalled();
+  });
+
   test('a token with read AND consume works the same', async () => {
     expect((await get(READ_CONSUME)).status).toBe(200);
   });
@@ -449,6 +516,16 @@ describe('conditional requests', () => {
     const res = await get(READ, { 'If-None-Match': tag });
     expect(res.status).toBe(200);
     expect(res.headers.get('etag')).not.toBe(tag);
+  });
+
+  test('each include set has its own tag: the default copy\'s tag never answers 304 for include=consumed', async () => {
+    const plainTag = (await get(READ)).headers.get('etag');
+    const res = await get(READ, { 'If-None-Match': plainTag }, '?include=consumed');
+    expect(res.status).toBe(200);
+    const allTag = res.headers.get('etag');
+    expect(allTag).not.toBe(plainTag);
+    expect((await get(READ, { 'If-None-Match': allTag }, '?include=consumed')).status).toBe(304);
+    expect((await get(READ, { 'If-None-Match': allTag })).status).toBe(200);
   });
 
   test('an offline-snapshot tag never matches (its own tag space)', async () => {

@@ -1,37 +1,39 @@
 /**
- * User-facing wine-correction proposals (#985 Slice A) — ONE implementation
- * shared by the REST route (routes/wineProposals.js) and the MCP tool
+ * User-facing wine-correction proposals — ONE implementation shared by the
+ * REST route (routes/wineProposals.js) and the MCP tool
  * suggest_wine_correction (mcp/tools/corrections.js), the ownerInquiryOps /
  * personalData pattern.
  *
  * This is the regular-user half of the proposal system: field corrections
- * only (merge / non-wine stay sommelier tools — mcp/tools/somm.js), filed
- * into the SAME WineCorrectionProposal queue the admin already reviews with
- * diff + bulk tooling. Suggestions never auto-apply; approval stays human.
+ * only (merge / non-wine stay sommelier tools,
+ * mcp/tools/somm/corrections.js), filed into the SAME WineCorrectionProposal
+ * queue the admin reviews with diff + bulk tooling. A suggestion waits for that
+ * review, with two exceptions decided in createFieldCorrection: a server that
+ * does not review contributions (services/trustedContributions), and a
+ * sweetness style that fills a blank.
  *
- * Gating (issue #985): demo exclusion is the transport's job (requireNonDemo /
+ * Gating: demo exclusion is the transport's job (requireNonDemo /
  * MCP's no-token rule); HERE lives the shared part — discussion ban, the
  * per-contribution-tier daily budget, and the one-pending-per-wine conflict.
  *
  * The one-pending rule is per WINE, not per user (partial unique index on
- * WineCorrectionProposal). Support ticket 2026-09-12: a user who noticed a
- * second gap right after filing was told "already awaiting review" — by their
- * own suggestion. So when the pending row is the caller's OWN, a new filing
- * AMENDS it instead of colliding; only somebody else's pending row is a
- * conflict. An amendment enters nothing new into the queue, so it bypasses
- * the daily budget (not the ban) — capped at AMENDMENTS_MAX per proposal so
- * the bypass cannot be farmed. `pendingForWine` exposes the same state to
- * readers (get_wine) so the block is discoverable before a correction is
- * composed.
+ * WineCorrectionProposal). A user who notices a second gap right after filing
+ * must not be told "already awaiting review" by their own suggestion. So when
+ * the pending row is the caller's OWN, a new filing AMENDS it instead of
+ * colliding; only somebody else's pending row is a conflict. An amendment
+ * enters nothing new into the queue, so it bypasses the daily budget (not the
+ * ban) — capped at AMENDMENTS_MAX per proposal so the bypass cannot be farmed.
+ * `pendingForWine` exposes the same state to readers (get_wine) so the block
+ * is discoverable before a correction is composed.
  *
- * An amendment is ONE atomic update pinned to { pending, this proposer }
- * (audit 2026-09-12 H-1): per-field $set paths, so two amendments of
- * different fields in the same second both land, and never a write onto a
- * row an admin decided in between — that case falls through to a fresh
- * filing, budget applied. The original reason and evidenceUrl are never
- * touched; each amendment is $pushed with its own reason/evidence, and the
- * snapshot is refreshed only for the fields being added, so drift the admin
- * should still see on the original fields survives.
+ * An amendment is ONE atomic update pinned to { pending, this proposer }:
+ * per-field $set paths, so two amendments of different fields in the same
+ * second both land, and never a write onto a row an admin decided in between
+ * — that case falls through to a fresh filing, budget applied. The original
+ * reason and evidenceUrl are never touched; each amendment is $pushed with
+ * its own reason/evidence, and the snapshot is refreshed only for the fields
+ * being added, so drift the admin should still see on the original fields
+ * survives.
  *
  * Results are transport-neutral: { ok: true, ... } or { ok: false, code,
  * message } — codes: invalid | banned | limit | not_found | conflict.
@@ -41,22 +43,22 @@ const { originFrom } = require('../utils/contributionOrigin');
 
 const { findVisibleWine } = require('./wineVisibility');
 const { stripHtml } = require('../utils/sanitize');
+const { identitySnapshot } = require('../utils/proposalSnapshot');
 const { isValidId } = require('../utils/validation');
 const { WINE_COLOURS, isStyleType } = require('../utils/wineColour');
 
 const { TIER_DAILY, checkContributionGate } = require('./contributionGate');
+const { appliesDirectly, applyCorrectionIfTrusted, applyAsFiler } = require('./trustedContributions');
+const { WITH_SWEETNESS_STYLE, SWEETNESS_STYLE_POPULATE } = require('../config/constants');
 
-const FIELDS = ['producer', 'name', 'appellation', 'region', 'country', 'classification'];
-// Structural fields a user may also correct (support ticket 2026-09-06: the
-// sommelier tool had them since 6a85ad44, the user tool did not — a whole
-// class of registry errors, wrong grape lists, was unfixable from a connector).
-// `type` is validated against the wine-type enum; `grapes` REPLACES the whole
-// variety list and every name must already exist in the taxonomy — resolved
-// at filing so the user learns about a typo now, and again at approval.
-// `colour` (support ticket 2026-09-17) is the colour of a sparkling, dessert or
-// fortified wine — refused on a wine the suggestion leaves red/white/rosé.
-const EXTRA_FIELDS = ['type', 'colour', 'grapes'];
-// Not a field but a MODIFIER of `grapes` (support ticket 2026-09-17): the names
+// The fields a correction may change, their limits and how a proposed value
+// is read are shared with the sommelier's tool (services/proposalFields), so
+// the two doors cannot accept different things for the same approval.
+const {
+  TEXT_FIELDS: FIELDS, EXTRA_FIELDS, STYLE_FIELD, WINE_TYPES, FIELD_MAX, GRAPE_NAME_MAX, REASON_MIN, REASON_MAX, URL_MAX,
+  readProposedFields, settleClassificationByCountry, settleSweetnessStyle,
+} = require('./proposalFields');
+// Not a field but a MODIFIER of `grapes`: the names
 // in the grape list the caller asserts are genuinely missing from the taxonomy.
 // It rides inside `fields` so every transport that forwards `fields` verbatim
 // (the REST route, the Registry Bridge) carries it without a protocol change;
@@ -65,25 +67,63 @@ const EXTRA_FIELDS = ['type', 'colour', 'grapes'];
 // proposal — nothing is minted here or at approval, which still refuses an
 // unknown variety until an admin has added it to the taxonomy deliberately.
 const FIELD_MODIFIERS = ['newGrapes'];
-const WINE_TYPES = ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'];
+// How many varieties a member's list may hold (a curator's tool allows more).
 const GRAPES_MAX = 12;
-const GRAPE_NAME_MAX = 60;
-const REASON_MIN = 10;
-const REASON_MAX = 1000;
 // Amendments bypass the daily budget (nothing new enters the queue), so they
 // are capped per proposal instead — enough for "I noticed three more gaps",
 // not enough to farm.
 const AMENDMENTS_MAX = 10;
-const FIELD_MAX = 200;
-const URL_MAX = 500;
 
 const fail = (code, message) => ({ ok: false, code, message });
 
 /**
- * Create a field_correction proposal from a regular user.
- * fields = { producer?, name?, appellation?, region?, country?, classification? }
+ * File a member's field correction: fields = the identity fields
+ * (services/proposalFields TEXT_FIELDS and EXTRA_FIELDS) and/or
+ * sweetnessStyle { term, source, url }. On a server that does not review
+ * contributions it applies at once (services/trustedContributions), and so
+ * does a sweetness style that fills a blank (applyStyleOnFiling below). The
+ * answer then carries `applied: true` and the corrected wine.
+ * Callers: POST /api/wine-proposals and the MCP tool suggest_wine_correction.
  */
-async function createFieldCorrection(userId, { wineId, fields, reason, evidenceUrl }, { via, req } = {}) {
+async function createFieldCorrection(userId, input, opts = {}) {
+  const result = await fileFieldCorrection(userId, input, opts);
+  const settled = await applyCorrectionIfTrusted(result, userId, opts);
+  if (!settled.ok || settled.applied) return settled;
+  return applyStyleOnFiling(settled, userId, opts);
+}
+
+/**
+ * The one member correction that applies on filing where contributions are
+ * reviewed: a sweetness style, on its own, on a wine that has none
+ * (services/proposalDirectApply memberAppliesOnFiling). The filed row stays,
+ * decided by the member, with the reason and the link, so a curator can read
+ * it afterwards. A relay from another server (via 'bridge') always waits. The
+ * answer then carries `applied: true` and `appliedBecause: 'sweetness_style'`.
+ */
+async function applyStyleOnFiling(result, userId, { via, req } = {}) {
+  if (!result.proposal || via === 'bridge') return result;
+  const pending = plain(result.proposal.proposedFields);
+  if (!pending[STYLE_FIELD]) return result;
+  let verdict;
+  try {
+    // Lazy: the classifier loads the registry models only a style needs.
+    const { memberAppliesOnFiling } = require('./proposalDirectApply');
+    verdict = await memberAppliesOnFiling(result.wine, pending);
+  } catch (err) {
+    // The suggestion is filed: a judgement that fails leaves it waiting for a
+    // curator, never an error on a filing that succeeded.
+    const { logger } = require('./audit');
+    logger.warn({ err: err.message, proposalId: String(result.proposal._id) }, 'sweetness style: could not judge the filing for an immediate apply; it waits for review');
+    return result;
+  }
+  if (!verdict.direct) return result;
+  // Judged on the style alone: a field amended into the row before the apply
+  // claims it keeps the whole row waiting (approveProposal onlyFields).
+  const applied = await applyAsFiler(result, userId, req, { onlyFields: [STYLE_FIELD] });
+  return applied.applied ? { ...applied, appliedBecause: 'sweetness_style' } : applied;
+}
+
+async function fileFieldCorrection(userId, { wineId, fields, reason, evidenceUrl }, { via, req } = {}) {
   const origin = originFrom(req, via);
   const cleanReason = stripHtml(typeof reason === 'string' ? reason : '').trim();
   if (cleanReason.length < REASON_MIN) {
@@ -104,59 +144,22 @@ async function createFieldCorrection(userId, { wineId, fields, reason, evidenceU
     }
   }
 
-  const proposedFields = {};
-  // Varieties the caller declared missing from the taxonomy — audit only.
-  let newGrapeNames = [];
   const src = fields || {};
   for (const f of Object.keys(src)) {
-    if (!FIELDS.includes(f) && !EXTRA_FIELDS.includes(f) && !FIELD_MODIFIERS.includes(f)) {
-      return fail('invalid', `Unknown field "${f}" — correctable fields: ${[...FIELDS, ...EXTRA_FIELDS].join(', ')}.`);
+    if (!FIELDS.includes(f) && !EXTRA_FIELDS.includes(f) && f !== STYLE_FIELD && !FIELD_MODIFIERS.includes(f)) {
+      return fail('invalid', `Unknown field "${f}" — correctable fields: ${[...FIELDS, ...EXTRA_FIELDS, STYLE_FIELD].join(', ')}.`);
     }
   }
   if (src.newGrapes !== undefined && src.newGrapes !== null && (src.grapes === undefined || src.grapes === null)) {
     return fail('invalid', 'newGrapes only qualifies a grapes list — send the complete corrected grapes list with it.');
   }
-  for (const f of FIELDS) {
-    if (src[f] === undefined || src[f] === null) continue;
-    const v = stripHtml(String(src[f])).trim();
-    if (!v) continue;
-    if (v.length > FIELD_MAX) {
-      return fail('invalid', `${f} must be at most ${FIELD_MAX} characters.`);
-    }
-    proposedFields[f] = v;
-  }
-  if (src.type !== undefined && src.type !== null) {
-    const t = String(src.type).trim().toLowerCase();
-    if (!WINE_TYPES.includes(t)) {
-      return fail('invalid', `type must be one of ${WINE_TYPES.join(', ')}.`);
-    }
-    proposedFields.type = t;
-  }
-  if (src.colour !== undefined && src.colour !== null) {
-    const c = String(src.colour).trim().toLowerCase();
-    if (!WINE_COLOURS.includes(c)) {
-      return fail('invalid', `colour must be one of ${WINE_COLOURS.join(', ')}.`);
-    }
-    proposedFields.colour = c;
-  }
-  if (src.grapes !== undefined && src.grapes !== null) {
-    if (!Array.isArray(src.grapes) || src.grapes.length === 0 || src.grapes.length > GRAPES_MAX) {
-      return fail('invalid', `grapes must be a list of 1 to ${GRAPES_MAX} variety names — the complete corrected list, since it replaces the current one.`);
-    }
-    const names = src.grapes.map((g) => stripHtml(String(g == null ? '' : g)).trim()).filter(Boolean);
-    if (names.length === 0 || names.some((n) => n.length > GRAPE_NAME_MAX)) {
-      return fail('invalid', `Each grape name must be 1 to ${GRAPE_NAME_MAX} characters.`);
-    }
-    const resolved = await resolveProposedGrapes(names, src.newGrapes);
-    if (!resolved.ok) return resolved;
-    // Canonical names, so the admin diff shows what would actually be written
-    // (a declared new variety stays as typed — there is no canonical form yet).
-    proposedFields.grapes = resolved.names;
-    newGrapeNames = resolved.newNames;
-  }
-  if (Object.keys(proposedFields).length === 0) {
-    return fail('invalid', 'Suggest at least one changed field.');
-  }
+  // One reading of the proposed values for both doors (services/proposalFields);
+  // newGrapeNames are the varieties the caller declared missing from the
+  // taxonomy (audit only), classificationTier the cleaned classification as
+  // sent, settled by the wine's country once the wine is loaded.
+  const read = await readProposedFields(src, { grapesMax: GRAPES_MAX, declaredNew: src.newGrapes, styleUrl: cleanUrl });
+  if (!read.ok) return fieldFailure(read);
+  const { proposedFields, classificationTier, newGrapeNames } = read;
 
   if (!isValidId(String(wineId))) return fail('invalid', 'Invalid wine id');
 
@@ -167,7 +170,8 @@ async function createFieldCorrection(userId, { wineId, fields, reason, evidenceU
   let amending = isOwn(existing, userId);
 
   // Ban + the ONE daily budget shared across all suggestion families.
-  const gate = await checkContributionGate(userId, { budget: !amending });
+  // No daily limit where nobody reviews (services/trustedContributions).
+  const gate = await checkContributionGate(userId, { budget: !amending && !appliesDirectly(via) });
   if (!gate.ok) return gate;
   const { user } = gate;
   // Visibility, not ownership: anyone who can SEE the wine may suggest a fix
@@ -176,11 +180,24 @@ async function createFieldCorrection(userId, { wineId, fields, reason, evidenceU
     userId,
     roles: req?.user?.roles || [],
     // noDrafts: a draft is edited directly by its creator; the correction
-    // queue is for shared records (draft design 2026-09-12).
+    // queue is for shared records.
     noDrafts: true,
-    populate: ['country', 'region', 'grapes'],
+    // The sweetness style too: a proposed style is held against the one the
+    // wine carries, and the snapshot records it.
+    select: WITH_SWEETNESS_STYLE,
+    populate: ['country', 'region', 'grapes', SWEETNESS_STYLE_POPULATE],
   });
   if (!wine) return fail('not_found', 'Wine not found');
+
+  // A word two tier systems share is settled by the wine's country, the
+  // country approval resolves in.
+  await settleClassificationByCountry(proposedFields, classificationTier, wine);
+  // A sweetness style is held against the wine now, so the member learns at
+  // once what the write rule would refuse at approval.
+  // An amendment is judged with the name, type and classification its
+  // waiting row already holds: approval applies the whole row.
+  const style = await settleSweetnessStyle(proposedFields, wine, amending ? plain(existing.proposedFields) : null);
+  if (!style.ok) return fieldFailure(style);
 
   // A colour only means something on a style type — judged against the type
   // this suggestion leaves the wine with: its own type field, else the type in
@@ -197,19 +214,9 @@ async function createFieldCorrection(userId, { wineId, fields, reason, evidenceU
     }
   }
 
-  const currentSnapshot = {
-    producer: wine.producer || null,
-    name: wine.name || null,
-    appellation: wine.appellation || null,
-    region: wine.region?.name || null,
-    country: wine.country?.name || null,
-    classification: wine.classification || null,
-    type: wine.type || null,
-    colour: wine.colour || null,
-    // Joined names, the shape the admin diff compares against (its liveIdentity
-    // and the somm path both join) — an array here rendered as permanent drift.
-    grapes: (wine.grapes || []).map((g) => (g && g.name) || String(g)).filter(Boolean).join(', ') || null,
-  };
+  // The shape the admin diff compares against, shared with the sommelier
+  // path and the review route (utils/proposalSnapshot): grapes as joined names.
+  const currentSnapshot = identitySnapshot(wine);
 
   const addendum = { fields: Object.keys(proposedFields), reason: cleanReason, evidenceUrl: cleanUrl };
   const label = `${wine.producer || '?'} — ${wine.name}`;
@@ -243,7 +250,7 @@ async function createFieldCorrection(userId, { wineId, fields, reason, evidenceU
       }
       // The row was decided while this filing was composed — it is a fresh
       // filing now, and a fresh filing is budgeted.
-      const fresh = await checkContributionGate(userId);
+      const fresh = await checkContributionGate(userId, { budget: !appliesDirectly(via) });
       if (!fresh.ok) return fresh;
       existing = null;
       amending = false;
@@ -265,8 +272,7 @@ async function createFieldCorrection(userId, { wineId, fields, reason, evidenceU
       // One pending field_correction per wine (partial unique index): a row
       // appeared between the lookup and this insert. Whose it is decides the
       // outcome — the caller's own (a parallel filing of theirs) is amended,
-      // never reported as "in the queue" while its fields were dropped
-      // (audit 2026-09-12 M-1).
+      // never reported as "in the queue" while its fields were dropped.
       if (err?.code === 11000) {
         existing = await findPendingForWine(wineId);
         amending = isOwn(existing, userId);
@@ -296,83 +302,54 @@ const OTHER_USER_CONFLICT =
 
 const isOwn = (row, userId) => !!row && String(row.proposer) === String(userId);
 
-// A deliberately-new variety is still a NAME: it starts with a letter or digit
-// and carries nothing but letters, digits and the punctuation real variety
-// names use ("Rkatsiteli", "Müller-Thurgau", "VB 32-7", "Pinot Meunier (Auxerrois)").
-// That refuses the shapes that polluted the taxonomy before the review gate —
-// "60% Merlot", "Merlot & Cabernet" — and, by length, a pasted sentence: the
-// longest real name runs to five words ("Muscat Blanc à Petits Grains").
-const NEW_GRAPE_NAME = /^[\p{L}\d][\p{L}\p{M}\d .'’()/-]*$/u;
-const NEW_GRAPE_MAX_WORDS = 5;
-const looksLikeGrapeName = (s) => NEW_GRAPE_NAME.test(s)
-  && (s.match(/\p{L}/gu) || []).length >= 2
-  && s.trim().split(/\s+/).length <= NEW_GRAPE_MAX_WORDS;
+const quoted = (names) => names.map((g) => `"${g}"`).join(', ');
 
 /**
- * Resolve a proposed grape list against the taxonomy. Every name must match a
- * variety (by name or synonym) EXCEPT the ones the caller declared in
- * `declaredNew`: those are kept as typed, for an admin to add to the taxonomy
- * before approving. Returns { ok: true, names, newNames } or a fail().
+ * What a refused reading of the proposed fields (services/proposalFields)
+ * says on the member path. Transport-neutral: the same text reaches the web
+ * form, the member's MCP tool and the Registry Bridge.
  */
-async function resolveProposedGrapes(names, declaredNew) {
-  const { resolveGrapeIdsStrict } = require('./wineProfileOps');
-  const { normalizeString, resolveGrapeName } = require('../utils/normalize');
-  // The key the resolver itself dedupes and matches on.
-  const keyOf = (n) => normalizeString(resolveGrapeName(n));
-
-  let declared = new Set();
-  if (declaredNew !== undefined && declaredNew !== null) {
-    if (!Array.isArray(declaredNew) || declaredNew.length > GRAPES_MAX) {
+function fieldFailure(refusal) {
+  switch (refusal.code) {
+    case 'field_too_long':
+      return fail('invalid', `${refusal.field} must be at most ${FIELD_MAX} characters.`);
+    case 'regulatory_mark':
+      return fail('invalid', `"${refusal.value}" is a regulatory mark, not a classification tier — leave classification out, or name the tier (Grand Cru, Premier Cru, Kabinett, Spätlese…).`);
+    case 'unknown_tier':
+      return fail('invalid', refusal.message);
+    case 'bad_type':
+      return fail('invalid', `type must be one of ${WINE_TYPES.join(', ')}.`);
+    case 'bad_colour':
+      return fail('invalid', `colour must be one of ${WINE_COLOURS.join(', ')}.`);
+    case 'grapes_list':
+      return fail('invalid', `grapes must be a list of 1 to ${GRAPES_MAX} variety names — the complete corrected list, since it replaces the current one.`);
+    case 'grape_name':
+      return fail('invalid', `Each grape name must be 1 to ${GRAPE_NAME_MAX} characters.`);
+    case 'new_grapes_list':
       return fail('invalid', `newGrapes must be a list of at most ${GRAPES_MAX} variety names.`);
-    }
-    declared = new Set(
-      declaredNew.map((g) => normalizeString(stripHtml(String(g == null ? '' : g)))).filter(Boolean)
-    );
+    case 'unknown_grapes':
+      return fail('invalid',
+        `These grape names are not in the taxonomy: ${quoted(refusal.names)}. ` +
+        'Check the spelling or use the grape\'s canonical name — a suggestion cannot create a variety.');
+    case 'implausible_grapes':
+      return fail('invalid',
+        `${quoted(refusal.names)} does not look like a grape variety name — ` +
+        'leave out percentages and anything that is not the variety itself.');
+    case 'taxonomy_changed':
+      return fail('conflict', 'The grape taxonomy changed while filing — please try again.');
+    case 'style_shape':
+      return fail('invalid', 'A sweetness style needs the term as the sweetness list has it, who names it (the producer or the trade) and the link to the page that does.');
+    case 'style_source':
+      return fail('invalid', 'The source of a sweetness style is "producer" (the producer\'s own wording) or "trade" (a merchant, a critic, a wine database).');
+    case 'style_url_required':
+      return fail('invalid', 'A sweetness style needs the link to the page that names it.');
+    case 'style_url':
+      return fail('invalid', 'The link for a sweetness style must be an http:// or https:// address with a host and no user name or password.');
+    case 'style_refused':
+      return fail('invalid', refusal.message);
+    default:
+      return fail('invalid', 'Suggest at least one changed field.');
   }
-
-  const strict = await resolveGrapeIdsStrict(names);
-  // Declaring a name that IS in the taxonomy costs nothing: it resolves.
-  if (strict.ok) return { ok: true, names: strict.names, newNames: [] };
-
-  // A name that normalizes to nothing (non-Latin script) can never be declared:
-  // it could not be matched or deduplicated later either.
-  const undeclared = strict.unmatched.filter((g) => !declared.has(normalizeString(g)));
-  if (undeclared.length) {
-    return fail('invalid',
-      `These grape names are not in the taxonomy: ${undeclared.map((g) => `"${g}"`).join(', ')}. ` +
-      'Check the spelling or use the grape\'s canonical name — a suggestion cannot create a variety.');
-  }
-  const implausible = strict.unmatched.filter((g) => !looksLikeGrapeName(g));
-  if (implausible.length) {
-    return fail('invalid',
-      `${implausible.map((g) => `"${g}"`).join(', ')} does not look like a grape variety name — ` +
-      'leave out percentages and anything that is not the variety itself.');
-  }
-
-  // By the resolver's KEY, not by raw string: it skips a second spelling of a
-  // name it has already seen ("Solaris", "solaris" — only the first comes back
-  // unmatched), so a raw comparison read the repeat as a KNOWN variety and the
-  // second pass below failed it as "the taxonomy changed", on every retry
-  // (pre-deploy audit 2026-09-18).
-  const unmatchedKeys = new Set(strict.unmatched.map(keyOf));
-  const known = names.filter((n) => { const k = keyOf(n); return !!k && !unmatchedKeys.has(k); });
-  let canonical = [];
-  if (known.length) {
-    const again = await resolveGrapeIdsStrict(known);
-    // The taxonomy moved between the two reads — the caller simply retries.
-    if (!again.ok) return fail('conflict', 'The grape taxonomy changed while filing — please try again.');
-    canonical = again.names;
-  }
-  const seen = new Set(canonical.map((n) => normalizeString(n)));
-  const newNames = [];
-  for (const raw of strict.unmatched) {
-    const clean = raw.replace(/\s+/g, ' ').trim();
-    const key = normalizeString(clean);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    newNames.push(clean);
-  }
-  return { ok: true, names: [...canonical, ...newNames], newNames };
 }
 
 /**
@@ -430,8 +407,8 @@ function findPendingForWine(wineId) {
 /**
  * Read-side view of the one-pending-per-wine state, for get_wine and the
  * like: which fields a pending suggestion covers and whether it is the
- * CALLER's (then also when it was filed) — never whose it is otherwise (the
- * #930 anonymisation rule: proposer identity stays with admins). Proposed
+ * CALLER's (then also when it was filed) — never whose it is otherwise
+ * (proposer identity stays with admins). Proposed
  * VALUES are not exposed either: the queue is not a second, unreviewed
  * registry.
  *

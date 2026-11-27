@@ -1,26 +1,24 @@
-// Registry-safe write tools (plan §5.1 — the two-step resolve→add contract):
+// Registry-safe write tools (the two-step resolve→add contract):
 // resolve_wine [read] / add_bottle [write] / update_bottle [write].
 //
 // Registry integrity is the design center here. add_bottle can only reference
 // an EXISTING registry wine (wine_id) or go through findOrCreateWine — the
-// same #674-hardened chokepoint every other surface uses (producer-in-name
-// strip, sibling match, fuzzy scoring, soft-zone). MCP is deliberately
-// STRICTER than REST: sibling matching stays ON even for confirmed creates,
-// and every wine minted here is stamped createdVia:'mcp' + audited
-// (wine.create), so admins can review AI-created wines as a class.
+// same chokepoint every other surface uses (producer-in-name strip, sibling
+// match, fuzzy scoring, soft-zone). MCP is deliberately STRICTER than REST:
+// sibling matching stays ON even for confirmed creates, and every wine minted
+// here is stamped createdVia:'mcp' + audited (wine.create), so admins can
+// review AI-created wines as a class.
 //
 // AI cost: creating a bottle fires the same fire-and-forget embed/enrich calls
 // as the web app, which carry their own kill-switch + per-user budget gates —
 // an MCP add costs exactly what a UI add costs, and dedup means a known wine
 // costs nothing.
 const { z } = require('zod');
-const WineDefinition = require('../../models/WineDefinition');
 const { findVisibleWine } = require('../../services/wineVisibility');
 const { registerTool } = require('../registry');
 // findOrCreateWine is required LAZILY inside handlers: it top-requires
-// services/search → the ESM-only meilisearch package, which jest cannot parse
-// — a top-level require here would break every suite that loads the tool
-// registry (the #702 failure mode).
+// services/search → the ESM-only meilisearch package, which jest cannot parse;
+// a top-level require here breaks every suite that loads the tool registry.
 const { addBottle, updateBottleFields, markArrived } = require('../../services/bottleOps');
 const { parseExpectedArrival } = require('../../utils/onOrder');
 const { ORDERED_STATUS } = require('../../config/constants');
@@ -30,24 +28,27 @@ const { announceMintedWine } = require('../../services/wineCommit');
 const { isValidId } = require('../../utils/validation');
 const { decorateGrapes } = require('../../utils/grapeDisplay');
 const { parseCurrency } = require('../../config/currencies');
+const { isSafeUrl } = require('../../utils/sanitize');
 const {
   ok, fail, objectId, MSG_CELLAR_NOT_FOUND, MSG_BOTTLE_NOT_FOUND,
-  resolveCellarAccess, resolveBottleAccess, wineSummary,
+  resolveCellarAccess, resolveBottleAccess, wineSummary, FIELD_DESCRIPTIONS,
 } = require('../toolUtil');
 const { logAction, replay, releaseClaim } = require('../actionLedger');
 
 const NEW_WINE_SHAPE = {
   name: z.string().trim().min(1).max(200).describe('Wine name WITHOUT the producer in it (e.g. "Sauvignon Blanc", not "Cloudy Bay Sauvignon Blanc")'),
   // Optional, NOT because a producerless wine is fine — it is the single most
-  // valuable identity field — but because refusing the add was worse: the
-  // bottle was simply lost. Omitting it mints a pendingIdentity registry row a
+  // valuable identity field — but because refusing the add is worse: the
+  // bottle would simply be lost. Omitting it mints a pendingIdentity row a
   // sommelier completes; the model should still ask the user first.
   producer: z.string().trim().max(200).optional()
     .describe('Omit ONLY when the user genuinely cannot tell you (unreadable label). The wine is then filed for sommelier completion and stays invisible to other users until then — never guess a producer to fill this in.'),
   country: z.string().trim().min(1).max(200).describe('Country name (required to create)'),
-  region: z.string().max(200).optional(),
-  appellation: z.string().max(200).optional(),
-  type: z.enum(['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified']).describe('Required: creating without the real type would mint a default-red registry entry'),
+  region: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.region),
+  appellation: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.appellation),
+  classification: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.classification),
+  type: z.enum(['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified']).optional().describe('Required unless category is "other": creating a wine without its real type would mint a default-red registry entry'),
+  category: z.enum(['wine', 'other']).optional().describe('"other" for a drink that is NOT wine (cider, beer, spirits, a soft drink): it stays in the user\'s cellar with no type, outside the shared wine registry, and gets no drink window or tasting profile. Default "wine".'),
   grapes: z.array(z.string().max(200)).max(10).optional(),
 };
 
@@ -64,12 +65,15 @@ registerTool({
   inputSchema: {
     name: z.string().min(1).max(200),
     producer: z.string().min(1).max(200),
-    appellation: z.string().max(200).optional(),
+    appellation: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.appellation),
+    // Accepted so a client can hand the lookup the same object it will pass
+    // as add_bottle's new_wine; it plays no part in matching.
+    classification: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.classification + ' Accepted here only so the lookup takes the same object as add_bottle new_wine; it plays no part in matching.'),
   },
   handler: async (args, ctx) => {
     const { findOrCreateWine } = require('../../services/findOrCreateWine');
     const result = await findOrCreateWine(
-      { name: args.name, producer: args.producer, appellation: args.appellation },
+      { name: args.name, producer: args.producer, appellation: args.appellation, classification: args.classification },
       ctx.user.id,
       { matchOnly: true }
     );
@@ -78,13 +82,13 @@ registerTool({
     // registry keeps referencing the canonical Grape doc.
     if (result.wine) {
       return ok(`Matched existing registry wine: ${result.wine.name}`, {
-        matched: { ...wineSummary(decorateGrapes(result.wine)) },
+        matched: { ...wineSummary(decorateGrapes(result.wine), { termLoaded: true }) },
         guidance: 'Use this wine_id in add_bottle. Do not create a new wine.',
       });
     }
     if (result.candidates?.length) {
       return ok(`${result.candidates.length} close candidate(s) — none certain`, {
-        candidates: result.candidates.map((c) => ({ ...wineSummary(decorateGrapes(c.wine)), score: c.score })),
+        candidates: result.candidates.map((c) => ({ ...wineSummary(decorateGrapes(c.wine), { termLoaded: true }), score: c.score })),
         guidance: 'If one of these IS the wine, use its wine_id in add_bottle. Only if none match, call add_bottle with new_wine and confirm_new_wine:true.',
       });
     }
@@ -94,6 +98,13 @@ registerTool({
     });
   },
 });
+
+// True when a YYYY-MM-DD string names a day that exists: "2026-02-30" has
+// the right shape and is no date.
+function isRealDay(day) {
+  const d = new Date(`${day}T00:00:00.000Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === day;
+}
 
 registerTool({
   name: 'add_bottle',
@@ -109,7 +120,8 @@ registerTool({
     'by itself after 7 days). Prefer it when the user is still gathering the facts of a wine the registry does not know. ' +
     'on_order:true adds a bottle that is bought but not delivered yet (en primeur, a pre-order, a delivery on its way): it ' +
     'stays out of the cellar counts, racks and suggestions until mark_arrived; expected_arrival is its month (YYYY-MM, ' +
-    'update_bottle changes it). One call adds one bottle — call it again for each further bottle of an order.',
+    'update_bottle changes it). One call adds one bottle — call it again for each further bottle of an order. ' +
+    'Bought in a shop: pass purchase_location (the shop), purchase_url (its page for the wine or the order) and purchase_date.',
   scope: 'write',
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   inputSchema: {
@@ -119,9 +131,12 @@ registerTool({
     confirm_new_wine: z.boolean().optional().describe('Set true to create despite close-but-unconfirmed candidates'),
     draft: z.boolean().optional().describe('With new_wine only: keep the new wine as the user\'s private draft (see publish_wine)'),
     vintage: z.string().max(10).optional().describe('e.g. "2019" or "NV"'),
+    bottle_size: z.string().max(40).optional().describe('A volume ("750ml", "1.5 L", "375ml") or a format name ("magnum", "half", "imperial"); a standard 750 ml bottle when left out'),
     price: z.number().min(0).optional(),
     currency: z.string().regex(/^[A-Za-z]{3}$/).optional(),
-    purchase_location: z.string().max(500).optional(),
+    purchase_location: z.string().max(500).optional().describe('Shop, merchant or place bought'),
+    purchase_url: z.string().max(2048).optional().describe('https link to the purchase or product page'),
+    purchase_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('Day bought, YYYY-MM-DD (today when left out)'),
     notes: z.string().max(5000).optional(),
     occasion: z.string().max(500).optional(),
     rating: z.number().min(0).max(100).optional(),
@@ -148,8 +163,7 @@ registerTool({
       return fail('invalid_input', 'draft:true applies to new_wine only — an existing registry wine cannot become a draft.');
     }
     // Before any wine is created: addBottle refuses an unsupported currency,
-    // and a new_wine would otherwise be left without its bottle (release
-    // audit 2026-10-13).
+    // and a new_wine would otherwise be left without its bottle.
     const currencyCheck = parseCurrency(args.currency);
     if (!currencyCheck.ok) return fail('invalid_input', currencyCheck.error);
     // The same for an order's month (a real month, not too far off): checked
@@ -157,6 +171,21 @@ registerTool({
     if (args.on_order === true) {
       const monthCheck = parseExpectedArrival(args.expected_arrival);
       if (!monthCheck.ok) return fail('invalid_input', monthCheck.error);
+    }
+    // And for the purchase link and day, for the same reason. addBottle checks
+    // the link again; nothing after this point checks that the day exists.
+    if (args.purchase_url && !isSafeUrl(args.purchase_url)) {
+      return fail('invalid_input', 'purchase_url must be a valid http or https URL');
+    }
+    if (args.purchase_date !== undefined && !isRealDay(args.purchase_date)) {
+      return fail('invalid_input', `purchase_date "${args.purchase_date}" is not a day in the calendar. Use YYYY-MM-DD.`);
+    }
+    // A size that cannot be read is refused, as in update_bottle
+    // (resolveMcpBottleSize below): the service would store it as 750 ml.
+    let bottleSize;
+    if (args.bottle_size) {
+      bottleSize = resolveMcpBottleSize(args.bottle_size);
+      if (!bottleSize) return fail('invalid_input', `bottle_size "${args.bottle_size}" is not a size Cellarion can read. Use one of: ${SIZE_HELP}.`);
     }
 
     const access = await resolveCellarAccess(ctx.user.id, args.cellar_id, 'editor');
@@ -168,15 +197,19 @@ registerTool({
     if (args.wine_id) {
       if (!isValidId(args.wine_id)) return fail('invalid_input', 'wine_id must be a 24-hex Mongo id.');
       // Visible-to-this-caller (services/wineVisibility): the creator may add
-      // more bottles of their own pending row (that is how a case of one
-      // unreadable label works), a stranger gets the same not_found a missing
-      // id gets — security audit M-4.
+      // more bottles of their own pending row (how a case of one unreadable
+      // label works); a stranger gets the same not_found as a missing id.
       wineDoc = await findVisibleWine(args.wine_id, {
-        userId: ctx.user.id, roles: ctx.user.roles, populate: ['country', 'region', 'grapes'],
+        userId: ctx.user.id, roles: ctx.user.roles,
+        select: '+sweetnessStyle',
+        populate: ['country', 'region', 'grapes', { path: 'labelSweetness', select: 'name band scale regulated -_id' }, { path: 'sweetnessStyle.term', select: 'name band scale regulated' }],
       });
       if (!wineDoc) return fail('not_found', 'No registry wine with that id. Use resolve_wine or search_registry.');
     } else {
       const { findOrCreateWine } = require('../../services/findOrCreateWine');
+      if (!args.new_wine.type && args.new_wine.category !== 'other') {
+        return fail('invalid_input', 'new_wine.type is required unless category is "other" (a drink that is not wine).');
+      }
       let result;
       try {
         // Sibling matching stays ON even when confirmed — stricter than REST,
@@ -190,9 +223,11 @@ registerTool({
           // apply to the deliberate registry-curation tool
           // (admin_add_registry_wine), which never passes this.
           allowPending: true,
-          // PRIVATE DRAFT (support ticket 2026-09-12): the row stays the
-          // user's until publish_wine. Strictly boolean true.
+          // PRIVATE DRAFT: the row stays the user's until publish_wine.
+          // Strictly boolean true.
           draft: args.draft === true,
+          // The Other category: born outside the shared wine registry.
+          nonWine: args.new_wine.category === 'other',
         });
       } catch (err) {
         if (err?.status === 400) return fail('invalid_input', err.message);
@@ -203,7 +238,7 @@ registerTool({
           'Very similar wines already exist — use one of these wine_ids, or call again with confirm_new_wine:true ONLY if the user confirms it is genuinely different: ' +
           result.candidates.map((c) => `${c.wine.name} — ${c.wine.producer} (wine_id ${c.wine._id}, score ${c.score})`).join('; '));
       }
-      // A no-wine result with no candidates either (audit L-7): the branch
+      // A no-wine result with no candidates either: the branch
       // above only covers the candidates case, so this fell through to
       // `wineDoc.name` and threw a 500. bulk.js:224 already handles it as a
       // failure rather than a crash — mirror that.
@@ -220,7 +255,7 @@ registerTool({
             // keeps meaning "the producer was missing".
             ...(wineDoc.pendingIdentity && !wineDoc.draft ? { pendingIdentity: true } : {}),
             ...(wineDoc.draft ? { draft: true } : {}),
-            // The refused producer string survives ONLY here (audit MED-1) —
+            // The refused producer string survives ONLY here —
             // the pending row stores '', and a curator needs what the label
             // scan / caller actually said.
             ...(result.producerRejected
@@ -233,9 +268,12 @@ registerTool({
 
     const result = await addBottle(access.cellar, wineDoc, {
       vintage: args.vintage,
+      bottleSize,
       price: args.price,
       currency: args.currency,
       purchaseLocation: args.purchase_location,
+      purchaseUrl: args.purchase_url,
+      purchaseDate: args.purchase_date,
       notes: args.notes,
       occasion: args.occasion,
       rating: args.rating,
@@ -249,6 +287,14 @@ registerTool({
     }, ctx.req);
     if (result.error) return fail('invalid_input', result.error.message);
     const { bottle } = result;
+    // category "other" on a record the registry already had as wine: the
+    // user now holds a bottle, so their word applies or files, as on the page.
+    let notWine = null;
+    if (args.new_wine) {
+      const { applyOtherCategoryAfterAdd } = require('../../services/nonWineOps');
+      notWine = await applyOtherCategoryAfterAdd({ wine: wineDoc, newWine: args.new_wine, userId: ctx.user.id, req: ctx.req, via: 'mcp' });
+      if (notWine && notWine.status === 'applied') wineDoc.nonWine = true;
+    }
 
     const wineDraft = wineDoc.draft === true;
     // A draft is pending by invariant; "pending identity" here keeps its own
@@ -258,8 +304,11 @@ registerTool({
       summary: `Added ${wineDoc.name} ${bottle.vintage} to "${access.cellar.name}"${bottle.status === ORDERED_STATUS ? ' — on order, not in the cellar until it arrives (mark_arrived)' : ''}${wineDraft ? (wineCreated ? ' (private draft wine — only you can see it; publish_wine when the record is complete)' : ' (on your private draft wine)') : wineCreated ? (pendingIdentity ? ' (registry wine filed for sommelier completion — no producer)' : ' (new registry wine created)') : ''}`,
       data: {
         bottle_id: bottle._id,
-        wine: { ...wineSummary(wineDoc) },
+        // Only a wine read by its id asked for the style; a wine this call
+        // found or created (findOrCreateWine) did not, so it carries no key.
+        wine: { ...wineSummary(wineDoc, { termLoaded: true, styleLoaded: !!args.wine_id }) },
         wine_created: wineCreated,
+        ...(notWine ? { not_wine: notWine, note: notWine.status === 'applied' ? 'The record was already in the registry as wine; on your word it is now in the Other category.' : notWine.status === 'filed' ? `The record was already in the registry as wine and ${notWine.holders} members hold it, so a curator will decide on the Other category; the bottle is saved.` : 'A curator proposal to move this record to Other is already waiting; the bottle is saved.' } : {}),
         // Say it plainly: the bottle is saved and usable, but the wine is not
         // shared registry content until a curator completes the identity.
         ...(pendingIdentity ? {
@@ -415,16 +464,15 @@ registerTool({
     if (result.error) return fail('invalid_input', result.error.message);
 
     // apply_to_lot: the lot-level fields of THIS call go to every other active
-    // bottle of the same wine and vintage in the user's own cellars (support
-    // ticket 2026-09-06 — six identical calls for a case). Each sibling runs
+    // bottle of the same wine and vintage in the user's own cellars, so a case
+    // needs one call, not one per bottle. Each sibling runs
     // the same shared validation; one that refuses (a peak outside ITS own
     // window, say) is reported under skipped, never fatal for the rest.
     // Notes and the purchase travel too, but only here, on an explicit
     // apply_to_lot — the app's own lot paths keep them per bottle.
     const lotFields = lotFieldsRequested;
-    // A price is meaningless without its currency: carry this bottle's
-    // (audit 2026-09-07 — siblings kept their own, default USD, so "350"
-    // landed as 350 USD next to 350 SEK).
+    // A price is meaningless without its currency: carry this bottle's, or a
+    // sibling would read the same number in its own (USD by default).
     if (lotFields.price !== undefined && lotFields.currency === undefined && bottle.currency) lotFields.currency = bottle.currency;
     const lot = { count: 0, applied: [], unchanged: 0, skipped: [] };
     const primaryChanged = Object.keys(result.changes).length > 0;
@@ -432,7 +480,7 @@ registerTool({
     const prevById = primaryChanged ? { [String(bottle._id)]: result.prev } : {};
     const warnings = [];
     // The lot is the caller's OWN bottles; from a bottle in someone else's
-    // cellar that would be the wrong lot (audit 2026-09-07), so say so.
+    // cellar that would be the wrong lot, so say so.
     if (args.apply_to_lot && !Object.keys(lotFields).length) {
       warnings.push(`apply_to_lot ignored: none of the fields in this call are lot-level (${MCP_LOT_PARAMS})`);
     } else if (args.apply_to_lot && !ownCellar) {
@@ -454,7 +502,7 @@ registerTool({
     if (!primaryChanged && !lot.applied.length) {
       // No mutation → logAction never runs, so the claim replay() took above
       // would stay pending and turn every same-key retry into a bogus `busy`
-      // for CLAIM_STALE_MS (audit 2026-07-24 M11). Release it: a retry simply
+      // for CLAIM_STALE_MS. Release it: a retry simply
       // re-runs and no-ops again.
       await releaseClaim(ctx, args.idempotency_key, 'update_bottle');
       return ok('No changes — every value already matched', withLot({ bottle_id: bottle._id, changes: {} }), extra);
@@ -491,7 +539,7 @@ registerTool({
 });
 
 // Shared with tools/bulk.js so batch items validate identically to singles.
-module.exports = { NEW_WINE_SHAPE };
+module.exports = { NEW_WINE_SHAPE, resolveMcpBottleSize, SIZE_HELP, isRealDay };
 
 // A bottle bought but not delivered yet has arrived — the MCP twin of the
 // On order page's "Mark as arrived" (bottleOps.markArrived, the same rules).

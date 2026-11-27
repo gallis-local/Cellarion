@@ -5,6 +5,22 @@ import { useTranslation } from 'react-i18next';
 import ReactMarkdown from 'react-markdown';
 import rehypeSanitize from 'rehype-sanitize';
 import { useAuth } from '../contexts/AuthContext';
+import { formatTemperatureRange, temperatureUnitOf } from '../utils/temperature';
+
+// Wine-level serving advice from the API: the temperature (the sommelier's or
+// the style's) in the reader's unit, and the air trait in words. The decanting
+// advice for a bottle's age lives on the bottle page, where the age is known.
+function ServingLine({ serving, user, t }) {
+  if (!serving?.temperature) return null;
+  const range = formatTemperatureRange(serving.temperature.min, serving.temperature.max, temperatureUnitOf(user));
+  return (
+    <div className="bd-ai-pairings bd-ai-serving">
+      <span className="bd-ai-pairings__label">{t('serving.label', { defaultValue: 'Serving' })}:</span>
+      {t('serving.temperature', { range, defaultValue: 'Serve at {{range}}' })}
+      {serving.needsAir ? ` · ${t(`serving.needsAir.${serving.needsAir}`)}` : ''}
+    </div>
+  );
+}
 import { fromNormalized } from '../utils/ratingUtils';
 import Layout from '../components/Layout';
 import SEOHead from '../components/SEOHead';
@@ -12,10 +28,13 @@ import SITE_URL from '../config/siteUrl';
 import WineImage from '../components/WineImage';
 import WineDiscussionsPanel from '../components/WineDiscussionsPanel';
 import AddToCellarButton from '../components/AddToCellarButton';
+import RegistryContributionPanel from '../components/RegistryContributionPanel';
+import { isHostedOrigin } from '../utils/mcpConnect';
 import { WhenToDrinkCard, WhereFromCard, MoreWinesCard } from '../components/WineContextCards';
 import { getWineImageUrl } from '../utils/wineImageUrl';
 import { API_URL } from '../api/apiConstants';
 import { swatchType, wineTypeLabel } from '../utils/wineColour';
+import { profileText } from '../utils/profileText';
 import './WineDetail.css';
 
 // Lazy like BottleDetail: the report modal is a rare interaction and must not
@@ -46,8 +65,7 @@ export default function WineDetail() {
     const fetchWine = async () => {
       try {
         // Signed in: send the session along so the same endpoint returns the
-        // full profile; anonymous visitors get the prose-only tier (registry
-        // lockdown 2026-09-06).
+        // full profile; anonymous visitors get the prose-only tier.
         const url = `${API_URL}/api/wines/${encodeURIComponent(idOrSlug)}/public`;
         const res = user ? await apiFetch(url) : await fetch(url);
         if (ignore) return;
@@ -96,8 +114,9 @@ export default function WineDetail() {
     wine.region?.name,
     wine.country?.name
   ].filter(Boolean).join(' · ');
-  // Same rule as the crawler page (backend og.js): the tasting prose makes the
-  // description this wine's own; cut on a word.
+  // Same rule as the crawler page (backend og/wine.js): the tasting prose makes the
+  // description this wine's own; cut on a word. The English prose, as there —
+  // a translated copy is for the card below.
   const fullDesc = wine.aiProfile?.description
     ? `${fullTitle}. ${wine.aiProfile.description}`
     : `${fullTitle}. ${description}. Discover, track, and manage your wine cellar with Cellarion.`;
@@ -119,6 +138,11 @@ export default function WineDetail() {
   const placeLink = (entry, label) => (entry?.path
     ? <Link to={entry.path} className="wd-detail-link">{label}</Link>
     : label);
+
+  // The card's prose: the translated copy while the server sent a fresh one
+  // (SuperAdmin → AI), else the English (utils/profileText).
+  const proseText = profileText(wine.aiProfile);
+  const proseLang = proseText.lang || undefined;
 
   const ratingScale = user?.preferences?.ratingScale || '5';
   const hasRating = wine.communityRating?.reviewCount > 0;
@@ -245,8 +269,8 @@ export default function WineDetail() {
         <div className="wd-card bd-ai-profile">
           <div className="bd-ai-profile__header">
             <h2>{t('wineDetail.tastingProfile', 'Tasting profile')}</h2>
-            {/* Provenance is load-bearing here too (#985): the public page
-                must never present AI-generated text as established fact. */}
+            {/* Provenance is load-bearing here too: the public page must
+                never present AI-generated text as established fact. */}
             {wine.aiProfile.source === 'curator' ? (
               <span className="bd-ai-tag bd-ai-tag--curator" title={t('wineDetail.provenanceCuratorTitle', 'A sommelier has verified this profile')}>
                 {t('wineDetail.provenanceCurator', 'Curator-verified')}
@@ -268,7 +292,7 @@ export default function WineDetail() {
               ap.acidity && `${ap.acidity} acidity`,
               ap.sweetness,
             ].filter(Boolean);
-            const flavours = ap.flavors || [];
+            const flavours = proseText.flavors;
             return (
               <>
                 {structure.length > 0 && (
@@ -282,7 +306,7 @@ export default function WineDetail() {
                 {flavours.length > 0 && (
                   <div className="bd-ai-group">
                     <span className="bd-ai-group-label">{t('wineDetail.flavours', 'Flavours')}</span>
-                    <div className="bd-ai-chips">
+                    <div className="bd-ai-chips" lang={proseLang}>
                       {flavours.map((f, i) => <span key={`f${i}`} className="bd-ai-chip">{f}</span>)}
                     </div>
                   </div>
@@ -291,21 +315,22 @@ export default function WineDetail() {
             );
           })()}
 
-          <div className="bd-ai-prose">
-            <ReactMarkdown rehypePlugins={[rehypeSanitize]} disallowedElements={['img']} unwrapDisallowed>{wine.aiProfile.description}</ReactMarkdown>
+          <div className="bd-ai-prose" lang={proseLang}>
+            <ReactMarkdown rehypePlugins={[rehypeSanitize]} disallowedElements={['img']} unwrapDisallowed>{proseText.description}</ReactMarkdown>
           </div>
 
-          {wine.aiProfile.foodPairings?.length > 0 && (
+          {proseText.foodPairings.length > 0 && (
             <div className="bd-ai-pairings">
               <span className="bd-ai-pairings__label">{t('wineDetail.pairsWith', 'Pairs with')}:</span>
-              {wine.aiProfile.foodPairings.join(' · ')}
+              {proseLang ? <span lang={proseLang}>{proseText.foodPairings.join(' · ')}</span> : proseText.foodPairings.join(' · ')}
             </div>
           )}
+          <ServingLine serving={wine.serving} user={user} t={t} />
         </div>
       )}
 
-      {/* No published profile — same honest pending state as the bottle page
-          (somm ticket 6a83e765): held and never-generated must read alike. */}
+      {/* No published profile — same honest pending state as the bottle page:
+          held and never-generated must read alike. */}
       {!wine.aiProfile?.description && (
         <div className="wd-card bd-ai-profile">
           <div className="bd-ai-profile__header">
@@ -317,6 +342,7 @@ export default function WineDetail() {
           <p style={{ color: 'var(--color-text-muted)', margin: 0, fontSize: '0.9rem' }}>
             {t('wineDetail.profilePendingBody', 'This wine hasn’t been assessed yet. A tasting profile appears here once it has been.')}
           </p>
+          <ServingLine serving={wine.serving} user={user} t={t} />
         </div>
       )}
 
@@ -346,13 +372,16 @@ export default function WineDetail() {
           <Link to="/cellars" className="btn btn-secondary">
             {t('wineDetail.backToCellars')}
           </Link>
-          {/* R7: the report link used to exist only on the bottle page — but
-              wrong shared data is most visible to NON-owners, right here. */}
+          {/* The report link is here as well as on the bottle page: wrong
+              shared data is most visible to NON-owners, right here. */}
           <button type="button" className="btn btn-secondary" onClick={() => setShowReport(true)}>
             {t('wineDetail.reportIssue')}
           </button>
         </div>
       )}
+
+      {/* A self-hosted install: offer a wine made here to the shared registry. */}
+      {user && !isHostedOrigin(window.location.origin) && <RegistryContributionPanel wineId={wine._id} />}
 
       <WhereFromCard context={context} countryName={wine.country?.name} />
       <MoreWinesCard context={context} wine={wine} />

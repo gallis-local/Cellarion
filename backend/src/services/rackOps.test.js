@@ -7,15 +7,21 @@
 
 jest.mock('../models/Cellar', () => {
   const M = jest.fn(function (doc) { Object.assign(this, doc); this._id = 'cellar-new'; this.save = jest.fn().mockResolvedValue(undefined); });
+  M.findById = jest.fn();
+  M.find = jest.fn();
   return M;
 });
+// The account a bottle is handed to: its isDemo flag is all a move reads.
+jest.mock('../models/User', () => ({ findById: jest.fn() }));
 jest.mock('../models/Rack', () => {
   const M = jest.fn(function (doc) { Object.assign(this, doc); this._id = 'rack-new'; this.save = jest.fn().mockResolvedValue(undefined); });
   M.RACK_TYPES = ['grid', 'x-rack', 'hex', 'triangle', 'stack', 'cube', 'shelf', 'cabinet'];
   M.updateMany = jest.fn().mockResolvedValue({});
+  M.updateOne = jest.fn().mockResolvedValue({});
+  M.findOneAndUpdate = jest.fn().mockResolvedValue(null);
   return M;
 });
-jest.mock('../models/Bottle', () => ({ findOne: jest.fn(), findById: jest.fn() }));
+jest.mock('../models/Bottle', () => ({ findOne: jest.fn(), findById: jest.fn(), exists: jest.fn() }));
 jest.mock('./audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../utils/rackGeometry', () => ({
   getMaxPosition: jest.fn(() => 32),
@@ -25,19 +31,27 @@ jest.mock('../utils/rackGeometry', () => ({
   validateCabinetConfig: jest.requireActual('../utils/rackGeometry').validateCabinetConfig,
 }));
 jest.mock('./bottleOps', () => ({ removeFromRacks: jest.fn().mockResolvedValue(undefined) }));
-jest.mock('./search', () => ({ indexBottle: jest.fn() }));
+jest.mock('./search', () => ({}));
 
 const Cellar = require('../models/Cellar');
+const User = require('../models/User');
 const Rack = require('../models/Rack');
 const Bottle = require('../models/Bottle');
 const { logAudit } = require('./audit');
 const { removeFromRacks } = require('./bottleOps');
-const { createCellar, createGridRack, placeBottleInRack, clearRackSlot, moveBottleToCellar, applyArrangement } = require('./rackOps');
+const {
+  createCellar, createGridRack, placeBottleInRack, clearRackSlot, findMoveDestination, moveBottleToCellar, applyArrangement,
+} = require('./rackOps');
 
 const REQ = { user: { id: 'u1', roles: ['user'] }, headers: {} };
 const selectable = (doc) => ({ select: jest.fn().mockResolvedValue(doc) });
 
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => {
+  jest.clearAllMocks();
+  // A placed bottle is looked at again after the save: still in the cellar.
+  Bottle.exists.mockResolvedValue({ _id: 'b1' });
+  Rack.findOneAndUpdate.mockResolvedValue(null);
+});
 
 describe('createCellar', () => {
   test('trims name, audits cellar.create; duplicate → 409 conflict', async () => {
@@ -64,7 +78,7 @@ describe('createGridRack', () => {
     expect((await createGridRack(cellar, { name: 'B', type: 'modular' }, REQ)).error.status).toBe(400);
   });
 
-  // typeConfig arrived with the REST POST /racks delegation (MCP-audit H1) —
+  // typeConfig arrived with the REST POST /racks delegation —
   // the grid branch of the route now runs through here, double-height rows
   // included.
   test('valid typeConfig.doubleHeightRows is stored; invalid rows / non-grid type are 400', async () => {
@@ -151,11 +165,13 @@ describe('placeBottleInRack', () => {
     // $inc __v: the cross-rack $pull must bump those racks' versions so a
     // concurrent whole-slots save() on one of them (auto_arrange) conflicts
     // cleanly instead of re-inserting the bottle it just lost.
-    expect(Rack.updateMany).toHaveBeenCalledWith(
+    expect(Rack.findOneAndUpdate).toHaveBeenCalledWith(
       { _id: { $ne: 'r1' }, cellar: 'c1', 'slots.bottle': 'b1' },
-      { $pull: { slots: { bottle: 'b1' } }, $inc: { __v: 1 } }
+      { $pull: { slots: { bottle: 'b1' } }, $inc: { __v: 1 } },
+      expect.objectContaining({ lean: true })
     );
-    expect(logAudit).toHaveBeenCalledWith(REQ, 'rack.slot_assign', expect.anything(), { position: 5 });
+    // The row names the bottle and the one it pushed out, not only the slot.
+    expect(logAudit).toHaveBeenCalledWith(REQ, 'rack.slot_assign', expect.anything(), { position: 5, bottleId: 'b1', displaced: 'bOccupant' });
   });
 
   test('VersionError on save → conflict (optimistic concurrency)', async () => {
@@ -174,6 +190,114 @@ describe('placeBottleInRack', () => {
     const res = await placeBottleInRack(r, 5, 'b1', REQ);
     expect(res.error).toMatchObject({ status: 409, code: 'conflict' });
     expect(res.error.message).toMatch(/another rack/);
+  });
+
+  test('a placement refused by a concurrent write gives the bottle back the slot it was taken from', async () => {
+    Bottle.findOne.mockReturnValue(selectable({ _id: 'b1', status: 'active' }));
+    // b1 sat in another rack of the cellar, slot 7.
+    Rack.findOneAndUpdate.mockResolvedValue({ _id: 'rOther', slots: [{ position: 7, bottle: 'b1' }] });
+    const r = rack(); r.save = jest.fn().mockRejectedValue(Object.assign(new Error('v'), { name: 'VersionError' }));
+    const res = await placeBottleInRack(r, 5, 'b1', REQ);
+    expect(res.error).toMatchObject({ status: 409, code: 'conflict' });
+    // Back into slot 7 of that rack, only if the slot is still free and the bottle sits nowhere else in it.
+    expect(Rack.updateOne).toHaveBeenCalledWith(
+      { _id: 'rOther', deletedAt: null, 'slots.position': { $ne: 7 }, 'slots.bottle': { $ne: 'b1' } },
+      { $push: { slots: { position: 7, bottle: 'b1' } }, $inc: { __v: 1 } }
+    );
+    expect(logAudit).not.toHaveBeenCalled();
+  });
+
+  test('a bottle that lost the race into another rack is placed there: nothing is put back', async () => {
+    Bottle.findOne.mockReturnValue(selectable({ _id: 'b1', status: 'active' }));
+    Rack.findOneAndUpdate.mockResolvedValue({ _id: 'rOther', slots: [{ position: 7, bottle: 'b1' }] });
+    const r = rack(); r.save = jest.fn().mockRejectedValue(Object.assign(new Error('E11000 duplicate key'), { code: 11000 }));
+    expect((await placeBottleInRack(r, 5, 'b1', REQ)).error).toMatchObject({ status: 409, code: 'conflict' });
+    expect(Rack.updateOne).not.toHaveBeenCalled();
+  });
+
+  test('a bottle that left the cellar while it was being placed is taken out again, and the bottle it pushed out gets the slot back', async () => {
+    Bottle.findOne.mockReturnValue(selectable({ _id: 'b1', status: 'active' }));
+    Bottle.exists.mockResolvedValue(null); // moved to another cellar, or drunk, meanwhile
+    const r = rack([{ position: 5, bottle: 'bOccupant' }]);
+    const res = await placeBottleInRack(r, 5, 'b1', REQ);
+    expect(res.error).toMatchObject({ status: 409, code: 'conflict' });
+    expect(Bottle.exists).toHaveBeenCalledWith({ _id: 'b1', cellar: 'c1', status: { $in: ['active', null] } });
+    expect(Rack.updateOne).toHaveBeenNthCalledWith(1, { _id: 'r1' }, { $pull: { slots: { bottle: 'b1' } }, $inc: { __v: 1 } });
+    expect(Rack.updateOne).toHaveBeenNthCalledWith(2,
+      { _id: 'r1', deletedAt: null, 'slots.position': { $ne: 5 }, 'slots.bottle': { $ne: 'bOccupant' } },
+      { $push: { slots: { position: 5, bottle: 'bOccupant' } }, $inc: { __v: 1 } });
+    expect(r.slots).toEqual([{ position: 5, bottle: 'bOccupant' }]);
+    expect(logAudit).not.toHaveBeenCalled();
+  });
+
+  test('a bottle that came from another rack is cleared from every other rack, also where the unique index is missing', async () => {
+    Bottle.findOne.mockReturnValue(selectable({ _id: 'b1', status: 'active' }));
+    Rack.findOneAndUpdate.mockResolvedValue({ _id: 'rOther', slots: [{ position: 7, bottle: 'b1' }] });
+    expect((await placeBottleInRack(rack(), 5, 'b1', REQ)).error).toBeUndefined();
+    expect(Rack.updateMany).toHaveBeenCalledWith(
+      { _id: { $ne: 'r1' }, cellar: 'c1', 'slots.bottle': 'b1' },
+      { $pull: { slots: { bottle: 'b1' } }, $inc: { __v: 1 } }
+    );
+    // A bottle that sat in no other rack costs no second write.
+    Rack.updateMany.mockClear();
+    Rack.findOneAndUpdate.mockResolvedValue(null);
+    expect((await placeBottleInRack(rack(), 6, 'b1', REQ)).error).toBeUndefined();
+    expect(Rack.updateMany).not.toHaveBeenCalled();
+  });
+
+  test('a bottle drunk or moved while it was out of its rack is not put back to stay', async () => {
+    Bottle.findOne.mockReturnValue(selectable({ _id: 'b1', status: 'active' }));
+    Rack.findOneAndUpdate.mockResolvedValue({ _id: 'rOther', slots: [{ position: 7, bottle: 'b1' }] });
+    Rack.updateOne.mockResolvedValue({ modifiedCount: 1 });
+    Bottle.exists.mockResolvedValue(null); // gone from the shelf meanwhile
+    const r = rack(); r.save = jest.fn().mockRejectedValue(Object.assign(new Error('v'), { name: 'VersionError' }));
+    expect((await placeBottleInRack(r, 5, 'b1', REQ)).error).toMatchObject({ status: 409 });
+    expect(Rack.updateOne).toHaveBeenLastCalledWith({ _id: 'rOther' }, { $pull: { slots: { bottle: 'b1' } }, $inc: { __v: 1 } });
+    Rack.updateOne.mockResolvedValue({});
+  });
+
+  test('a save that fails for another reason still puts the bottle back, then fails loudly', async () => {
+    Bottle.findOne.mockReturnValue(selectable({ _id: 'b1', status: 'active' }));
+    Rack.findOneAndUpdate.mockResolvedValue({ _id: 'rOther', slots: [{ position: 7, bottle: 'b1' }] });
+    const r = rack(); r.save = jest.fn().mockRejectedValue(new Error('disk full'));
+    await expect(placeBottleInRack(r, 5, 'b1', REQ)).rejects.toThrow('disk full');
+    expect(Rack.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: 'rOther', 'slots.position': { $ne: 7 } }),
+      { $push: { slots: { position: 7, bottle: 'b1' } }, $inc: { __v: 1 } }
+    );
+  });
+
+  test('a saved placement stands, with its audit row, when the bottle cannot be looked at again', async () => {
+    Bottle.findOne.mockReturnValue(selectable({ _id: 'b1', status: 'active' }));
+    Bottle.exists.mockRejectedValue(new Error('connection reset'));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const r = rack();
+    const res = await placeBottleInRack(r, 5, 'b1', REQ);
+    warn.mockRestore();
+    expect(res.error).toBeUndefined();
+    expect(r.slots).toEqual([{ position: 5, bottle: 'b1' }]);
+    expect(logAudit).toHaveBeenCalledWith(REQ, 'rack.slot_assign', expect.anything(), { position: 5, bottleId: 'b1' });
+  });
+
+  test('an id sent in upper case names the same bottle: it keeps one slot', async () => {
+    const stored = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    Bottle.findOne.mockReturnValue(selectable({ _id: stored, status: 'active' }));
+    const r = rack([{ position: 5, bottle: stored }]);
+    const res = await placeBottleInRack(r, 3, stored.toUpperCase(), REQ);
+    expect(res.error).toBeUndefined();
+    expect(res.previousPosition).toBe(5);
+    expect(r.slots).toEqual([{ position: 3, bottle: stored }]);
+  });
+
+  test('a position is a whole slot number: one too large to print in full is refused, never read as slot 1', async () => {
+    Bottle.findOne.mockReturnValue(selectable({ _id: 'b1', status: 'active' }));
+    const r = rack([{ position: 1, bottle: 'bOccupant' }]);
+    for (const position of [1e21, '1000000000000000000000', '5abc', 1.5, -1, '']) {
+      const res = await placeBottleInRack(r, position, 'b1', REQ);
+      expect([position, res.error && res.error.status]).toEqual([position, 400]);
+    }
+    expect(r.slots).toEqual([{ position: 1, bottle: 'bOccupant' }]);
+    expect(r.save).not.toHaveBeenCalled();
   });
 });
 
@@ -196,7 +320,25 @@ describe('clearRackSlot', () => {
     const res = await clearRackSlot(r, 5, REQ);
     expect(res.cleared).toBe('b1');
     expect(r.slots).toEqual([]);
-    expect(logAudit).toHaveBeenCalledWith(REQ, 'rack.slot_clear', expect.anything(), { position: 5 });
+    expect(logAudit).toHaveBeenCalledWith(REQ, 'rack.slot_clear', expect.anything(), { position: 5, bottleId: 'b1' });
+  });
+
+  test('an empty slot of the rack is fine; a position the rack does not have is refused and nothing is saved', async () => {
+    const r = { _id: 'r1', cellar: 'c1', slots: [{ position: 1, bottle: 'b1' }], save: jest.fn().mockResolvedValue(undefined) };
+    expect((await clearRackSlot(r, 5, REQ)).cleared).toBeNull();
+    r.save.mockClear();
+    for (const position of [0, 33, 1e21, '1000000000000000000000', '5abc']) {
+      const res = await clearRackSlot(r, position, REQ);
+      expect([position, res.error && res.error.status]).toEqual([position, 400]);
+    }
+    expect(r.slots).toEqual([{ position: 1, bottle: 'b1' }]);
+    expect(r.save).not.toHaveBeenCalled();
+  });
+
+  test('a bottle can always be taken out, even from a position beyond the range of the rack', async () => {
+    const r = { _id: 'r1', cellar: 'c1', slots: [{ position: 40, bottle: 'b1' }], save: jest.fn().mockResolvedValue(undefined) };
+    expect((await clearRackSlot(r, 40, REQ)).cleared).toBe('b1');
+    expect(r.slots).toEqual([]);
   });
 });
 
@@ -205,8 +347,8 @@ describe('moveBottleToCellar', () => {
     _id: 'b1', status: 'active', vintage: '2019', cellarHistory: [], addedToCellarAt: new Date('2026-01-01'),
     createdAt: new Date('2026-01-01'), save: jest.fn().mockResolvedValue(undefined), ...over,
   });
-  const src = { _id: 'c1', name: 'Source' };
-  const dest = { _id: 'c2', name: 'Dest' };
+  const src = { _id: 'c1', name: 'Source', user: 'u1' };
+  const dest = { _id: 'c2', name: 'Dest', user: 'u1' };
 
   test('save-FIRST then unplace; seeds history both ends; dual audit', async () => {
     const b = bottle();
@@ -231,9 +373,140 @@ describe('moveBottleToCellar', () => {
     expect((await moveBottleToCellar(b, src, dest, REQ)).error).toMatchObject({ status: 409, code: 'conflict' });
     expect(removeFromRacks).not.toHaveBeenCalled(); // never unracked on a failed save
   });
+
+  describe('a move that hands the bottle to another account', () => {
+    const shared = { _id: 'c3', name: 'Ours', user: 'friend' };
+    const lean = (v) => ({ select: () => ({ lean: () => Promise.resolve(v) }) });
+    // ownedByNewOwner: the history cellar ids the new owner owns.
+    const accounts = ({ demo = false, ownedByNewOwner = [] } = {}) => {
+      User.findById.mockReturnValue(lean({ isDemo: demo }));
+      Cellar.find.mockReturnValue(lean(ownedByNewOwner.map((_id) => ({ _id }))));
+    };
+    beforeEach(() => accounts());
+
+    test('the bottle becomes the destination owner\'s, and goes back with the move back', async () => {
+      const b = bottle({ user: 'u1' });
+      await moveBottleToCellar(b, src, shared, REQ);
+      expect(b.user).toBe('friend');
+      expect(b.save).toHaveBeenCalled();
+      accounts({ ownedByNewOwner: ['c1'] });
+      await moveBottleToCellar(b, shared, src, REQ);
+      expect(b.user).toBe('u1');
+    });
+
+    test('the reminders already sent to the previous owner are cleared, so the new owner gets them', async () => {
+      const sent = new Date('2026-10-01');
+      const b = bottle({
+        user: 'u1', drinkWindowNotifiedStatus: 'peak', drinkWindowNotifiedAt: sent,
+        reservationNotifiedAt: sent, openBottleNotifiedAt: sent, arrivalNotifiedAt: sent,
+      });
+      await moveBottleToCellar(b, src, shared, REQ);
+      expect(b).toMatchObject({
+        drinkWindowNotifiedStatus: null, drinkWindowNotifiedAt: null,
+        reservationNotifiedAt: null, openBottleNotifiedAt: null, arrivalNotifiedAt: undefined,
+      });
+    });
+
+    test('the journey keeps the dates of the earlier cellars but not their names', async () => {
+      const b = bottle({
+        user: 'u1',
+        cellarHistory: [
+          { cellar: 'c9', cellarName: 'Andrew Private', enteredAt: new Date('2025-01-01') },
+          { cellar: 'c1', cellarName: 'Source', enteredAt: new Date('2025-06-01') },
+        ],
+      });
+      await moveBottleToCellar(b, src, shared, REQ);
+      expect(b.cellarHistory).toEqual([
+        { cellar: undefined, cellarName: undefined, enteredAt: new Date('2025-01-01') },
+        { cellar: undefined, cellarName: undefined, enteredAt: new Date('2025-06-01') },
+        expect.objectContaining({ cellar: 'c3', cellarName: 'Ours' }),
+      ]);
+      expect(Cellar.find).toHaveBeenCalledWith({ _id: { $in: ['c9', 'c1'] }, user: 'friend' });
+    });
+
+    test('a cellar the new owner owns keeps its name in the journey', async () => {
+      accounts({ ownedByNewOwner: ['c7'] });
+      const b = bottle({ user: 'u1', cellarHistory: [{ cellar: 'c7', cellarName: 'Friend Old', enteredAt: new Date('2025-01-01') }] });
+      await moveBottleToCellar(b, src, shared, REQ);
+      expect(b.cellarHistory[0]).toMatchObject({ cellar: 'c7', cellarName: 'Friend Old' });
+    });
+
+    test('the log row on the other owner\'s cellar leaves out the mover\'s own cellar', async () => {
+      await moveBottleToCellar(bottle({ user: 'u1' }), src, shared, REQ);
+      // On the mover's own cellar: where it went (a cellar the mover can see).
+      expect(logAudit).toHaveBeenCalledWith(REQ, 'bottle.move.out', expect.objectContaining({ cellarId: 'c1' }),
+        expect.objectContaining({ toCellarId: 'c3', toCellarName: 'Ours' }));
+      // On the friend's cellar: only that it came from another account.
+      const moveIn = logAudit.mock.calls.find(([, action]) => action === 'bottle.move.in');
+      expect(moveIn[3]).toMatchObject({ fromOtherAccount: true });
+      expect(moveIn[3]).not.toHaveProperty('fromCellarName');
+      expect(moveIn[3]).not.toHaveProperty('fromCellarId');
+    });
+
+    test('between two other people\'s cellars, nothing moves', async () => {
+      const b = bottle({ user: 'friend' });
+      const other = { _id: 'c4', name: 'Theirs', user: 'friend2' };
+      const res = await moveBottleToCellar(b, shared, other, REQ);
+      expect(res.error).toMatchObject({ status: 403, code: 'not_your_cellar' });
+      expect(b.save).not.toHaveBeenCalled();
+      expect(b.user).toBe('friend');
+    });
+
+    test('a demo account never takes a bottle over', async () => {
+      accounts({ demo: true });
+      const b = bottle({ user: 'u1' });
+      const res = await moveBottleToCellar(b, src, shared, REQ);
+      expect(res.error).toMatchObject({ status: 400, code: 'demo_owner' });
+      expect(b.save).not.toHaveBeenCalled();
+    });
+
+    test('between two cellars of the same other owner, an editor moves and the names stay', async () => {
+      const second = { _id: 'c5', name: 'Ours Too', user: 'friend' };
+      const b = bottle({ user: 'friend' });
+      const res = await moveBottleToCellar(b, shared, second, REQ);
+      expect(res.error).toBeUndefined();
+      expect(b.user).toBe('friend');
+      expect(User.findById).not.toHaveBeenCalled();
+      expect(b.cellarHistory.map((h) => h.cellarName)).toEqual(['Ours', 'Ours Too']);
+      expect(logAudit).toHaveBeenCalledWith(REQ, 'bottle.move.in', expect.anything(),
+        expect.objectContaining({ fromCellarName: 'Ours' }));
+    });
+  });
 });
 
-describe('rack group (support ticket 2026-09-06)', () => {
+describe('findMoveDestination', () => {
+  const cellar = (over = {}) => ({ _id: 'aaaaaaaaaaaaaaaaaaaaaaaa', user: 'friend', members: [], deletedAt: null, ...over });
+  const ID = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+
+  test('the owner and an editor may move into a cellar', async () => {
+    const own = cellar({ user: 'u1' });
+    Cellar.findById.mockResolvedValue(own);
+    expect(await findMoveDestination('u1', ID)).toBe(own);
+    const edited = cellar({ members: [{ user: 'u1', role: 'editor' }] });
+    Cellar.findById.mockResolvedValue(edited);
+    expect(await findMoveDestination('u1', ID)).toBe(edited);
+  });
+
+  test('a viewer, a stranger, a deleted cellar and a missing one all read as null', async () => {
+    Cellar.findById.mockResolvedValue(cellar({ members: [{ user: 'u1', role: 'viewer' }] }));
+    expect(await findMoveDestination('u1', ID)).toBeNull();
+    Cellar.findById.mockResolvedValue(cellar());
+    expect(await findMoveDestination('u1', ID)).toBeNull();
+    Cellar.findById.mockResolvedValue(cellar({ user: 'u1', deletedAt: new Date() }));
+    expect(await findMoveDestination('u1', ID)).toBeNull();
+    Cellar.findById.mockResolvedValue(null);
+    expect(await findMoveDestination('u1', ID)).toBeNull();
+  });
+
+  test('an id that is not an id string is never looked up', async () => {
+    for (const bad of ['attic', { $ne: null }, ['x'], undefined]) {
+      expect(await findMoveDestination('u1', bad)).toBeNull();
+    }
+    expect(Cellar.findById).not.toHaveBeenCalled();
+  });
+});
+
+describe('rack group', () => {
   const { normalizeRackGroup } = require('./rackOps');
   const cellar = { _id: 'c1', user: 'u1' };
   const REQ = { user: { id: 'u1' } };

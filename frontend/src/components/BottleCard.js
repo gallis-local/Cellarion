@@ -8,6 +8,7 @@ import { glassesLeft, daysLeft, freshnessStatus } from '../utils/openBottle';
 import { isReserved, reservationSummary } from '../utils/reservation';
 import BottlePlaceholder from './BottlePlaceholder';
 import './BottleCard.css';
+import { formatVintage } from '../utils/vintage';
 
 const MATURITY_LABELS = {
   'not-ready': { key: 'maturity.notReady', cls: 'maturity-badge--not-ready' },
@@ -31,11 +32,11 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
   const cellarBadgeColor = bottle.cellarColor || null;
   // A collapsed group spans multiple bottles (possibly in different racks), so a
   // single rack badge would be misleading — suppress it until the group expands.
-  // The badge names the slot too ("Fridge · slot 12"; forum request 2026-10-13:
-  // finding a bottle should not mean opening it).
+  // The badge names the slot too ("Fridge · slot 12"): finding a bottle
+  // should not mean opening it.
   const rackInfo = isGroup ? null : rackMap?.get(bottle._id);
-  // "slot" is the bottle page's already-translated word (release audit
-  // 2026-10-13: drinkOne.slot is English-only in the other locales).
+  // "slot" is the bottle page's already-translated word (drinkOne.slot is
+  // English-only in the other locales).
   const rackBadgeText = rackInfo && (rackInfo.position != null
     ? `${rackInfo.rackName} · ${t('bottleDetail.rackSlot', 'slot')} ${rackInfo.position}`
     : rackInfo.rackName);
@@ -49,10 +50,10 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
   // (pending or approved) → the vintage's official photo → the wine's
   // registry image → the owner's photo of another vintage. Same order as the
   // bottle page hero. A photo you took of YOUR bottle beats a generic registry
-  // image and must not disappear when an admin approves it (ticket 2026-09-05,
-  // #1227); a photo of ANOTHER vintage only stands in when the wine has no
+  // image and must not disappear when an admin approves it; a photo
+  // of ANOTHER vintage only stands in when the wine has no
   // image at all, so a 2016 bottle never wears the 2015 label while the wine
-  // has a picture, and a card with any photo is never blank (ticket 2026-10-09).
+  // has a picture, and a card with any photo is never blank.
   const ownImage = bottle.defaultImageUrl || bottle.pendingImageUrl;
   const registryImage = bottle.vintageImageUrl || bottle.wineDefinition?.image;
   // A photo that fails to load shows the drawn bottle instead of a blank;
@@ -128,7 +129,7 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
   };
   // In select mode a stacked card toggles ALL its bottles, so the ⊕ becomes a
   // real button that expands the group instead — the only way to pick one
-  // bottle out of five (Johan, 2026-09-03, from the phone). It stops
+  // bottle out of five, on a phone too. It stops
   // propagation so the card's own click / keydown handlers don't also flip
   // the selection. `onExpand` is the expand handler when the card's own
   // click does something else (opens the vintage page).
@@ -136,7 +137,7 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
   const canExpandInSelect = selectable && isGroup && typeof expandHandler === 'function';
   const expandGroup = (e) => { e.stopPropagation(); expandHandler(); };
   const stopKeys = (e) => e.stopPropagation();
-  // A card's direct action (support ticket 2026-10-09): "Drink one" takes a
+  // A card's direct action: "Drink one" takes a
   // single bottle out without expanding the group first. The cellar list
   // offers it on every card, one bottle or many (the card itself opens the
   // vintage page), compact (`actionsInline`) so it never adds a line on a
@@ -177,7 +178,7 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
   const notePreview = showNotes && !isGroup && viewMode !== 'card'
     ? [occasion, firstNoteLine].filter(Boolean).join(' · ')
     : '';
-  // Desktop hover bonus (the ticket asked for a tooltip): full text on title.
+  // Desktop hover bonus (a tooltip): full text on title.
   const noteTitle = notePreview
     ? [occasion, (bottle.notes || '').trim()].filter(Boolean).join('\n\n')
     : undefined;
@@ -229,7 +230,7 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
           <div className="bottle-grid-name">{displayName}</div>
           <div className="bottle-grid-producer">{displayProducer}</div>
           <div className="bottle-grid-meta">
-            {bottle.vintage && <span className="bottle-vintage">{bottle.vintage}</span>}
+            {bottle.vintage && <span className="bottle-vintage">{formatVintage(bottle.vintage, t)}</span>}
             {bottle.wineDefinition?.region?.name && (
               <span className="bottle-grid-region">{bottle.wineDefinition.region.name}</span>
             )}
@@ -330,14 +331,14 @@ function BottleCard({ bottle, rackMap, cellarId, viewMode, groupCount = 1, onCli
 
       <div className="bottle-info">
         {/* The name truncates, the ×n pill never does — a long name on a
-            narrow row used to take the count with it. */}
+            narrow row must not take the count with it. */}
         <div className="bottle-name">
           <span className="bottle-name-text">{displayName}</span>
           {isGroup && <span className="bottle-count-pill">×{groupCount}</span>}
         </div>
         <div className="bottle-meta">
-          <span className="bottle-producer">{displayProducer}</span>
-          {bottle.vintage && <span className="bottle-vintage">{bottle.vintage}</span>}
+          {displayProducer && <span className="bottle-producer">{displayProducer}</span>}
+          {bottle.vintage && <span className="bottle-vintage">{formatVintage(bottle.vintage, t)}</span>}
         </div>
         {/* The details picked under "Show on cards" (rating, price, …). */}
         {details && <div className="bottle-details">{details}</div>}

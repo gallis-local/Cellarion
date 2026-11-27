@@ -8,16 +8,16 @@ import OwnerInquiryCard from '../components/bottle/OwnerInquiryCard';
 import './CuratorQuestion.css';
 
 /**
- * What a curator-question notification opens (support ticket 2026-10-14).
+ * What a curator-question notification opens.
  *
- * The notification used to link straight to the bottle the question was sent
- * about, and that link went dead once the bottle or its cellar was deleted.
- * Now it opens this page, which asks the server for a bottle page of the wine
+ * The notification does not link straight to the bottle the question was sent
+ * about: that link would go dead once the bottle or its cellar was deleted.
+ * It opens this page, which asks the server for a bottle page of the wine
  * the member can open NOW and goes there (the question card renders on it).
  * With no bottle of the wine left, the question shows here on its own: THIS
  * question (the card is handed it, not left to look one up by wine), with
  * words that fit its state — still open, answered and waiting, replied to,
- * or closed without a reply (pre-release audit 2026-10-14).
+ * or closed without a reply.
  */
 export default function CuratorQuestion() {
   const { id } = useParams();
@@ -56,7 +56,7 @@ export default function CuratorQuestion() {
   if (state.status === 'error') {
     return (
       <div className="curator-question-page">
-        <p className="error-message" role="alert">{t('curatorQuestion.loadError', 'Could not load the question.')}</p>
+        <div className="alert alert-error" role="alert">{t('curatorQuestion.loadError', 'Could not load the question.')}</div>
         <button type="button" className="btn btn-secondary btn-small" onClick={() => setAttempt((n) => n + 1)}>
           {t('common.retry', 'Retry')}
         </button>
@@ -70,6 +70,7 @@ export default function CuratorQuestion() {
         <h1>{t('curatorQuestion.goneTitle', 'This question is closed')}</h1>
         <p>{t('curatorQuestion.gone', 'The curators have closed this question, or it was not addressed to you. Nothing is needed from you.')}</p>
         <Link to="/cellars" className="btn btn-secondary btn-small">{t('curatorQuestion.toCellars', 'Go to your cellars')}</Link>
+        <AllQuestionsLink />
       </div>
     );
   }
@@ -92,21 +93,47 @@ export default function CuratorQuestion() {
             : null}
         />
       ) : (
+        <AnsweredQuestion inquiry={inquiry} />
+      )}
+      <AllQuestionsLink />
+    </div>
+  );
+}
+
+function AllQuestionsLink() {
+  const { t } = useTranslation();
+  return (
+    <p className="curator-question-more">
+      <Link to="/questions">{t('curatorQuestions.allLink', 'All questions from the curators')}</Link>
+    </p>
+  );
+}
+
+/**
+ * A question the member answered that has no curator reply to show (a reply
+ * shows on OwnerInquiryCard): the question, their answer, and where it
+ * stands. Shared with the questions list (CuratorQuestions.js), which passes
+ * `justSent` for an answer sent from its card a moment ago so the card's
+ * thank-you stays with the question.
+ */
+export function AnsweredQuestion({ inquiry, justSent = false }) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <blockquote className="curator-question-quote">{inquiry.question}</blockquote>
+      {inquiry.myResponse && (
         <>
-          <blockquote className="curator-question-quote">{inquiry.question}</blockquote>
-          {inquiry.myResponse && (
-            <>
-              <p className="curator-question-label">{t('bottleDetail.ownerInquiry.yourAnswer', 'Your answer')}</p>
-              <blockquote className="curator-question-quote">{inquiry.myResponse}</blockquote>
-            </>
-          )}
-          <p className="curator-question-answered" role="status">
-            {inquiry.status === 'resolved'
-              ? t('curatorQuestion.resolved', 'The curators have closed this question. Thank you for your answer.')
-              : t('curatorQuestion.answered', 'You answered this question. Thank you — the curators will take it from here.')}
-          </p>
+          <p className="curator-question-label">{t('bottleDetail.ownerInquiry.yourAnswer', 'Your answer')}</p>
+          <blockquote className="curator-question-quote">{inquiry.myResponse}</blockquote>
         </>
       )}
-    </div>
+      <p className="curator-question-answered" role="status">
+        {justSent
+          ? t('bottleDetail.ownerInquiry.thanks', 'Thank you — your answer was sent to the curators and helps keep the shared registry accurate.')
+          : inquiry.status === 'resolved'
+            ? t('curatorQuestion.resolved', 'The curators have closed this question. Thank you for your answer.')
+            : t('curatorQuestion.answered', 'You answered this question. Thank you — the curators will take it from here.')}
+      </p>
+    </>
   );
 }

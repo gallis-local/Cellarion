@@ -131,6 +131,13 @@
 
   /* Mobile bottom nav */
   --bottom-nav-height: 64px;
+
+  /* Page widths: every top-level page uses one of these as its max-width, so
+     the left edge only moves between three places. Statistics, the widest,
+     takes the full width of .main-content instead. */
+  --page-width-narrow: 720px;
+  --page-width-default: 900px;
+  --page-width-wide: 1200px;
 }
 
 /* ── Dark Mode ── */
@@ -307,6 +314,20 @@ a:hover {
   margin: 0;
 }
 
+.page-header .header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+/* A header with its own actions keeps them beside the title, on a phone
+   too; the title wraps before the buttons do. Both stay top-aligned, so the
+   title sits at the same height whether or not a page has a button. */
+.page-header:has(> .header-actions) > :first-child {
+  min-width: 0;
+}
+
 /* ── Back link ── */
 .back-link {
   color: var(--color-primary);
@@ -422,23 +443,12 @@ a:hover {
     margin-bottom: 1.25rem;
   }
 
-  .page-header .header-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    width: 100%;
+  .page-header:has(> .header-actions) {
+    flex-direction: row;
   }
 
   .page-header .header-actions .btn {
-    flex: 1;
-    min-width: 100px;
-    text-align: center;
     white-space: nowrap;
-  }
-
-  .page-header .header-actions .btn-more {
-    flex: none;
-    min-width: unset;
   }
 
   .grid-2 {

@@ -3,14 +3,11 @@
 //
 // CACHING: the immutable long cache belongs to a file we ACTUALLY SERVED, so
 // it is set by uploadsCacheHeaders below (passed to express.static's
-// setHeaders), never by this guard. The guard used to set it for any
-// image-looking path, including ones with no file behind them — the request
-// then fell through to the 404 handler carrying a one-year immutable header,
-// and Cloudflare cached the 404 for a year (confirmed 2026-09-15 on
-// /api/uploads/blog/*.webp requested moments before the files landed:
-// CF-Cache-Status HIT on a 404 that no purge was available for). The same trap
-// would pin a bottle photo requested a moment before its processing finished.
-// A miss is now explicitly uncacheable.
+// setHeaders), never by this guard. An image-looking path with no file behind
+// it falls through to the 404 handler, and a one-year immutable header on
+// that 404 lets Cloudflare cache it for a year with no purge available — a
+// blog image or a bottle photo requested a moment before its file lands would
+// stay missing. A miss is explicitly uncacheable.
 //
 // NOTE: this mount is INTENTIONALLY unauthenticated. Bottle images must load
 // from plain <img src> tags (which cannot send Authorization headers), and
@@ -84,7 +81,22 @@ function createConvertedPhotoFallback({ uploadsRoot = '/app/uploads' } = {}) {
 
 const convertedPhotoFallback = createConvertedPhotoFallback();
 
+// A read of this public mount (a photo or its thumbnail) is not an API call
+// and must not spend the per-IP API budget (app.js apiLimiter). One open cellar
+// page loads dozens of thumbnails, and a Home Assistant install fetches every
+// label photo from ONE address that also carries its polls, inventory reads
+// and take-outs, so a large cellar could 429 the whole integration. Nothing
+// here is expensive per request: a file read or a miss, and thumbnail renders
+// are bounded on their own (services/thumbnails: 2 at once, a short queue,
+// then 503, each thumbnail rendered once).
+function isPublicUploadRead(req) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+  const p = req.originalUrl.split('?')[0];
+  return p.startsWith('/api/uploads/');
+}
+
 module.exports = {
+  isPublicUploadRead,
   uploadsGuard,
   uploadsCacheHeaders,
   createConvertedPhotoFallback,

@@ -15,7 +15,6 @@
  * be access-checked to editor+.
  */
 const path = require('path');
-const fs = require('fs');
 const { writeFileAtomic } = require('../utils/atomicWrite');
 const crypto = require('crypto');
 const BottleImage = require('../models/BottleImage');
@@ -70,7 +69,7 @@ function sanitizeCredit(credit, userRoles) {
  *   approved + public, reviewed by the uploader, BEFORE background removal is
  *   kicked off. The worker keeps an already-approved row approved; a row
  *   approved after the hand-off raced it and usually ended 'processed' —
- *   invisible in every gallery (release audit 2026-10-09, H1).
+ *   invisible in every gallery.
  * @param {'web'|'mcp'} [opts.via='web']   the surface, named in the audit row
  * @param {object}  req                    for downstream audit attribution
  * @returns {{ image }} | {{ error: { status, message } }}
@@ -101,7 +100,7 @@ async function ingestBottleImage({ buffer, userId, userRoles = [], bottle = null
     return { error: { status: 400, message: 'Image format could not be verified' } };
   }
 
-  // keepBackground (ticket 6a97f870): the uploader opted out of background
+  // keepBackground: the uploader opted out of background
   // removal — a label-only photo or a product shot, which rembg would cut up.
   // The original is then the kept image from the start: processedUrl points at
   // it so every consumer that prefers processedUrl (exports, the wine's
@@ -140,7 +139,7 @@ async function ingestBottleImage({ buffer, userId, userRoles = [], bottle = null
   try { contentHash = hashImageBytes(stored); } catch { /* non-fatal */ }
 
   const originalUrl = `/api/uploads/originals/${filename}`;
-  const image = new BottleImage({
+  let image = new BottleImage({
     bottle: bottle ? bottle._id : null,
     wineDefinition: wineDefinitionId || null,
     // A photo is of one bottle, so it is of that bottle's vintage.
@@ -163,6 +162,12 @@ async function ingestBottleImage({ buffer, userId, userRoles = [], bottle = null
     } : {}),
   });
   await image.save();
+  // A keep-background photo is ready as uploaded: on a server that does not
+  // review photos it is published now (others, once background removal ends),
+  // and the caller is answered with the photo as published.
+  if (keep && !publish && await require('./trustedContributions').approvePhotoIfTrusted(image._id, req)) {
+    image = (await BottleImage.findById(image._id)) || image;
+  }
 
   // One attach row for both surfaces, and only for a photo put on a bottle:
   // the admin flows that publish a registry picture write their own row, and
@@ -227,9 +232,9 @@ async function attachOfficialWineImage({ buffer, wineDefinitionId, credit = null
 /**
  * Persist the ORIGINAL frame a label scan was run on, so a curator working the
  * pending-identity queue can read the label instead of guessing from three
- * broken strings. Until now the scan bytes lived only in the request handler
- * and were garbage-collected with it — which is exactly why an unreadable
- * label produced an unfixable registry row.
+ * broken strings. Bytes that live only in the request handler are
+ * garbage-collected with it, and an unreadable label then leaves an
+ * unfixable registry row.
  *
  * Deliberately NOT ingestBottleImage: no per-bottle cap applies (there is no
  * bottle), no background removal is kicked off (the scan flow already ran one

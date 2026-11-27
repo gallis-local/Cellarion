@@ -36,6 +36,28 @@ function supportReplyTo() {
 }
 
 /**
+ * Who signs the emails written in the first person (the supporter
+ * thank-you): SUPPORT_SIGNATURE when the install sets it, else the display
+ * name of MAILGUN_FROM ("Cellarion" out of "Cellarion <no-reply@…>"), else
+ * "Cellarion". Never a person's name by default: the code is shared by every
+ * install, and whose signature belongs on the mail is each install's own.
+ */
+function supportSignature() {
+  const configured = (process.env.SUPPORT_SIGNATURE || '').trim();
+  if (configured) return configured;
+  // "Name <address>": the part before the angle bracket. A From that is only
+  // an address (bracketed or bare) has no name to sign with.
+  const bracket = FROM.indexOf('<');
+  let display = (bracket >= 0 ? FROM.slice(0, bracket) : FROM).trim();
+  // A display name holding a comma or a period is written in double quotes;
+  // the quotes are the header's, not the name's.
+  if (display.length >= 2 && display.startsWith('"') && display.endsWith('"')) {
+    display = display.slice(1, -1).trim();
+  }
+  return display && !display.includes('@') ? display : 'Cellarion';
+}
+
+/**
  * Send an email verification link to a newly registered user.
  * @param {string} toEmail  - Recipient email address
  * @param {string} username - Username for greeting
@@ -132,8 +154,44 @@ async function sendPasswordResetEmail(toEmail, username, token) {
   });
 }
 
+// The drink-window email lists at most this many wines; the rest are counted.
+// After an import, or at the turn of the year, hundreds of wines change at once.
+const DIGEST_LIST_MAX = 20;
+const DIGEST_STATUS_ORDER = ['declining', 'ending', 'peak'];
+// Any status that is not peak or ending is worded as past its window.
+const digestStatus = (status) => (status === 'peak' || status === 'ending' ? status : 'declining');
+
 /**
- * Send a drink-window digest email summarising bottles that need attention.
+ * The wines a drink-window email lists when there are more than it shows: an
+ * equal share of each status present, most urgent first, the free places going
+ * to the more urgent statuses. Without the share, a long list would show only
+ * wines past their window.
+ *
+ * @param {Array<{name:string, vintage:string, status:string}>} bottles
+ * @param {number} [max]
+ * @returns {Array<{name:string, vintage:string, status:string}>}
+ */
+function pickDigestLines(bottles, max = DIGEST_LIST_MAX) {
+  if (bottles.length <= max) return bottles;
+  const byStatus = DIGEST_STATUS_ORDER
+    .map((status) => bottles.filter((b) => digestStatus(b.status) === status))
+    .filter((list) => list.length > 0);
+  const share = Math.floor(max / byStatus.length);
+  const picked = byStatus.map((list) => list.slice(0, share));
+  let free = max - picked.reduce((n, list) => n + list.length, 0);
+  for (let i = 0; i < byStatus.length && free > 0; i++) {
+    const extra = byStatus[i].slice(picked[i].length, picked[i].length + free);
+    picked[i].push(...extra);
+    free -= extra.length;
+  }
+  return picked.flat();
+}
+
+/**
+ * Send the drink-window email: the wines whose bottles reached a new status.
+ * Called by services/drinkWindowNotifier.maybeSendDrinkWindowEmail, at most
+ * once a week per member. Lists up to DIGEST_LIST_MAX wines; beyond that it
+ * gives the number per status and counts the rest.
  * @param {string} toEmail
  * @param {string} username
  * @param {Array<{name:string, vintage:string, status:string}>} bottles
@@ -168,16 +226,37 @@ async function sendDrinkWindowDigest(toEmail, username, bottles, userId) {
   const statusColor = (s) =>
     s === 'peak' ? '#2D7A45' : s === 'ending' ? '#D4A373' : '#C0504D';
 
-  const rows = bottles.map(b => `
+  const listed = pickDigestLines(bottles);
+  const more = bottles.length - listed.length;
+  // Only when the list is cut: how many wines there are of each status.
+  const countOf = (status) => bottles.filter((b) => digestStatus(b.status) === status).length;
+  const summary = more > 0
+    ? [
+      [countOf('declining'), 'past their window'],
+      [countOf('ending'), 'with their peak ending soon'],
+      [countOf('peak'), 'at peak'],
+    ].filter(([n]) => n > 0).map(([n, label]) => `${n} ${label}`).join(', ')
+    : '';
+  const intro = more > 0
+    ? `${bottles.length} wines in your cellar have drink-window updates: ${summary}. Here are ${listed.length} of them:`
+    : 'Some bottles in your cellar have drink-window updates:';
+  const moreLine = more > 0 ? `…and ${more} more. Your cellar shows which wines are ready to drink.` : '';
+
+  const rows = listed.map(b => `
     <tr>
       <td style="padding:8px 12px;border-bottom:1px solid #eee;">${escapeHtml(b.name)} ${escapeHtml(b.vintage)}</td>
       <td style="padding:8px 12px;border-bottom:1px solid #eee;color:${statusColor(b.status)};font-weight:600;">
         ${statusLabel(b.status)}
       </td>
     </tr>
-  `).join('');
+  `).join('') + (more > 0 ? `
+    <tr>
+      <td colspan="2" style="padding:8px 12px;color:#666;">${moreLine}</td>
+    </tr>
+  ` : '');
 
-  const textLines = bottles.map(b => `- ${b.name} ${b.vintage}: ${statusLabel(b.status)}`);
+  const textLines = listed.map(b => `- ${b.name} ${b.vintage}: ${statusLabel(b.status)}`);
+  if (more > 0) textLines.push(moreLine);
 
   await mg.messages.create(DOMAIN, {
     from: FROM,
@@ -186,7 +265,7 @@ async function sendDrinkWindowDigest(toEmail, username, bottles, userId) {
     text: [
       `Hello ${username},`,
       '',
-      'Some bottles in your cellar have drink-window updates:',
+      intro,
       '',
       ...textLines,
       '',
@@ -200,7 +279,7 @@ async function sendDrinkWindowDigest(toEmail, username, bottles, userId) {
     html: `
       <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#2a2a2a;">
         <p>Hello <strong>${escapeHtml(username)}</strong>,</p>
-        <p>Some bottles in your cellar have drink-window updates:</p>
+        <p>${escapeHtml(intro)}</p>
         <table style="width:100%;border-collapse:collapse;margin:1rem 0;">
           <thead>
             <tr style="background:#f5f5f5;">
@@ -561,6 +640,7 @@ async function sendSecurityAlertEmail(toEmail, trigger) {
  */
 async function sendSupporterThankYou(toEmail, username, tier) {
   const replyTo = supportReplyTo();
+  const signature = supportSignature();
 
   await mg.messages.create(DOMAIN, {
     from: FROM,
@@ -576,7 +656,7 @@ async function sendSupporterThankYou(toEmail, username, tier) {
       '',
       'There is no obligation to answer. You have already done the important part. If you do write back, it comes straight to me.',
       '',
-      'Johan'
+      signature
     ].join('\n'),
     html: `
       <div style="font-family:sans-serif;max-width:480px;margin:0 auto;color:#2a2a2a;line-height:1.55;">
@@ -588,16 +668,15 @@ async function sendSupporterThankYou(toEmail, username, tier) {
            and is there anything you are missing?</p>
         <p>There is no obligation to answer. You have already done the important part.
            If you do write back, it comes straight to me.</p>
-        <p>Johan</p>
+        <p>${escapeHtml(signature)}</p>
       </div>
     `
   });
 }
 
 /**
- * Send a user support's answer to their ticket (2026-09-26). Until now the
- * answer only reached the in-app bell, so someone who asked a question and
- * left never saw it. This is a service email about the user's own request,
+ * Send a user support's answer to their ticket. The in-app bell alone never
+ * reaches someone who asked a question and left. This is a service email about the user's own request,
  * sent unless they turned it off (preferences.notifications.supportReply) or
  * unsubscribed; the caller checks both.
  *
@@ -673,9 +752,9 @@ async function sendSupportReplyEmail(toEmail, recipientName, recipientId, ticket
 
 /**
  * A curator's question about a wine the recipient owns a bottle of
- * (services/ownerInquiryEmail). Until 2026-10-20 these reached the in-app bell
- * and push only, and almost nobody answered. Sent unless the recipient turned
- * it off (preferences.notifications.ownerInquiry) or unsubscribed; the caller
+ * (services/ownerInquiryEmail): the in-app bell and push alone are rarely
+ * answered. Sent unless the recipient turned it off
+ * (preferences.notifications.ownerInquiry) or unsubscribed; the caller
  * checks both, and rations it to one a day.
  *
  * The question is in the email itself, so an owner can read the label first;
@@ -899,6 +978,116 @@ async function sendNewMemberEmptyEmail(toEmail, recipientName, recipientId) {
   });
 }
 
+const longDateUtc = (d) => new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
+const listWords = (items) => (items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}` : String(items[0] ?? ''));
+
+/**
+ * One of the recipient's API tokens still calls routes that stop answering
+ * tokens at a sunset (services/apiDeprecationNotices): the first notice, or a
+ * reminder before the date. Names the token, the routes and the date, and
+ * points to what replaces them.
+ *
+ * Sent only to members who have not opted out of all email (the caller
+ * checks; the bell and Settings tell the rest), and it carries the one-click
+ * unsubscribe link like every member email. It ends by itself once the token
+ * stops calling these routes or is revoked. Reply-To reaches a person where
+ * support has an address: the email asks to hear what is missing from the
+ * API.
+ *
+ * @param {string} toEmail
+ * @param {string} recipientName  display/username (greeting)
+ * @param {object} notice
+ * @param {string} notice.tokenName       the token's name, as its owner wrote it
+ * @param {string[]} notice.routes        route keys, e.g. 'GET /api/cellars/:id'
+ * @param {Date}   notice.sunset          when they stop answering tokens
+ * @param {Date}   [notice.lastUsedAt]    when the token last called one
+ * @param {number} [notice.daysLeft]      set on a reminder: days until the sunset
+ * @param {number[]} [notice.reminderDays] set on the first notice: when reminders follow
+ */
+async function sendApiDeprecationEmail(toEmail, recipientName, notice) {
+  if (!EMAIL_VERIFICATION_ENABLED) return;
+
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const guideUrl = `${frontendUrl}/developers`;
+  const tokensUrl = `${frontendUrl}/settings#api-tokens`;
+  const { createUnsubscribeToken } = require('../utils/unsubscribe');
+  const unsubLink = notice.recipientId
+    ? `${frontendUrl}/api/users/unsubscribe?token=${createUnsubscribeToken(notice.recipientId)}`
+    : null;
+  // The token's name is the owner's text: one line, bounded, before it becomes a header.
+  const name = String(notice.tokenName || 'API token').replace(/[\r\n]+/g, ' ').trim().slice(0, 100);
+  const routes = (notice.routes || []).map(String);
+  const one = routes.length === 1;
+  const date = longDateUtc(notice.sunset);
+  const reminder = Number.isFinite(notice.daysLeft);
+  const what = one ? 'a route' : 'routes';
+
+  const subject = `${reminder ? 'Reminder: your' : 'Your'} API token "${name}" uses ${what} that stop${one ? 's' : ''} working on ${date}`;
+  const intro = reminder
+    ? `A reminder: your Cellarion API token "${name}" still calls ${what} that API tokens can no longer use from ${date}, in ${notice.daysLeft} day${notice.daysLeft === 1 ? '' : 's'}:`
+    : `Your Cellarion API token "${name}" still calls ${what} that API tokens can no longer use from ${date}:`;
+  const effect = `From then on ${one ? 'it answers' : 'they answer'} with 403 Forbidden, so whatever uses this token (an integration, a script) stops getting that data unless it changes first. GET /api/inventory covers most of what ${one ? 'it was' : 'they were'} used for, and the API guide shows what to use instead.`;
+  // A reply reaches someone only where support has its own address; a server
+  // without one replies to the no-reply sender, so it points at the issues.
+  const askUs = supportReplyTo() !== FROM
+    ? 'reply to this email'
+    : 'open an issue at https://github.com/jagduvi1/Cellarion/issues';
+  const passOn = `If someone else made the integration, update it to its latest version or pass this on to them. If something you need is missing from the API, ${askUs}.`;
+  const why = [
+    notice.lastUsedAt
+      ? `You get this email because this token called ${one ? 'it' : 'them'} on ${longDateUtc(notice.lastUsedAt)}.`
+      : `You get this email because this token calls ${one ? 'it' : 'them'}.`,
+    reminder
+      ? 'No more reminders come once it stops, or once you revoke it.'
+      : (notice.reminderDays?.length ? `Reminders follow ${listWords(notice.reminderDays)} days before the date while it still does.` : ''),
+  ].filter(Boolean).join(' ');
+
+  await mg.messages.create(DOMAIN, {
+    from: FROM,
+    to: [toEmail],
+    'h:Reply-To': supportReplyTo(),
+    subject,
+    text: [
+      `Hello ${recipientName},`,
+      '',
+      intro,
+      '',
+      ...routes.map((r) => `- ${r}`),
+      '',
+      effect,
+      guideUrl,
+      '',
+      passOn,
+      '',
+      `Your API tokens: ${tokensUrl}`,
+      '',
+      why,
+      ...(unsubLink ? ['', `Unsubscribe from all Cellarion emails: ${unsubLink}`] : []),
+    ].join('\n'),
+    html: `
+      <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#2a2a2a;line-height:1.5;">
+        <p>Hello <strong>${escapeHtml(recipientName)}</strong>,</p>
+        <p>${escapeHtml(intro)}</p>
+        <ul style="margin:0 0 1rem;padding-left:1.25rem;">${routes.map((r) => `<li><code>${escapeHtml(r)}</code></li>`).join('')}</ul>
+        <p>${escapeHtml(effect)}</p>
+        <p style="margin:1.5rem 0;">
+          <a href="${guideUrl}"
+             style="background:#7B9E88;color:#0d0d0d;padding:10px 22px;
+                    border-radius:4px;text-decoration:none;font-weight:600;
+                    display:inline-block;">
+            Open the API guide
+          </a>
+        </p>
+        <p>${escapeHtml(passOn)}</p>
+        <p><a href="${tokensUrl}">Your API tokens</a></p>
+        <hr style="border:none;border-top:1px solid #ddd;margin:2rem 0;" />
+        <p style="color:#9A9484;font-size:0.85em;">${escapeHtml(why)}</p>
+        ${unsubLink ? `<p style="color:#9A9484;font-size:0.85em;"><a href="${unsubLink}" style="color:#9A9484;">Unsubscribe from all Cellarion emails</a></p>` : ''}
+      </div>
+    `
+  });
+}
+
 /**
  * Warn the site admin that today's AI calls reached a share of the site-wide
  * daily cap (services/aiCapAlertJob). At the cap every AI feature is off for
@@ -979,4 +1168,75 @@ async function sendAiCapAlertEmail(toEmail, alert) {
   });
 }
 
-module.exports = { sendVerificationEmail, sendPasswordResetEmail, sendDrinkWindowDigest, sendRecommendationEmail, sendCellarInviteEmail, sendDiscussionReplyEmail, sendAccountLockoutAlert, sendSecurityAlertEmail, sendAiCapAlertEmail, sendSupporterThankYou, sendSupportReplyEmail, sendOwnerInquiryEmail, sendNewMemberCellarEmail, sendNewMemberEmptyEmail, EMAIL_VERIFICATION_ENABLED };
+// "1 December 2028" — the deletion date as the notices print it (UTC, so the
+// date in the email is the date the job uses).
+const longDate = (d) => new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
+
+/**
+ * A notice before an unused account is deleted (services/inactiveAccounts):
+ * the first 30 days before the date, the final one 7 days before. A message
+ * about the account itself, so it is sent even to someone who unsubscribed
+ * from all email (Privacy Policy, section 8), and it carries no unsubscribe
+ * link that could not stop it. Signing in once keeps the account.
+ *
+ * @param {string} toEmail
+ * @param {string} recipientName  display/username (greeting)
+ * @param {object} notice  { final, deleteAfter, lastActiveAt, months, bottles }
+ */
+async function sendInactivityNoticeEmail(toEmail, recipientName, notice) {
+  if (!EMAIL_VERIFICATION_ENABLED) return;
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const signInUrl = `${frontendUrl}/login`;
+  const when = longDate(notice.deleteAfter);
+  const since = longDate(notice.lastActiveAt);
+  const holds = notice.bottles > 0 ? ` It still holds ${bottlesWord(notice.bottles)}.` : '';
+  const subject = notice.final
+    ? `Last notice: your Cellarion account will be deleted on ${when}`
+    : `Your Cellarion account will be deleted on ${when}`;
+  const lead = notice.final ? 'This is the last notice about your Cellarion account.' : null;
+  const unused = `You have not used your Cellarion account since ${since}.${holds}`;
+  const rule = `Cellarion deletes accounts that have not been used for ${notice.months} months, so nobody's data is kept longer than it is needed. Your account and everything in it will be deleted on ${when}.`;
+  const keep = 'To keep it, sign in once before then. That is all it takes.';
+  const copy = 'Want a copy first? After signing in, Settings has a download of your cellar and of all your data.';
+  const nothing = 'If you no longer need the account, you do not have to do anything.';
+  const footer = 'This is a notice about your account itself, so it is sent even if you unsubscribed from Cellarion emails. It is sent twice: 30 days and 7 days before the date.';
+
+  await mg.messages.create(DOMAIN, {
+    from: FROM,
+    to: [toEmail],
+    'h:Reply-To': supportReplyTo(),
+    subject,
+    text: [
+      `Hello ${recipientName},`,
+      '',
+      ...(lead ? [lead, ''] : []),
+      unused,
+      rule,
+      '',
+      keep,
+      `Sign in: ${signInUrl}`,
+      '',
+      copy,
+      nothing,
+      '',
+      footer,
+    ].join('\n'),
+    html: `
+      <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#2a2a2a;line-height:1.5;">
+        <p>Hello <strong>${escapeHtml(recipientName)}</strong>,</p>
+        ${lead ? `<p><strong>${escapeHtml(lead)}</strong></p>` : ''}
+        <p>${escapeHtml(unused)}</p>
+        <p>${escapeHtml(rule)}</p>
+        <p>${escapeHtml(keep)}</p>
+        <p style="margin:1.5rem 0;">
+          <a href="${signInUrl}" style="background:#7B9E88;color:#0d0d0d;${NEW_MEMBER_BUTTON}">Sign in</a>
+        </p>
+        <p style="color:#555;">${escapeHtml(copy)} ${escapeHtml(nothing)}</p>
+        <hr style="border:none;border-top:1px solid #ddd;margin:2rem 0;" />
+        <p style="color:#9A9484;font-size:0.85em;">${escapeHtml(footer)}</p>
+      </div>
+    `,
+  });
+}
+
+module.exports = { sendVerificationEmail, sendPasswordResetEmail, sendDrinkWindowDigest, sendRecommendationEmail, sendCellarInviteEmail, sendDiscussionReplyEmail, sendAccountLockoutAlert, sendSecurityAlertEmail, sendAiCapAlertEmail, sendSupporterThankYou, sendSupportReplyEmail, sendOwnerInquiryEmail, sendNewMemberCellarEmail, sendNewMemberEmptyEmail, sendApiDeprecationEmail, sendInactivityNoticeEmail, EMAIL_VERIFICATION_ENABLED };

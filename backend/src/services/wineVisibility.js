@@ -12,31 +12,33 @@
  *   • pending + anyone else  → NOT visible, reported as the same not-found a
  *                              missing id gets, so its existence never leaks
  *
- * It lives here rather than being re-typed at each call site because the
- * security audit found NINE routes that validated "wine exists" with a bare
- * findById/exists: reviews, wishlist, recommendations, wine reports, wine
- * requests, bottles, and the MCP write/bulk/wine-list tools. A rule spelled out
- * nine times is a rule nine places can forget.
+ * It lives here rather than being re-typed at each call site: every route that
+ * validates "wine exists" needs it (reviews, wishlist, recommendations, wine
+ * reports, wine requests, bottles, and the MCP write/bulk/wine-list tools),
+ * and a bare findById/exists at any of them shows a pending row to anyone.
+ * A rule spelled out at each site is a rule each site can forget.
  *
  * Expressed as a QUERY FILTER, not a post-filter: `pendingIdentity` and
  * `createdBy` are never in a caller's projection (SAFE_SELECT-style inclusive
- * selects omit both), and a post-filter reading an absent field is exactly the
- * dead gate this audit found in mcp/tools/wines.js — `undefined === true` is
- * false, so the check never fires. Mongo decides instead.
+ * selects omit both), and a post-filter reading an absent field is a dead
+ * gate — `undefined === true` is false, so the check never fires. Mongo
+ * decides instead.
  */
 
 const WineDefinition = require('../models/WineDefinition');
 const { isValidId } = require('../utils/validation');
 
-const CURATION_ROLES = ['somm', 'admin'];
+// Frozen: the MCP tools hold this very array as their role gate
+// (mcp/toolUtil SOMM_ROLES), so a write through any holder would widen all.
+const CURATION_ROLES = Object.freeze(['somm', 'admin']);
 
 /** somm/admin — the roles whose job is completing pending rows. */
 const isCurator = (roles) => Array.isArray(roles) && roles.some((r) => CURATION_ROLES.includes(r));
 
 /**
- * The one clause that keeps PRIVATE DRAFTS out of a query (support ticket
- * 2026-09-12). A draft is `pendingIdentity: true` as well (model invariant),
- * so every pending exclusion already hides it; this constant is for the
+ * The one clause that keeps PRIVATE DRAFTS out of a query. A draft is
+ * `pendingIdentity: true` as well (model invariant), so every pending
+ * exclusion already hides it; this constant is for the
  * surfaces that deliberately INCLUDE pending rows — the curation queue, the
  * curator scan reads, the admin wine loads — and must still not see a draft.
  * Spread it, never re-type it.
@@ -108,7 +110,7 @@ async function isDraftVisibleViaSharedCellar(wineId, userId) {
   const Bottle = require('../models/Bottle');
   // The cellar's OWNER is `user`, not a member (utils/cellarAccess) — an
   // editor adding their draft bottle into someone else's cellar must leave
-  // that owner able to read it too (audit 2026-09-12).
+  // that owner able to read it too.
   const cellarIds = await Cellar.find({ $or: [{ user: userId }, { 'members.user': userId }], deletedAt: null }).distinct('_id');
   if (cellarIds.length === 0) return false;
   return Boolean(await Bottle.exists({ wineDefinition: wineId, cellar: { $in: cellarIds } }));
@@ -129,9 +131,9 @@ async function isDraftVisibleViaSharedCellar(wineId, userId) {
  * @param {boolean} [opts.lean=false]
  * @param {boolean} [opts.noDrafts=false]  exclude drafts entirely, even the
  *   caller's own — share/publish surfaces (see wineVisibilityFilter)
- * @param {boolean} [opts.viaSharedCellar=false]  READ surfaces: a draft the
- *   caller cannot see as creator is still returned when a shared cellar they
- *   belong to holds a bottle of it
+ * @param {boolean} [opts.viaSharedCellar=false]  READ surfaces: a draft, or a
+ *   wine waiting for a curator's check, that the caller cannot see as creator
+ *   is still returned when a shared cellar they belong to holds a bottle of it
  * @returns {Promise<object|null>}
  */
 async function findVisibleWine(id, opts = {}) {
@@ -151,8 +153,11 @@ async function findVisibleWine(id, opts = {}) {
   const wine = await build({ _id: String(id), ...wineVisibilityFilter({ userId, roles }, { noDrafts }) });
   if (wine || !viaSharedCellar || noDrafts) return wine;
   // A miss on a read surface: the one other way in is a shared cellar's bottle.
+  // That holds for a draft and for a wine waiting for a curator's check
+  // (models/WineDefinition.uncheckedIdentity): an editor's import into someone
+  // else's cellar must leave the owner and the other members able to read it.
   if (!(await isDraftVisibleViaSharedCellar(String(id), userId))) return null;
-  return build({ _id: String(id), draft: true });
+  return build({ _id: String(id), $or: [{ draft: true }, { uncheckedIdentity: true }] });
 }
 
 module.exports = {

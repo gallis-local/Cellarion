@@ -1,9 +1,9 @@
-// The shared typed-value system (issue #986). Validates a raw value against a
+// The shared typed-value system. Validates a raw value against a
 // key's declared type and returns the canonical cast form. Values are
 // validated for TYPE, never for truth.
 //
 // This module is deliberately free of personal-data specifics: the public
-// registry vocabulary (#985) and the analytics catalogue (#987) reuse the same
+// registry vocabulary and the analytics catalogue reuse the same
 // types, so `key` here is any object shaped { type, enumOptions? } — the unit
 // lives on the key and plays no part in validation.
 
@@ -28,8 +28,12 @@ function validateValue(key, raw) {
 
   switch (key.type) {
     case 'text': {
-      if (typeof raw !== 'string') return { ok: false, error: 'Expected text' };
-      const value = raw.trim();
+      // A number-only value (an article number, an EAN, a lot code) often
+      // arrives from an API or MCP client as a JSON number; a text key keeps
+      // it as text. Leading zeros survive only when it is sent as a string.
+      const str = typeof raw === 'number' && Number.isFinite(raw) ? String(raw) : raw;
+      if (typeof str !== 'string') return { ok: false, error: 'Expected text' };
+      const value = str.trim();
       if (!value) return { ok: false, error: 'A value is required' };
       if (value.length > TEXT_MAX) {
         return { ok: false, error: `Text too long (max ${TEXT_MAX} characters)` };

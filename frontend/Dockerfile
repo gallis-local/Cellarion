@@ -1,6 +1,6 @@
 # ── Stage 1: build React app ──────────────────────────────────────────────────
 # Digest-pinned (security audit L-11); Dependabot's docker ecosystem bumps it.
-FROM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS builder
+FROM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS builder
 
 WORKDIR /app
 
@@ -17,8 +17,8 @@ ARG APP_VERSION=
 # injects the tracker script. Empty values are a no-op (no script, no CSP impact).
 ARG VITE_UMAMI_URL=
 ARG VITE_UMAMI_WEBSITE_ID=
-# Public site URL baked into canonical/SEO meta tags (config/siteUrl.js).
-# Empty falls back to https://cellarion.app — self-hosters set their own domain.
+# Pins the address in share links and canonical/SEO meta tags (config/siteUrl.js).
+# Empty: the address the app is opened at, so one image serves every install.
 ARG VITE_SITE_URL=
 ENV VITE_UMAMI_URL=$VITE_UMAMI_URL \
     VITE_UMAMI_WEBSITE_ID=$VITE_UMAMI_WEBSITE_ID \

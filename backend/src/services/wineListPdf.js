@@ -24,26 +24,32 @@ const TYPE_TITLES = {
   en: {
     red: 'Red Wines', white: 'White Wines', rosé: 'Rosé Wines',
     sparkling: 'Sparkling Wines', dessert: 'Dessert Wines', fortified: 'Fortified Wines',
+    other: 'Other', unknown: 'Unknown',
   },
   sv: {
     red: 'Röda Viner', white: 'Vita Viner', rosé: 'Rosévin',
     sparkling: 'Mousserande Viner', dessert: 'Dessertviner', fortified: 'Starkvin',
+    other: 'Övrigt', unknown: 'Okänd',
   },
   fr: {
     red: 'Vins Rouges', white: 'Vins Blancs', rosé: 'Vins Rosés',
     sparkling: 'Vins Effervescents', dessert: 'Vins de Dessert', fortified: 'Vins Fortifiés',
+    other: 'Autres', unknown: 'Inconnu',
   },
   de: {
     red: 'Rotweine', white: 'Weißweine', rosé: 'Roséweine',
     sparkling: 'Schaumweine', dessert: 'Dessertweine', fortified: 'Likörweine',
+    other: 'Sonstiges', unknown: 'Unbekannt',
   },
   es: {
     red: 'Vinos Tintos', white: 'Vinos Blancos', rosé: 'Vinos Rosados',
     sparkling: 'Vinos Espumosos', dessert: 'Vinos de Postre', fortified: 'Vinos Fortificados',
+    other: 'Otros', unknown: 'Desconocido',
   },
   it: {
     red: 'Vini Rossi', white: 'Vini Bianchi', rosé: 'Vini Rosati',
     sparkling: 'Spumanti', dessert: 'Vini da Dessert', fortified: 'Vini Liquorosi',
+    other: 'Altro', unknown: 'Sconosciuto',
   },
 };
 
@@ -66,17 +72,32 @@ const LAST_BOTTLE_LABEL = {
   de: 'Letzte Flasche', es: 'Última botella', it: 'Ultima bottiglia',
 };
 
+// The bottle count (layout.showStock), in the list's language: [one, other].
+// French counts 0 and 1 in the singular. Mirrored in the frontend
+// (utils/wineListSections.js) — keep the two in sync.
+const BOTTLE_COUNT_LABEL = {
+  en: ['bottle', 'bottles'], sv: ['flaska', 'flaskor'], fr: ['bouteille', 'bouteilles'],
+  de: ['Flasche', 'Flaschen'], es: ['botella', 'botellas'], it: ['bottiglia', 'bottiglie'],
+};
+
+/** "3 bottles", "1 flaska", "0 bouteille" — a count in the list's language. */
+function bottleCountText(count, lang = 'en') {
+  const [one, other] = BOTTLE_COUNT_LABEL[lang] || BOTTLE_COUNT_LABEL.en;
+  const singular = lang === 'fr' ? count <= 1 : count === 1;
+  return `${count} ${singular ? one : other}`;
+}
+
 // Suffix on a heading repeated after a page break
 const CONTINUED_LABEL = {
   en: 'continued', sv: 'forts.', fr: 'suite', de: 'Fortsetzung', es: 'continuación', it: 'continua',
 };
 
 // Auto-mode grouping: the fields a heading level may group on, outermost
-// first in the classic menu order, and the depth cap (support ticket
-// 2026-09-12 — a menu reads naturally at three).
+// first in the classic menu order, and the depth cap (a menu reads
+// naturally at three).
 const LEVEL_FIELDS = ['type', 'country', 'region', 'appellation'];
 const MAX_LEVELS = 3;
-const DEFAULT_TYPE_ORDER = ['sparkling', 'white', 'rosé', 'red', 'dessert', 'fortified'];
+const DEFAULT_TYPE_ORDER = ['sparkling', 'white', 'rosé', 'red', 'dessert', 'fortified', 'other', 'unknown'];
 
 /**
  * The grouping levels in force for an auto-mode list: the explicit `levels`
@@ -98,7 +119,9 @@ function groupingLevels(grouping = {}) {
 // but never to the heading it already sits under ("Italy › Italy"): that
 // goes to "Other", which sorts last.
 function groupKeyOf(wine, level, parentKey) {
-  if (level === 'type') return wine.type || 'other';
+  // Mirrors frontend/src/utils/wineListSections.js: Other = a drink that is
+  // not wine; a wine of unknown colour is its own group.
+  if (level === 'type') return wine.nonWine ? 'other' : (wine.type || 'unknown');
   if (level === 'country') return wine.country || 'Other';
   const key = level === 'region'
     ? (wine.region || wine.country)
@@ -171,7 +194,7 @@ function buildSections(wineList, wineMap) {
 
 // `lang` is the LIST's language: country and region print in it where the
 // taxonomy row carries that name, else the canonical name (Toskana, but
-// Bordeaux stays Bordeaux) — support ticket 2026-09-12.
+// Bordeaux stays Bordeaux).
 function resolveEntry(entry, wineMap, layout = {}, lang = 'en') {
   const key = entryKey(entry);
   const info = wineMap.get(key);
@@ -190,14 +213,18 @@ function resolveEntry(entry, wineMap, layout = {}, lang = 'en') {
     appellation: wine.appellation || '',
     grapes: (wine.grapes || []).map(g => g.name).filter(Boolean),
     type: wine.type || '',
+    nonWine: wine.nonWine === true,
     price: entry.listPrice != null ? entry.listPrice : info.avgPrice,
     glassPrice: entry.byGlass && entry.glassPrice != null ? entry.glassPrice : null,
     // Kept apart from glassPrice so a hidden-price menu can still say
     // "by the glass" and still build the by-the-glass lead section.
     byGlass: !!entry.byGlass,
     // Live cellar stock of exactly one — the marker is only ever shown for
-    // the last bottle, never a count (support ticket 2026-09-12).
+    // the last bottle, never a count.
     lastBottle: !!layout.markLastBottle && info.stock === 1,
+    // The live count, only when the list shows counts (layout.showStock);
+    // null otherwise, so no renderer and no payload carries it.
+    bottleCount: layout.showStock ? info.stock : null,
     sortOrder: entry.sortOrder || 0,
     stock: info.stock,
     wineDefinitionId: wine._id?.toString(),
@@ -419,7 +446,7 @@ async function generateWineListPdf(wineList, wineMap, opts = {}) {
     const level = section.level || 0;
     // Ancestors only while deciding the break: a break placed between two
     // sibling groups repeats the parents ("RED WINES (continued) › Italy
-    // (continued)") before the new sibling — post-ship audit 2026-09-12.
+    // (continued)") before the new sibling.
     stack.length = level;
 
     if (level === 0 && i > 0 && newPageEachSection) {
@@ -455,7 +482,7 @@ async function generateWineListPdf(wineList, wineMap, opts = {}) {
       // An entry is never split: name + price line, and the producer/grape
       // line under it, move to the next page together (with a pending
       // run-in sub-header, which would otherwise be orphaned).
-      const need = entryHeight(wine) + (sub ? 20 : 0);
+      const need = entryHeight(wine, lang) + (sub ? 20 : 0);
       if (doc.y + need > bottomLimit) {
         breakPage({ repeatHeadings: true });
         lastSubHeader = null;
@@ -474,7 +501,7 @@ async function generateWineListPdf(wineList, wineMap, opts = {}) {
 
       renderWineEntry(doc, wine, {
         margin, contentWidth, font, fontBold, fontItalic,
-        scheme, currencySymbol, glassLabel, hidePrices,
+        scheme, currencySymbol, glassLabel, hidePrices, lang,
       });
     }
   }
@@ -490,7 +517,7 @@ async function generateWineListPdf(wineList, wineMap, opts = {}) {
   // Page numbers + footer on all pages. They sit INSIDE the bottom margin, so
   // the margin is lifted while they are stamped — otherwise PDFKit treats
   // each of them as overflow and appends a blank page per element per page
-  // (support ticket 2026-09-12: a 4-page menu came out as 12).
+  // (a 4-page menu comes out as 12).
   const range = doc.bufferedPageRange();
   for (let i = 0; i < range.count; i++) {
     doc.switchToPage(i);
@@ -516,11 +543,21 @@ async function generateWineListPdf(wineList, wineMap, opts = {}) {
   return doc;
 }
 
-/** Height renderWineEntry will use for a wine (see its final `doc.y` line). */
-function entryHeight(wine) {
+/**
+ * The smaller second line of an entry: producer — region · grapes · bottle
+ * count. One helper for the renderer and for entryHeight, so the page-break
+ * check measures exactly what is printed.
+ */
+function entryDetails(wine, lang = 'en') {
   const grapes = (wine.grapes || []).slice(0, 3).join(', ');
   const producerRegion = [wine.producer, wine.region].filter(Boolean).join(' — ');
-  return [producerRegion, grapes].filter(Boolean).length ? 26 : 15;
+  const count = wine.bottleCount != null ? bottleCountText(wine.bottleCount, lang) : '';
+  return [producerRegion, grapes, count].filter(Boolean).join(' · ');
+}
+
+/** Height renderWineEntry will use for a wine (see its final `doc.y` line). */
+function entryHeight(wine, lang = 'en') {
+  return entryDetails(wine, lang) ? 26 : 15;
 }
 
 /** "CHF 16", "zł 160", "Fr. 16" but "$16": a space after a symbol ending in a letter (any script) or a dot, none after a sign. */
@@ -578,7 +615,7 @@ function renderHeader(doc, branding, scheme, fontBold, fontItalic, contentWidth,
 }
 
 function renderWineEntry(doc, wine, opts) {
-  const { margin, contentWidth, font, fontBold, fontItalic, scheme, currencySymbol, glassLabel, hidePrices } = opts;
+  const { margin, contentWidth, font, fontBold, fontItalic, scheme, currencySymbol, glassLabel, hidePrices, lang } = opts;
   const indent = margin + 20;
   const priceColWidth = 100;
   const nameColWidth = contentWidth - 20 - priceColWidth;
@@ -625,9 +662,7 @@ function renderWineEntry(doc, wine, opts) {
     }
   }
 
-  const grapes = (wine.grapes || []).slice(0, 3).join(', ');
-  const producerRegion = [wine.producer, wine.region].filter(Boolean).join(' — ');
-  const details = [producerRegion, grapes].filter(Boolean).join(' · ');
+  const details = entryDetails(wine, lang);
   if (details) {
     doc.font(fontItalic).fontSize(8).fillColor(scheme.subheading);
     doc.text(details, indent, y + 13, { width: nameColWidth + priceColWidth, lineBreak: false });
@@ -638,5 +673,5 @@ function renderWineEntry(doc, wine, opts) {
 
 module.exports = {
   generateWineListPdf, buildSections, resolveEntry, groupingLevels, priceWithSymbol,
-  LEVEL_FIELDS, MAX_LEVELS, LAST_BOTTLE_LABEL, CONTINUED_LABEL,
+  LEVEL_FIELDS, MAX_LEVELS, LAST_BOTTLE_LABEL, BOTTLE_COUNT_LABEL, bottleCountText,
 };

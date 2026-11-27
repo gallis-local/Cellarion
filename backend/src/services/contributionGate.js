@@ -1,17 +1,19 @@
 /**
- * The ONE contributor gate for community suggestions (#985): discussion-ban
+ * The ONE contributor gate for community suggestions: discussion-ban
  * check + the per-tier daily budget, counted across ALL suggestion
  * collections — wine corrections, registry key proposals and registry value
  * suggestions share a single pool, so "your daily limit" means one number
  * everywhere (the MCP tool descriptions promise exactly this).
  *
- * Extracted from wineProposalOps/registryDataOps after the 2026-08-17 audit
- * found three drifting copies and a shared-budget claim the code didn't keep.
+ * One gate, not a copy per suggestion kind: copies drift, and the shared
+ * budget the tools promise holds only when every kind counts through here.
  */
 const User = require('../models/User');
 
 // Daily suggestion budget per contribution tier (User.contribution.tier).
-// Proven contributors fast-track; new accounts cannot swamp the queues.
+// Proven contributors fast-track; new accounts cannot swamp the queues. The
+// tier follows the Cellar Cred score, which a member's accepted suggestions
+// raise (services/suggestionCred) — the promise the refusal below makes.
 const TIER_DAILY = {
   newcomer: 3,
   contributor: 5,
@@ -27,8 +29,8 @@ const fail = (code, message) => ({ ok: false, code, message });
  * transport-neutral failure the ops services already speak.
  *
  * `budget: false` applies the ban only. Used when the write AMENDS a row the
- * user already has in a queue (support ticket 2026-09-12: adding a field to
- * one's own pending wine correction) — nothing new enters the queue, so it
+ * user already has in a queue (e.g. adding a field to one's own pending wine
+ * correction) — nothing new enters the queue, so it
  * must not be refused as "one more suggestion today".
  */
 async function checkContributionGate(userId, { budget = true } = {}) {

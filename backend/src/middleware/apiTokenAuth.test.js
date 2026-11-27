@@ -22,10 +22,16 @@ jest.mock('../models/ApiToken', () => {
 });
 jest.mock('../models/User', () => ({ findById: jest.fn() }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
+// What a marked token leads to is services/apiDeprecationNotices.test.js.
+jest.mock('../services/apiDeprecationNotices', () => ({ markTokenDeprecatedUse: jest.fn(() => Promise.resolve()) }));
+// The write itself is services/lastActive.test.js.
+jest.mock('../services/lastActive', () => ({ touchLastActive: jest.fn(() => Promise.resolve()) }));
 
 const ApiToken = require('../models/ApiToken');
 const User = require('../models/User');
 const { logAudit } = require('../services/audit');
+const { markTokenDeprecatedUse } = require('../services/apiDeprecationNotices');
+const { touchLastActive } = require('../services/lastActive');
 const {
   isApiTokenCredential,
   authenticateApiToken,
@@ -33,6 +39,12 @@ const {
   classifyRequest,
 } = require('./apiTokenAuth');
 const { SUNSET } = require('../config/apiDeprecations');
+
+// A test that expects a route to be "deprecated" pins the clock before the
+// sunset: from that day on the same route is denied by design, so an
+// unpinned test would start failing on that date.
+const BEFORE_SUNSET = new Date(SUNSET.getTime() - 24 * 60 * 60 * 1000);
+afterEach(() => jest.useRealTimers());
 
 beforeEach(() => jest.clearAllMocks());
 
@@ -73,6 +85,9 @@ describe('isRequestAllowed (default-deny)', () => {
     ['GET', '/api/auth/whoami'],
     ['POST', '/api/mcp'],
   ])('read scope allows %s %s', (method, path) => {
+    // GET /api/stats and /api/cellars/:id are admitted by a deprecated rule
+    // only, so the clock is pinned before the sunset.
+    jest.useFakeTimers({ now: BEFORE_SUNSET });
     expect(isRequestAllowed(READ, method, path)).toBe(true);
   });
 
@@ -234,15 +249,47 @@ describe('isRequestAllowed (default-deny)', () => {
     expect(isRequestAllowed(READ, 'GET', '/api/mcp/activity')).toBe(false); // timeline stays JWT-only
   });
 
-  test('write scope: MCP endpoint only — never any REST route', () => {
+  test('write scope: the MCP endpoint and the three moves — no other REST route', () => {
     const WRITE = ['write'];
+    const ID = 'a'.repeat(24);
     expect(isRequestAllowed(WRITE, 'POST', '/api/mcp')).toBe(true);
     expect(isRequestAllowed(WRITE, 'GET', '/api/mcp')).toBe(true);   // session SSE stream
     expect(isRequestAllowed(WRITE, 'DELETE', '/api/mcp')).toBe(true); // session termination
+    // The moves: to another cellar, into a rack slot, out of one.
+    expect(isRequestAllowed(WRITE, 'POST', `/api/bottles/${ID}/move`)).toBe(true);
+    expect(isRequestAllowed(WRITE, 'PUT', `/api/racks/${ID}/slots/12`)).toBe(true);
+    expect(isRequestAllowed(WRITE, 'DELETE', `/api/racks/${ID}/slots/12`)).toBe(true);
+    // Their neighbours stay closed: the bulk move, the in-rack swap, disabling
+    // a slot, moving a whole rack's bottles, arranging, editing or deleting.
+    expect(isRequestAllowed(WRITE, 'POST', '/api/bottles/bulk/move')).toBe(false);
+    expect(isRequestAllowed(WRITE, 'POST', `/api/racks/${ID}/slots/12/move`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'POST', `/api/racks/${ID}/slots/12/disable`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'DELETE', `/api/racks/${ID}/slots/12/disable`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'POST', `/api/racks/${ID}/move-bottles`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'POST', `/api/racks/${ID}/arrange/apply`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'PUT', `/api/racks/${ID}`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'DELETE', `/api/racks/${ID}`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'PUT', `/api/racks/${ID}/slots/1x`)).toBe(false);
+    // A slot number has at most nine digits: none that a number cannot hold exactly.
+    expect(isRequestAllowed(WRITE, 'PUT', `/api/racks/${ID}/slots/999999999`)).toBe(true);
+    expect(isRequestAllowed(WRITE, 'PUT', `/api/racks/${ID}/slots/1000000000`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'DELETE', `/api/racks/${ID}/slots/1000000000000000000000`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'PUT', '/api/racks/not-an-id/slots/1')).toBe(false);
     expect(isRequestAllowed(WRITE, 'POST', '/api/bottles')).toBe(false);
-    expect(isRequestAllowed(WRITE, 'PUT', '/api/bottles/' + 'a'.repeat(24))).toBe(false);
+    expect(isRequestAllowed(WRITE, 'PUT', `/api/bottles/${ID}`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'DELETE', `/api/bottles/${ID}`)).toBe(false);
+    expect(isRequestAllowed(WRITE, 'POST', `/api/bottles/${ID}/consume`)).toBe(false);
     expect(isRequestAllowed(WRITE, 'GET', '/api/cellars')).toBe(false);
     expect(isRequestAllowed(WRITE, 'GET', '/api/mcp/activity')).toBe(false);
+  });
+
+  test('the moves need write: read and consume tokens are refused', () => {
+    const ID = 'a'.repeat(24);
+    for (const scopes of [READ, CONSUME, BOTH, ['climate']]) {
+      expect([scopes, isRequestAllowed(scopes, 'POST', `/api/bottles/${ID}/move`)]).toEqual([scopes, false]);
+      expect([scopes, isRequestAllowed(scopes, 'PUT', `/api/racks/${ID}/slots/12`)]).toEqual([scopes, false]);
+      expect([scopes, isRequestAllowed(scopes, 'DELETE', `/api/racks/${ID}/slots/12`)]).toEqual([scopes, false]);
+    }
   });
 
   test('GET /api/auth/whoami is granted ONLY by read (own account id for HA reauth)', () => {
@@ -274,8 +321,13 @@ describe('classifyRequest: the documented reads, and the ones on their way out',
     '/api/stats', '/api/stats/value-history', `/api/cellars/${oid}`, `/api/cellars/${oid}/statistics`,
     '/api/cellars/multi/bottles', '/api/bottles/trash', `/api/bottles/${oid}/lot-history`, '/api/bottles/notanid',
   ])('GET %s is deprecated: still answered, until the sunset', (path) => {
-    expect(classifyRequest(READ, 'GET', path)).toBe('deprecated');
-    expect(isRequestAllowed(READ, 'GET', path)).toBe(true);
+    jest.useFakeTimers({ now: BEFORE_SUNSET });
+    try {
+      expect(classifyRequest(READ, 'GET', path)).toBe('deprecated');
+      expect(isRequestAllowed(READ, 'GET', path)).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test('a path in another letter case is checked as Express routes it (case-insensitively)', () => {
@@ -288,7 +340,7 @@ describe('classifyRequest: the documented reads, and the ones on their way out',
     // Case changes nothing that was allowed or deprecated.
     expect(classifyRequest(READ, 'GET', '/API/Inventory')).toBe('allowed');
     expect(classifyRequest(READ, 'GET', `/api/bottles/${oid.toUpperCase()}`)).toBe('allowed');
-    expect(classifyRequest(READ, 'GET', '/api/Stats/Value-History')).toBe('deprecated');
+    expect(classifyRequest(READ, 'GET', '/api/Stats/Value-History', BEFORE_SUNSET.getTime())).toBe('deprecated');
   });
 
   test('from the sunset on, a deprecated route is denied', () => {
@@ -343,6 +395,7 @@ describe('authenticateApiToken', () => {
   });
 
   test('a deprecated route is answered with Deprecation, Sunset and Link; a documented one without', async () => {
+    jest.useFakeTimers({ now: BEFORE_SUNSET });
     const headersFor = async (baseUrl, path) => {
       ApiToken.findOne.mockResolvedValue(activeToken());
       User.findById.mockReturnValue(selectable(activeUser()));
@@ -358,6 +411,33 @@ describe('authenticateApiToken', () => {
     expect(old.Sunset).toBe(SUNSET.toUTCString());
     expect(old.Link).toMatch(/\/developers>; rel="deprecation"/);
     expect(await headersFor('/api/stats', '/overview')).toEqual({});
+    jest.useRealTimers();
+  });
+
+  test('a deprecated route, once answered, is marked on the token that called it; a documented one is not', async () => {
+    jest.useFakeTimers({ now: BEFORE_SUNSET });
+    const run = async (baseUrl, path) => {
+      const token = activeToken();
+      ApiToken.findOne.mockResolvedValue(token);
+      User.findById.mockReturnValue(selectable(activeUser()));
+      const handlers = {};
+      const res = { ...mockRes(), setHeader: jest.fn(), on: jest.fn((event, fn) => { handlers[event] = fn; }) };
+      const req = mockReq('GET', baseUrl, path);
+      const next = jest.fn();
+      await authenticateApiToken(req, res, next, RAW);
+      expect(next).toHaveBeenCalled();
+      return { token, req, res, handlers };
+    };
+
+    const old = await run('/api/cellars', `/${'a'.repeat(24)}`);
+    expect(markTokenDeprecatedUse).not.toHaveBeenCalled(); // not before it is answered
+    old.handlers.finish();
+    expect(markTokenDeprecatedUse).toHaveBeenCalledWith(old.token, old.req, old.res);
+
+    markTokenDeprecatedUse.mockClear();
+    const documented = await run('/api/stats', '/overview');
+    expect(documented.handlers.finish).toBeUndefined();
+    expect(markTokenDeprecatedUse).not.toHaveBeenCalled();
   });
 
   test('unknown or revoked token → 401 (findOne filters revokedAt null)', async () => {
@@ -435,6 +515,28 @@ describe('authenticateApiToken', () => {
       await authenticateApiToken(mockReq(method, baseUrl, path), res, next, RAW);
       expect(res.status).toHaveBeenCalledWith(403);
       expect(next).not.toHaveBeenCalled();
+    }
+  });
+
+  test('an OAuth token with the write scope CANNOT use the REST moves a personal write token reaches', async () => {
+    const ID = 'a'.repeat(24);
+    for (const [method, baseUrl, path] of [
+      ['POST', '/api/bottles', `/${ID}/move`],
+      ['PUT', '/api/racks', `/${ID}/slots/3`],
+      ['DELETE', '/api/racks', `/${ID}/slots/3`],
+    ]) {
+      ApiToken.findOne.mockResolvedValue(activeToken({ origin: 'oauth', scopes: ['read', 'consume', 'write'], expiresAt: new Date(Date.now() + 60000) }));
+      User.findById.mockReturnValue(selectable(activeUser()));
+      const res = mockRes(); const next = jest.fn();
+      await authenticateApiToken(mockReq(method, baseUrl, path), res, next, RAW);
+      expect([method, path, res.status.mock.calls[0]]).toEqual([method, path, [403]]);
+      expect(next).not.toHaveBeenCalled();
+      // The same request with a personal write token goes through.
+      ApiToken.findOne.mockResolvedValue(activeToken({ scopes: ['write'] }));
+      User.findById.mockReturnValue(selectable(activeUser()));
+      const ok = jest.fn();
+      await authenticateApiToken(mockReq(method, baseUrl, path), mockRes(), ok, RAW);
+      expect([method, path, ok.mock.calls.length]).toEqual([method, path, 1]);
     }
   });
 
@@ -529,6 +631,19 @@ describe('authenticateApiToken', () => {
       expect(polls).toBeGreaterThan(20);
       expect(ApiToken.updateOne).toHaveBeenCalledTimes(polls);
       expect(logAudit).toHaveBeenCalledTimes(1);
+      // ...and the owner's active day once, with the day's first use.
+      expect(touchLastActive).toHaveBeenCalledTimes(1);
+    });
+
+    // An integration at work is the member using Cellarion (User.lastActiveAt).
+    test('the first use of the day also records the owner\'s active day; other uses that day do not', async () => {
+      await use(new Date('2026-09-25T23:30:00Z'));
+      expect(touchLastActive).toHaveBeenCalledWith(userId, new Date('2026-09-26T10:00:00Z'));
+
+      touchLastActive.mockClear();
+      await use(new Date('2026-09-26T07:59:00Z'));
+      await use(new Date('2026-09-26T09:30:00Z'));
+      expect(touchLastActive).not.toHaveBeenCalled();
     });
   });
 });

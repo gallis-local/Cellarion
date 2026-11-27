@@ -15,7 +15,7 @@ jest.mock('../models/WineVintageProfile', () => ({ findById: jest.fn(), findOne:
 jest.mock('../models/WineVintagePrice', () => ({ deleteOne: jest.fn() }));
 jest.mock('../models/WineEmbedding', () => ({ findOne: jest.fn() }));
 jest.mock('../models/McpActionLog', () => ({ create: jest.fn(), findOne: jest.fn(), findOneAndUpdate: jest.fn() }));
-jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn(), indexWine: jest.fn() }));
+jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), indexWine: jest.fn() }));
 jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), buildEmptyStats: jest.fn() }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../services/indexNow', () => ({ submitUrls: jest.fn() }));
@@ -152,8 +152,19 @@ describe('official image + credit', () => {
       expect.objectContaining({ via: 'mcp', credit: 'Photo: Systembolaget' }));
   });
 
+  test('the answer about a created wine carries no sweetness_style key; one read by its id carries the style', async () => {
+    findOrCreateWine.mockResolvedValue({ wine: WINE, created: true });
+    const created = parse(await tool('admin_add_registry_wine').handler({ name: 'Barolo', producer: 'Bartolo Mascarello', country: 'Italy', type: 'red' }, ADMIN_CTX));
+    expect(created.data.wine).not.toHaveProperty('sweetness_style');
+    const q = { select: jest.fn(() => q), populate: jest.fn().mockResolvedValue({ ...WINE, populate: undefined }) };
+    WineDefinition.findById.mockReturnValue(q);
+    const existing = parse(await tool('admin_add_registry_wine').handler({ name: 'x', producer: 'x', country: 'x', type: 'red', existing_wine_id: String(WINE._id) }, ADMIN_CTX));
+    expect(existing.data.wine).toHaveProperty('sweetness_style', null);
+  });
+
   test('existing_wine_id sets the image WITHOUT creating anything', async () => {
-    WineDefinition.findById.mockReturnValue({ populate: jest.fn().mockResolvedValue({ ...WINE, populate: undefined }) });
+    const q = { select: jest.fn(() => q), populate: jest.fn().mockResolvedValue({ ...WINE, populate: undefined }) };
+    WineDefinition.findById.mockReturnValue(q);
     safeFetchImage.mockResolvedValue({ buffer: Buffer.from('img') });
     attachOfficialWineImage.mockResolvedValue({ image: { _id: oid('9'), status: 'approved' } });
     const res = await tool('admin_add_registry_wine').handler({
@@ -178,7 +189,7 @@ describe('official image + credit', () => {
   });
 });
 
-// ─── Taxonomy review queues over MCP (strategy 2026-07-29 R2/R3) ─────────────
+// ─── Taxonomy review queues over MCP ─────────────
 
 jest.mock('../services/taxonomyReview', () => ({
   listPendingRegions: jest.fn(),
@@ -270,7 +281,7 @@ describe('taxonomy review tools', () => {
     expect(Appellation).not.toHaveBeenCalled();
   });
 
-  // ── dismiss / restore — the queue's terminal state (ticket 6a842d5e) ──────
+  // ── dismiss / restore — the queue's terminal state ────────────────────────
 
   test('dismiss_appellation records the skip via the shared service and audits like the REST twin', async () => {
     dismissUnmatchedAppellation.mockResolvedValue({ key: 'qualitatswein', name: 'Qualitätswein', created: true });

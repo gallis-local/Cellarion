@@ -7,7 +7,7 @@
  * form left an orphan registry row forever (31 zero-bottle createdVia:'ui'
  * rows on prod 2026-08-10; the "Domaine de Riquewihr — Kaefferkopf" case).
  * The wine is now resolved-or-minted INSIDE the bottle create, the same
- * commit-time pattern as import /confirm (#899) and the MCP add_bottle tool.
+ * commit-time pattern as import /confirm and the MCP add_bottle tool.
  *
  * Pinned here:
  *   - exactly one of wineDefinition | newWine (400 otherwise)
@@ -29,8 +29,6 @@ process.env.JWT_SECRET = 'test-secret';
 jest.mock('../services/search', () => ({
   getIsAvailable: () => false,
   search: async () => ({ ids: [] }),
-  indexBottle: jest.fn(),
-  removeBottle: jest.fn(),
 }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../services/indexNow', () => ({ submitUrls: jest.fn() }));
@@ -177,7 +175,7 @@ describe('POST /api/bottles — wine reference contract', () => {
   test('the by-id path is untouched: loads the wine, never calls findOrCreateWine, never audits wine.create', async () => {
     // findOne, not findById: the by-id path resolves through
     // services/wineVisibility so a stranger's pendingIdentity row answers the
-    // same 404 a missing id does (security audit M-4).
+    // same 404 a missing id does.
     WineDefinition.findOne.mockResolvedValue(WINE_DOC);
 
     const { status, body } = await post({ cellar: CELLAR_ID, vintage: '2019', wineDefinition: WINE_ID });
@@ -210,7 +208,8 @@ describe('POST /api/bottles — newWine mints at commit', () => {
     expect(userId).toBe(USER_ID);
     // allowPending: the commit path files an incomplete identity instead of
     // 400-ing the user's bottle away (pending-identity wines).
-    expect(opts).toEqual({ confirmCreate: false, skipSiblingMatch: false, createdVia: 'ui', allowPending: true, draft: false });
+    // nonWine: the Other category rides the same options; false for a wine.
+    expect(opts).toEqual({ confirmCreate: false, skipSiblingMatch: false, createdVia: 'ui', allowPending: true, draft: false, nonWine: false });
 
     // audit parity with every other registry-write surface: same action name,
     // same detail shape — plus IndexNow on a real creation
@@ -239,7 +238,7 @@ describe('POST /api/bottles — newWine mints at commit', () => {
     await post({ cellar: CELLAR_ID, vintage: '2019', newWine: { ...NEW_WINE, confirmCreate: true } });
 
     expect(findOrCreateWine.mock.calls[0][2]).toEqual({
-      confirmCreate: true, skipSiblingMatch: true, createdVia: 'ui', allowPending: true, draft: false,
+      confirmCreate: true, skipSiblingMatch: true, createdVia: 'ui', allowPending: true, draft: false, nonWine: false,
     });
   });
 

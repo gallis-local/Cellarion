@@ -8,6 +8,7 @@ const {
   normalizeProducerKey,
   generateWineKey,
   normalizeAppellation,
+  normalizeClassification,
   levenshteinDistance,
   calculateSimilarity,
   generateTrigrams,
@@ -54,7 +55,7 @@ describe('normalizeString', () => {
     expect(normalizeString('  trimmed  ')).toBe('trimmed');
   });
 
-  test('still strips stars: they mean nothing outside a wine name (release audit 2026-10-13)', () => {
+  test('still strips stars: they mean nothing outside a wine name', () => {
     // A star-only placeholder must stay empty, and a footnote star on a
     // grape / region / country must not make it a different one.
     expect(normalizeString('*')).toBe('');
@@ -124,7 +125,90 @@ describe('tokenize', () => {
 
 // ─── generateWineKey ─────────────────────────────────────────────────────────
 
-describe('normalizeAppellation (ticket #2C: tier-suffix proliferation)', () => {
+// ─── normalizeClassification ───────────────────────
+
+describe('normalizeClassification', () => {
+  test('a quality tier is kept as typed, whitespace folded', () => {
+    expect(normalizeClassification('Grand Cru Classé en 1855')).toBe('Grand Cru Classé en 1855');
+    expect(normalizeClassification('  Riserva ')).toBe('Riserva');
+    expect(normalizeClassification('Grand  Cru')).toBe('Grand Cru');
+    expect(normalizeClassification('Spätlese')).toBe('Spätlese');
+    expect(normalizeClassification('Premier Cru')).toBe('Premier Cru');
+    // A category in its own system, not the appellation's mark: kept.
+    expect(normalizeClassification('Vin de France')).toBe('Vin de France');
+    expect(normalizeClassification('Qualitätswein')).toBe('Qualitätswein');
+  });
+
+  test('the regulatory mark alone is no classification at all', () => {
+    for (const mark of ['DOCG', 'DOC', 'DOCa', 'D.O.C.G.', 'D.O.C.', 'AOC', 'AOP', 'IGT', 'IGP', 'DO', 'AVA', 'DOQ', 'PDO', 'PGI']) {
+      expect(normalizeClassification(mark)).toBeNull();
+    }
+  });
+
+  test('a spelled-out mark is no classification either', () => {
+    expect(normalizeClassification('Denominazione di Origine Controllata e Garantita')).toBeNull();
+    expect(normalizeClassification('Denominazione di Origine Controllata')).toBeNull();
+    expect(normalizeClassification('Denominazione di Origine Protetta')).toBeNull();
+    expect(normalizeClassification('Indicazione Geografica Tipica')).toBeNull();
+    expect(normalizeClassification("Appellation d'Origine Protégée")).toBeNull();
+    expect(normalizeClassification("Appellation d'Origine Contrôlée")).toBeNull();
+    expect(normalizeClassification('Indication Géographique Protégée')).toBeNull();
+    expect(normalizeClassification('Denominación de Origen')).toBeNull();
+  });
+
+  test('a mark attached to a real tier is dropped and the tier stays', () => {
+    expect(normalizeClassification('Riserva DOCG')).toBe('Riserva');
+    expect(normalizeClassification('DOCG Riserva')).toBe('Riserva');
+    expect(normalizeClassification('Gran Reserva DOCa')).toBe('Gran Reserva');
+    expect(normalizeClassification('Superiore DOC')).toBe('Superiore');
+    expect(normalizeClassification('Classico Superiore D.O.C.G.')).toBe('Classico Superiore');
+    expect(normalizeClassification('Riserva, Denominazione di Origine Controllata e Garantita')).toBe('Riserva');
+  });
+
+  test('empty, blank and non-string inputs are null', () => {
+    expect(normalizeClassification(null)).toBeNull();
+    expect(normalizeClassification(undefined)).toBeNull();
+    expect(normalizeClassification('')).toBeNull();
+    expect(normalizeClassification('   ')).toBeNull();
+  });
+
+  test('bracketed, wrapped and Austrian marks are marks too', () => {
+    expect(normalizeClassification('Riserva (DOCG)')).toBe('Riserva');
+    expect(normalizeClassification('(DOCG)')).toBeNull();
+    expect(normalizeClassification('Denominazione di Origine Controllata (DOC)')).toBeNull();
+    expect(normalizeClassification('Appellation Pauillac Contrôlée')).toBeNull();
+    expect(normalizeClassification('Appellation Saint-Émilion Grand Cru Contrôlée')).toBeNull();
+    expect(normalizeClassification('Appellation Côtes du Rhône Protégée')).toBeNull();
+    expect(normalizeClassification('DAC')).toBeNull();
+    expect(normalizeClassification('Districtus Austriae Controllatus')).toBeNull();
+    expect(normalizeClassification('Reserve DO')).toBe('Reserve');
+    expect(normalizeClassification('DO Pago')).toBe('Pago');
+    // The appellation keeps its own exceptions.
+    expect(normalizeAppellation('Kamptal DAC')).toBe('Kamptal DAC');
+    expect(normalizeAppellation('Barolo (DOCG)')).toBe('Barolo');
+  });
+
+  test('the apostrophe Italian spelling and the bare French mark', () => {
+    expect(normalizeClassification("Denominazione d'Origine Controllata")).toBeNull();
+    expect(normalizeClassification("Denominazione d’Origine Controllata e Garantita")).toBeNull();
+    expect(normalizeClassification('Appellation Contrôlée')).toBeNull();
+    expect(normalizeClassification('Appellation Protégée')).toBeNull();
+    expect(normalizeClassification("Riserva Denominazione d'Origine Controllata")).toBe('Riserva');
+    expect(normalizeAppellation("Langhe Denominazione d'Origine Controllata")).toBe('Langhe');
+    expect(normalizeAppellation('Pommard Appellation Contrôlée')).toBe('Pommard');
+    expect(normalizeAppellation('Appellation Contrôlée')).toBe('Appellation Contrôlée'); // all-mark input survives, as every appellation rule
+  });
+
+  test('the appellation rule is unchanged by sharing its loops', () => {
+    expect(normalizeAppellation('DOCG')).toBe('DOCG');
+    expect(normalizeAppellation('Denominazione di Origine Controllata')).toBe('Denominazione di Origine Controllata');
+    expect(normalizeAppellation('Chianti Denominazione di Origine Controllata')).toBe('Chianti');
+    expect(normalizeAppellation('D.O. Valle Central')).toBe('Valle Central');
+    expect(normalizeAppellation('Vin du Québec - Indication géographique protégée')).toBe('Vin du Québec');
+  });
+});
+
+describe('normalizeAppellation (tier-suffix proliferation)', () => {
   test('strips the trailing classification tier', () => {
     expect(normalizeAppellation('Barolo DOCG')).toBe('Barolo');
     expect(normalizeAppellation('Barolo')).toBe('Barolo');
@@ -165,11 +249,10 @@ describe('normalizeAppellation (ticket #2C: tier-suffix proliferation)', () => {
     expect(normalizeAppellation('Swartland WO')).toBe('Swartland');
   });
 
-  // Ticket 6a842d54: "Denominación de Origen Valencia" and "Samos PDO" sat in
-  // the unmatched queue over curated "Valencia"/"Samos" — spelled-out phrases
-  // are invisible to the single-token loops, and the English EU marks were in
-  // neither token set.
-  test('strips spelled-out tier phrases from either end (ticket 6a842d54)', () => {
+  // "Denominación de Origen Valencia" and "Samos PDO" must match curated
+  // "Valencia"/"Samos" — spelled-out phrases are invisible to the
+  // single-token loops, and the English EU marks need a token set too.
+  test('strips spelled-out tier phrases from either end', () => {
     expect(normalizeAppellation('Denominación de Origen Valencia')).toBe('Valencia');
     expect(normalizeAppellation('Denominación de Origen Calificada Rioja')).toBe('Rioja');
     expect(normalizeAppellation('Chianti Denominazione di Origine Controllata e Garantita')).toBe('Chianti');
@@ -182,16 +265,16 @@ describe('normalizeAppellation (ticket #2C: tier-suffix proliferation)', () => {
     expect(normalizeAppellation('Ribera del Duero')).toBe('Ribera del Duero');
   });
 
-  test('PDO/PGI tier marks strip from both sides (ticket 6a842d54)', () => {
+  test('PDO/PGI tier marks strip from both sides', () => {
     expect(normalizeAppellation('Samos PDO')).toBe('Samos');
     expect(normalizeAppellation('PDO Santorini')).toBe('Santorini');
     expect(normalizeAppellation('Peloponnese PGI')).toBe('Peloponnese');
     expect(normalizeAppellation('Samos P.D.O.')).toBe('Samos'); // dotted form, same fold as the loops
   });
 
-  // Prod 2026-08-18: the phrase strip left the separator behind —
-  // "Vin du Québec - Indication géographique protégée" → "Vin du Québec -",
-  // one hand-fixed row. A bare punctuation token at either end is debris.
+  // The phrase strip must not leave the separator behind —
+  // "Vin du Québec - Indication géographique protégée" → "Vin du Québec -".
+  // A bare punctuation token at either end is debris.
   test('a separator left dangling by a strip is dropped from either end', () => {
     expect(normalizeAppellation('Vin du Québec - Indication géographique protégée')).toBe('Vin du Québec');
     expect(normalizeAppellation('Rioja – DOCa')).toBe('Rioja');
@@ -202,11 +285,11 @@ describe('normalizeAppellation (ticket #2C: tier-suffix proliferation)', () => {
     expect(normalizeAppellation('-')).toBe('-');
   });
 
-  // Prod 2026-08-13: "Lison Classico D.O.C.G." kept its tier. The LEADING loop
-  // has always folded dots out of the candidate token ("D.O. Valle Central"
-  // above); the trailing loop only trimmed dots off the END, so 'd.o.c.g'
-  // never matched anything in the tier set and the abbreviated forms labels
-  // actually print sailed straight through into the registry.
+  // "Lison Classico D.O.C.G." loses its tier. The LEADING loop folds dots out
+  // of the candidate token ("D.O. Valle Central" above); a trailing loop that
+  // only trimmed dots off the END would never match 'd.o.c.g' in the tier
+  // set, and the abbreviated forms labels actually print would sail straight
+  // through into the registry.
   test('strips a DOTTED trailing tier, the same fold the leading loop uses', () => {
     expect(normalizeAppellation('Lison Classico D.O.C.G.')).toBe('Lison Classico');
     expect(normalizeAppellation('Rioja D.O.Ca.')).toBe('Rioja');
@@ -249,7 +332,7 @@ describe('stripTrailingVintage (registry is vintage-neutral — audit B2)', () =
     expect(stripTrailingVintage('Bourgogne Rouge 2019 2019')).toBe('Bourgogne Rouge');
   });
 
-  test('a long separator run stays linear and still strips (CodeQL polynomial-redos, 2026-09-12)', () => {
+  test('a long separator run stays linear and still strips (CodeQL polynomial-redos)', () => {
     // The separator class is bounded to 8 repetitions; the caller's trim
     // removes what a longer run leaves behind, so the result is unchanged.
     expect(stripTrailingVintage(`Cuvée${' '.repeat(40)}2019`)).toBe('Cuvée');
@@ -512,10 +595,9 @@ describe('resolveCountryName', () => {
     expect(resolveCountryName('America')).toBe('United States');
   });
 
-  // A 48-row import on 2026-08-21 lost HALF its rows here: 24 rejected as
-  // unrecognized countries, every one an ISO code (de ×11, fr ×5, ro ×5, it,
-  // pl, es). The codes below are exactly the ones that file used, plus the
-  // rest of the wine world.
+  // An import file may state the country as an ISO code ("de", "fr", "ro"…);
+  // rejecting those as unrecognized countries loses the row. The codes below
+  // cover the wine world.
   describe('ISO 3166-1 alpha-2 codes', () => {
     test.each([
       ['de', 'Germany'], ['fr', 'France'], ['ro', 'Romania'],
@@ -640,7 +722,7 @@ describe('isRecognizedCountry', () => {
   });
 
   test('false for the prod junk this gate exists to stop', () => {
-    expect(isRecognizedCountry('Espalda')).toBe(false); // misread "España" (ticket 2026-07-26)
+    expect(isRecognizedCountry('Espalda')).toBe(false); // misread "España"
     expect(isRecognizedCountry('Atlantis')).toBe(false);
     expect(isRecognizedCountry('Back label')).toBe(false);
     expect(isRecognizedCountry('Red')).toBe(false);
@@ -711,7 +793,7 @@ describe('isJunkGrapeName', () => {
   });
 });
 
-describe('resolveGrapeName — blend-percentage artifacts (taxonomy audit 2026-07-18)', () => {
+describe('resolveGrapeName — blend-percentage artifacts', () => {
   test('strips a leading percentage and resolves the remainder', () => {
     // "70% Monastrell" existed as a Grape document on prod
     expect(resolveGrapeName('70% Monastrell')).toBe('Mourvèdre');
@@ -751,7 +833,7 @@ describe('resolveGrapeName — Sangiovese Grosso', () => {
   });
 });
 
-describe('resolveGrapeName — spelling variants merged 2026-07-11', () => {
+describe('resolveGrapeName — spelling variants', () => {
   test('maps spelling variants and typos to canonical names', () => {
     expect(resolveGrapeName('Agiorghitiko')).toBe('Agiorgitiko');
     expect(resolveGrapeName('Inzolia')).toBe('Insolia');
@@ -798,7 +880,7 @@ describe('producer house prefixes (the launch-day Barolo duplicate)', () => {
   });
 });
 
-describe('normalizeProducerKey (ticket #2B: dup-cluster bucketing)', () => {
+describe('normalizeProducerKey (dup-cluster bucketing)', () => {
   test('a corporate suffix + a wine stop word collapse to the same key', () => {
     // The exact repro: two registry strings for one producer must bucket together.
     expect(normalizeProducerKey('Kumeu River Wines Limited')).toBe('kumeu river');
@@ -820,8 +902,8 @@ describe('normalizeProducerKey (ticket #2B: dup-cluster bucketing)', () => {
   });
 });
 
-describe('normalizeProducerKey — Saint fold + founding-year strip (tickets d49fea22 / d49dfd38)', () => {
-  test('St / Ste / Saint / Sainte share one bucket token — the Caronne 3-spelling split', () => {
+describe('normalizeProducerKey — Saint fold + founding-year strip', () => {
+  test('St / Ste / Saint / Sainte share one bucket token — three spellings of Caronne', () => {
     const key = normalizeProducerKey('Château Caronne Sainte Gemme');
     expect(key).toBe('caronne saint gemme');
     expect(normalizeProducerKey('Château Caronne Ste Gemme')).toBe(key);
@@ -846,9 +928,9 @@ describe('normalizeProducerKey — Saint fold + founding-year strip (tickets d49
     expect(normalizeProducerKey('1848 Winery')).toBe('1848');
   });
 
-  test('a stop/corp word after the founding year does not hide it (audit 2026-08-10)', () => {
-    // Pre-fix, "X 1846" and "X 1846 Winery" split into different keys — a
-    // regression against the pre-fold bucketing, which unified them.
+  test('a stop/corp word after the founding year does not hide it', () => {
+    // "X 1846" and "X 1846 Winery" must share one key, as they would
+    // without the founding-year fold.
     expect(normalizeProducerKey("Grand Pappy's 1846 Winery")).toBe('grand pappys');
     expect(normalizeProducerKey('Bodega Norton 1895 Ltd')).toBe('norton');
     expect(normalizeProducerKey("Grand Pappy's Est. 1846 Winery")).toBe('grand pappys');
@@ -870,7 +952,7 @@ describe('normalizeProducerKey — Saint fold + founding-year strip (tickets d49
   });
 });
 
-// ─── draftWineKey — the private-draft key namespace (2026-09-12) ─────────────
+// ─── draftWineKey — the private-draft key namespace ──────────────────────────
 
 describe('draftWineKey', () => {
   const { draftWineKey, draftProducerKey, DRAFT_KEY_PREFIX, generateWineKey, pendingWineKey, normalizeString } = require('./normalize');
@@ -895,5 +977,132 @@ describe('draftWineKey', () => {
 
   test('tolerates a missing producer and appellation (a draft may be producerless)', () => {
     expect(draftWineKey('Kaefferkopf', undefined, U1)).toBe(`draft~${U1}::kaefferkopf:`);
+  });
+});
+
+describe('appendSweetnessTerm — every spelling of the term counts as carried', () => {
+  const { appendSweetnessTerm: append, generateWineSlug: slug } = require('./normalize');
+  test.each([
+    ['Champagne Extra-Brut', { name: 'Extra Brut', synonyms: ['Extra-Brut'] }],
+    ['Champagne Extra-Brut', ['Extra Brut']],
+    ['Vouvray Demi Sec', { name: 'demi-sec', synonyms: ['demi sec'] }],
+    ['Vouvray Demi Sec', ['demi-sec']],
+    ['Cava Brut Natur', { name: 'Brut Nature', synonyms: ['Brut Natur'] }],
+    ['Riesling Medium', { name: 'medium sweet', synonyms: ['medium', 'medium-sweet'] }],
+  ])('%s is not doubled', (name, term) => {
+    expect(append(name, term)).toBe(name);
+    expect(slug(name, 'Example Estate', term)).toBe(slug(name, 'Example Estate'));
+  });
+
+  test.each([
+    // Spellings the write rule reads as the term (utils/normalize SWEETNESS_ALIASES).
+    ['Riesling Suess', { name: 'süß', synonyms: [] }],
+    ['Riesling Troken', { name: 'trocken', synonyms: [] }],
+    // Every character the rule reads between the words of one term.
+    ['Cava Brut' + String.fromCharCode(0xAD) + 'Nature', { name: 'Brut Nature', synonyms: [] }],
+    ['Cava Brut' + String.fromCharCode(0x200B) + 'Nature', { name: 'Brut Nature', synonyms: [] }],
+    ['Cava Brut' + String.fromCharCode(0x2212) + 'Nature', { name: 'Brut Nature', synonyms: [] }],
+    ['Cava Brut' + String.fromCharCode(0x2013) + 'Nature', { name: 'Brut Nature', synonyms: [] }],
+  ])('%j carries the term the rule reads in it', (name, term) => {
+    expect(append(name, term)).toBe(name);
+    expect(slug(name, 'Example Estate', term)).toBe(slug(name, 'Example Estate'));
+  });
+
+  test('a term the name does not carry is shown after it, as the first spelling', () => {
+    expect(append('Riesling Kabinett', { name: 'trocken', synonyms: [] })).toBe('Riesling Kabinett trocken');
+    expect(append('Riesling Kabinett', ['trocken', 'troken'])).toBe('Riesling Kabinett trocken');
+    expect(append('Riesling Kabinett', 'trocken')).toBe('Riesling Kabinett trocken');
+  });
+
+  test('a wine without a term keeps its name and its slug byte for byte', () => {
+    for (const name of ['Riesling Kabinett', 'Champagne Extra-Brut', 'Cava Brut Natur', '  Rosé  ', 'Château X Grand Vin', 'Cuvée  Double  Space']) {
+      for (const none of [null, undefined, '', [], { name: '' }]) {
+        expect(append(name, none)).toBe(name.trim());
+        expect(slug(name, 'Example Estate', none)).toBe(slug(name, 'Example Estate'));
+      }
+    }
+  });
+});
+
+describe('appendSweetnessTerm appends a term only where it always did', () => {
+  const { appendSweetnessTerm: append, normalizeSweetnessTerm: fold } = require('./normalize');
+  const seed = require('../data/sweetness-terms.json');
+  // The function as main has it: the oracle. Where it does not append, the
+  // display name and the slug must not either; where it does, they may leave
+  // the term off when the name carries it another way (a dash, a synonym).
+  const mainAppend = (name, term) => {
+    const n = String(name == null ? '' : name).trim();
+    const t = String(term == null ? '' : term).trim();
+    if (!t) return n;
+    if (!n) return t;
+    return ` ${fold(n)} `.includes(` ${fold(t)} `) ? n : `${n} ${t}`;
+  };
+  const GAPS = ['-', '/', '.', ', ', ' ', '\u2013', '\u00AD', '\u200B', ''];
+  const cap = (w) => w.charAt(0).toUpperCase() + w.slice(1);
+  /** A spelling written another way: split inside a word, words joined differently, letters dotted, capitals. */
+  function* variants(spelling) {
+    const words = spelling.split(/[\s-]+/).filter(Boolean);
+    for (const g of GAPS) {
+      yield words.map(cap).join(g);
+      yield words.join(g).toUpperCase();
+      for (const w of words) {
+        if (w.length < 4) continue;
+        for (const at of [2, Math.floor(w.length / 2), w.length - 2]) {
+          yield words.map((x) => (x === w ? `${cap(w.slice(0, at))}${g}${cap(w.slice(at))}` : x)).join(' ');
+        }
+      }
+    }
+    yield [...spelling.replace(/\s+/g, '')].join('.').toUpperCase() + '.';
+  }
+
+  test('over every seed spelling written many ways: never appended where main does not append', () => {
+    let checked = 0;
+    for (const row of seed) {
+      const rowArg = { name: row.name, synonyms: row.synonyms || [] };
+      for (const spelling of [row.name, ...(row.synonyms || [])]) {
+        for (const v of variants(spelling)) {
+          for (const name of [`Riesling ${v}`, `${v} Rosé 2019`, v]) {
+            for (const term of [rowArg, row.name, [row.name, ...(row.synonyms || [])]]) {
+              checked += 1;
+              const main = mainAppend(name, typeof term === 'string' ? term : row.name);
+              if (main === name.trim()) expect([name, append(name, term)]).toEqual([name, name.trim()]);
+            }
+          }
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(10000);
+  });
+
+  test.each([
+    ['Riesling Halb-Trocken', 'halbtrocken'],
+    ['Riesling Fein-Herb', 'feinherb'],
+    ['Riesling Frucht-Süß', 'fruchtsüß'],
+    ['Müller-Thurgau halb-trocken', 'halbtrocken'],
+    ['Vouvray Demi/Sec', 'demi-sec'],
+    ['Vouvray Demi.Sec', 'demi-sec'],
+    ['Cava Brut, Nature', 'Brut Nature'],
+    ['Côtes S.E.C.', 'sec'],
+  ])('%s with the term %s stays as it is', (name, term) => {
+    expect(mainAppend(name, term)).toBe(name);
+    expect(append(name, { name: term, synonyms: [] })).toBe(name);
+  });
+});
+
+describe('a wine without a term keys and slugs as it always has', () => {
+  const { generateWineSlug: slug, generateWineKey: key } = require('./normalize');
+  // Literal keys and slugs, the same as main's: a wine without a term must
+  // never move.
+  test.each([
+    ['Riesling Kabinett', 'Example Estate', 'example-estate-riesling-kabinett', 'example estate:riesling kabinett:mosel'],
+    ['Champagne Extra-Brut', 'Example Estate', 'example-estate-champagne-extrabrut', 'example estate:champagne extrabrut:mosel'],
+    ['Cava Brut Natur', '', 'cava-brut-natur', ':cava brut natur:mosel'],
+    ['  Rosé  ', 'Example Estate', 'example-estate-rose', 'example estate:rose:mosel'],
+    ['Vouvray Demi Sec', 'Example Estate', 'example-estate-vouvray-demi-sec', 'example estate:vouvray demi sec:mosel'],
+    ['Brut Premier', 'Example Estate', 'example-estate-brut-premier', 'example estate:brut premier:mosel'],
+    ['Auslese***', 'Example Estate', 'example-estate-auslese', 'example estate:auslese 3star:mosel'],
+  ])('%s by %s', (name, producer, expectedSlug, expectedKey) => {
+    expect(slug(name, producer)).toBe(expectedSlug);
+    expect(key(name, producer, 'Mosel')).toBe(expectedKey);
   });
 });

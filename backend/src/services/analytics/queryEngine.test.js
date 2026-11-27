@@ -214,8 +214,8 @@ describe('filter compilation is a whitelist, not an interpreter', () => {
     expect(post[0]['wd.producer']).toBeDefined();
     expect(needsWine).toBe(true);
   });
-  // Support ticket 2026-09-05: a typed Producer "=" filter was byte-exact, so
-  // "gaja" found nothing and the table looked broken.
+  // A typed Producer "=" filter must not be byte-exact, or "gaja" finds
+  // nothing and the table looks broken.
   test('text "=" is case-insensitive and anchored', async () => {
     const { post } = await compileFilters([{ field: 'wine.producer', op: 'eq', value: 'gaja' }], USER);
     expect(post[0]['wd.producer']).toEqual({ $regex: '^gaja$', $options: 'i' });
@@ -265,7 +265,7 @@ describe('personal key/value filters', () => {
       { wineDefinition: 'f'.repeat(24), vintage: '2019' },
       { wineDefinition: '1'.repeat(24) },
     ]);
-    // Audit F1: the entry query is predicate-FREE (precedence resolves in JS)
+    // The entry query is predicate-FREE (precedence resolves in JS)
     // and author-scoped.
     expect(PersonalDataEntry.find).toHaveBeenCalledWith({ author: USER, key: KEY_ID });
   });
@@ -657,7 +657,7 @@ describe('AUDIT fixes 2026-08-19 — the rest of the confirmed nine', () => {
   test('a rating filter in its own scale compares against the expression for that scale', async () => {
     const { exprFilters } = await compileFilters([{ field: 'rating.current', op: 'gte', value: 90, scale: '100' }], USER);
     expect(exprFilters[0].pred).toEqual({ $gte: 90 });
-    // Rounded to the scale's step, as the rows show it (release audit 2026-10-12).
+    // Rounded to the scale's step, as the rows show it.
     expect(exprFilters[0].expr).toEqual({ $round: [ratingConversionExpr('rating', 'ratingScale', '100'), 0] });
     await expect(compileFilters([{ field: 'rating.current', op: 'gte', value: 101, scale: '100' }], USER))
       .rejects.toThrow(/100-point scale runs 0–100/);
@@ -722,7 +722,7 @@ describe('KPI shape — zero dimensions (dashboards R-E)', () => {
 
 });
 
-describe('rack name / group dimensions (support ticket 2026-09-06)', () => {
+describe('rack name / group dimensions', () => {
   const B1 = 'e'.repeat(24);
   const B2 = '1'.repeat(24);
   const racksInScope = () => Rack.find.mockReturnValue(chainLean([

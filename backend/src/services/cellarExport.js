@@ -52,7 +52,7 @@ function urlToArchivePath(url) {
  * @param racks           lean Rack docs (for slot → rack placement).
  * @param imagesByBottle  Map<bottleIdString, BottleImage[]> — the user's own
  *                        images, grouped by bottle. Empty/omitted → no `images`
- *                        key is emitted (matches the legacy no-images export).
+ *                        key is emitted.
  * @param reviewsByBottle Map<bottleIdString, Review[]> — the user's own reviews
  *                        tied to the bottle. Empty/omitted → no `reviews` key.
  * @param profilesByWineVintage Map<`${wineDefId}:${vintage}`, WineVintageProfile>
@@ -91,6 +91,10 @@ function mapBottlesForExport(bottles, racks, imagesByBottle = new Map(), reviews
       region: wine.region?.name || '',
       appellation: wine.appellation || '',
       type: wine.type || '',
+      // The Other category (a drink that is not wine) travels as its own
+      // field: a bare type of '' would re-import as an untyped WINE and mint
+      // a cider into the shared registry.
+      category: wine.nonWine === true ? 'other' : 'wine',
       // The colour of a sparkling/dessert/fortified wine, when recorded — so a
       // sparkling rosé survives an export → import round-trip as one.
       ...(wine.colour ? { colour: wine.colour } : {}),
@@ -190,8 +194,8 @@ function mapBottlesForExport(bottles, racks, imagesByBottle = new Map(), reviews
     // (and a future importer) exactly which images belong to which bottle.
     //
     // Only the CROPPED / background-removed image is exported. The pre-crop
-    // original is never included (it's the version we keep, and for moderated
-    // images the original is already deleted on approval). We fall back to the
+    // original is never included: once a processed file exists the original
+    // is normally deleted (imageProcessor.discardOriginal). We fall back to the
     // original only when there is no processed version at all, so an image is
     // never silently dropped from the export.
     const imgs = imagesByBottle.get(b._id.toString()) || [];
@@ -308,10 +312,10 @@ async function buildCellarDataExport(userId, scope) {
           { path: 'region', select: 'name' },
           { path: 'grapes', select: 'name' },
         ],
-        // Every wine field mapBottlesForExport emits has to be listed here —
-        // `colour` was emitted but not selected, so no export ever carried one
-        // (audit 2026-09-19; pinned by cellarExport.select.test.js).
-        select: 'name producer type colour appellation country region grapes',
+        // Every wine field mapBottlesForExport emits has to be listed here: a
+        // field emitted but not selected is silently missing from every export
+        // (pinned by cellarExport.select.test.js).
+        select: 'name producer type colour nonWine appellation country region grapes',
       })
       .limit(EXPORT_MAX)
       .lean(),
@@ -325,7 +329,7 @@ async function buildCellarDataExport(userId, scope) {
       ? BottleImage.find({ uploadedBy: userId, bottle: { $in: bottleIds } })
           .select('bottle originalUrl processedUrl credit createdAt').limit(EXPORT_MAX).lean()
       : [],
-    // Label scans (audit L-2). They hang off a WINE, never a bottle, so the
+    // Label scans. They hang off a WINE, never a bottle, so the
     // bottle-scoped query above could never reach them — yet
     // services/userDataRegistry states the bytes ship in this ZIP, and they
     // are unambiguously the user's own photos. Only the user's own, and only
@@ -540,8 +544,7 @@ const IMAGE_EXPORT_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
 /**
  * Atomically claim this user's weekly image-export allowance BEFORE the
  * expensive build, so two concurrent requests can't both kick off a large
- * archive. Replaces a non-atomic check-then-set that was bypassable under
- * concurrency.
+ * archive (a check-then-set would let them).
  * @returns {Promise<{claimed:true, claimStamp:Date, priorStamp:Date|null}
  *                   | {claimed:false, nextAvailableAt:Date}
  *                   | {claimed:false, notFound:true}>}
@@ -628,7 +631,6 @@ module.exports = {
   mapBottlesForExport,
   collectImageFiles,
   urlToArchivePath,
-  EXPORT_README,
   EXPORT_MAX,
   IMAGE_EXPORT_COOLDOWN_MS,
   claimImageExportAllowance,

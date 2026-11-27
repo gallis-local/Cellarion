@@ -1,15 +1,16 @@
 const express = require('express');
 const { requireAuth } = require('../middleware/auth');
-const { idempotency } = require('../middleware/idempotency');
+const { idempotency, keepStatusOnly } = require('../middleware/idempotency');
 const { requireCellarAccess } = require('../middleware/cellarAccess');
 const { ROLE_LEVELS } = require('../middleware/bottleAccess');
 const Rack = require('../models/Rack');
 const { RACK_TYPES } = require('../models/Rack');
 const Cellar = require('../models/Cellar');
-const Bottle = require('../models/Bottle');
 const CellarLayout = require('../models/CellarLayout');
 const { getCellarRole } = require('../utils/cellarAccess');
 const { getMaxPosition, validateDoubleHeightRows, validateCabinetConfig, cabinetShelfAlternate, cabinetRows, modularTotalSlots } = require('../utils/rackGeometry');
+const { validateWallConfig } = require('../utils/wallGeometry');
+const { planWallRenumber, renumberWall, renumberOpenedFromSlots } = require('../services/wallEdit');
 const {
   createGridRack, placeBottleInRack, clearRackSlot,
   ARRANGE_SLOT_POPULATE, usablePositionCount,
@@ -17,7 +18,7 @@ const {
   normalizeRackGroup, moveRackBottles,
 } = require('../services/rackOps');
 const { ARRANGE_STRATEGIES, buildArrangePlan } = require('../utils/rackArrange');
-const { isValidId } = require('../utils/validation');
+const { isValidId, parseSlotPosition } = require('../utils/validation');
 const { logAudit } = require('../services/audit');
 const { classifyMaturity, buildProfileMap } = require('../utils/maturityUtils');
 const { WINE_LIST_SELECT } = require('../config/constants');
@@ -27,12 +28,12 @@ const router = express.Router();
 // What a rack view needs of each placed bottle: the bottle, and its wine as
 // the cellar list sends it (WINE_LIST_SELECT — never the AI profile, internal
 // keys, the wine's creator or another user's label-scan evidence) with only the
-// NAMES of its country, region and grapes. Until 2026-09 every rack response
-// populated whole documents: a large cellar came to about 5 MB, most of it
-// taxonomy descriptions, and every shared wine's scan evidence rode along
-// (scaling audit 2026-09-25). Lean: thousands of bottles as plain objects,
-// while the rack itself stays a document, so schema defaults (zones,
-// disabledPositions, …) still fill racks saved before those fields existed.
+// NAMES of its country, region and grapes. Whole populated documents would
+// make a large cellar's rack response megabytes, most of it taxonomy
+// descriptions, with every shared wine's scan evidence riding along.
+// Lean: thousands of bottles as plain objects, while the rack itself stays a
+// document, so schema defaults (zones, disabledPositions, …) still fill racks
+// saved before those fields existed.
 const SLOT_BOTTLES = {
   path: 'slots.bottle',
   options: { lean: true },
@@ -54,14 +55,33 @@ const MAX_MODULES = 50;
 // A modular rack's slots in total. Within the per-module bounds alone, 50
 // modules of a 20×20 cube with 10×10 cells is two million slots — which the
 // racks page, the print map and the room then draw, one by one, for every
-// member of the cellar (audit 2026-10-14). The largest real cabinets are a
+// member of the cellar. The largest real cabinets are a
 // few thousand.
 const MAX_RACK_SLOTS = 10000;
 // Mirrors the Rack schema's rows/cols bounds (models/Rack.js). Checked at the
 // request boundary because geometry runs on the values BEFORE save() would
-// reject them (security audit 2026-09-02 D14-1).
+// reject them.
 const MAX_RACK_DIM = 20;
 const isRackDim = (v) => Number.isInteger(v) && v >= 1 && v <= MAX_RACK_DIM;
+
+// What is wrong with a modules list, as the 400's message, or null. One check
+// for create and for every update that sends a list: an update of a rack that
+// is already modular sends `modules` without `isModular`.
+function modulesProblem(modules) {
+  if (!Array.isArray(modules) || modules.length === 0) return 'Modular racks must have at least one module';
+  if (modules.length > MAX_MODULES) return `Maximum ${MAX_MODULES} modules allowed per rack`;
+  for (const m of modules) {
+    if (!m || !m.type || !RACK_TYPES.includes(m.type)) return `Invalid module type: ${m?.type}`;
+    // A wall is a rack of its own (its boxes are its modules); as a module it
+    // would have no boxes and hold nothing.
+    if (m.type === 'wall') return 'A wall cannot be a module of a modular rack';
+    if ((m.rows !== undefined && !isRackDim(m.rows)) || (m.cols !== undefined && !isRackDim(m.cols))) {
+      return `Module rows and cols must be whole numbers between 1 and ${MAX_RACK_DIM}`;
+    }
+  }
+  if (modularTotalSlots(modules) > MAX_RACK_SLOTS) return `A rack can hold at most ${MAX_RACK_SLOTS} slots in total`;
+  return null;
+}
 
 /**
  * Serialize rack doc(s) with a maturityStatus attached to every populated
@@ -110,6 +130,26 @@ async function rackAccess(req, res, rack, minRole, deniedMessage) {
   return role;
 }
 
+// The rack as the racks page draws it: every placed bottle with its wine and
+// maturity. Every write the offline queue can send (place, move, clear —
+// frontend utils/offlineOps queueableKind) answers a session through here, so
+// the retry ledger keeps the status of such a write and never the drawing.
+async function drawnRack(req, rack) {
+  await rack.populate(SLOT_BOTTLES);
+  keepStatusOnly(req);
+  return { rack: await withMaturity(rack) };
+}
+
+// What a slot write answers. A session gets the drawn rack. An API token gets
+// the summary form of GET /api/racks?summary=1 (slot bottle ids) and what the
+// write did to the other bottle involved — the public contract
+// (openapi/document.js PlaceResponse, UnplaceResponse), which the retry ledger
+// keeps whole.
+async function slotAnswer(req, rack, change) {
+  if (req.apiToken) return { rack: rack.toObject(), ...change };
+  return drawnRack(req, rack);
+}
+
 // GET /api/racks/nfc/:id  — resolve a rack ID to its cellar (for NFC tag redirect)
 // Requires auth so only logged-in users can follow NFC links.
 router.get('/nfc/:id', requireAuth, async (req, res) => {
@@ -119,7 +159,7 @@ router.get('/nfc/:id', requireAuth, async (req, res) => {
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
     // Only members of the rack's cellar may resolve the tag — anyone else gets
     // the same 404 as a nonexistent rack, so this endpoint is not an existence
-    // oracle for rack IDs or a rack→cellar linkage leak (audit L-4 / I-9).
+    // oracle for rack IDs or a rack→cellar linkage leak.
     const cellar = await Cellar.findById(rack.cellar).select('user members deletedAt');
     if (!cellar || cellar.deletedAt || !getCellarRole(cellar, req.user.id)) {
       return res.status(404).json({ error: 'Rack not found' });
@@ -137,8 +177,8 @@ router.get('/nfc/:id', requireAuth, async (req, res) => {
 });
 
 router.use(requireAuth);
-// Writes sent with an Idempotency-Key (the offline queue, #1355) apply at
-// most once; without the header nothing changes.
+// Writes sent with an Idempotency-Key (the offline queue) apply at most once;
+// without the header nothing changes.
 router.use(idempotency);
 
 // GET /api/racks?cellar=:id  — list racks for a cellar (owner, editor, viewer)
@@ -177,20 +217,8 @@ router.post('/', requireCellarAccess('editor'), async (req, res) => {
     // Modular racks are a REST-only route path (no MCP twin to drift against;
     // the read tools treat them specially).
     if (isModular && modules) {
-      if (!Array.isArray(modules) || modules.length === 0) {
-        return res.status(400).json({ error: 'Modular racks must have at least one module' });
-      }
-      if (modules.length > MAX_MODULES) {
-        return res.status(400).json({ error: `Maximum ${MAX_MODULES} modules allowed per rack` });
-      }
-      for (const m of modules) {
-        if (!m.type || !RACK_TYPES.includes(m.type)) {
-          return res.status(400).json({ error: `Invalid module type: ${m.type}` });
-        }
-      }
-      if (modularTotalSlots(modules) > MAX_RACK_SLOTS) {
-        return res.status(400).json({ error: `A rack can hold at most ${MAX_RACK_SLOTS} slots in total` });
-      }
+      const problem = modulesProblem(modules);
+      if (problem) return res.status(400).json({ error: problem });
       // Racks are owned by the cellar owner
       const rack = new Rack({
         cellar: req.cellar._id,
@@ -202,14 +230,14 @@ router.post('/', requireCellarAccess('editor'), async (req, res) => {
       });
       await rack.save();
       // cellarId so this rack appears in the cellar's audit page (which
-      // filters on resource.cellarId) — grand-audit M6.
+      // filters on resource.cellarId).
       logAudit(req, 'rack.create', { type: 'rack', id: rack._id, cellarId: rack.cellar }, { name: rack.name });
       return res.status(201).json({ rack });
     }
 
-    // Grid family: ONE shared implementation with the MCP create_rack tool
-    // (plan §7) — type/typeConfig validation, ownership, duplicate-name 409
-    // and the rack.create audit all live in rackOps.createGridRack.
+    // Grid family: ONE shared implementation with the MCP create_rack tool —
+    // type/typeConfig validation, ownership, duplicate-name 409 and the
+    // rack.create audit all live in rackOps.createGridRack.
     const result = await createGridRack(req.cellar, { name, type, rows, cols, typeConfig, group }, req);
     if (result.error) return res.status(result.error.status).json({ error: result.error.message });
     res.status(201).json({ rack: result.rack });
@@ -261,35 +289,21 @@ router.put('/:id', async (req, res) => {
       }
     }
 
-    // Validate modular modules if provided
-    if (isModular && modules) {
-      if (!Array.isArray(modules) || modules.length === 0) {
-        return res.status(400).json({ error: 'Modular racks must have at least one module' });
-      }
-      if (modules.length > MAX_MODULES) {
-        return res.status(400).json({ error: `Maximum ${MAX_MODULES} modules allowed per rack` });
-      }
-      for (const m of modules) {
-        if (!m || !m.type || !RACK_TYPES.includes(m.type)) {
-          return res.status(400).json({ error: `Invalid module type: ${m?.type}` });
-        }
-        if ((m.rows !== undefined && !isRackDim(m.rows)) || (m.cols !== undefined && !isRackDim(m.cols))) {
-          return res.status(400).json({ error: `Module rows and cols must be whole numbers between 1 and ${MAX_RACK_DIM}` });
-        }
-      }
-      if (modularTotalSlots(modules) > MAX_RACK_SLOTS) {
-        return res.status(400).json({ error: `A rack can hold at most ${MAX_RACK_SLOTS} slots in total` });
-      }
+    // A modules list is checked whenever one is sent for a rack that is, or is
+    // becoming, modular: `isModular` need not be in the request.
+    const willBeModular = isModular !== undefined ? !!isModular : !!rack.isModular;
+    if (modules !== undefined && willBeModular) {
+      const problem = modulesProblem(modules);
+      if (problem) return res.status(400).json({ error: problem });
     } else if (type && !RACK_TYPES.includes(type)) {
       return res.status(400).json({ error: `Invalid rack type. Must be one of: ${RACK_TYPES.join(', ')}` });
     }
 
     // Dimensions are validated HERE, before any geometry runs on them. The
     // schema's min/max only fires at save(), but getMaxPosition() below runs
-    // on the request's values first — and a rows of "1e308" used to park the
-    // event loop in the hex slot count for every tenant (security audit
-    // 2026-09-02 D14-1). The closed-form hex count removed the loop; this keeps
-    // nonsense out of every other formula too.
+    // on the request's values first, and a rows of "1e308" in a per-row loop
+    // would park the event loop for every tenant. The hex count is closed-form
+    // (utils/rackGeometry); this keeps nonsense out of every other formula too.
     if ((rows !== undefined && !isRackDim(rows)) || (cols !== undefined && !isRackDim(cols))) {
       return res.status(400).json({ error: `rows and cols must be whole numbers between 1 and ${MAX_RACK_DIM}` });
     }
@@ -315,10 +329,10 @@ router.put('/:id', async (req, res) => {
     }
     // A cabinet's shelf lists must keep matching its shape: changing rows or
     // switching to cabinet without a fresh shelfRows is rejected, and so is a
-    // cols narrower than a stored per-shelf width (audit 2026-09-16 — a
-    // cols-only PUT used to slip past and leave a cabinet no later edit
-    // could save). Only when the SHAPE is in the request — a rename, group,
-    // zone or NFC edit must never trip over a stored list (audit 2026-09-15).
+    // cols narrower than a stored per-shelf width (a cols-only PUT must not
+    // leave a cabinet no later edit could save). Only when the SHAPE is in the
+    // request — a rename, group, zone or NFC edit must never trip over a
+    // stored list.
     if (type !== undefined || rows !== undefined || cols !== undefined || typeConfig !== undefined) {
       const effType = type !== undefined ? type : rack.type;
       const effRows = rows !== undefined ? rows : rack.rows;
@@ -330,6 +344,11 @@ router.put('/:id', async (req, res) => {
           || (Array.isArray(effConfig?.shelfRows) ? null : 'shelfRows is required for a cabinet rack');
         if (cabError) return res.status(400).json({ error: cabError });
       }
+      // A wall's boxes must fit the wall it will be, and no other type keeps
+      // a boxes list: switching away from a wall needs the new type's own
+      // typeConfig.
+      const wallError = validateWallConfig(effConfig || {}, effType, effRows, effCols, effModular);
+      if (wallError) return res.status(400).json({ error: wallError });
     }
 
     // Two deep and how the bottles lie are mostly drawing, and the edit form
@@ -342,7 +361,7 @@ router.put('/:id', async (req, res) => {
     // already numbered. So on a cabinet holding any of those, the widths with
     // the stored two deep and lie must equal the new ones. Only those two
     // come from the stored shape, so the other shape edits keep their own
-    // rules (release audit 2026-10-14: ticking Two deep moved a bottle).
+    // rules (ticking Two deep moved a bottle).
     const numbered = (rack.slots || []).length > 0 || (rack.disabledPositions || []).length > 0
       || (rack.zones || []).some((z) => (z.positions || []).length > 0);
     if (typeConfig && !rack.isModular && (type !== undefined ? type : rack.type) === 'cabinet' && numbered) {
@@ -364,6 +383,26 @@ router.put('/:id', async (req, res) => {
       }
     }
 
+    // A wall is numbered box after box (utils/wallGeometry). An edit of a wall
+    // in use is planned here, before the shape changes, so that every bottle
+    // keeps its box; and a rack in use cannot become a wall or stop being
+    // one, because its numbers would mean other places.
+    const shapeSent = type !== undefined || rows !== undefined || cols !== undefined || typeConfig !== undefined;
+    const wasWall = !rack.isModular && rack.type === 'wall';
+    const willBeWall = !willBeModular && (type !== undefined ? type : rack.type) === 'wall';
+    let wallPlan = null;
+    if (shapeSent && wasWall !== willBeWall && numbered) {
+      return res.status(400).json({ error: 'A rack that holds bottles, zones or switched-off slots cannot change to or from a wall. Empty it first.' });
+    }
+    if (shapeSent && wasWall && willBeWall) {
+      wallPlan = await planWallRenumber(rack, {
+        rows: rows !== undefined ? rows : rack.rows,
+        cols: cols !== undefined ? cols : rack.cols,
+        typeConfig: typeConfig !== undefined ? typeConfig : rack.typeConfig,
+      });
+      if (wallPlan.error) return res.status(400).json({ error: wallPlan.error });
+    }
+
     // A shape edit renumbers slots; keep both sides for the audit row below.
     const shapeOf = (r) => ({ type: r.type, rows: r.rows, cols: r.cols, typeConfig: r.typeConfig ? JSON.parse(JSON.stringify(r.typeConfig)) : null });
     const shapeBefore = shapeOf(rack);
@@ -371,7 +410,7 @@ router.put('/:id', async (req, res) => {
     if (name !== undefined) rack.name = name;
     // '' or null clears the group (ungrouped); absent leaves it alone.
     if (group !== undefined) {
-      // A non-string group is a client bug, not a request to un-group (audit 2026-09-07).
+      // A non-string group is a client bug, not a request to un-group.
       if (group !== null && typeof group !== 'string') return res.status(400).json({ error: 'group must be a string' });
       rack.group = normalizeRackGroup(group);
     }
@@ -392,6 +431,8 @@ router.put('/:id', async (req, res) => {
         positions: [...new Set(z.positions)].sort((a, b) => a - b),
       }));
     }
+
+    if (wallPlan) renumberWall(rack, wallPlan, { zonesSent: zones !== undefined });
 
     // Validate that existing slots still fit within new dimensions
     const newMax = getMaxPosition(rack);
@@ -416,6 +457,7 @@ router.put('/:id', async (req, res) => {
     }
 
     await rack.save();
+    if (wallPlan) await renumberOpenedFromSlots(rack, wallPlan);
     await rack.populate(SLOT_BOTTLES);
 
     // cellarId so the update shows on the cellar's audit page like rack.create.
@@ -483,7 +525,7 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-// Offline-queue preconditions (#1355): a write queued offline carries what the
+// Offline-queue preconditions: a write queued offline carries what the
 // user saw when they made it — the occupant of each slot it touches (a bottle
 // id, or null for an empty slot). If the rack has changed since (a partner
 // placed a bottle there meanwhile), the write is refused with 409 instead of
@@ -494,15 +536,16 @@ function slotChanged(rack, position, expected) {
   if (expected === undefined) return false;
   const slot = rack.slots.find((s) => s.position === position);
   const actual = slot && slot.bottle ? String(slot.bottle) : null;
-  return actual !== (expected ? String(expected) : null);
+  // Ids compare as text; a stored id prints in lower case.
+  return actual !== (expected ? String(expected).toLowerCase() : null);
 }
 
 // PUT /api/racks/:id/slots/:position  — assign a bottle to a slot (owner or editor)
 router.put('/:id/slots/:position', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
-    const position = parseInt(req.params.position, 10);
-    if (isNaN(position)) return res.status(400).json({ error: 'Invalid position' });
+    const position = parseSlotPosition(req.params.position);
+    if (position === null) return res.status(400).json({ error: 'Invalid position' });
     const { bottleId } = req.body;
     if (!isValidId(bottleId)) return res.status(400).json({ error: 'Valid bottleId required' });
 
@@ -516,8 +559,7 @@ router.put('/:id/slots/:position', async (req, res) => {
     const result = await placeBottleInRack(rack, position, bottleId, req);
     if (result.error) return res.status(result.error.status).json({ error: result.error.message });
 
-    await rack.populate(SLOT_BOTTLES);
-    res.json({ rack: await withMaturity(rack) });
+    res.json(await slotAnswer(req, rack, { displaced: result.displaced }));
   } catch (err) {
     console.error('Assign slot error:', err);
     res.status(500).json({ error: 'Failed to assign slot' });
@@ -562,10 +604,8 @@ router.post('/:id/slots/:position/move', async (req, res) => {
     if (toSlot) toSlot.position = from; // occupied target → swap
     await rack.save();
 
-    await rack.populate(SLOT_BOTTLES);
-
     logAudit(req, 'rack.slot_move', { type: 'rack', id: rack._id, cellarId: rack.cellar }, { from, to, swapped: !!toSlot });
-    res.json({ rack: await withMaturity(rack) });
+    res.json(await drawnRack(req, rack));
   } catch (err) {
     if (err.name === 'VersionError') {
       return res.status(409).json({ error: 'This rack was modified by another request. Please refresh and try again.' });
@@ -588,7 +628,7 @@ router.post('/:id/move-bottles', async (req, res) => {
     const source = await Rack.findOne({ _id: req.params.id, deletedAt: null });
     // The target is looked up IN the source's cellar: a rack elsewhere reads
     // exactly like one that does not exist, so the answer cannot be used to
-    // probe for other people's rack ids (release audit 2026-10-12).
+    // probe for other people's rack ids.
     const target = source ? await Rack.findOne({ _id: toRackId, cellar: source.cellar, deletedAt: null }) : null;
     if (!source || !target) return res.status(404).json({ error: 'Rack not found' });
 
@@ -726,8 +766,8 @@ router.post('/:id/arrange/apply', async (req, res) => {
 router.delete('/:id/slots/:position', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
-    const position = parseInt(req.params.position, 10);
-    if (isNaN(position)) return res.status(400).json({ error: 'Invalid position' });
+    const position = parseSlotPosition(req.params.position);
+    if (position === null) return res.status(400).json({ error: 'Invalid position' });
 
     const rack = await Rack.findOne({ _id: req.params.id, deletedAt: null });
     if (!rack) return res.status(404).json({ error: 'Rack not found' });
@@ -741,8 +781,7 @@ router.delete('/:id/slots/:position', async (req, res) => {
     const result = await clearRackSlot(rack, position, req);
     if (result.error) return res.status(result.error.status).json({ error: result.error.message });
 
-    await rack.populate(SLOT_BOTTLES);
-    res.json({ rack: await withMaturity(rack) });
+    res.json(await slotAnswer(req, rack, { removed: result.cleared }));
   } catch (err) {
     console.error('Clear slot error:', err);
     res.status(500).json({ error: 'Failed to clear slot' });

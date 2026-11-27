@@ -6,7 +6,7 @@ import { requestImageFor } from '../utils/requestImage';
 import safeUrl from '../utils/safeUrl';
 import './WineRequests.css';
 
-// Links a request may carry (#1460): the required source plus two more — a
+// Links a request may carry: the required source plus two more — a
 // winery page and a review give the reviewer different evidence. The same
 // bound as the server's (services/accountOps MAX_SOURCE_URLS).
 const MAX_LINKS = 3;
@@ -29,12 +29,12 @@ function WineRequests() {
   const [imageFile, setImageFile] = useState(null);
   const [imageBgRemoved, setImageBgRemoved] = useState(null);
   const [processingBg, setProcessingBg] = useState(false);
-  // The back label (#1460): a photo or a link, like the front. Never the
+  // The back label: a photo or a link, like the front. Never the
   // wine's picture and no background removal here; after review the admin
   // may publish it among the wine's gallery photos (the notice says so).
   const [backImageFile, setBackImageFile] = useState(null);
   // One submission at a time: the photo encodes take a moment, and a second
-  // tap used to file the same request twice.
+  // tap would file the same request twice.
   const [submitting, setSubmitting] = useState(false);
   const [backImageUrl, setBackImageUrl] = useState('');
 
@@ -74,9 +74,16 @@ function WineRequests() {
   };
 
   const compressImage = (file) => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const img = new Image();
       const url = URL.createObjectURL(file);
+      // A file the browser cannot decode (a HEIC on most desktops, a broken
+      // download) never loads: without this the preview stays "processing"
+      // and Submit stays disabled for good.
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('the photo could not be read'));
+      };
       img.onload = () => {
         const MAX = 900;
         let w = img.naturalWidth;
@@ -127,7 +134,11 @@ function WineRequests() {
       if (imageFile) {
         // The background-removed preview (or the photo itself), re-encoded to
         // fit the server's cap — a raw PNG preview often did not (utils/requestImage).
-        imageValue = await requestImageFor({ preview: imageBgRemoved, file: imageFile });
+        imageValue = await requestImageFor({ preview: imageBgRemoved, file: imageFile }).catch(() => undefined);
+        if (imageValue === undefined) {
+          alert(t('wineRequests.photoUnreadable'));
+          return;
+        }
         if (!imageValue) {
           alert(t('wineRequests.photoTooLarge'));
           return;
@@ -170,9 +181,8 @@ function WineRequests() {
     resetForm();
     setShowForm(false);
   };
-  // Closing the form forgets its photos and links: a photo taken for one wine
-  // used to ride along into the next request after the form was reopened
-  // (release audit 2026-10-09, F2).
+  // Closing the form forgets its photos and links, so a photo taken for one
+  // wine never rides along into the next request after the form is reopened.
   const toggleForm = () => (showForm ? handleCancel() : setShowForm(true));
 
   const setExtraUrl = (index, value) => setExtraUrls(extraUrls.map((u, i) => (i === index ? value : u)));
@@ -180,11 +190,13 @@ function WineRequests() {
 
   return (
     <div className="wine-requests-page">
-      <div className="winerequest-header">
+      <div className="page-header">
         <h1>{t('wineRequests.title')}</h1>
-        <button onClick={toggleForm} className="btn btn-primary winerequest-desktop-create">
-          {showForm ? t('common.cancel') : `+ ${t('wineRequests.newRequest')}`}
-        </button>
+        <div className="header-actions winerequest-desktop-create">
+          <button onClick={toggleForm} className="btn btn-primary">
+            {showForm ? t('common.cancel') : `+ ${t('wineRequests.newRequest')}`}
+          </button>
+        </div>
       </div>
 
       <button className="fab winerequest-fab" onClick={toggleForm} aria-label="New Request">
@@ -216,7 +228,7 @@ function WineRequests() {
               />
             </div>
 
-            {/* More links (#1460): a winery page AND a review, each worth having */}
+            {/* More links: a winery page AND a review, each worth having */}
             <div className="form-group">
               <label>{t('wineRequests.moreLinksLabel', 'More links')} <span className="label-optional">({t('common.optional', 'optional')})</span></label>
               <p className="field-hint">{t('wineRequests.linksHint', 'A winery page and a review each give the reviewer something different.')}</p>
@@ -276,7 +288,7 @@ function WineRequests() {
               </p>
             </div>
 
-            {/* Back label (#1460): never the wine's picture, but after review it may
+            {/* Back label: never the wine's picture, but after review it may
                 join the wine's public photos — said here, like the notice above. */}
             <div className="form-group">
               <label>{t('wineRequests.backImageLabel', 'Back label')} <span className="label-optional">({t('common.optional', 'optional')})</span></label>
@@ -360,7 +372,7 @@ function WineRequests() {
               )}
               {request.status === 'resolved' && request.linkedWineDefinition && (
                 <div className="resolution">
-                  <strong>{t('wineRequests.linkedTo')}</strong> {request.linkedWineDefinition.name} by {request.linkedWineDefinition.producer}
+                  <strong>{t('wineRequests.linkedTo')}</strong> {t('wineRequests.linkedWine', { wine: request.linkedWineDefinition.name, producer: request.linkedWineDefinition.producer })}
                 </div>
               )}
               {request.adminNotes && (

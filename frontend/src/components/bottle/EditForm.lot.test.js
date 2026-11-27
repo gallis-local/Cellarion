@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 
 // "Also apply the drink window and price to the other N bottles of this wine
-// and vintage" (support ticket 2026-09-06). The checkbox only appears when the
+// and vintage". The checkbox only appears when the
 // bottle response listed siblings; ticked, the CHANGED lot-level fields go to
 // them through the bulk route after the single save; the outcome travels to
 // the page through onSaved.
@@ -80,6 +80,28 @@ describe('EditForm lot checkbox', () => {
     fireEvent.click(screen.getByText('bottleDetail.saveChanges'));
     await waitFor(() => expect(onSaved).toHaveBeenCalledWith(expect.anything(), { nothing: true }));
     expect(bulkUpdateBottles).not.toHaveBeenCalled();
+  });
+
+  test('opened from the page\'s window link: the drink-window years are scrolled into view and "drink from" has the keyboard', () => {
+    const scrolled = vi.fn();
+    const had = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scrolled;
+    try {
+      const { unmount } = render(<EditForm bottle={BOTTLE} focus="drinkWindow" onSaved={() => {}} onCancel={() => {}} />);
+      const drinkFrom = screen.getByPlaceholderText('addBottle.drinkFromPlaceholder');
+      expect(drinkFrom).toHaveFocus();
+      expect(scrolled).toHaveBeenCalledWith({ block: 'center' });
+      expect(scrolled.mock.contexts[0]).toContainElement(drinkFrom);
+      unmount();
+
+      // From the Edit buttons: the form opens at its top, as before.
+      scrolled.mockClear();
+      render(<EditForm bottle={BOTTLE} onSaved={() => {}} onCancel={() => {}} />);
+      expect(screen.getByPlaceholderText('addBottle.drinkFromPlaceholder')).not.toHaveFocus();
+      expect(scrolled).not.toHaveBeenCalled();
+    } finally {
+      Element.prototype.scrollIntoView = had;
+    }
   });
 
   test('unticked: siblings are never touched', async () => {

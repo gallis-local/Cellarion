@@ -16,8 +16,8 @@ const jwt = require('jsonwebtoken');
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 
 jest.mock('../services/search', () => ({
-  indexBottle: jest.fn(), removeBottle: jest.fn(), indexWine: jest.fn(),
-  bulkIndexBottles: jest.fn(), getIsAvailable: jest.fn(() => false),
+  indexWine: jest.fn(),
+  getIsAvailable: jest.fn(() => false),
 }));
 jest.mock('../services/bottleLot', () => ({ findLotSiblingIds: jest.fn().mockResolvedValue([]) }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
@@ -32,7 +32,7 @@ jest.mock('../utils/exchangeRates', () => ({ getSnapshotForDate: jest.fn().mockR
 jest.mock('../utils/vintageProfile', () => ({ ensurePendingVintageProfile: jest.fn() }));
 jest.mock('../models/Cellar', () => ({ findById: jest.fn() }));
 jest.mock('../models/WineDefinition', () => ({ findById: jest.fn() }));
-jest.mock('../models/Rack', () => ({ findOne: jest.fn(), updateMany: jest.fn() }));
+jest.mock('../models/Rack', () => ({ findOne: jest.fn(), exists: jest.fn(), updateMany: jest.fn() }));
 jest.mock('../models/CellarLayout', () => ({ findOne: jest.fn() }));
 jest.mock('../models/Country', () => ({}));
 jest.mock('../models/Region', () => ({}));
@@ -94,7 +94,7 @@ beforeEach(() => {
   Cellar.findById.mockResolvedValue({
     _id: CELLAR, user: USER, deletedAt: null, members: [], userColors: [],
   });
-  // Own photos: find().sort().limit().lean(); the vintage official: find().select().lean() (2026-10-09).
+  // Own photos: find().sort().limit().lean(); the vintage official: find().select().lean().
   BottleImage.find.mockImplementation(() => { const q = { sort: () => q, limit: () => q, select: () => q, lean: async () => [] }; return q; });
   BottleImage.findOne.mockReturnValue(sortLean(null));
   BottleImage.findById.mockReturnValue({ lean: async () => null });
@@ -114,14 +114,24 @@ describe('GET /api/bottles/:id rackInfo', () => {
     expect(body.rackInfo).toEqual({ rackId: RACK, rackName: 'Wine Fridge', position: 7, inRoom: true });
     // The query the index serves — and soft-deleted racks excluded.
     expect(Rack.findOne).toHaveBeenCalledWith({ cellar: CELLAR, 'slots.bottle': BOTTLE, deletedAt: null });
+    // A racked bottle proves the cellar has racks — no second query.
+    expect(body.cellarHasRacks).toBe(true);
+    expect(Rack.exists).not.toHaveBeenCalled();
   });
 
-  test('an unracked bottle answers rackInfo null', async () => {
+  test('an unracked bottle answers rackInfo null, and whether the cellar has a rack to place it in', async () => {
     Bottle.findById.mockResolvedValue(mkBottle());
     Rack.findOne.mockReturnValue(selectLean(null));
+    Rack.exists.mockResolvedValue({ _id: RACK });
     const { body } = await getJson(app(), `/api/bottles/${BOTTLE}`);
     expect(body.rackInfo).toBeNull();
+    expect(body.cellarHasRacks).toBe(true);
+    expect(Rack.exists).toHaveBeenCalledWith({ cellar: CELLAR, deletedAt: null });
     expect(CellarLayout.findOne).not.toHaveBeenCalled(); // no layout query when unracked
+
+    Rack.exists.mockResolvedValue(null);
+    const none = await getJson(app(), `/api/bottles/${BOTTLE}`);
+    expect(none.body.cellarHasRacks).toBe(false); // nothing to place it in: the page offers no link
   });
 
   test('a rack outside the 3D room answers inRoom false', async () => {
@@ -145,5 +155,6 @@ describe('GET /api/bottles/:id rackInfo', () => {
     const { status, body } = await getJson(app(), `/api/bottles/${BOTTLE}`);
     expect(status).toBe(200);
     expect(body.rackInfo).toBeNull();
+    expect(body.cellarHasRacks).toBe(false);
   });
 });

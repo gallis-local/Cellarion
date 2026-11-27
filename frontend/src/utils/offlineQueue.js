@@ -1,5 +1,5 @@
 /**
- * Offline write queue (#1355). A queueable write (utils/offlineOps) that the
+ * Offline write queue. A queueable write (utils/offlineOps) that the
  * network can't take is stored on the device, applied to the device's copy at
  * once (the page carries on as if it had succeeded), and sent — in order, with
  * its Idempotency-Key and the preconditions of what the user saw — once the
@@ -24,8 +24,8 @@ import { isOfflineModeEnabled } from './offlineMode';
 const OTHER_ACCOUNT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // Any op, anyone's, after three months: a change queued by an account that
 // ended (signed out elsewhere, deleted) with nobody signing in here since would
-// otherwise sit in the device's storage indefinitely (release audit
-// 2026-09-27, L). The user's own op has shown in the banner for 90 days by then.
+// otherwise sit in the device's storage indefinitely. The user's own op has
+// shown in the banner for 90 days by then.
 const ABANDONED_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 const SENT_KEEP_MS = 60 * 60 * 1000;
 export const QUEUE_CHANGED_EVENT = 'cellarion-offline-queue';

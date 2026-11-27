@@ -12,26 +12,32 @@ export const TYPE_TITLES = {
   en: {
     red: 'Red Wines', white: 'White Wines', 'rosé': 'Rosé Wines',
     sparkling: 'Sparkling Wines', dessert: 'Dessert Wines', fortified: 'Fortified Wines',
+    other: 'Other', unknown: 'Unknown',
   },
   sv: {
     red: 'Röda Viner', white: 'Vita Viner', 'rosé': 'Rosévin',
     sparkling: 'Mousserande Viner', dessert: 'Dessertviner', fortified: 'Starkvin',
+    other: 'Övrigt', unknown: 'Okänd',
   },
   fr: {
     red: 'Vins Rouges', white: 'Vins Blancs', 'rosé': 'Vins Rosés',
     sparkling: 'Vins Effervescents', dessert: 'Vins de Dessert', fortified: 'Vins Fortifiés',
+    other: 'Autres', unknown: 'Inconnu',
   },
   de: {
     red: 'Rotweine', white: 'Weißweine', 'rosé': 'Roséweine',
     sparkling: 'Schaumweine', dessert: 'Dessertweine', fortified: 'Likörweine',
+    other: 'Sonstiges', unknown: 'Unbekannt',
   },
   es: {
     red: 'Vinos Tintos', white: 'Vinos Blancos', 'rosé': 'Vinos Rosados',
     sparkling: 'Vinos Espumosos', dessert: 'Vinos de Postre', fortified: 'Vinos Fortificados',
+    other: 'Otros', unknown: 'Desconocido',
   },
   it: {
     red: 'Vini Rossi', white: 'Vini Bianchi', 'rosé': 'Vini Rosati',
     sparkling: 'Spumanti', dessert: 'Vini da Dessert', fortified: 'Vini Liquorosi',
+    other: 'Altro', unknown: 'Sconosciuto',
   },
 };
 
@@ -45,6 +51,21 @@ export const GLASS_LABEL = {
 };
 
 // The "last bottle" badge (layout.markLastBottle), in the list's language
+// The bottle count (layout.showStock), in the list's language: [one, other].
+// French counts 0 and 1 in the singular. Mirrors the backend
+// (services/wineListPdf.js) — keep the two in sync.
+export const BOTTLE_COUNT_LABEL = {
+  en: ['bottle', 'bottles'], sv: ['flaska', 'flaskor'], fr: ['bouteille', 'bouteilles'],
+  de: ['Flasche', 'Flaschen'], es: ['botella', 'botellas'], it: ['bottiglia', 'bottiglie'],
+};
+
+/** "3 bottles", "1 flaska", "0 bouteille" — a count in the list's language. */
+export function bottleCountText(count, lang = 'en') {
+  const [one, other] = BOTTLE_COUNT_LABEL[lang] || BOTTLE_COUNT_LABEL.en;
+  const singular = lang === 'fr' ? count <= 1 : count === 1;
+  return `${count} ${singular ? one : other}`;
+}
+
 export const LAST_BOTTLE_LABEL = {
   en: 'Last bottle', sv: 'Sista flaskan', fr: 'Dernière bouteille',
   de: 'Letzte Flasche', es: 'Última botella', it: 'Ultima bottiglia',
@@ -53,7 +74,7 @@ export const LAST_BOTTLE_LABEL = {
 // Auto-mode grouping: the fields a heading level may group on, and the cap
 export const LEVEL_FIELDS = ['type', 'country', 'region', 'appellation'];
 export const MAX_LEVELS = 3;
-const DEFAULT_TYPE_ORDER = ['sparkling', 'white', 'rosé', 'red', 'dessert', 'fortified'];
+const DEFAULT_TYPE_ORDER = ['sparkling', 'white', 'rosé', 'red', 'dessert', 'fortified', 'other', 'unknown'];
 
 /**
  * The grouping levels in force: explicit `levels` (unknown fields and
@@ -102,10 +123,13 @@ function resolveEntry(entry, winesByKey, layout = {}, lang = 'en') {
     appellation: wine.appellation || '',
     grapes: (wine.grapes || []).map(g => g.name).filter(Boolean),
     type: wine.type || '',
+    nonWine: wine.nonWine === true,
     price: entry.listPrice != null ? entry.listPrice : item.avgPrice,
     glassPrice: entry.byGlass && entry.glassPrice != null ? entry.glassPrice : null,
     byGlass: !!entry.byGlass,
     lastBottle: !!layout.markLastBottle && item.stock === 1,
+    // The live count, only when the list shows counts (layout.showStock).
+    bottleCount: layout.showStock ? item.stock : null,
     sortOrder: entry.sortOrder || 0,
   };
 }
@@ -142,7 +166,8 @@ function formatTypeTitle(type, lang = 'en') {
 // A wine missing the field of a nested level falls back up the geography —
 // but never to the heading it already sits under: that goes to "Other", last.
 function groupKeyOf(wine, level, parentKey) {
-  if (level === 'type') return wine.type || 'other';
+  // Other = a drink that is not wine; a wine of unknown colour is its own group.
+  if (level === 'type') return wine.nonWine ? 'other' : (wine.type || 'unknown');
   if (level === 'country') return wine.country || 'Other';
   const key = level === 'region'
     ? (wine.region || wine.country)

@@ -1,8 +1,9 @@
 /**
- * User-facing wine-correction suggestions (#985 Slice A) — thin HTTP wrappers
- * over services/wineProposalOps.js (shared with the MCP tool
- * suggest_wine_correction). Regular users file field corrections into the
- * SAME admin queue the sommelier flow uses; nothing auto-applies.
+ * User-facing wine-correction suggestions — thin HTTP wrappers over
+ * services/wineProposalOps.js (shared with the MCP tool suggest_wine_correction).
+ * Field corrections go into the SAME admin queue the sommelier flow uses. One
+ * applies at once where contributions are not reviewed (trustedContributions),
+ * and so does a sweetness style that fills a blank (services/wineProposalOps).
  */
 const express = require('express');
 const { requireAuth, requireNonDemo } = require('../middleware/auth');
@@ -35,9 +36,14 @@ router.post('/', requireNonDemo, async (req, res, next) => {
     // this install's key. Fire-and-forget — the local proposal stands alone.
     registryBridge.forwardCorrection(result.wine, { fields, reason, evidenceUrl }).catch(() => {});
     // 201 for a new queue row; 200 when the caller's own pending suggestion
-    // absorbed these fields instead (support ticket 2026-09-12).
+    // absorbed these fields instead.
     res.status(result.amended ? 200 : 201).json({
       amended: !!result.amended,
+      // true when it is already applied to the wine and nothing is pending:
+      // a server that does not review contributions
+      // (services/trustedContributions), or a sweetness style that filled a
+      // blank (services/wineProposalOps applyStyleOnFiling).
+      applied: !!result.applied,
       proposal: {
         _id: result.proposal._id,
         proposedFields: result.proposal.proposedFields,

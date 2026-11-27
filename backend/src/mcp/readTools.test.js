@@ -28,12 +28,22 @@ jest.mock('../services/photoState', () => ({ photosForBottle: jest.fn().mockReso
 jest.mock('../models/Rack', () => ({ find: jest.fn(), findOne: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../models/WishlistItem', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../models/JournalEntry', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
-// get_wine reads the correction queue for signed-in callers (support ticket
-// 2026-09-12) — mocked as "nothing pending" so the real model never buffers.
+// get_wine reads the correction queue for signed-in callers — mocked as
+// "nothing pending" so the real model never buffers.
 jest.mock('../models/WineCorrectionProposal', () => ({
   findOne: jest.fn(() => ({ select: () => ({ lean: async () => null }) })),
 }));
 jest.mock('../models/WineDefinition', () => ({ find: jest.fn(), findById: jest.fn(), findOne: jest.fn() }));
+// The sweetness category is read from real rows in
+// routes/sweetnessCategory.surfaces.mongo.test.js; here its reader answers
+// "nothing read", so the mocked wine model is not asked for it.
+jest.mock('../services/sweetnessCategory', () => ({
+  ...jest.requireActual('../services/sweetnessCategory'),
+  readSweetnessCategories: jest.fn(async () => new Map()),
+}));
+// get_bottle reads the vintage's window for its serving line (utils/servingUtils);
+// no profiles here, so the line carries the style's temperature only.
+jest.mock('../models/WineVintageProfile', () => ({ find: jest.fn(() => ({ lean: () => Promise.resolve([]) })) }));
 jest.mock('../models/User', () => ({ findById: jest.fn() }));
 // get_bottle looks up an unanswered curator question for the viewer
 // (open_curator_question, 2026-09-24) — "none" by default so the real model
@@ -166,10 +176,37 @@ describe('ownership scoping', () => {
     expect(parse(res).error.code).toBe('not_found');
   });
 
-  // REGRESSION (audit HIGH): document refs are ObjectId INSTANCES, not strings.
+  // REGRESSION: document refs are ObjectId INSTANCES, not strings.
   // A string-only isValidId gate made get_bottle/get_rack fail on every real
   // call while string-mocked tests stayed green. These success paths use real
   // ObjectIds so that class of bug can never pass the suite again.
+  test('get_bottle carries the wine\'s sweetness reading, and still answers when that lookup fails', async () => {
+    const { readSweetnessCategories } = require('../services/sweetnessCategory');
+    const cellarId = new mongoose.Types.ObjectId(oid('c'));
+    const bottle = () => chain({
+      _id: oid('d'), cellar: cellarId, vintage: '2015', status: 'active',
+      wineDefinition: { _id: oid('f'), name: 'Riesling Beerenauslese', producer: 'X', grapes: [] },
+      pours: [],
+    });
+    Cellar.findById.mockReturnValue(chain({ _id: cellarId, user: ME, members: [], deletedAt: null, name: 'Mine' }));
+    Rack.findOne.mockReturnValue(chain(null));
+
+    Bottle.findById.mockReturnValue(bottle());
+    readSweetnessCategories.mockResolvedValueOnce(new Map([[oid('f'), { category: 'sweet', basis: 'tier' }]]));
+    const read = parse(await tool('get_bottle').handler({ bottle_id: oid('d') }, CTX));
+    expect(read.data.wine).toMatchObject({ sweetness_category: 'sweet', sweetness_category_basis: 'tier' });
+
+    Bottle.findById.mockReturnValue(bottle());
+    readSweetnessCategories.mockRejectedValueOnce(new Error('database away'));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = await tool('get_bottle').handler({ bottle_id: oid('d') }, CTX);
+    warn.mockRestore();
+    expect(res.isError).toBeUndefined();
+    // Left out, never null: null would say the record states none.
+    expect(parse(res).data.wine).not.toHaveProperty('sweetness_category');
+    expect(parse(res).data.wine.name).toBe('Riesling Beerenauslese');
+  });
+
   test('get_bottle succeeds on the owner\'s own bottle with a real ObjectId cellar ref', async () => {
     const cellarId = new mongoose.Types.ObjectId(oid('c'));
     Bottle.findById.mockReturnValue(chain({
@@ -186,6 +223,23 @@ describe('ownership scoping', () => {
     expect(body.data.placement).toBeNull();
     // No curator question waiting → the field is absent, not null.
     expect(body.data).not.toHaveProperty('open_curator_question');
+    // Nothing recorded about the purchase → every part reads null.
+    expect(body.data.purchase).toEqual({ date: null, location: null, url: null });
+  });
+
+  // What add_bottle / update_bottle stored reads back: the shop and its link.
+  test('get_bottle shows where the bottle was bought, link included', async () => {
+    const cellarId = new mongoose.Types.ObjectId(oid('c'));
+    const bought = new Date('2026-11-20T00:00:00.000Z');
+    Bottle.findById.mockReturnValue(chain({
+      _id: oid('d'), cellar: cellarId, vintage: '2019', status: 'active',
+      wineDefinition: { _id: oid('f'), name: 'Barolo', producer: 'X', grapes: [] },
+      pours: [], purchaseDate: bought, purchaseLocation: 'Shop Example', purchaseUrl: 'https://shop.example/wines/barolo-2019',
+    }));
+    Cellar.findById.mockReturnValue(chain({ _id: cellarId, user: ME, members: [], deletedAt: null, name: 'Mine' }));
+    Rack.findOne.mockReturnValue(chain(null));
+    const body = parse(await tool('get_bottle').handler({ bottle_id: oid('d') }, CTX));
+    expect(body.data.purchase).toEqual({ date: bought.toISOString(), location: 'Shop Example', url: 'https://shop.example/wines/barolo-2019' });
   });
 
   // Placement in the words someone at the rack uses (utils/rackGeometry.
@@ -321,7 +375,7 @@ describe('PII and data minimisation', () => {
     expect(res.content[0].text).not.toContain(STRANGER);
   });
 
-  test('list_journal pairings carry the bottle/wine references and the producer; stored text is only the fallback (ticket 6aa6c200)', async () => {
+  test('list_journal pairings carry the bottle/wine references and the producer; stored text is only the fallback', async () => {
     JournalEntry.countDocuments.mockResolvedValue(1);
     JournalEntry.find.mockReturnValue(chain([{
       _id: oid('e'), date: new Date(), people: [],
@@ -438,7 +492,7 @@ describe('privilege parity & bounds', () => {
     Bottle.find.mockReturnValue(chain([]));
     await tool('search_bottles').handler({ query: 'barolo', status: 'all', vintage: '2015' }, CTX);
     // Scope lives INSIDE the search (owned cellarIds) and hydration
-    // re-asserts exactly that scope (defence in depth, audit 2026-09-02 D10-5).
+    // re-asserts exactly that scope (defence in depth).
     // Nothing ELSE may be re-filtered here — status/vintage/type after
     // pagination would put holes in pages and make totals lie.
     const hydrate = Bottle.find.mock.calls[0][0];
@@ -488,5 +542,44 @@ describe('privilege parity & bounds', () => {
     expect(over.isError).toBe(true);
     expect(JSON.parse(over.content[0].text).error.code).toBe('rate_limited');
     expect(t.handler).toHaveBeenCalledTimes(MAX_CALLS_PER_REQUEST);
+  });
+});
+
+// The translated copy of the prose (utils/profileLanguage, SuperAdmin → AI) is
+// for the member screens only: MCP reads the English profile, the same with or
+// without a copy stored — whether the copy is fresh or not.
+describe('tasting_profile is the English profile, never its translation', () => {
+  const AT = new Date('2026-11-13T10:00:00Z');
+  const ENGLISH = {
+    body: 'full', tannin: 'high', acidity: 'high', sweetness: 'dry', flavors: ['tar', 'rose'],
+    foodPairings: ['braised beef'], description: 'Firm and fragrant.', source: 'ai', generatedAt: AT,
+  };
+  const COPY = { lang: 'de', description: 'Fest und duftig.', flavors: ['Teer'], foodPairings: ['Schmorbraten'], generatedAt: AT };
+  const aiConfig = require('../config/aiConfig');
+  beforeEach(() => aiConfig.set({ aiTextLanguage: 'de' })); // the copy is fresh
+  afterEach(() => aiConfig.set({}));
+
+  test('get_wine', async () => {
+    WineDefinition.findOne.mockReturnValue(chain({
+      _id: oid('f'), name: 'Cannubi Boschis', producer: 'Luciano Sandrone', type: 'red', grapes: [],
+      aiProfile: { ...ENGLISH, localized: COPY },
+    }));
+    const res = await tool('get_wine').handler({ wine_id: oid('f') }, CTX);
+    const profile = parse(res).data.tasting_profile;
+    expect(profile).toEqual(JSON.parse(JSON.stringify(ENGLISH)));
+    expect(res.content[0].text).not.toMatch(/localized|Fest und duftig|Schmorbraten/);
+  });
+
+  test('get_bottle', async () => {
+    const cellarId = new mongoose.Types.ObjectId(oid('c'));
+    Bottle.findById.mockReturnValue(chain({
+      _id: oid('d'), cellar: cellarId, vintage: '2015', status: 'active', pours: [],
+      wineDefinition: { _id: oid('f'), name: 'Cannubi Boschis', producer: 'Luciano Sandrone', grapes: [], aiProfile: { ...ENGLISH, localized: COPY } },
+    }));
+    Cellar.findById.mockReturnValue(chain({ _id: cellarId, user: ME, members: [], deletedAt: null, name: 'Mine' }));
+    Rack.findOne.mockReturnValue(chain(null));
+    const res = await tool('get_bottle').handler({ bottle_id: oid('d') }, CTX);
+    expect(parse(res).data.wine.tasting_profile).toEqual(JSON.parse(JSON.stringify(ENGLISH)));
+    expect(res.content[0].text).not.toMatch(/localized|Fest und duftig|Schmorbraten/);
   });
 });

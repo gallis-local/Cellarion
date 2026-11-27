@@ -2,7 +2,7 @@ import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import AdminRequests from './AdminRequests';
 import { adminResolveWineRequest } from '../api/admin';
 
-// Audit 2026-08-03 H5: the admin wine-request queue sent no page/limit params
+// The admin wine-request queue sent no page/limit params
 // and dropped the server's `total`, so anything beyond the oldest 50 requests
 // per status was permanently unreachable through the UI. These tests pin the
 // pagination contract: page/limit are sent, the total is shown, the filter
@@ -18,12 +18,15 @@ const apiFetch = vi.fn();
 vi.mock('../contexts/AuthContext', () => ({ useAuth: () => ({ apiFetch }) }));
 
 const getWineRequests = vi.fn();
+const getPhotos = vi.fn();
+const getGrapes = vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({ grapes: [] }) }));
 vi.mock('../api/admin', () => ({
   adminGetWineRequests: (...a) => getWineRequests(...a),
+  adminGetWineRequestPhotos: (...a) => getPhotos(...a),
   adminResolveWineRequest: vi.fn(),
   adminRejectWineRequest: vi.fn(),
   adminGetCountries: () => Promise.resolve({ ok: true, json: () => Promise.resolve({ countries: [] }) }),
-  adminGetGrapes: () => Promise.resolve({ ok: true, json: () => Promise.resolve({ grapes: [] }) }),
+  adminGetGrapes: (...a) => getGrapes(...a),
   adminGetRegions: vi.fn(),
   adminGetAppellations: vi.fn(),
 }));
@@ -130,7 +133,7 @@ test('snaps back to the last page when the current page falls off the end', asyn
 
 // A photo attached to a request is stored inline on it. The approval form offers
 // it as a checkbox (on by default) and sends useRequestPhoto; the server stores
-// it as the wine's picture FILE. It never goes into the image field (2026-09-27).
+// it as the wine's picture FILE. It never goes into the image field.
 test('a photo attached to the request is offered as a checkbox and sent as useRequestPhoto, not as the image', async () => {
   adminResolveWineRequest.mockResolvedValue(jsonRes({ wineRequest: {} }));
   getWineRequests.mockResolvedValue(jsonRes({
@@ -166,7 +169,7 @@ test('no checkbox for a request without a photo, or once a link is typed', async
   expect(screen.queryByTestId('use-request-photo')).toBeNull();
 });
 
-// A request may carry several links and a back-label photo (#1460). The detail
+// A request may carry several links and a back-label photo. The detail
 // shows every link and both photos, captioned, so the reviewer sees what the
 // requester saw.
 test('every link and the back label photo are shown on the request', async () => {
@@ -201,7 +204,7 @@ test('a request with one link and no back label shows them the old way', async (
   expect(screen.queryByText('admin.requests.frontLabel')).toBeNull();
 });
 
-// The back label on a request (#1460) is offered for the wine's public photos
+// The back label on a request is offered for the wine's public photos
 // with its own checkbox, on by default, and sent as addBackPhoto.
 test('a back label on the request is offered for the public photos, on by default, and sent as addBackPhoto', async () => {
   adminResolveWineRequest.mockResolvedValue(jsonRes({ wineRequest: {} }));
@@ -244,4 +247,52 @@ test('a back label given as a link offers no checkbox', async () => {
   fireEvent.click(await screen.findByText('Wine 0'));
   await screen.findByPlaceholderText('https://...');
   expect(screen.queryByTestId('add-back-photo')).toBeNull();
+});
+
+test('grape names on a request pre-select the varieties the taxonomy knows by that name; others are not guessed', async () => {
+  getGrapes.mockImplementationOnce(() => Promise.resolve({ ok: true, json: () => Promise.resolve({
+    grapes: [{ _id: 'g-pn', name: 'Pinot Noir' }, { _id: 'g-ch', name: 'Chardonnay' }],
+  }) }));
+  adminResolveWineRequest.mockResolvedValue(jsonRes({ wineRequest: {} }));
+  getWineRequests.mockResolvedValue(jsonRes({
+    count: 1, total: 1,
+    requests: [{ ...makeRequests(1)[0], via: 'bridge', suggestedGrapes: ['pinot noir', 'Pinot Noir', 'Gamay Noir à Jus Blanc'] }],
+  }));
+  render(<AdminRequests />);
+  fireEvent.click(await screen.findByText('Wine 0'));
+  // The names stay readable above the form, the unknown one included.
+  expect(await screen.findByText(/Gamay Noir à Jus Blanc/)).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: 'admin.requests.resolve' }));
+  await waitFor(() => expect(adminResolveWineRequest).toHaveBeenCalledTimes(1));
+  expect(adminResolveWineRequest.mock.calls[0][2].wineData.grapes).toEqual(['g-pn']);
+});
+
+test('an inline photo the list only flags is offered at once and loaded for the request opened', async () => {
+  adminResolveWineRequest.mockResolvedValue(jsonRes({ wineRequest: {} }));
+  getPhotos.mockResolvedValue(jsonRes({ image: 'data:image/webp;base64,UklGRg==', backImage: 'data:image/webp;base64,UklGRh==' }));
+  getWineRequests.mockResolvedValue(jsonRes({
+    count: 1, total: 1,
+    requests: [{ ...makeRequests(1)[0], image: null, backImage: null, hasInlineImage: true, hasInlineBackImage: true }],
+  }));
+  render(<AdminRequests />);
+  fireEvent.click(await screen.findByText('Wine 0'));
+
+  // The choices are there before the photos arrive: the approval uses the
+  // stored photo, never the bytes this page loaded.
+  expect(screen.getByTestId('use-request-photo')).toBeChecked();
+  expect(screen.getByTestId('add-back-photo')).toBeChecked();
+  await waitFor(() => expect(getPhotos).toHaveBeenCalledWith(apiFetch, 'req-0'));
+  await waitFor(() => expect(document.querySelectorAll('img.wine-image-preview')).toHaveLength(2));
+
+  fireEvent.click(screen.getByRole('button', { name: 'admin.requests.resolve' }));
+  await waitFor(() => expect(adminResolveWineRequest).toHaveBeenCalledTimes(1));
+  expect(adminResolveWineRequest.mock.calls[0][2].wineData).toMatchObject({ useRequestPhoto: true, addBackPhoto: true, image: '' });
+});
+
+test('a request without inline photos loads none', async () => {
+  getWineRequests.mockResolvedValue(jsonRes({ count: 1, total: 1, requests: [{ ...makeRequests(1)[0], hasInlineImage: false, hasInlineBackImage: false }] }));
+  render(<AdminRequests />);
+  fireEvent.click(await screen.findByText('Wine 0'));
+  expect(getPhotos).not.toHaveBeenCalled();
 });

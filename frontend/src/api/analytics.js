@@ -1,6 +1,6 @@
 import { JSON_HEADERS } from './apiConstants';
 
-// Self-service analytics (#987). One query endpoint serves the table, the
+// Self-service analytics. One query endpoint serves the table, the
 // CSV export and (later) charts — the request shape is documented on
 // backend/src/routes/analytics.js.
 
@@ -13,7 +13,7 @@ export const runAnalyticsQuery = (apiFetch, query) =>
     body: JSON.stringify(query),
   });
 
-// Dashboards (#987): several named boards per user.
+// Dashboards: several named boards per user.
 export const listDashboards = (apiFetch) => apiFetch('/api/analytics/dashboards');
 
 export const createDashboard = (apiFetch, name, widgets = []) =>
@@ -33,7 +33,7 @@ export const updateDashboard = (apiFetch, id, patch) =>
 export const deleteDashboard = (apiFetch, id) =>
   apiFetch(`/api/analytics/dashboards/${id}`, { method: 'DELETE' });
 
-// Saved views + preset stars (#987 saved-views slice).
+// Saved views + preset stars.
 export const listViews = (apiFetch) => apiFetch('/api/analytics/views');
 
 export const saveView = (apiFetch, view) =>

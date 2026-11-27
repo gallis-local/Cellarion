@@ -12,7 +12,10 @@
  *   stack    — single vertical column; height = rows
  *   cube     — grid of sub-modules; outer grid = rows × cols, each module = moduleRows × moduleCols
  *   shelf    — open case storage; rows × cols (same count as grid, different visual)
+ *   wall     — boxes on a grid of rows × cols cells, each with its own content
+ *              (typeConfig.boxes); counted and numbered in utils/wallGeometry.js
  */
+const { wallTotalSlots } = require('./wallGeometry');
 
 /**
  * Filter typeConfig.doubleHeightRows down to the entries that actually
@@ -104,10 +107,9 @@ function totalSlots(type, rows, cols, typeConfig) {
       // hexFlip is deliberately not read here: it reverses which rows are
       // which, a pure reversal that can never change the total.
       if (typeConfig?.hexEqualRows) return rows * cols;
-      // Closed form, not a loop (security audit 2026-09-02 D14-1): this ran
-      // `rows` iterations, and the rack UPDATE route computed it on the
-      // request's still-unvalidated rows before the schema's max-20 check —
-      // one PUT with rows "1e308" parked the event loop for every tenant.
+      // Closed form, not a loop: the count must stay cheap whatever `rows` a
+      // caller passes, even an unvalidated "1e308" — a loop of `rows`
+      // iterations would park the event loop for every tenant.
       // Even rows (0-indexed) hold `cols`, odd rows hold max(1, cols-1).
       const evenRows = Math.ceil(rows / 2);
       const oddRows = Math.floor(rows / 2);
@@ -151,6 +153,11 @@ function totalSlots(type, rows, cols, typeConfig) {
         .reduce((sum, bay) => sum + cabinetBayCapacity(bay.rows, bay.cols, cabinetBayOpts(bay, twoDeep)), 0);
     }
 
+    case 'wall':
+      // One rack built from boxes; see the POSITION NUMBERING CONTRACT in
+      // utils/wallGeometry.js.
+      return wallTotalSlots(rows, cols, typeConfig);
+
     default: {
       // Fall back to grid behaviour (including double-height rows)
       const doubles = validDoubleHeightRows(rows, cols, typeConfig?.doubleHeightRows);
@@ -180,7 +187,7 @@ function totalSlots(type, rows, cols, typeConfig) {
 // (typeConfig.shelfAlternate[i]); cabinetBays resolves every bay's rows,
 // width and pattern, and the walk above simply uses the bay's own width. So a
 // Liebherr GrandCru 5001 is one cabinet: three honeycomb shelves 6 wide
-// between two staggered shelves 4 wide (support ticket 2026-08-31). Mirrored
+// between two staggered shelves 4 wide. Mirrored
 // in frontend/src/utils/rackLayouts.cabinetLayout.
 
 const CABINET_MAX_ROWS_PER_SHELF = 12;
@@ -282,17 +289,16 @@ function cabinetBays(rows, cols, typeConfig) {
  * lies in the gaps between those bottles and holds one fewer, the level
  * above nests in the grooves of the first so its front row holds one fewer
  * and its back row is full width again, and so on: 6 / 5 in front of 5 / 6,
- * the wooden shelf of a Liebherr GrandCru (support ticket 2026-09-15).
+ * the wooden shelf of a Liebherr GrandCru.
  * Without twoDeep the levels simply alternate cols, cols−1, cols, …
  * A single-bottle-wide cabinet has nothing to alternate (never 0 wide).
  *
  * One bottle across the front (sideways 'front') of a ONE-deep shelf: the
  * first row is that bottle plus cols−1 lying front to back behind it, and the
  * levels above rest on those, so they are counted from cols−1. A slim
- * fridge's stacked shelf: 1 across + 4, with 3 in the grooves on top (forum
- * 2026-10-14; it used to stack 4 on 3). Two deep is left as it was: there the
- * front and back rows share the level, and the bottle across lies in front
- * of both.
+ * fridge's stacked shelf: 1 across + 4, with 3 in the grooves on top. Two
+ * deep does not take this rule: there the front and back rows share the
+ * level, and the bottle across lies in front of both.
  */
 function cabinetRowWidth(row, cols, { twoDeep = true, alternate = false, sideways = '' } = {}) {
   const base = sideways === 'front' && !twoDeep && row > 1 ? Math.max(1, cols - 1) : cols;
@@ -435,14 +441,13 @@ function validateCabinetConfig(typeConfig, effectiveType, effectiveRows, effecti
  * The cabinet typeConfig an import stores: every list fitted to the shelf
  * count, every flag a real boolean (headToTail only one deep), and a per-shelf
  * key that is not a list DROPPED — a hand-edited file's `"shelfSideways":
- * "front"` used to be stored as a one-entry list on a 3-shelf cabinet, and
- * every later edit of the rack was then refused (release audit 2026-10-13).
- * Other keys pass through untouched.
+ * "front"`, stored as a one-entry list on a 3-shelf cabinet, would get every
+ * later edit of the rack refused. Other keys pass through untouched.
  */
 function fitCabinetTypeConfig(rows, cols, typeConfig) {
   const tc = typeConfig && typeof typeConfig === 'object' ? typeConfig : {};
   // A grid-only key in a hand-edited export would make every later edit of
-  // the cabinet a 400 ("only supported on grid racks" — audit 2026-10-14).
+  // the cabinet a 400 ("only supported on grid racks").
   delete tc.doubleHeightRows;
   return {
     ...tc,

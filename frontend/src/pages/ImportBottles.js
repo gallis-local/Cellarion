@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { useParams, useNavigate, Link } from 'react-router-dom';
+import { useParams, Link } from 'react-router-dom';
 import { useTranslation, Trans } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { validateImport, confirmImport, scanReceipt } from '../api/bottles';
@@ -36,6 +36,8 @@ import { getTotalSlots } from '../utils/rackLayouts';
 import { TYPE_DIMENSIONS } from '../components/racks/RackTypeSelector';
 import AnchorPicker from './import/AnchorPicker';
 import CurrencyPicker from './import/CurrencyPicker';
+import IntegerField from '../components/IntegerField';
+import ImportCurationNotes from '../components/ImportCurationNotes';
 import {
   listImportSessions,
   createImportSession,
@@ -46,87 +48,21 @@ import {
 import Modal from '../components/Modal';
 import './ImportBottles.css';
 import { backLabel } from '../utils/backLabel';
-
-const STEPS = ['upload', 'review', 'importing', 'done'];
-
-// Mirrors backend config/constants MAX_IMPORT_SIZE: /confirm hard-rejects
-// bigger batches in one request, while /validate runs in 25-row slices and
-// happily validates any size — so without an upfront warning a larger file
-// only fails at the very last click, after all the review work.
-const MAX_IMPORT_ROWS = 2000;
+import { formatVintage } from '../utils/vintage';
+import {
+  STEPS, MAX_IMPORT_ROWS, FORMAT_LABEL_KEYS, STATUS_LABEL_KEYS, STATUS_CLASSES, ENCODING_LABELS,
+  CT_TABLE_LABEL_KEYS, CT_PATTERN_LABEL_KEYS, TYPE_DOTS,
+} from './import/importConstants';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-const FORMAT_LABEL_KEYS = {
-  cellarion: 'importBottles.formats.cellarion',
-  vivino: 'importBottles.formats.vivino',
-  cellartracker: 'importBottles.formats.cellartracker',
-  'oeno-export': 'importBottles.formats.oenoExport',
-  generic: 'importBottles.formats.generic',
-  receipt: 'importBottles.formats.receipt'
-};
-
-const STATUS_LABEL_KEYS = {
-  exact: 'importBottles.status.exact',
-  fuzzy: 'importBottles.status.fuzzy',
-  ai_match: 'importBottles.status.aiMatch',
-  ai_new: 'importBottles.status.aiNew',
-  no_match: 'importBottles.status.noMatch',
-  error: 'importBottles.status.error',
-  skipped: 'importBottles.status.skipped'
-};
-
-const STATUS_CLASSES = {
-  exact: 'status-exact',
-  fuzzy: 'status-fuzzy',
-  ai_match: 'status-ai',
-  ai_new: 'status-ai',
-  no_match: 'status-nomatch',
-  error: 'status-error',
-  skipped: 'status-skipped'
-};
-
-// Human-readable labels for the encodings decodeImportBuffer can detect
-const ENCODING_LABELS = {
-  'utf-8': 'UTF-8',
-  'utf-16le': 'UTF-16 LE',
-  'utf-16be': 'UTF-16 BE',
-  'windows-1252': 'Windows-1252'
-};
-
-// CellarTracker table names shown next to the detected format
-const CT_TABLE_LABEL_KEYS = {
-  list: 'importBottles.ctTables.list',
-  inventory: 'importBottles.ctTables.inventory',
-  bottles: 'importBottles.ctTables.bottles',
-  consumed: 'importBottles.ctTables.consumed',
-  purchase: 'importBottles.ctTables.purchase',
-  pending: 'importBottles.ctTables.pending'
-};
-
-// Pattern labels for CellarTracker Location/Bin auto-mapped racks
-const CT_PATTERN_LABEL_KEYS = {
-  'rowcol': 'importBottles.rackAutoMap.patternRowCol',
-  'rowcol-depth': 'importBottles.rackAutoMap.patternRowColDepth',
-  'letter-number': 'importBottles.rackAutoMap.patternLetterNumber',
-  'segments': 'importBottles.rackAutoMap.patternSegments',
-  'sequential': 'importBottles.rackAutoMap.patternSequential'
-};
-
-const TYPE_DOTS = {
-  red: '#8B2252',
-  white: '#F5E6C8',
-  'rosé': '#FFB6C1',
-  sparkling: '#FFD700',
-  dessert: '#DAA520',
-  fortified: '#8B4513'
-};
+// Thrown by validateBatch once the page its match loop ran for is gone.
+class MatchAbandoned extends Error {}
 
 function ImportBottles() {
   const { t } = useTranslation();
   const { id: cellarId } = useParams();
   const { apiFetch, user } = useAuth();
-  const navigate = useNavigate();
   // Step state
   const [step, setStep] = useState('upload');
   const [error, setError] = useState(null);
@@ -134,7 +70,7 @@ function ImportBottles() {
   // Upload step
   const [parsedItems, setParsedItems] = useState([]);
   // The last CSV's raw text, kept so a CellarTracker bin-order change can
-  // re-run the parser (support ticket 2026-09-05: bins typed "column,row").
+  // re-run the parser (some owners type bins as "column,row").
   const [sourceText, setSourceText] = useState(null);
   const [ctBinOrder, setCtBinOrder] = useState('row-col');
   const [detectedFormat, setDetectedFormat] = useState(null);
@@ -164,7 +100,7 @@ function ImportBottles() {
   // currency column. Seeded from the user's profile preference, but can be
   // overridden per-import via the picker.
   const [importCurrency, setImportCurrency] = useState(user?.preferences?.currency || 'USD');
-  // Whole-import comment/occasion (support ticket 2026-07-30): typed once,
+  // Whole-import comment/occasion: typed once,
   // applied by the backend to every bottle this import creates — rows that
   // carry their own note in the file keep it (fill-blank only).
   const [importNotes, setImportNotes] = useState('');
@@ -192,6 +128,11 @@ function ImportBottles() {
   // while it waited (handleAiSearch).
   const selectionsRef = useRef(selections);
   useEffect(() => { selectionsRef.current = selections; }, [selections]);
+  // Bumped when the page is left or switches to another cellar. A match loop
+  // started before that stops at its next batch, instead of spending AI
+  // look-ups (and the AI rate limit) on results no screen will show.
+  const runGenRef = useRef(0);
+  useEffect(() => () => { runGenRef.current += 1; }, [cellarId]);
   const [searchModal, setSearchModal] = useState(null); // { index } or null
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
@@ -676,9 +617,12 @@ function ImportBottles() {
   // non-retryable error — so a 1000+ bottle import waits through brief AI rate
   // limits and continues instead of failing mid-way. Shared by the initial
   // validate and the AI-budget retry so both get the same backoff.
-  const validateBatch = useCallback(async (batchItems) => {
+  // `abandoned` is the calling loop's check: once it says yes, no further
+  // attempt is sent and MatchAbandoned is thrown instead.
+  const validateBatch = useCallback(async (batchItems, abandoned = () => false) => {
     const MAX_RETRIES = 5;
     for (let attempt = 0; ; attempt++) {
+      if (abandoned()) throw new MatchAbandoned();
       let res;
       try {
         res = await validateImport(apiFetch, { cellarId, items: batchItems });
@@ -728,12 +672,15 @@ function ImportBottles() {
     if (!resuming) track('import-started', { format: detectedFormat || 'unknown', rows: total });
     setValidationProgress({ done: startOffset, total });
 
+    const gen = runGenRef.current;
+    const abandoned = () => runGenRef.current !== gen;
     try {
       for (let offset = startOffset; offset < total; offset += VALIDATE_BATCH_SIZE) {
         // Re-index each batch so indices match their position in parsedItems
         const batch = preparedItems.slice(offset, offset + VALIDATE_BATCH_SIZE);
 
-        const data = await validateBatch(batch);
+        const data = await validateBatch(batch, abandoned);
+        if (abandoned()) return;
 
         // Shift batch-local indices back to global indices
         const shifted = data.results.map(r => ({ ...r, index: r.index + offset }));
@@ -764,6 +711,7 @@ function ImportBottles() {
       setValidationResume(null);
       setStep('review');
     } catch (err) {
+      if (err instanceof MatchAbandoned) return;
       const msg = err.message || t('importBottles.errors.validationNetwork');
       // Partial progress is committed — say so next to the error instead of
       // letting the user assume everything was lost.
@@ -818,10 +766,13 @@ function ImportBottles() {
     // can't discard batches that already succeeded, and (c) reuse
     // validateBatch's capped backoff so a 429/5xx waits instead of aborting.
     let workingResults = results;
+    const gen = runGenRef.current;
+    const abandoned = () => runGenRef.current !== gen;
     try {
       for (let offset = 0; offset < rows.length; offset += VALIDATE_BATCH_SIZE) {
         const batchRows = rows.slice(offset, offset + VALIDATE_BATCH_SIZE);
-        const data = await validateBatch(batchRows.map(r => r.item));
+        const data = await validateBatch(batchRows.map(r => r.item), abandoned);
+        if (abandoned()) return;
 
         // Map batch-local indices back to the rows' original global indices
         const batchUpdates = new Map();
@@ -839,6 +790,7 @@ function ImportBottles() {
         setRetryAiProgress({ done: Math.min(offset + VALIDATE_BATCH_SIZE, rows.length), total: rows.length });
       }
     } catch (err) {
+      if (err instanceof MatchAbandoned) return;
       setError(err.message || t('importBottles.errors.validationNetwork'));
     } finally {
       // The budget was (partially) spent even on a mid-loop failure — refresh.
@@ -1050,8 +1002,8 @@ function ImportBottles() {
   const getImportableCount = () => results.filter(isImportableRow).length;
 
   // A typed vintage on a flagged row must be a real year before confirm, or
-  // the one row the user took care of is the one the server rejects
-  // (audit 2026-09-07). Empty stays NV.
+  // the one row the user took care of is the one the server rejects.
+  // Empty stays NV.
   const isBadTypedVintage = (v) => {
     if (!v || v === 'NV') return false;
     const n = parseInt(v, 10);
@@ -1268,11 +1220,12 @@ function ImportBottles() {
     return (
       <div className="rack-config-automap">
         <div className="rack-config-automap-pattern">
-          {t(CT_PATTERN_LABEL_KEYS[auto.pattern] || 'importBottles.rackAutoMap.patternGeneric')}
-          {' — '}
-          {auto.rows && auto.cols
-            ? t('importBottles.rackAutoMap.detectedDims', { rows: auto.rows, cols: auto.cols, count: auto.binCount })
-            : t('importBottles.rackAutoMap.detectedSeq', { count: auto.binCount })}
+          {t('importBottles.rackAutoMap.patternWithDetail', {
+            pattern: t(CT_PATTERN_LABEL_KEYS[auto.pattern] || 'importBottles.rackAutoMap.patternGeneric'),
+            detail: auto.rows && auto.cols
+              ? t('importBottles.rackAutoMap.detectedDims', { rows: auto.rows, cols: auto.cols, count: auto.binCount })
+              : t('importBottles.rackAutoMap.detectedSeq', { count: auto.binCount }),
+          })}
         </div>
         <div className="rack-config-automap-counts">
           {t('importBottles.rackAutoMap.placed', { count: auto.placedCount })}
@@ -1633,7 +1586,7 @@ function ImportBottles() {
                       <strong>
                         {existing.isModular
                           ? t('importBottles.rack.modularLayout', { count: (existing.modules || []).length })
-                          : `${existing.type} ${existing.rows}×${existing.cols}${existing.typeConfig?.bottlesPerCell > 1 ? t('importBottles.rack.perCellShort', { n: existing.typeConfig.bottlesPerCell }) : ''}`}
+                          : `${t(`racks.type_${existing.type}`, existing.type)} ${existing.rows}×${existing.cols}${existing.typeConfig?.bottlesPerCell > 1 ? t('importBottles.rack.perCellShort', { n: existing.typeConfig.bottlesPerCell }) : ''}`}
                       </strong>
                       {existingCapacity !== null && <>{t('importBottles.rack.slotsSuffix', { count: existingCapacity })}</>}.
                       {' '}{t('importBottles.rack.reshapeNote')}
@@ -1647,7 +1600,7 @@ function ImportBottles() {
                       <div className="rack-config-warn rack-config-existing-warn">
                         <Trans
                           i18nKey="importBottles.rack.oenoTypeWarning"
-                          values={{ type: existing.type }}
+                          values={{ type: t(`racks.type_${existing.type}`, existing.type) }}
                           components={{ 1: <strong />, 3: <code /> }}
                         />
                       </div>
@@ -1748,11 +1701,10 @@ function ImportBottles() {
                     {dims.showRows && (
                       <label className="rack-config-field">
                         <span>{dims.rowLabel === 'racks.heightLabel' ? t('importBottles.rack.height') : dims.rowLabel === 'racks.shelvesLabel' ? t('importBottles.rack.shelves') : t('importBottles.rack.rows')}</span>
-                        <input
-                          type="number" min="1" max="20"
+                        <IntegerField
+                          min={1} max={20}
                           value={cfg.rows}
-                          onChange={(e) => {
-                            const newRows = parseInt(e.target.value, 10) || 1;
+                          onCommit={(newRows) => {
                             if (cfg.type !== 'cabinet') { updateCfg({ rows: newRows }); return; }
                             // Cabinet: keep the per-shelf list the length of the
                             // shelf count. Extra shelves are 1-row shelves added at
@@ -1774,10 +1726,10 @@ function ImportBottles() {
                     {dims.showCols && (
                       <label className="rack-config-field">
                         <span>{dims.colLabel === 'racks.baseWidthLabel' ? t('importBottles.rack.baseWidth') : dims.colLabel === 'racks.bottlesAcrossLabel' ? t('importBottles.rack.bottlesAcross') : t('importBottles.rack.cols')}</span>
-                        <input
-                          type="number" min="1" max="20"
+                        <IntegerField
+                          min={1} max={20}
                           value={cfg.cols}
-                          onChange={(e) => updateCfg({ cols: parseInt(e.target.value, 10) || 1 })}
+                          onCommit={(cols) => updateCfg({ cols })}
                         />
                       </label>
                     )}
@@ -1908,7 +1860,7 @@ function ImportBottles() {
                     <td>{item.producer || '—'}</td>
                     <td>{item.wineName || '—'}</td>
                     <td>
-                      {item.vintage || t('importBottles.preview.nv')}
+                      {formatVintage(item.vintage, t) || t('importBottles.preview.nv')}
                       {item.vintageMissing && <span className="import-flag" title={t('importBottles.preview.vintageMissing')}> ?</span>}
                     </td>
                     <td>{item.country || '—'}</td>
@@ -2031,6 +1983,10 @@ function ImportBottles() {
             </div>
           )}
         </div>
+        {/* A matched, saved list is easy to take for a finished import. */}
+        <p className="review-not-imported">
+          {t('importBottles.review.notImportedYet', 'Nothing is in your cellar yet. Check the list, then press Import at the bottom to add the bottles.')}
+        </p>
 
         {/* Parse-time warnings (CT truncation / pending bottles on order) + encoding info */}
         {renderImportWarnings()}
@@ -2215,8 +2171,8 @@ function ImportBottles() {
                         <span>{r.item.wineName}</span>
                         <span className="source-meta">
                           {r.item.vintageMissing ? (
-                            // The file had no vintage for this row (audit ticket
-                            // 2026-09-05): say so, and take the year right here.
+                            // The file had no vintage for this row: say so,
+                            // and take the year right here.
                             <input
                               type="text"
                               inputMode="numeric"
@@ -2233,7 +2189,7 @@ function ImportBottles() {
                                   : x));
                               }}
                             />
-                          ) : (r.item.vintage || t('importBottles.preview.nv'))}
+                          ) : (formatVintage(r.item.vintage, t) || t('importBottles.preview.nv'))}
                           {r.item.country && ` · ${r.item.country}`}
                         </span>
                         {/* Receipt rows: the line as printed, to check an
@@ -2283,13 +2239,19 @@ function ImportBottles() {
                                  t('importBottles.review.whyNoMatch')}
                               </summary>
                               <p>
-                                {r.aiDebug.aiExplanation ||
-                                 (r.aiDebug.aiStatus === 'failed'
-                                   ? t('importBottles.review.lookupFailedDesc')
-                                   : r.aiDebug.aiStatus === 'create_failed'
-                                   ? t('importBottles.review.createFailedDesc')
-                                   : t('importBottles.review.couldNotIdentifyDesc'))}
+                                {r.aiDebug.aiStatus === 'failed'
+                                  ? t('importBottles.review.lookupFailedDesc')
+                                  : r.aiDebug.aiStatus === 'create_failed'
+                                  ? t('importBottles.review.createFailedDesc')
+                                  : t('importBottles.review.couldNotIdentifyDesc')}
                               </p>
+                              {/* The AI's own wording, or the server's message when saving
+                                  failed: not translated, so it comes after the sentence that is. */}
+                              {r.aiDebug.aiExplanation && (
+                                <p className="ai-info-explanation">
+                                  {t('importBottles.review.explanation', { text: r.aiDebug.aiExplanation })}
+                                </p>
+                              )}
                             </details>
                           )}
                         </>
@@ -2330,7 +2292,7 @@ function ImportBottles() {
                             {isExpanded ? t('importBottles.review.hide') : t('importBottles.review.options', { count: r.matches.length })}
                           </button>
                         )}
-                        {/* A producer-less row can be looked up too: the model splits the producer out of the display name (2026-09-14). */}
+                        {/* A producer-less row can be looked up too: the model splits the producer out of the display name. */}
                         {r.status === 'fuzzy' && r.item.wineName && !isSkipped && !isRequested && (
                           <button
                             className="btn btn-secondary btn-xs"
@@ -2613,18 +2575,7 @@ function ImportBottles() {
           )}
         </div>
       )}
-      {/* One plain line, no dialog and no extra step: the bottles ARE imported,
-          so this is information, not an action. Rows whose wine could not be
-          fully identified used to be dropped silently; now they land and a
-          curator finishes the wine. */}
-      {importResult?.pendingIdentityCount > 0 && (
-        <p className="done-note">
-          {/* `n`, not `count`: passing i18next's magic `count` would demand a
-              plural-suffix key pair, which this codebase's i18n workflow keeps
-              out of feature PRs. */}
-          {t('importBottles.done.pendingIdentityNote', { n: importResult.pendingIdentityCount })}
-        </p>
-      )}
+      <ImportCurationNotes result={importResult} />
       {skippedDetails.length > 0 && (
         <details className="done-errors-detail">
           <summary>{t('importBottles.done.skippedSummary', { count: skippedDetails.length })}</summary>

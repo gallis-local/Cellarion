@@ -1,0 +1,335 @@
+// Drink-window (maturity) curation, the one body behind both doors: the REST
+// routes in routes/somm/maturity.js (the web somm page) and the MCP tools in
+// mcp/tools/somm/maturity.js (set_vintage_maturity, reset_maturity_row,
+// remove_from_maturity_queue), plus the undo inverses mcp/revert.js applies.
+//
+// A WineVintageProfile row is one wine+vintage pair. Setting its window marks
+// it reviewed with the curator's stamp; withdrawing (reset) clears it back to
+// pending; removing deletes a pending stub outright (the next bottle add
+// re-seeds it). Every write moves the wine owners' data version, because
+// their maturity statistics change with the window, and audits under the
+// action strings both doors share. Each door keeps its own input parsing and
+// wording; it passes `via` so the audit row says which door was used.
+//
+// NV vintages store the window as year-offsets after each bottle's purchase
+// year (relative), since there is no vintage to anchor absolute years to.
+//
+// This module stays free of Express and of the MCP envelope.
+
+const WineVintageProfile = require('../models/WineVintageProfile');
+const { logAudit, logger } = require('./audit');
+const { bumpWineOwners } = require('./dataVersion');
+
+const PHASE_FIELDS = ['earlyFrom', 'earlyUntil', 'peakFrom', 'peakUntil', 'lateFrom', 'lateUntil'];
+const PHASE_PAIRS = [['earlyFrom', 'earlyUntil'], ['peakFrom', 'peakUntil'], ['lateFrom', 'lateUntil']];
+/** The curator note's length limit, as the WineVintageProfile schema enforces it. */
+const SOMM_NOTES_MAX = 2000;
+
+/** The wine id of a profile whether or not wineDefinition is populated. */
+const wineIdOf = (profile) => profile.wineDefinition?._id || profile.wineDefinition;
+
+/** The vintage string the profiles store: trimmed, and "nv" in any case as NV. */
+function canonicalVintage(raw) {
+  const v = String(raw).trim();
+  return /^nv$/i.test(v) ? 'NV' : v;
+}
+
+/** Relative offsets 0–100 for an NV row, absolute years 1900–2200 otherwise. */
+function windowRange(profile) {
+  const relative = profile.vintage === 'NV';
+  return relative ? { relative, min: 0, max: 100 } : { relative, min: 1900, max: 2200 };
+}
+
+/**
+ * The six phases the row would hold after a patch: each incoming value
+ * (undefined = keep the stored one, null = clear) checked against the row's
+ * range, then every RETAINED value checked too, then the ordering. Returns
+ * { ok: true, next }, or a refusal the caller words itself:
+ *   { rule: 'range', field, value }       an incoming value outside the range
+ *   { rule: 'retained', field, value }    a stored value this patch keeps is
+ *                                         outside it (code 'conflict')
+ *   { rule: 'order', field, after }       `field` lies before `after`
+ * each with ok: false, a code ('invalid_input' or 'conflict') and `relative`,
+ * which says whether the range was NV offsets or years. Callers:
+ * PUT /api/somm/maturity/:id, and mergeWindow below for set_vintage_maturity.
+ *
+ * The retained-value check is what keeps a profile that predates the relative
+ * flag — absolute years stored under vintage NV — from being half-rewritten:
+ * the save flips relative, which would silently reread a carried-forward 2024
+ * as "2024 years after purchase". Such a row has to be rewritten whole.
+ */
+function checkWindow(profile, incoming) {
+  const { relative, min, max } = windowRange(profile);
+  const refuse = (code, rule, about) => ({ ok: false, code, rule, relative, ...about });
+  const next = {};
+  for (const f of PHASE_FIELDS) {
+    const v = incoming[f];
+    if (v === undefined) { next[f] = profile[f] ?? null; continue; }
+    if (v === null) { next[f] = null; continue; }
+    if (v < min || v > max) return refuse('invalid_input', 'range', { field: f, value: v });
+    next[f] = v;
+  }
+  for (const f of PHASE_FIELDS) {
+    if (incoming[f] !== undefined) continue;
+    const v = next[f];
+    if (v != null && (v < min || v > max)) return refuse('conflict', 'retained', { field: f, value: v });
+  }
+  for (const [from, until] of PHASE_PAIRS) {
+    if (next[from] != null && next[until] != null && next[until] < next[from]) {
+      return refuse('invalid_input', 'order', { field: until, after: from });
+    }
+  }
+  if (next.earlyFrom != null && next.peakFrom != null && next.peakFrom < next.earlyFrom) {
+    return refuse('invalid_input', 'order', { field: 'peakFrom', after: 'earlyFrom' });
+  }
+  if (next.peakFrom != null && next.lateFrom != null && next.lateFrom < next.peakFrom) {
+    return refuse('invalid_input', 'order', { field: 'lateFrom', after: 'peakFrom' });
+  }
+  return { ok: true, next };
+}
+
+/**
+ * checkWindow as set_vintage_maturity answers it: { ok: true, next } or
+ * { ok: false, code, message }, the message in the tool's words.
+ */
+function mergeWindow(profile, incoming) {
+  const checked = checkWindow(profile, incoming);
+  if (checked.ok) return checked;
+  const { code, rule, relative, field, value, after } = checked;
+  if (rule === 'range') {
+    return { ok: false, code, message: `${field}: ${value} out of range (${relative ? 'NV uses relative offsets 0–100' : 'years 1900–2200'})` };
+  }
+  if (rule === 'retained') {
+    return {
+      ok: false,
+      code,
+      message: `${field}=${value} retained from the stored profile is outside the ${relative ? 'NV offset range 0–100' : 'year range 1900–2200'} — ` +
+        'this profile still carries values in the other unit. Rewrite all six phases in this call (pass null to clear a phase).',
+    };
+  }
+  if (field === 'peakFrom' && after === 'earlyFrom') return { ok: false, code, message: 'peak_from cannot be before early_from' };
+  if (field === 'lateFrom' && after === 'peakFrom') return { ok: false, code, message: 'late_from cannot be before peak_from' };
+  return { ok: false, code, message: `${field} cannot be before ${after}` };
+}
+
+/**
+ * Everything an undo needs to put the row back verbatim: the six phases
+ * (null when unset), the note, and the review state. Both set and reset
+ * record this shape, so one undo branch restores either.
+ */
+function windowSnapshot(profile) {
+  const s = profile.suggestion;
+  return {
+    ...PHASE_FIELDS.reduce((acc, f) => ((acc[f] = profile[f] ?? null), acc), {}),
+    sommNotes: profile.sommNotes ?? null,
+    status: profile.status,
+    relative: !!profile.relative,
+    setBy: profile.setBy ? String(profile.setBy) : null,
+    setAt: profile.setAt || null,
+    // An install's proposal (seedSuggestedWindows), so an undo brings it back.
+    suggestion: s ? JSON.parse(JSON.stringify(typeof s.toObject === 'function' ? s.toObject() : s)) : null,
+  };
+}
+
+/**
+ * Does a row carry anything beyond the auto-seeded pending stub: a phase, a
+ * note or an author? A member's import can create a PENDING row with all
+ * three (a suggested window), so "pending" does not mean "empty".
+ */
+function hasWindowContent(profile) {
+  return PHASE_FIELDS.some((f) => profile[f] !== null && profile[f] !== undefined)
+    || !!profile.sommNotes || !!profile.setBy || !!profile.suggestion;
+}
+
+/**
+ * Write a validated window onto the row: the phases named in `next` (null
+ * clears; a phase `next` does not name is left as it is), the note when given
+ * (undefined leaves it), reviewed with the curator's stamp and the row's
+ * relative flag, and drops a suggestion the row carried. Saves, moves the
+ * owners' data version, audits somm.maturity.review. Returns the relative flag.
+ */
+async function applyWindow(profile, next, { sommNotes, actorId, req, via }) {
+  for (const f of PHASE_FIELDS) {
+    if (!(f in next)) continue;
+    profile[f] = next[f] === null ? undefined : next[f];
+  }
+  if (sommNotes !== undefined) profile.sommNotes = sommNotes;
+  const { relative } = windowRange(profile);
+  profile.relative = relative;
+  profile.status = 'reviewed';
+  profile.setBy = actorId;
+  profile.setAt = new Date();
+  // A suggestion has done its job once a curator set the window.
+  profile.suggestion = undefined;
+  await profile.save();
+  bumpWineOwners([wineIdOf(profile)]);
+  logAudit(req, 'somm.maturity.review',
+    { type: 'wine', id: wineIdOf(profile) },
+    { vintage: profile.vintage, relative, ...(via ? { via } : {}) });
+  return relative;
+}
+
+/**
+ * Withdraw a reviewed window: every phase and the note cleared, pending
+ * again, the reviewer stamp dropped. The caller has checked the row is
+ * reviewed. Saves, moves the owners' data version, audits somm.maturity.reset.
+ */
+async function resetWindow(profile, { reason, req, via } = {}) {
+  for (const f of PHASE_FIELDS) profile[f] = undefined;
+  profile.sommNotes = '';
+  profile.status = 'pending';
+  profile.setBy = null;
+  profile.setAt = null;
+  await profile.save();
+  bumpWineOwners([wineIdOf(profile)]);
+  logAudit(req, 'somm.maturity.reset',
+    { type: 'wine', id: wineIdOf(profile) },
+    { vintage: profile.vintage, ...(reason ? { reason } : {}), ...(via ? { via } : {}) });
+}
+
+/**
+ * Delete a pending row the wine was never released in. Nothing is remembered
+ * on purpose: the next bottle add of this wine+vintage re-seeds the row. The
+ * caller has checked the row is not reviewed, and the delete checks it again:
+ * a row another curator reviewed between that load and this delete stays.
+ * Audits somm.maturity.remove. Returns false, with nothing audited, when the
+ * row was reviewed or already gone.
+ */
+async function removePendingRow(profile, { reason, req, via } = {}) {
+  const res = await WineVintageProfile.deleteOne({ _id: profile._id, status: { $ne: 'reviewed' } });
+  if (!res?.deletedCount) return false;
+  logAudit(req, 'somm.maturity.remove',
+    { type: 'wine', id: wineIdOf(profile) },
+    { vintage: profile.vintage, ...(reason ? { reason } : {}), ...(via ? { via } : {}) });
+  return true;
+}
+
+/**
+ * What the undo of a removal needs: the pair, and the row's content when it
+ * had any (windowSnapshot's shape, so an imported suggestion comes back whole).
+ * A plain stub records the pair alone.
+ */
+function removalSnapshot(profile) {
+  return {
+    wineDefinition: String(wineIdOf(profile)),
+    vintage: profile.vintage,
+    ...(hasWindowContent(profile) ? windowSnapshot(profile) : {}),
+  };
+}
+
+/**
+ * Undo of applyWindow and resetWindow: re-apply a windowSnapshot field for
+ * field, then save (a failed save, such as the row having been deleted
+ * meanwhile, is thrown to the caller) and move the owners' data version. The
+ * audit row stays with the caller, whose action string depends on what is
+ * being undone.
+ */
+async function restoreWindow(profile, prev) {
+  for (const f of PHASE_FIELDS) {
+    profile[f] = prev[f] === null || prev[f] === undefined ? undefined : prev[f];
+  }
+  profile.sommNotes = prev.sommNotes === null ? undefined : prev.sommNotes;
+  profile.status = prev.status || 'pending';
+  profile.relative = !!prev.relative;
+  profile.setBy = prev.setBy || null;
+  profile.setAt = prev.setAt || null;
+  // A snapshot from before suggestions existed has no key: leave the row's own.
+  if ('suggestion' in prev) profile.suggestion = prev.suggestion || undefined;
+  await profile.save();
+  bumpWineOwners([wineIdOf(profile)]);
+}
+
+/**
+ * Undo of removePendingRow, from a removalSnapshot: the pending row comes
+ * back by upsert on the unique (wineDefinition, vintage) index, so a bottle
+ * add that re-seeded it in the meantime is simply found. It comes back as it
+ * was: relative for an NV pair (as the seeding helper writes it), and with
+ * the phases, note and author an imported suggestion carried. A direct upsert
+ * rather than the seeding helper, which swallows errors: an undo must fail
+ * loudly so its ledger row can be unclaimed and retried.
+ */
+async function reseedPendingRow(prev) {
+  const { wineDefinition, vintage } = prev;
+  const content = {};
+  for (const f of PHASE_FIELDS) {
+    if (prev[f] !== null && prev[f] !== undefined) content[f] = prev[f];
+  }
+  if (prev.sommNotes) content.sommNotes = prev.sommNotes;
+  if (prev.setBy) content.setBy = prev.setBy;
+  if (prev.suggestion) content.suggestion = prev.suggestion;
+  const relative = prev.relative !== undefined ? !!prev.relative : vintage === 'NV';
+  await WineVintageProfile.findOneAndUpdate(
+    { wineDefinition, vintage },
+    { $setOnInsert: { wineDefinition, vintage, status: 'pending', relative, ...content } },
+    { upsert: true }
+  );
+}
+
+/**
+ * Drink windows proposed from OUTSIDE curation, today the windows a
+ * self-hosted install sent with a wine it contributed: each is stored as the
+ * row's `suggestion`, NEVER in its phase fields, so no reader can take it for
+ * a window and no partial curator write can publish part of it. The row is
+ * created pending when the vintage has none; a reviewed row, or one already
+ * holding a suggestion, is left alone in one atomic write. Nothing is seeded
+ * for a wine kept out of the queue (a non-wine, pending or draft row). Year
+ * vintages only (utils/validation parseAndValidateVintage), each window
+ * checked with checkWindow; one that fails is left out. Caller:
+ * services/wineRequestOps completeRequestResolve. Returns the vintages written.
+ */
+async function seedSuggestedWindows(wineId, windows, { requestId = null } = {}) {
+  const WineDefinition = require('../models/WineDefinition');
+  const { MATURITY_QUEUE_EXCLUDED } = require('../utils/vintageProfile');
+  const { parseAndValidateVintage } = require('../utils/validation');
+  if (await WineDefinition.exists({ _id: wineId, ...MATURITY_QUEUE_EXCLUDED })) return [];
+  const written = [];
+  for (const win of Array.isArray(windows) ? windows : []) {
+    const parsed = parseAndValidateVintage(win?.vintage);
+    if (!parsed.ok || !/^\d{4}$/.test(parsed.value)) continue;
+    const vintage = parsed.value;
+    const incoming = {};
+    for (const f of PHASE_FIELDS) {
+      if (Number.isInteger(win[f])) incoming[f] = win[f];
+    }
+    if (!Object.keys(incoming).length) continue;
+    const checked = checkWindow({ vintage }, incoming);
+    if (!checked.ok) continue;
+    const suggestion = { source: 'bridge', requestId, at: new Date() };
+    for (const f of PHASE_FIELDS) {
+      if (checked.next[f] != null) suggestion[f] = checked.next[f];
+    }
+    try {
+      // The filter IS the rule: a reviewed row, or one with a suggestion,
+      // does not match, and the upsert's insert then collides with it on the
+      // unique (wine, vintage) index instead of touching it.
+      const res = await WineVintageProfile.updateOne(
+        { wineDefinition: wineId, vintage, status: { $ne: 'reviewed' }, suggestion: { $exists: false } },
+        { $set: { suggestion }, $setOnInsert: { wineDefinition: wineId, vintage, status: 'pending', relative: false } },
+        { upsert: true }
+      );
+      if (res.upsertedCount || res.modifiedCount) written.push(vintage);
+    } catch (err) {
+      if (err?.code !== 11000) logger.warn({ err, wineId: String(wineId), vintage }, 'suggested drink window not stored');
+    }
+  }
+  return written;
+}
+
+module.exports = {
+  PHASE_FIELDS,
+  SOMM_NOTES_MAX,
+  wineIdOf,
+  canonicalVintage,
+  windowRange,
+  checkWindow,
+  mergeWindow,
+  windowSnapshot,
+  hasWindowContent,
+  applyWindow,
+  resetWindow,
+  removePendingRow,
+  removalSnapshot,
+  restoreWindow,
+  reseedPendingRow,
+  seedSuggestedWindows,
+};

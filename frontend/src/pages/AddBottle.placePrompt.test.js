@@ -7,9 +7,10 @@
  */
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 
-const { apiFetchMock, navigateMock } = vi.hoisted(() => ({
+const { apiFetchMock, navigateMock, routerState } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
   navigateMock: vi.fn(),
+  routerState: { current: null },
 }));
 
 vi.mock('../api/wines', () => ({
@@ -22,6 +23,7 @@ vi.mock('../contexts/AuthContext', () => ({
 }));
 vi.mock('react-router-dom', () => ({
   useParams: () => ({ id: 'cellar1' }),
+  useLocation: () => ({ state: routerState.current }),
   useNavigate: () => navigateMock,
   Link: ({ children }) => <a href="/">{children}</a>,
 }));
@@ -100,11 +102,25 @@ describe('AddBottle — "Place your bottles now?" (issue #1055)', () => {
     expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1/racks', { state: { placeQueue: ['b1', 'b2'] } });
   });
 
-  // The cellar page then says what was added, with "Add another bottle"
-  // (newcomer walkthrough 2026-10-15).
+  // Replaced, not pushed: Back from the rack must not land on the emptied form.
+  test('an add started from an empty rack slot skips the question and goes back to that rack with the slot, in place of the add page', async () => {
+    const placeAt = { rackId: 'r1', position: 7 };
+    routerState.current = { placeAt };
+    try {
+      routeApi({ racks: [{ _id: 'r1', name: 'Wall', type: 'grid' }] });
+      await submitTwoBottles();
+
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1/racks?rack=r1', { replace: true, state: { placeQueue: [expect.any(String), expect.any(String)], placeAt } }));
+      expect(screen.queryByText('addBottle.placePrompt.title')).not.toBeInTheDocument();
+    } finally {
+      routerState.current = null;
+    }
+  });
+
+  // The cellar page then says what was added, with "Add another bottle".
   // Not opened from the list here (no `cameFrom`): the add page is replaced,
   // so Back never lands on an emptied form — from the place dialog too, once
-  // its own Back entry is gone (release audit 2026-10-16).
+  // its own Back entry is gone.
   const NOTICE = { addedNotice: { name: 'Kaefferkopf 2019', count: 2, history: false, onOrder: false } };
   const ADDED = { replace: true, state: NOTICE };
 
@@ -153,7 +169,7 @@ test('the notice names the wine the bottles were saved under', async () => {
   }));
 });
 
-// Release audit 2026-10-16: opened from the cellar list, a save goes BACK to
+// Opened from the cellar list, a save goes BACK to
 // it (a second copy of the list made the first Back dead), and the notice
 // waits for it in sessionStorage — router state cannot ride a pop.
 describe('back to the list it came from', () => {

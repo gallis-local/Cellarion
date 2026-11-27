@@ -20,8 +20,8 @@ const { stripHtml } = require('../utils/sanitize');
 const { SUPPORTED_CURRENCIES } = require('../config/currencies');
 const featureFlags = require('../config/featureFlags');
 
-// Allow-lists — the single source of truth the REST routes previously kept
-// inline. Kept here so the MCP tools validate byte-for-byte identically.
+// Allow-lists — the single source of truth for the REST routes and the MCP
+// tools, so both validate byte-for-byte identically.
 const ALLOWED_CURRENCIES = SUPPORTED_CURRENCIES;
 // Validated by SHAPE, not by membership: the set of UI languages lives in the
 // frontend (one directory per locale, shipped by Weblate) and the backend image
@@ -36,6 +36,7 @@ const LANGUAGE_TAG = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$/;
 // BCP-47 maximum.
 const LANGUAGE_TAG_MAX = 35;
 const ALLOWED_RATING_SCALES = ['5', '20', '100'];
+const ALLOWED_TEMPERATURE_UNITS = ['C', 'F'];
 const ALLOWED_RACK_NAV = ['auto', 'room', 'rack'];
 const ALLOWED_RESTOCK_SCOPE = ['all', 'cellar'];
 const ALLOWED_VISIBILITY = ['public', 'private'];
@@ -52,8 +53,15 @@ const err = (status, message) => ({ status, message });
  * the user. Returns { update } or { error }.
  */
 async function buildPreferencesUpdate(userId, body = {}) {
-  const { currency, language, ratingScale, rackNavigation, restockScope, cellarSort, defaultCellarId, notifications, earlyAccess, collapsedBlocks } = body;
+  const { currency, language, ratingScale, rackNavigation, restockScope, cellarSort, defaultCellarId, notifications, earlyAccess, collapsedBlocks, temperatureUnit } = body;
   const update = {};
+
+  if (temperatureUnit !== undefined) {
+    if (typeof temperatureUnit !== 'string' || !ALLOWED_TEMPERATURE_UNITS.includes(temperatureUnit.toUpperCase())) {
+      return { error: err(400, `Invalid temperature unit. Allowed: ${ALLOWED_TEMPERATURE_UNITS.join(', ')}`) };
+    }
+    update['preferences.temperatureUnit'] = temperatureUnit.toUpperCase();
+  }
 
   // Notifications: per-category × per-channel booleans, explicitly allow-listed
   // so a caller can't inject arbitrary keys into preferences.notifications.
@@ -90,7 +98,7 @@ async function buildPreferencesUpdate(userId, body = {}) {
     // Turning any email back on withdraws the blanket objection the one-click
     // unsubscribe recorded (User.emailOptOutAt): from here on the per-category
     // switches decide. Turning one off never sets it — that is a per-category
-    // choice, the unsubscribe link is the objection (audit 2026-09-27 M7).
+    // choice, the unsubscribe link is the objection.
     if (Object.entries(update).some(([k, v]) => k.endsWith('.email') && v === true)) {
       update.emailOptOutAt = null;
     }
@@ -358,11 +366,11 @@ function validateSourceUrl(url) {
     return 'URLs pointing to private/internal addresses are not allowed';
   }
   // For IP-literal hosts, reuse the structural private/reserved classifier the
-  // image-fetch SSRF guard uses (security audit L-1). WHATWG `new URL` already
-  // canonicalizes decimal/hex/octal IPv4 to dotted-quad; isPrivateAddress adds
-  // the IPv6 / ULA / link-local / v4-mapped forms the old lexical denylist
-  // missed. DNS names are intentionally left as-is: this value is stored and
-  // rendered as a link, never fetched by the server, so no DNS resolution here.
+  // image-fetch SSRF guard uses. WHATWG `new URL` already canonicalizes
+  // decimal/hex/octal IPv4 to dotted-quad; isPrivateAddress adds the IPv6 /
+  // ULA / link-local / v4-mapped forms a lexical denylist misses. DNS names
+  // are intentionally left as-is: this value is stored and rendered as a
+  // link, never fetched by the server, so no DNS resolution here.
   if (net.isIP(host) && isPrivateAddress(host)) {
     return 'URLs pointing to private/internal addresses are not allowed';
   }
@@ -379,9 +387,9 @@ function validateSourceUrl(url) {
  *     FRONTEND_URL origin — what the request form sends after background
  *     removal).
  * Anything else — a protocol-relative `//host/x`, `javascript:`, a bare word
- * — is refused. Until audit 2026-09 (F06-1) such a value flowed verbatim into
- * WineDefinition.image on approval, where every viewer's AuthImage would have
- * fetched it with the bearer token attached.
+ * — is refused: on approval it would flow verbatim into
+ * WineDefinition.image, where every viewer's AuthImage fetches it with the
+ * bearer token attached.
  * Returns an error string, or null when the value is acceptable (empty is fine).
  */
 const MAX_IMAGE_REF_LENGTH = 500000;
@@ -405,8 +413,8 @@ function isOwnUploadUrl(value) {
 }
 
 // A wine record never stores its picture inline (allowInline: false): a
-// data: URI of up to half a megabyte rode along in every list and page that
-// showed the wine. A photo attached to a request becomes a file at approval
+// data: URI of up to half a megabyte would ride along in every list and page
+// that shows the wine. A photo attached to a request becomes a file at approval
 // (routes/admin/wineRequests.js).
 function validateImageRef(image, { allowInline = true } = {}) {
   const shapes = allowInline ? 'an http(s) link or an inline image' : 'an http(s) link or an uploaded file';
@@ -426,7 +434,7 @@ function validateImageRef(image, { allowInline = true } = {}) {
 }
 
 /**
- * The links of a request (#1460): sourceUrl and sourceUrls merged in that
+ * The links of a request: sourceUrl and sourceUrls merged in that
  * order, trimmed, without repeats, at most MAX_SOURCE_URLS, each a public
  * http(s) URL. The first is required — it is what sourceUrl holds for every
  * reader and older install that knows one link. Returns { links } or { error }.
@@ -435,10 +443,10 @@ const MAX_SOURCE_URLS = 3;
 function collectSourceUrls(sourceUrl, sourceUrls) {
   if (sourceUrls != null && !Array.isArray(sourceUrls)) return { error: 'sourceUrls must be a list of links' };
   // Refuse the length BEFORE the loop: the route accepts megabytes of JSON,
-  // and the repeat check below is quadratic in the list (release audit
-  // 2026-10-09, H2 — a 5 MB list of one-character strings pinned the event
-  // loop for minutes). The form sends sourceUrl inside sourceUrls too, so the
-  // list itself is capped at the maximum, repeats included.
+  // and the repeat check below is quadratic in the list, so a long list of
+  // tiny strings pins the event loop for minutes. The form sends sourceUrl
+  // inside sourceUrls too, so the list itself is capped at the maximum,
+  // repeats included.
   if (sourceUrls && sourceUrls.length > MAX_SOURCE_URLS) return { error: `At most ${MAX_SOURCE_URLS} source links` };
   const links = [];
   for (const raw of [sourceUrl, ...(sourceUrls || [])]) {
@@ -509,6 +517,7 @@ module.exports = {
   createWineRequest,
   validateSourceUrl,
   validateImageRef,
+  isOwnUploadPath,
   MAX_SOURCE_URLS,
   // Exposed so the MCP tool descriptions/schemas can enumerate the same options.
   ALLOWED_CURRENCIES,

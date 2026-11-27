@@ -78,18 +78,12 @@ jest.mock('../services/search', () => ({
   initialize: jest.fn(),
   getIsAvailable: () => false,
   search: async () => ({ ids: [] }),
-  searchBottles: async () => ({ ids: [] }),
   searchDiscussions: async () => ({ ids: [] }),
   indexWine: jest.fn(),
   removeWine: jest.fn(),
-  indexBottle: jest.fn(),
-  removeBottle: jest.fn(),
-  removeBottles: jest.fn(),
-  bulkIndexBottles: jest.fn(),
   indexDiscussion: jest.fn(),
   removeDiscussion: jest.fn(),
   fullSync: jest.fn(),
-  fullSyncBottles: jest.fn(),
   fullSyncDiscussions: jest.fn(),
 }));
 
@@ -543,7 +537,7 @@ describe('POST /api/auth/refresh — rotation', () => {
 
 // 30 per 15 min for one refresh TOKEN — not one address, which many people
 // can share (a carrier's NAT, an office) — plus a per-address ceiling of 300
-// so made-up cookies can't flood the session lookup (scaling audit 2026-09-25).
+// so made-up cookies can't flood the session lookup.
 // The clock is frozen, so a window never resets: every test here uses cookies
 // and addresses no other test uses.
 describe('POST /api/auth/refresh — rate limits', () => {
@@ -559,10 +553,15 @@ describe('POST /api/auth/refresh — rate limits', () => {
     expect((await request({ path: '/api/auth/refresh', cookie: madeUpCookie() })).status).toBe(401);
   });
 
-  test('without a cookie the limit falls back to the address', async () => {
+  test('without a cookie there is nothing to limit: the 31st probe from one address is 401 like the first', async () => {
+    // The app's cold-start session probe. Signed-out visitors and crawlers
+    // that execute the app send one per page view; none can guess a token.
+    // Counted, a crawler on the public wine pages was answered 429 for most
+    // of its crawl.
     mockFixedIp = '198.51.100.2';
-    for (let i = 0; i < 30; i++) expect((await request({ path: '/api/auth/refresh' })).status).toBe(401);
-    expect((await request({ path: '/api/auth/refresh' })).status).toBe(429);
+    for (let i = 0; i < 31; i++) expect((await request({ path: '/api/auth/refresh' })).status).toBe(401);
+    // And the address's own ceiling is untouched: a made-up cookie still gets the normal answer.
+    expect((await request({ path: '/api/auth/refresh', cookie: madeUpCookie() })).status).toBe(401);
   });
 
   test('one address is capped at 300 refreshes per window, however many cookies it makes up', async () => {
@@ -630,7 +629,7 @@ describe('POST /api/auth/logout', () => {
     expect(refreshCookies(res)).toHaveLength(0);
   });
 
-  // Offline mode (#1355): an offline session has no access token. A logout
+  // Offline mode: an offline session has no access token. A logout
   // that required one left the server session and cookie alive, and the next
   // online start signed the same account back in.
   test('without a bearer token the cookie alone identifies and ends this device\'s session', async () => {
@@ -658,7 +657,7 @@ describe('POST /api/auth/logout', () => {
     expect(user.sessions).toHaveLength(0);
   });
 
-  // Audit 2026-09-27 M5: the route needs no token, so another site can make a
+  // The route needs no token, so another site can make a
   // browser POST here top-level. SameSite=Lax keeps the cookie out of that
   // request — but a deletion header in the response would still be honoured,
   // signing the victim out at their next refresh (and wiping their offline
@@ -821,7 +820,7 @@ describe('POST /api/auth/reset-password', () => {
       body: { token: rawToken, password: 'AnotherSecret123!' },
     });
     expect(replay.status).toBe(400);
-    expect(replay.body).toEqual({ error: 'Invalid or expired reset token' });
+    expect(replay.body).toEqual({ error: 'Invalid or expired reset token', code: 'reset_token_invalid' });
   });
 
   test('expired token (hash still stored, past 1h window) → 400, password untouched', async () => {
@@ -835,7 +834,7 @@ describe('POST /api/auth/reset-password', () => {
     });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: 'Invalid or expired reset token' });
+    expect(res.body).toEqual({ error: 'Invalid or expired reset token', code: 'reset_token_invalid' });
     expect(user.password).toBe(oldPassword);
     expect(user.save).not.toHaveBeenCalled();
   });
@@ -849,7 +848,7 @@ describe('POST /api/auth/reset-password', () => {
     });
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: 'Invalid or expired reset token' });
+    expect(res.body).toEqual({ error: 'Invalid or expired reset token', code: 'reset_token_invalid' });
   });
 
   test('missing token or password → 400', async () => {
@@ -927,7 +926,7 @@ describe('POST /api/auth/reset-password', () => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /api/auth/verify-email — must NOT issue a session (security audit M-1)
+// POST /api/auth/verify-email — must NOT issue a session
 // ---------------------------------------------------------------------------
 describe('POST /api/auth/verify-email', () => {
   const withVerifyToken = (raw) => makeUserDoc({

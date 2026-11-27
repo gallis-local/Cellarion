@@ -19,7 +19,6 @@ jest.mock('../services/search', () => ({
   getIsAvailable: () => false,
   search: async () => ({ ids: [] }),
   indexWine: () => {},
-  bulkIndexBottles: jest.fn(),
 }));
 jest.mock('../services/labelScan', () => ({ identifyWineFromText: jest.fn() }));
 jest.mock('../services/findOrCreateWine', () => ({ findOrCreateWine: jest.fn() }));
@@ -131,10 +130,9 @@ test('a row with NO producer still imports — the bottle lands, the wine goes t
   expect(fields.producer).toBe('');
   expect(userId).toBe(USER_ID);
   // toEqual, not objectContaining: the option set is a drift canary, so a new
-  // option has to be added here deliberately. `provenance` joined on
-  // 2026-08-31 (somm ticket 6a958dbc) — and this row is the purest case for
-  // it, since the file states nothing but a vintage, so every identity field
-  // the wine ends up with came from the model.
+  // option has to be added here deliberately. This row is the purest case
+  // for `provenance`: the file states nothing but a vintage, so every
+  // identity field the wine ends up with came from the model.
   expect(opts).toEqual({
     createdVia: 'import',
     allowPending: true,
@@ -186,4 +184,57 @@ test('repeated rows of the same unidentified wine mint ONE registry row (batch c
   expect(body.created).toBe(2);
   expect(findOrCreateWine).toHaveBeenCalledTimes(1);
   expect(body.pendingIdentityCount).toBe(1);
+});
+
+describe('a server that checks imported wines before they are public (config/importPolicy)', () => {
+  const importPolicy = require('../config/importPolicy');
+  const UNCHECKED_WINE = { _id: WINE_ID, name: 'Kaefferkopf', producer: 'Cave de Kaysersberg', pendingIdentity: true, uncheckedIdentity: true };
+  const ROW = { aiWine: { name: 'Kaefferkopf', producer: 'Cave de Kaysersberg', country: 'France' }, vintage: '2019' };
+
+  beforeEach(() => importPolicy.set({ checkNewWines: true }));
+  afterEach(() => importPolicy.set({}));
+
+  test('the mint is asked for a wine that waits for the check', async () => {
+    findOrCreateWine.mockResolvedValue({ wine: UNCHECKED_WINE, created: true, unchecked: true });
+    await confirm([ROW]);
+    expect(findOrCreateWine.mock.calls[0][2]).toEqual({
+      createdVia: 'import',
+      allowPending: true,
+      unchecked: true,
+      provenance: expect.any(Object),
+    });
+  });
+
+  test('it is counted as waiting for a check, not as a wine that could not be identified', async () => {
+    findOrCreateWine.mockResolvedValue({ wine: UNCHECKED_WINE, created: true, unchecked: true });
+    const { body } = await confirm([ROW]);
+
+    expect(body.created).toBe(1);
+    expect(body.uncheckedCount).toBe(1);
+    expect(body.pendingIdentityCount).toBe(0);
+    expect(logAudit).toHaveBeenCalledWith(
+      expect.anything(), 'wine.create', { type: 'wine', id: WINE_ID },
+      expect.objectContaining({ via: 'import', unchecked: true }),
+    );
+    expect(logAudit.mock.calls.find((c) => c[1] === 'wine.create')[3].pendingIdentity).toBeUndefined();
+    expect(logAudit).toHaveBeenCalledWith(
+      expect.anything(), 'bottle.import', expect.anything(),
+      expect.objectContaining({ created: 1, pendingIdentity: 0, unchecked: 1 }),
+    );
+  });
+
+  test('a waiting wine with NO producer is the one that could not be identified', async () => {
+    findOrCreateWine.mockResolvedValue({ wine: { ...UNCHECKED_WINE, producer: '' }, created: true, unchecked: true, pendingIdentity: true });
+    const { body } = await confirm([{ aiWine: { name: 'Kaefferkopf', country: 'France' }, vintage: '2019' }]);
+    expect(body.pendingIdentityCount).toBe(1);
+    expect(body.uncheckedCount).toBeUndefined();
+  });
+
+  test('with the check off the response and the mint are as they always were', async () => {
+    importPolicy.set({});
+    findOrCreateWine.mockResolvedValue({ wine: { _id: WINE_ID, name: 'Kaefferkopf', producer: 'Cave de Kaysersberg' }, created: true });
+    const { body } = await confirm([ROW]);
+    expect(findOrCreateWine.mock.calls[0][2].unchecked).toBeUndefined();
+    expect(body.uncheckedCount).toBeUndefined();
+  });
 });

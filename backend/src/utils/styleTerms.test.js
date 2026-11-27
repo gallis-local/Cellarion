@@ -1,6 +1,6 @@
 const { statedStyle, conflictingStyleTerms, SWEETNESS_WORDS } = require('./styleTerms');
 
-// The vineyard the reporter's bottles come from (issue #1134). Kept as one
+// The vineyard the reporter's bottles come from. Kept as one
 // constant so a test reads as the tail of the name, which is the only part
 // that differs and the whole reason the scorer could not separate them.
 const V = 'Brauneberger Juffer-Sonnenuhr Riesling ';
@@ -38,6 +38,15 @@ describe('statedStyle', () => {
       .toMatch(/different sweetness/);
     // …and the two spellings of the same wine are NOT a conflict.
     expect(conflictingStyleTerms('Riesling Spätlese Suess', 'Riesling Spätlese Süß')).toBeNull();
+  });
+
+  it('reads fruchtsüß in all three spellings and keeps it apart from trocken', () => {
+    for (const name of ['Riesling Spätlese fruchtsüß', 'Riesling Spätlese Fruchtsüss', 'Riesling Spätlese Fruchtsuess']) {
+      expect([...statedStyle(name).sweetness]).toEqual(['fruchtsuss']);
+    }
+    expect(conflictingStyleTerms('Riesling Spätlese fruchtsüß', 'Riesling Spätlese Trocken'))
+      .toMatch(/different sweetness/);
+    expect(conflictingStyleTerms('Riesling Spätlese Fruchtsuess', 'Riesling Spätlese fruchtsüß')).toBeNull();
   });
 
   it('keeps the nested tier names apart', () => {

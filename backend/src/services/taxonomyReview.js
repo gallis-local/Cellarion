@@ -3,7 +3,7 @@
  * the admin MCP tools so the two surfaces cannot drift (the same reason
  * wineProfileOps/bottleOps exist).
  *
- * Two queues, one philosophy (strategy 2026-07-29): user writes are never
+ * Two queues, one philosophy: user writes are never
  * blocked by taxonomy — doubt is routed here instead.
  *   - Pending regions (R3): auto-minted by a user write, awaiting an admin's
  *     approve / merge / fix.
@@ -21,7 +21,7 @@ const { isValidId } = require('../utils/validation');
 const { stripHtml } = require('../utils/sanitize');
 
 /**
- * Ref validation for an Appellation write (code audit 2026-07-30: "appellation
+ * Ref validation for an Appellation write ("appellation
  * region not checked against country"). The schema declares country and region
  * refs but Mongoose verifies neither that the ids exist nor that the region
  * belongs to the country — listUnmatchedAppellations() below even drops
@@ -101,8 +101,8 @@ async function listUnmatchedAppellations() {
     if (a.normalizedName) matched.add(a.normalizedName);
     for (const s of a.normalizedSynonyms || []) matched.add(s);
   }
-  // Dismissed keys suppress exactly like curated coverage does (ticket
-  // 6a842d5e): judged through candidateKeys below, so a dismissal of
+  // Dismissed keys suppress exactly like curated coverage does: judged
+  // through candidateKeys below, so a dismissal of
   // "somewhere" also silences a later "Somewhere DO".
   const dismissed = new Set(skips.map((s) => s.normalizedKey));
 
@@ -110,8 +110,8 @@ async function listUnmatchedAppellations() {
   for (const r of rows) {
     const cleaned = normalizeAppellation(r._id.ap || '') || r._id.ap || '';
     const key = normalizeAppellationKey(cleaned);
-    // Covered when ANY resolver candidate key matches, not just the exact one
-    // (release-audit F2): "Yecla DO" is governed by the curated "Yecla" — the
+    // Covered when ANY resolver candidate key matches, not just the exact one:
+    // "Yecla DO" is governed by the curated "Yecla" — the
     // resolver folds it at write time, and listing it here invites an admin to
     // promote the decorated form, whose exact-match hit would then permanently
     // beat the stripped variant and split the appellation in two. What remains
@@ -172,7 +172,7 @@ function unmatchedGroupKey(name) {
 
 /**
  * Dismiss an unmatched-appellation string: reviewed and judged NOT
- * promotable (ticket 6a842d5e — the queue's missing terminal state).
+ * promotable (the queue's terminal state besides promotion).
  * Suppression is by group key, so every spelling variant that folds onto it
  * goes quiet too. First dismisser wins a race ($setOnInsert, same stance as
  * the price-queue skip); the reason is the durable record of the judgement.

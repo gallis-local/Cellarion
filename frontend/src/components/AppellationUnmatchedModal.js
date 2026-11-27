@@ -7,7 +7,7 @@ import {
 } from '../api/admin';
 
 /**
- * The appellation review queue (registry strategy 2026-07-29, R2).
+ * The appellation review queue.
  *
  * Wines carry appellations as free text; anything no curated Appellation doc
  * covers surfaces here with the majority spelling, wine count and suggested
@@ -17,7 +17,7 @@ import {
  * adding a bottle is never blocked by taxonomy, which is why this queue
  * exists at all.
  *
- * "Dismiss" is the queue's terminal state (ticket 6a842d5e): a string
+ * "Dismiss" is the queue's terminal state: a string
  * reviewed and judged NOT an appellation (a quality tier, a fantasy name)
  * leaves the queue for good instead of resurfacing on every visit. The
  * dismissed list below the queue is the restorable record.

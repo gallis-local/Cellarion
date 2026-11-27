@@ -20,6 +20,7 @@ const { stripHtml } = require('../utils/sanitize');
 const { photoVintage, vintageOfficialOrder } = require('../utils/imageVintage');
 const rateLimitsConfig = require('../config/rateLimits');
 const { logAudit } = require('../services/audit');
+const { approvePhotoIfTrusted } = require('../services/trustedContributions');
 
 /**
  * Safely remove an uploaded file, but only if it resides within the expected
@@ -66,11 +67,10 @@ const imageUploadLimiter = liveWindowLimiter({
   }
 });
 
-// Header-level magic-byte + dimension pre-checks used to live here. They are
-// gone: the /upload route now hands the bytes to services/imageOps, whose
-// sanitizeImageBuffer decodes-validates-and-strips in one fail-CLOSED step
-// (the old dimension check failed OPEN on unreadable headers). The per-request
-// MAX_IMAGES_PER_BOTTLE cap still lives here for the link-to-bottle route.
+// No header-level magic-byte or dimension pre-check here: the /upload route
+// hands the bytes to services/imageOps, whose sanitizeImageBuffer (imageSanitizer)
+// decodes-validates-and-strips in one fail-CLOSED step. The per-request
+// MAX_IMAGES_PER_BOTTLE cap lives here for the link-to-bottle route.
 
 const router = express.Router();
 
@@ -107,8 +107,8 @@ router.post('/upload', requireAuth, requireNonDemo, imageUploadLimiter, handleIm
 
     const { bottleId, wineDefinitionId, credit } = req.body;
     // Multipart field, so a string: "1" / "true" / "on" from the upload form's
-    // "keep the background" checkbox (ticket 6a97f870 — label-only photos
-    // came back cropped because rembg expects a whole bottle).
+    // "keep the background" checkbox (a label-only photo comes back cropped
+    // from rembg, which expects a whole bottle).
     const keepBackground = ['1', 'true', 'on'].includes(String(req.body.keepBackground ?? '').trim().toLowerCase());
 
     // Verify bottle ownership if bottleId is provided (access is the route's
@@ -201,9 +201,8 @@ router.get('/bottle/:bottleId', requireAuth, async (req, res) => {
     // The uploader sees their own photos in every state EXCEPT rejected. The
     // reject route deletes the files and nulls both URLs, keeping only a
     // tombstone row — and a row with no URL is not a photo anyone can show.
-    // Handing it back took the whole bottle page down for its owner (support
-    // ticket 2026-09-03: ImageCarousel called .startsWith on the null URL and
-    // the ErrorBoundary swallowed the page) — 138 bottles / 47 owners on prod.
+    // Handing it back gives every client a photo it cannot render (the
+    // frontend side is pinned in components/ImageCarousel.test.js).
     // ?scope=vintage (the vintage page): the photos of EVERY bottle of this
     // wine and vintage in this cellar, not just this one — a label photo
     // added through one bottle belongs to the vintage, and the page must not
@@ -239,11 +238,11 @@ router.get('/bottle/:bottleId', requireAuth, async (req, res) => {
       }).sort({ assignedToWine: -1, createdAt: -1 });
       // Exclude any that are already in the bottle-specific list
       wineImages = wineImages.filter(img => !bottleImageIds.has(img._id.toString()));
-      // Photos of THIS vintage first (support ticket 2026-10-09), led by the
+      // Photos of THIS vintage first, led by the
       // vintage's official photo: the first wine-level slide is the one a
       // bottle without its own photo opens on, and a 2016 bottle should open
       // on a 2016 label when one exists. With none, the wine's official image
-      // leads, as before. Within each part the official-first, newest-first
+      // leads. Within each part the official-first, newest-first
       // order of the query holds.
       const thisVintage = photoVintage(bottle.vintage);
       if (thisVintage) {
@@ -255,7 +254,7 @@ router.get('/bottle/:bottleId', requireAuth, async (req, res) => {
       }
     }
 
-    // Audit 2026-09 D05-1: the gallery is read by every cellar member, viewers
+    // The gallery is read by every cellar member, viewers
     // included, and returned whole documents — uploader, reviewer and reporter
     // identities of every public wine photo. The page needs the picture, its
     // credit and state, and whether the photo is the caller's own.
@@ -307,7 +306,7 @@ router.get('/wine/:wineDefinitionId', requireAuth, async (req, res) => {
       ...(showAll
         // The admin branch deliberately keeps private/unapproved rows, but
         // never label scans — admin/images.js already removes them from every
-        // moderation surface (audit L-6) and refuses to promote them.
+        // moderation surface and refuses to promote them.
         ? { status: { $ne: 'rejected' } }
         : { status: 'approved', visibility: 'public' })
     };
@@ -362,8 +361,8 @@ router.get('/:id', requireAuth, async (req, res) => {
     // only somm/admin, and only for an image tied to a wine that is still
     // pending (or the label scan itself, which exists for no other purpose and
     // is never public). It does NOT open ordinary users' bottle galleries to
-    // curators. The bytes themselves were always served by the unauthenticated
-    // random-UUID static mount (app.js), so this is the one gate that mattered.
+    // curators. The bytes themselves are served by the unauthenticated
+    // random-UUID static mount (app.js), so this is the one gate that matters.
     let curationRead = false;
     let curationWineId = null;
     if (!authorized && (req.user.roles?.includes('somm') || req.user.roles?.includes('admin'))) {
@@ -373,9 +372,8 @@ router.get('/:id', requireAuth, async (req, res) => {
         // wrong completion can still be corrected against the label, which is
         // the whole reason the scan outlives the queue at all. Outside that it
         // is an ordinary private photo of a wine nobody has been asked to
-        // identify, and this branch used to hand every one of them to any somm
-        // token. One definition, shared with the MCP tool
-        // (services/labelScanAccess).
+        // identify, which no somm token may read. One definition, shared with
+        // the MCP tool (services/labelScanAccess).
         const WineDefinition = require('../models/WineDefinition');
         const scanWine = image.wineDefinition
           ? await WineDefinition.findById(image.wineDefinition).select('pendingIdentity draft').lean()
@@ -392,7 +390,7 @@ router.get('/:id', requireAuth, async (req, res) => {
         }
         const WineDefinition = require('../models/WineDefinition');
         // A private draft is pending too, but its photos are not curation
-        // evidence — nobody has been asked to identify it (draft design 2026-09-12).
+        // evidence — nobody has been asked to identify it.
         if (wineId && await WineDefinition.exists({ _id: wineId, pendingIdentity: true, draft: { $ne: true } })) {
           authorized = true;
           curationRead = true;
@@ -401,7 +399,7 @@ router.get('/:id', requireAuth, async (req, res) => {
       }
     }
     // A curator reading somebody's private photo or label scan leaves a
-    // record — same helper and action as the MCP twin (audit 2026-09 M03-4).
+    // record — same helper and action as the MCP twin.
     if (curationRead) {
       logCurationImageRead(req, {
         wineId: curationWineId || image.wineDefinition || null,
@@ -431,7 +429,7 @@ router.get('/:id', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Image not found' });
     }
 
-    // PROJECT the response (audit L-4). Returning the whole document handed
+    // PROJECT the response. Returning the whole document handed
     // back uploadedBy — and the somm/admin branch above exists precisely so a
     // curator can read a stranger's label scan, which the pending-wine queue
     // goes to deliberate lengths to keep ANONYMOUS (services/pendingWineOps).
@@ -543,7 +541,7 @@ router.post('/link-to-bottle', requireAuth, async (req, res) => {
     }
 
     // Enforce the same per-bottle cap /upload applies — the normal AddBottle
-    // flow uploads bottleless images then links here, which used to bypass it.
+    // flow uploads bottleless images then links here, so this is where it binds.
     const existingCount = await BottleImage.countDocuments({ bottle: bottleId });
     if (existingCount + imageIds.length > MAX_IMAGES_PER_BOTTLE) {
       return res.status(400).json({ error: `Maximum of ${MAX_IMAGES_PER_BOTTLE} images per bottle reached` });
@@ -556,11 +554,14 @@ router.post('/link-to-bottle', requireAuth, async (req, res) => {
     const linkedIds = [...new Set(imageIds.map(String))].filter(id => ownIds.has(id));
 
     // The AddBottle flow uploads before the bottle exists, so the photo learns
-    // its vintage here, with its bottle (support ticket 2026-10-09).
+    // its vintage here, with its bottle.
     await BottleImage.updateMany(own, { bottle: bottleId, vintage: photoVintage(bottle.vintage) });
     if (linkedIds.length) {
       logAudit(req, 'image.link', { type: 'bottle', id: bottle._id, cellarId: bottle.cellar },
         { imageIds: linkedIds, via: 'web' });
+      // Uploaded before the bottle existed: on a server that does not review
+      // photos, the ready ones are published now that they have a bottle.
+      for (const id of linkedIds) await approvePhotoIfTrusted(id, req);
     }
 
     res.json({ message: 'Images linked to bottle' });
@@ -590,7 +591,7 @@ router.post('/:id/retry', requireAuth, requireNonDemo, async (req, res) => {
     }
     // Retry is for an image with NO processed file yet: a run that failed
     // ('uploaded'), or one an admin approved before rembg got to it
-    // ('approved' with no processedUrl) — the latter used to be stuck for good.
+    // ('approved' with no processedUrl) — without retry the latter is stuck.
     if (image.processedUrl || !['uploaded', 'approved'].includes(image.status)) {
       return res.status(400).json({ error: 'Image is not waiting to be processed' });
     }
@@ -610,13 +611,10 @@ router.post('/:id/retry', requireAuth, requireNonDemo, async (req, res) => {
 
 // ── Removing a photo ────────────────────────────────────────────────────────
 //
-// Support ticket 6a865f60 (2026-08-20): "How do I remove a picture — the webcam
-// picked up too much to my taste." They could not. Until now a photo was only
-// ever deleted as a SIDE EFFECT of deleting the bottle, the cellar or the whole
-// account, so the smallest available remedy for one unwanted webcam frame was
-// destroying something much larger. An admin had no surface either: label scans
-// are deliberately excluded from the review queue (audit L-6), so the only way
-// to honour that request was a script against the database.
+// A member must be able to remove one unwanted photo on its own, not only as a
+// SIDE EFFECT of deleting the bottle, the cellar or the whole account. An admin
+// is no fallback for this: label scans are deliberately excluded from the
+// review queue, so an admin has no surface that lists them.
 //
 // The line between the two verbs is whether the photo is still ONLY the
 // uploader's. A photo assigned to a wine has become registry content that other

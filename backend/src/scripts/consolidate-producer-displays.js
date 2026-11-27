@@ -1,23 +1,22 @@
 /**
- * Consolidate producer DISPLAY splits across the registry — the productized
- * form of the 2026-08-14 cleanup (130 clusters → 22, 199 rows), for the
- * periodic sweep the display-split watchdog metric rings for.
+ * Consolidate producer DISPLAY splits across the registry, for the periodic
+ * sweep the display-split watchdog metric rings for.
  *
  * A "display split" is one estate stored under several producer strings that
  * all fold to the same comparison key: "Philipp Kuhn" / "Weingut Philipp
  * Kuhn" / "Felton Road Wines Ltd" vs "Felton Road". The mint-time resolver
  * (services/producerSpelling.js) prevents NEW splits; this script folds the
- * ones that predate it — or that its deliberate ambiguity guards let through.
+ * stored ones, including those its deliberate ambiguity guards let through.
  *
- * TARGET RULE (Johan, 2026-08-14 — "fullest estate form", hardened against
+ * TARGET RULE ("fullest estate form", hardened against
  * the single-outlier trap):
  *   1. a spelling with a legal suffix (Ltd, GmbH, S.L.) is never canonical
  *   2. prefer a spelling carrying an estate TITLE (Weingut/Domaine/Château/…)
  *   3. otherwise majority, ties → the spelling whose earliest wine is oldest
  *   4. a 1-v-1 tie neither rule settles is a COIN FLIP → held for a human
  *
- * HELD, never auto-consolidated (each guard caught a real different-estate
- * pair on prod): clusters spanning >1 country (Taylors AU=Clare Valley vs
+ * HELD, never auto-consolidated (each guard keeps a real different-estate
+ * pair apart): clusters spanning >1 country (Taylors AU=Clare Valley vs
  * PT=Port) · different CORE tokens · two DIFFERENT estate titles (Domaine de
  * Bellevue vs Château Bellevue) · sentinel producers ("Unknown") ·
  * unresolvable ties (Stag's Leap Wine Cellars vs Stags Leap — two real Napa
@@ -40,6 +39,7 @@
 
 const mongoose = require('mongoose');
 const WineDefinition = require('../models/WineDefinition');
+const { loadTerms } = require('../services/sweetnessOps');
 const Country = require('../models/Country');
 require('../models/Region');
 require('../models/Grape');
@@ -51,7 +51,7 @@ const { logAudit } = require('../services/audit');
 // region, appellation, classification, type, grapes) and the profile whose
 // snapshot follows a spelling change, plus what the planner and the save hooks
 // read. Guarded by consolidate-producer-displays.test.js.
-const WINE_SELECT = 'name producer appellation country region classification type grapes aiProfile normalizedKey canonicalKey slug nonWine createdAt verifiedChecks crossChecksCleared';
+const WINE_SELECT = 'name producer appellation country region classification type grapes aiProfile normalizedKey canonicalKey slug nonWine createdAt verifiedChecks crossChecksCleared labelSweetness';
 
 // Estate-title and decoration vocabularies for the TARGET rule only (bucket
 // membership itself comes from producerSegment — one fold, shared with the
@@ -87,7 +87,7 @@ const hasLegal = (s) => toks(s).some((t) => LEGAL.has(t));
   // The projection must carry every field profileInputsSnapshot() reads plus
   // aiProfile itself, or the snapshot refresh below never sees a current
   // snapshot and the next enrichment sweep regenerates every renamed
-  // profile as stale (release audit 2026-09-29).
+  // profile as stale.
   const wines = await WineDefinition.find({ pendingIdentity: { $ne: true } })
     .select(WINE_SELECT);
   const countries = await Country.find({}).select('name').lean();
@@ -159,6 +159,12 @@ const hasLegal = (s) => toks(s).some((t) => LEGAL.has(t));
   }
 
   // ---- row-level plan + UNIQUE-key collision pre-check ------------------
+  // A termed wine's keys carry the term's word (utils/normalize
+  // SWEETNESS_KEY_MARK): built here as the save hook builds them, so the clash
+  // check compares like with like. The word comes from the term table's
+  // in-memory copy (one load), not a populate per wine.
+  const terms = await loadTerms();
+  const sweetnessOf = (w) => (w.labelSweetness ? (terms.byId.get(String(w.labelSweetness._id || w.labelSweetness))?.name || null) : null);
   const planned = [];
   for (const g of safe) {
     for (const [sp, e] of g.spellings) {
@@ -167,8 +173,8 @@ const hasLegal = (s) => toks(s).some((t) => LEGAL.has(t));
         if (w.producer === g.target) continue;
         planned.push({
           doc: w, group: g, from: w.producer,
-          newKey: generateWineKey(w.name, g.target, w.appellation),
-          newCanon: computeCanonicalKey(w.name, g.target, w.appellation),
+          newKey: generateWineKey(w.name, g.target, w.appellation, { sweetness: sweetnessOf(w) }),
+          newCanon: computeCanonicalKey(w.name, g.target, w.appellation, { sweetness: sweetnessOf(w) }),
         });
       }
     }
@@ -219,7 +225,7 @@ const hasLegal = (s) => toks(s).some((t) => LEGAL.has(t));
   let written = 0, failed = 0;
   // A spelling is not a new identity: a profile that described the record
   // still does, so its input snapshot follows the spelling — otherwise the
-  // next enrichment sweep regenerates it as stale (review 2026-09-28).
+  // next enrichment sweep regenerates it as stale.
   const { profileInputsSnapshot } = require('../services/enrichmentJob');
   for (const p of planned) {
     if (p.blocked) continue;
@@ -245,8 +251,7 @@ const hasLegal = (s) => toks(s).some((t) => LEGAL.has(t));
 
   // logAudit persists fire-and-forget, which suits a long-lived server and not
   // a script that exits: disconnecting immediately races the last writes and
-  // silently drops audit rows for work that really happened (observed on the
-  // 2026-08-17 supporter backfill). Let them settle first.
+  // silently drops audit rows for work that really happened. Let them settle.
   await new Promise(resolve => setTimeout(resolve, 1000));
 
   await mongoose.disconnect();

@@ -8,7 +8,7 @@
  * ordered) the server did not mark as conflicting, or null.
  *
  * styleConflict: the row and the candidate NAME a different Prädikat or
- * sweetness, so they are two wines from one producer's range (issue #1134).
+ * sweetness, so they are two wines from one producer's range.
  * colourConflict: the row and the candidate state different colours — the
  * other bottle of a red/white pair sharing one name. Either way the user can
  * still pick it by hand; it is only never chosen FOR them. Every preselection
@@ -54,7 +54,7 @@ function followingSiblings(results, selections, sourceIndex, identityChoice) {
     const cur = sel[r.index];
     if (cur == null) return true;
     // A skip is a decision only an undo on that row reverses: a sibling
-    // skipped on purpose never follows a wine choice (audit 2026-10-14).
+    // skipped on purpose never follows a wine choice.
     return identityChoice && before != null && before !== 'skip' && cur === before;
   });
 }
@@ -253,8 +253,7 @@ export function mergeRetryResults(results, batchUpdates) {
  * Merge one validate batch's server-computed summary into the running
  * combined summary, returning a NEW object (the previous one may already be
  * committed to React state). Numeric counters add up; the boolean-ish
- * aiBudgetExhausted flag survives as a truthy number the same way the old
- * in-place merge handled it.
+ * aiBudgetExhausted flag survives as a truthy number.
  *
  * @param {object|null} base   running combined summary (null on first batch)
  * @param {object} add         this batch's summary from the server
@@ -287,7 +286,7 @@ export function autoSelectionsFor(rows) {
     ) {
       // Never preselect a match the server marked styleConflict or
       // colourConflict (preselectableMatch): bulk-confirming the preselection
-      // is exactly how issue #1134 replays at import scale. The best
+      // would file every such bottle under a sibling wine. The best
       // non-conflicting candidate is preselected instead; if every candidate
       // conflicts, the row is left for the user.
       const top = preselectableMatch(r.matches);
@@ -341,8 +340,8 @@ export function restoreSessionMeta(session) {
 /**
  * After a budget-status refresh, decide the local request-flag state. Once the
  * server reports no pending request, a sticky local 'requested' must be
- * released so the user can ask again after an admin decides — the old code left
- * it stuck forever.
+ * released so the user can ask again after an admin decides; kept, it would
+ * stay stuck forever.
  */
 export function nextAiBudgetRequestState(prev, status) {
   if (prev === 'requested' && status && !status.pendingRequest) return 'idle';

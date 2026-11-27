@@ -75,6 +75,29 @@ describe('shared-cellar owner nudge', () => {
     expect(getDataVersion('owner1')).not.toBe(before);
   });
 
+  test('a row about another cellar than the request\'s reaches THAT cellar\'s owner', async () => {
+    // A move into a friend's shared cellar: the request carries the source
+    // cellar (the mover's own), and the move.in row is about the destination.
+    const source = 'c'.repeat(24);
+    const dest = 'd'.repeat(24);
+    Cellar.findById.mockReturnValue({ select: () => ({ lean: () => Promise.resolve({ user: 'friend1' }) }) });
+    const before = getDataVersion('friend1');
+    const req = { ...reqFor('mover1'), cellar: { _id: source, user: 'mover1' } };
+    logAudit(req, 'bottle.move.in', { type: 'bottle', cellarId: dest }, {});
+    await new Promise(r => setImmediate(r)); // let the fire-and-forget lookup settle
+    expect(Cellar.findById).toHaveBeenCalledWith(dest);
+    expect(eventBus.emit).toHaveBeenCalledWith('friend1', 'stats_changed', { reason: 'bottle.move.in' });
+    expect(getDataVersion('friend1')).not.toBe(before);
+  });
+
+  test('a row about the request\'s own cellar still takes the owner from the request', () => {
+    const cellarId = 'c'.repeat(24);
+    const req = { ...reqFor('member2'), cellar: { _id: cellarId, user: 'owner2' } };
+    logAudit(req, 'bottle.move.out', { type: 'bottle', cellarId }, {});
+    expect(Cellar.findById).not.toHaveBeenCalled();
+    expect(eventBus.emit).toHaveBeenCalledWith('owner2', 'stats_changed', { reason: 'bottle.move.out' });
+  });
+
   test('a cellarId that is not a plain 24-hex id never reaches the query', () => {
     eventBus.streamCounts.mockReturnValue({ total: 1, users: 1 });
     logAudit(reqFor('u1'), 'cellar.restore', { type: 'cellar', cellarId: { $ne: null } }, {});
@@ -108,19 +131,80 @@ describe('logAudit → data version (services/dataVersion, the REST read caches)
 
   // The offline copy holds the racks, and its 304 check reads this version
   // (routes/offline): a placement it can't see would keep a device's rack
-  // view stale. Racks don't change statistics, so no stats_changed push.
+  // view stale. Racks don't change statistics, so no stats_changed push; they
+  // send racks_changed, to the actor and to the cellar's owner.
   test.each(['rack.slot_assign', 'rack.slot_move', 'rack.slot_clear', 'rack.create', 'rack.delete'])(
-    '%s moves the version of the actor and the cellar owner, without a stats push',
+    '%s moves the version of the actor and the cellar owner and sends racks_changed, never a stats push',
     async (action) => {
       const cellarId = 'b'.repeat(24);
-      Cellar.findById.mockReturnValue({ select: () => ({ lean: () => Promise.resolve({ user: 'dv-rack-owner' }) }) });
-      const actor = getDataVersion('dv-rack-member');
-      const owner = getDataVersion('dv-rack-owner');
-      logAudit(reqFor('dv-rack-member'), action, { type: 'rack', id: 'r1', cellarId }, {});
+      // Ids of their own per action: a user who just heard of a rack change is not told again at once.
+      const member = `dv-rack-member-${action}`;
+      const ownerId = `dv-rack-owner-${action}`;
+      Cellar.findById.mockReturnValue({ select: () => ({ lean: () => Promise.resolve({ user: ownerId }) }) });
+      const actor = getDataVersion(member);
+      const owner = getDataVersion(ownerId);
+      logAudit(reqFor(member), action, { type: 'rack', id: 'r1', cellarId }, {});
       await new Promise(r => setImmediate(r)); // the owner lookup is fire-and-forget
-      expect(getDataVersion('dv-rack-member')).not.toBe(actor);
-      expect(getDataVersion('dv-rack-owner')).not.toBe(owner);
-      expect(eventBus.emit).not.toHaveBeenCalled();
+      expect(getDataVersion(member)).not.toBe(actor);
+      expect(getDataVersion(ownerId)).not.toBe(owner);
+      expect(eventBus.emit).not.toHaveBeenCalledWith(expect.anything(), 'stats_changed', expect.anything());
+      expect(eventBus.emit).toHaveBeenCalledWith(member, 'racks_changed', { reason: action });
+      expect(eventBus.emit).toHaveBeenCalledWith(ownerId, 'racks_changed', { reason: action });
     },
   );
+});
+
+describe('racks_changed during a racking session', () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+  const sent = (userId) => eventBus.emit.mock.calls.filter(([u, e]) => u === userId && e === 'racks_changed');
+
+  test('the first change is told at once, the rest at most once per quiet window, and the last one always', () => {
+    const user = 'rack-session';
+    for (let i = 0; i < 40; i++) logAudit(reqFor(user), 'rack.slot_assign', { type: 'rack' }, {});
+    logAudit(reqFor(user), 'rack.slot_clear', { type: 'rack' }, {});
+    expect(sent(user)).toHaveLength(1);
+
+    jest.advanceTimersByTime(30000);
+    expect(sent(user)).toHaveLength(2);
+    expect(sent(user)[1][2]).toEqual({ reason: 'rack.slot_clear' });
+
+    // Nothing more happened: silence, and no timer left behind.
+    jest.advanceTimersByTime(30000);
+    expect(sent(user)).toHaveLength(2);
+    expect(jest.getTimerCount()).toBe(0);
+
+    // A change after the quiet window is told at once again.
+    logAudit(reqFor(user), 'rack.slot_move', { type: 'rack' }, {});
+    expect(sent(user)).toHaveLength(3);
+  });
+
+  test('one member in a session does not delay the first change of another', () => {
+    logAudit(reqFor('rack-a'), 'rack.slot_assign', { type: 'rack' }, {});
+    logAudit(reqFor('rack-b'), 'rack.slot_assign', { type: 'rack' }, {});
+    expect(sent('rack-a')).toHaveLength(1);
+    expect(sent('rack-b')).toHaveLength(1);
+  });
+});
+
+describe('who made the change', () => {
+  const AuditLog = require('../models/AuditLog');
+
+  test('a request that came with an API token is stamped on the row; a signed-in session is not', () => {
+    const tokenId = 'a'.repeat(24);
+    logAudit({ ...reqFor('u1'), apiToken: { id: tokenId, scopes: ['write'] } }, 'bottle.move.out', { type: 'bottle' }, {});
+    expect(AuditLog.create.mock.calls[0][0].actor).toMatchObject({ userId: 'u1', tokenId });
+
+    logAudit(reqFor('u1'), 'bottle.move.out', { type: 'bottle' }, {});
+    expect(AuditLog.create.mock.calls[1][0].actor).not.toHaveProperty('tokenId');
+  });
+
+  test('a token id that is not a well-formed id is left off, so the row is still written', () => {
+    for (const id of ['not-an-object-id', '', 12345, { $ne: null }]) {
+      AuditLog.create.mockClear();
+      logAudit({ ...reqFor('u1'), apiToken: { id, scopes: ['write'] } }, 'bottle.move.out', { type: 'bottle' }, {});
+      expect(AuditLog.create).toHaveBeenCalledTimes(1);
+      expect(AuditLog.create.mock.calls[0][0].actor).not.toHaveProperty('tokenId');
+    }
+  });
 });

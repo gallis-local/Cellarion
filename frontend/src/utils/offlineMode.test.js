@@ -1,5 +1,4 @@
 import {
-  OFFLINE_MODE_RELEASED,
   needsOfflineChoice,
   isOfflineModeEnabled,
   setOfflineModePreference,
@@ -35,8 +34,7 @@ beforeEach(() => { vi.stubGlobal('localStorage', memoryStorage()); });
 afterEach(() => vi.unstubAllGlobals());
 
 describe('offline mode switch', () => {
-  it('is released: off by default in a plain browser tab', () => {
-    expect(OFFLINE_MODE_RELEASED).toBe(true);
+  it('is off by default in a plain browser tab', () => {
     expect(isOfflineModeEnabled()).toBe(false);
   });
 
@@ -72,7 +70,7 @@ describe('offline mode switch', () => {
   });
 });
 
-// Audit 2026-09-27 M3: the choice used to be the browser's, so on a shared
+// The choice used to be the browser's, so on a shared
 // device the next account to sign in was copied to the device without ever
 // being asked — "nothing stored before a yes" held for the first account only.
 describe('one account\'s choice', () => {

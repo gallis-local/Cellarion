@@ -2,7 +2,7 @@
  * DELETE /api/bottles/:id/open and DELETE /api/bottles/:id/pour must refuse a
  * CONSUMED bottle.
  *
- * WHY THIS TEST EXISTS (security audit 2026-07-30, M-1):
+ * WHY THIS TEST EXISTS:
  * A consumed bottle deliberately KEEPS openedAt / preservationMethod / pours —
  * they are drinking history on the consumption record, not current state. PR
  * #866 added that guard to the three MCP tools one at a time and left the REST
@@ -23,8 +23,6 @@ process.env.JWT_SECRET = 'test-secret';
 jest.mock('../services/search', () => ({
   getIsAvailable: () => false,
   search: async () => ({ ids: [] }),
-  indexBottle: jest.fn(),
-  removeBottle: jest.fn(),
 }));
 jest.mock('../services/bottleLot', () => ({ findLotSiblingIds: jest.fn().mockResolvedValue([]) }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));

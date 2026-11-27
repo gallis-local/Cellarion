@@ -1,5 +1,5 @@
 // Shared helpers for MCP tool handlers: uniform response envelope, the error
-// taxonomy from MCP plan §5.4, and the standalone access checks (the service-
+// code taxonomy (fail), and the standalone access checks (the service-
 // context equivalents of middleware/cellarAccess + middleware/bottleAccess —
 // same semantics, no req/res).
 const { z } = require('zod');
@@ -19,7 +19,7 @@ const objectId = z.string().regex(/^[a-f0-9]{24}$/i, 'must be a 24-hex id');
 const MSG_CELLAR_NOT_FOUND = 'No such cellar, or you have no access to it. Use list_cellars for valid ids.';
 const MSG_BOTTLE_NOT_FOUND = 'No such bottle, or you have no access to it. Find ids via search_bottles.';
 
-/** Success envelope (§7): { summary, data, warnings?, page? } as one text part. */
+/** Success envelope: { summary, data, warnings?, page? } as one text part. */
 function ok(summary, data, extra = {}) {
   return {
     content: [{ type: 'text', text: JSON.stringify({ summary, data, ...extra }) }],
@@ -27,13 +27,13 @@ function ok(summary, data, extra = {}) {
 }
 
 /**
- * Error envelope. `code` is from the §5.4 taxonomy: invalid_input | not_found |
+ * Error envelope. `code` is from one fixed taxonomy: invalid_input | not_found |
  * forbidden_scope | budget_exhausted | conflict | rate_limited | busy |
  * unavailable. Messages are written for the calling MODEL to self-correct from,
  * not for humans.
- * `busy` (MCP-audit M1) = an identical idempotency_key request is mid-flight;
+ * `busy` = an identical idempotency_key request is mid-flight;
  * retry the SAME key shortly (distinct from `conflict`, which is not retryable).
- * `unavailable` (MCP-audit M3-low) = a backend dependency (vector search/embeddings/
+ * `unavailable` = a backend dependency (vector search/embeddings/
  * image service) is temporarily down or rebuilding — retry later; slowing the
  * call cadence does NOT help (distinct from `rate_limited`, which it is not).
  */
@@ -93,13 +93,57 @@ function accessibleCellars(userId) {
 }
 
 /** Compact registry-wine summary. NEVER include normalizedKey/createdBy/productNumber. */
-function wineSummary(wd) {
+/**
+ * The classification taxonomy rows a wine carries, for the API: [{ name,
+ * kind }], only when they were populated (an id-only array answers []).
+ * `classification` (the joined string) stays beside it for older clients.
+ */
+const { classificationsOut } = require('../services/classificationOps');
+const { labelSweetnessOut, labelSweetnessFields, sweetnessStyleFields, wineDisplayName } = require('../services/sweetnessOps');
+
+/**
+ * A wine's sweetness reading (services/sweetnessCategory readSweetnessCategories:
+ * { category, basis } or null) as two keys. sweetness_category is dry |
+ * off-dry | medium-sweet | sweet on one scale for still and sparkling wines,
+ * null when the record states none; sweetness_category_basis says what it
+ * rests on (label | name | style | tier | type).
+ */
+const sweetnessCategoryOut = (read) => ({
+  sweetness_category: read ? read.category : null,
+  sweetness_category_basis: read ? read.basis : null,
+});
+
+function wineSummary(wd, { termLoaded = false, styleLoaded = false, sweetness } = {}) {
   if (!wd) return null;
   return {
     wine_id: wd._id,
     name: wd.name,
+    // label_sweetness ({ name, band, scale, regulated } or null — the sweetness
+    // the LABEL states, never the tasting profile's estimate) and display_name
+    // (the name as the label reads it), BOTH only when the caller's read
+    // selected and populated the field (termLoaded): then a row that predates
+    // the field reads as null, like a row that states none. A read that did
+    // not load it carries neither key, so a missing key means "not on this
+    // surface", never "no term" (services/sweetnessOps.labelSweetnessFields).
+    ...labelSweetnessFields(wd, { loaded: termLoaded }),
+    // sweetness_style ({ name, band, scale, regulated, source, source_url } or
+    // null — the term the wine is KNOWN by when its label states none, named
+    // by the producer or the trade; descriptive, never identity) only when the
+    // caller asked for the field and populated its term (styleLoaded: true,
+    // or 'shaped' when a shaper already gave the outgoing shape — see
+    // services/sweetnessOps.sweetnessStyleFields): the path is select: false,
+    // so a read that did not ask carries no key, and neither does a style this
+    // read cannot vouch for.
+    ...sweetnessStyleFields(wd, { loaded: styleLoaded }),
+    // sweetness_category and its basis only when the caller looked the reading
+    // up and passed it (`sweetness`: the reading, or null for a wine that
+    // states none): a summary built without it carries neither key.
+    ...(sweetness === undefined ? {} : sweetnessCategoryOut(sweetness)),
     producer: wd.producer || null,
     type: wd.type || null,
+    // 'other' = a drink that is not wine (cider, beer, spirits), kept in the
+    // user's cellar outside the shared wine registry; 'wine' otherwise.
+    category: wd.nonWine === true ? 'other' : 'wine',
     // Only a sparkling/dessert/fortified wine carries one (utils/wineColour) —
     // included when set, so the common still wine pays nothing for it.
     ...(wd.colour ? { colour: wd.colour } : {}),
@@ -122,6 +166,7 @@ function bottleSummary(b) {
     wine: b.wineDefinition
       ? {
           name: b.wineDefinition.name, producer: b.wineDefinition.producer || null, type: b.wineDefinition.type || null,
+          ...(b.wineDefinition.nonWine === true ? { category: 'other' } : {}),
           ...(b.wineDefinition.colour ? { colour: b.wineDefinition.colour } : {}),
           // The user's private draft wine (publish_wine to share it).
           ...(b.wineDefinition.draft === true ? { draft: true } : {}),
@@ -136,9 +181,8 @@ function bottleSummary(b) {
     rating_scale: b.rating != null ? b.ratingScale : undefined,
     drink_from: b.drinkFrom ?? null,
     drink_to: b.drinkTo ?? null,
-    // The peak pair is writable through update_bottle and was missing from
-    // every read (support ticket 2026-09-07) — an assistant could set it and
-    // never see it again.
+    // The peak pair is writable through update_bottle, so every read carries
+    // it too — an assistant that sets it must be able to see it again.
     peak_from: b.peakFrom ?? null,
     peak_until: b.peakUntil ?? null,
     opened_at: b.openedAt || undefined,
@@ -178,6 +222,20 @@ function hasContent(obj) {
   });
 }
 
+// The curator roles, one list for the whole app (services/wineVisibility):
+// a tool declares `requireRole: SOMM_ROLES` so the registry never advertises
+// it to other callers, and re-checks inside the handler with requireSomm —
+// two layers that can only drift safely.
+const { CURATION_ROLES: SOMM_ROLES } = require('../services/wineVisibility');
+
+/** The in-handler role re-check of a sommelier tool: null when allowed, else the refusal envelope. */
+function requireSomm(ctx) {
+  const roles = ctx.user?.roles || [];
+  return SOMM_ROLES.some((r) => roles.includes(r))
+    ? null
+    : fail('forbidden_scope', 'This tool needs the sommelier (or admin) role.');
+}
+
 /** Clamp a limit/offset pair from validated zod input. */
 function pageParams(args, defLimit, maxLimit) {
   const limit = Math.min(Math.max(parseInt(args.limit, 10) || defLimit, 1), maxLimit);
@@ -185,7 +243,37 @@ function pageParams(args, defLimit, maxLimit) {
   return { limit, offset };
 }
 
+// A correction proposal's fields as the tools' arguments spell them. The
+// proposal stores the sweetness style as sweetnessStyle { term, source, url };
+// the tools take and answer sweetness_style { term, source, source_url }, so
+// what one tool reports can be sent to another as it stands.
+const proposalFieldName = (f) => (f === 'sweetnessStyle' ? 'sweetness_style' : f);
+function proposalFieldsOut(pf) {
+  const plain = pf && typeof pf.toObject === 'function' ? pf.toObject() : pf;
+  if (!plain || !plain.sweetnessStyle) return plain || null;
+  const { sweetnessStyle: s, ...rest } = plain;
+  return { ...rest, sweetness_style: { term: s.term, source: s.source, source_url: s.url } };
+}
+
+// What belongs in the three registry fields every add/correct tool takes —
+// one text, so no tool schema drifts from the rule.
+const FIELD_DESCRIPTIONS = {
+  region: 'The wine region NAME where THIS wine is grown (e.g. "Piedmont", "Barossa Valley") — never assumed from where the producer is based.',
+  appellation: 'The appellation as its register names it, WITHOUT the regulatory mark: "Barolo" not "Barolo DOCG", "Pauillac" not "Pauillac AOC". Premier/Grand Cru stays only where it is part of the legal name ("Chablis Premier Cru", "Saint-Émilion Grand Cru"). Never a quality tier, and never a production method ("Méthode Traditionnelle", "Metodo Classico", "Méthode Cap Classique"): the appellation is the origin, null when the label names none.',
+  classification: 'A quality tier granted ON TOP of the appellation, named as the registry\'s classification list has it (list_classifications): Riserva, Gran Reserva, Grand Cru Classé, Cru Bourgeois, Premier Cru in Champagne, a German Prädikat (Kabinett, Spätlese), VDP Grosse Lage … Several tiers comma-separated ("Spätlese, VDP Grosse Lage"). NEVER the regulatory mark (DOCG, DOC, AOC, IGT, AVA) — that follows from the appellation and is dropped on write; a word the list lacks is refused with the known tiers.',
+  labelSweetness: 'The sweetness the LABEL states, as printed — trocken, halbtrocken, feinherb, Brut Nature, Extra Brut, Brut, Extra Dry, amabile, meio seco … — named as list_sweetness_terms has it (a listed spelling is accepted). ONE term. The server knows the scale from the wine\'s type: "trocken" on a Sekt is the sec band, on a still wine the dry band. The printed word only: never derived from a Kabinett/Spätlese tier, never the tasting profile\'s dry/off-dry/sweet estimate, and no term when the label states none. Fortified wines carry none.',
+  sweetnessStyle: 'The sweetness term the wine is KNOWN by when its LABEL prints none (feinherb, fruchtsüß, edelsüß …), as { term, source, source_url }: `term` as list_sweetness_terms has it; `source` "producer" (the producer\'s own wording) or "trade" (a merchant, a critic, a wine database); `source_url` the page that names this term for this wine (evidence_url is used when it is left out; one of the two is required). A term with a legal definition (regulated: true: trocken, halbtrocken, Brut …) only from the producer. Never a taste impression, never worked out from a Kabinett/Spätlese tier or the alcohol, and never a word the label itself prints. Descriptive: no part of the wine\'s identity.',
+};
+
 module.exports = {
+  classificationsOut,
+  labelSweetnessOut,
+  labelSweetnessFields,
+  sweetnessStyleFields,
+  wineDisplayName,
+  FIELD_DESCRIPTIONS,
+  proposalFieldName,
+  proposalFieldsOut,
   ok,
   fail,
   objectId,
@@ -200,4 +288,6 @@ module.exports = {
   pageParams,
   hasContent,
   ROLE_LEVELS,
+  SOMM_ROLES,
+  requireSomm,
 };

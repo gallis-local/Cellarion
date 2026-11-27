@@ -66,10 +66,10 @@ const apiTokenSchema = new mongoose.Schema({
   // ─── OAuth 2.1 connection fields (MCP one-click connectors) ───────────────
   // A token minted through the OAuth flow (routes/mcpOAuth.js) is a normal
   // scoped cel_ token PLUS the four fields below. A user-minted PAT leaves them
-  // all null/unset. This is the plan's "OAuth layered on the existing token
-  // store": the access token IS a scoped cel_ token, so it inherits the
-  // SCOPE_ALLOWLIST (/api/mcp only), instant revoke, and the connected-tokens
-  // UI — it just also expires and can be refreshed.
+  // all null/unset. OAuth is layered on the existing token store: the access
+  // token IS a scoped cel_ token, so it inherits the SCOPE_ALLOWLIST (/api/mcp
+  // only), instant revoke, and the connected-tokens UI — it just also expires
+  // and can be refreshed.
   //
   // origin distinguishes the two for the UI/audit; 'oauth' tokens show as a
   // connected AI, 'personal' as a user-minted PAT.
@@ -78,8 +78,8 @@ const apiTokenSchema = new mongoose.Schema({
     enum: ['personal', 'oauth'],
     default: 'personal',
   },
-  // Access-token expiry. NULL = never expires (personal PATs keep today's
-  // behaviour). apiTokenAuth rejects a token past this instant.
+  // Access-token expiry. NULL = never expires (personal PATs). apiTokenAuth
+  // rejects a token past this instant.
   expiresAt: {
     type: Date,
     default: null,
@@ -124,6 +124,30 @@ const apiTokenSchema = new mongoose.Schema({
   resource: {
     type: String,
     default: null,
+  },
+
+  // ─── Deprecated routes this token still calls (config/apiDeprecations) ────
+  // Written when the token is answered on a deprecated route, so its owner —
+  // the one person whose integration would break — can be told before the
+  // sunset (services/apiDeprecationNotices). `routes` holds the declared
+  // Express routes ('GET /api/cellars/:id'), as ApiDeprecatedUse counts them,
+  // never a requested path. `sunset` is the SUNSET the record belongs to: a
+  // record from an earlier deprecation, or from before the date moved, starts
+  // over. Absent on a token that never called one; exported and deleted with
+  // the token, and cleared once its sunset has passed.
+  deprecatedUse: {
+    sunset: { type: Date },
+    firstAt: { type: Date },
+    lastAt: { type: Date },
+    routes: { type: [String], default: undefined },
+    // When the first notice and each reminder (by days before the sunset)
+    // went out. Each is stamped by an atomic conditional update BEFORE it is
+    // sent, so no notice can go twice.
+    notifiedAt: { type: Date },
+    reminders: {
+      type: [new mongoose.Schema({ daysBefore: Number, at: Date }, { _id: false })],
+      default: undefined,
+    },
   },
 });
 

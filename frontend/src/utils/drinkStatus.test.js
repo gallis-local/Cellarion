@@ -31,7 +31,7 @@ describe('getMaturityStatus', () => {
     expect(getMaturityStatus({ status: 'reviewed' })).toBeNull();
   });
 
-  // Release audit 2026-10-13: a late phase with no end fell through to "Optimal maturity".
+  // A late phase with no end fell through to "Optimal maturity".
   test('a late phase with no end stays late once it has begun', () => {
     const profile = { status: 'reviewed', earlyFrom: 2020, earlyUntil: 2023, peakFrom: 2024, peakUntil: 2027, lateFrom: 2028 };
     expect(getMaturityStatus(profile, undefined, 2027).status).toBe('peak');
@@ -273,5 +273,21 @@ describe('getBottleDrinkStatus', () => {
   test('relative (NV) profile still resolved via anchor year when no personal window', () => {
     const nvProfile = { status: 'reviewed', relative: true, peakFrom: 2, peakUntil: 4 };
     expect(getBottleDrinkStatus({}, nvProfile, CURRENT_YEAR - 3).status).toBe('peak');
+  });
+});
+
+describe('getMaturityStatus: a relative (NV) window with no year to count from', () => {
+  const nvProfile = { status: 'reviewed', relative: true, earlyFrom: 0, earlyUntil: 2, peakFrom: 2, peakUntil: 4, lateFrom: 4, lateUntil: 6 };
+
+  test.each([['no anchor year', undefined], ['a null anchor year', null], ['an anchor year that is not a number', NaN]])(
+    'has no status with %s: its numbers are offsets, not calendar years',
+    (name, anchorYear) => {
+      expect(getMaturityStatus(nvProfile, anchorYear)).toBeNull();
+    },
+  );
+
+  test('an ordinary vintage window needs no anchor year', () => {
+    const year = new Date().getFullYear();
+    expect(getMaturityStatus({ status: 'reviewed', peakFrom: year - 1, peakUntil: year + 1 }).status).toBe('peak');
   });
 });

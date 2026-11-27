@@ -3,11 +3,12 @@ import './ImageCarousel.css';
 import AuthImage from './AuthImage';
 import { API_URL } from '../api/apiConstants';
 import { useTranslation } from 'react-i18next';
+import { formatVintage } from '../utils/vintage';
 
-// The owner's own photo carries its review state as a small pill (discussion
-// #1227: "I don't know if some uploads have been rejected or are still
-// waiting"). Other people's photos only reach a gallery once published, so
-// the pill is for `mine` rows only; rejected rows never reach the carousel.
+// The owner's own photo carries its review state as a small pill, so a photo
+// still waiting is never taken for a rejected one. Other people's photos only
+// reach a gallery once published, so the pill is for `mine` rows only;
+// rejected rows never reach the carousel.
 const PHOTO_STATE = { uploaded: 'queued', processing: 'processing', processed: 'review', approved: 'published' };
 const STATE_FALLBACK = { queued: 'Queued', processing: 'Processing…', review: 'Awaiting review', published: 'Published' };
 
@@ -59,29 +60,31 @@ function ImageCarousel({ images, size = 'medium', vintage, defaultImageId, onSet
         {currentImage.credit && (
           <div className="carousel-credit">© {currentImage.credit}</div>
         )}
-        {/* A wine-level photo of ANOTHER vintage says which year it shows
-            (support ticket 2026-10-09): the year on the label is not this
+        {/* A wine-level photo of ANOTHER vintage says which year it shows:
+            the year on the label is not this
             bottle's. Same-vintage and untagged photos carry nothing. */}
         {vintage && currentImage.vintage && String(currentImage.vintage) !== String(vintage) && (
           <div className="carousel-vintage" role="note">
-            {t('imageGallery.otherVintage', '{{vintage}} label', { vintage: currentImage.vintage })}
+            {t('imageGallery.otherVintage', '{{vintage}} label', { vintage: formatVintage(currentImage.vintage, t) })}
           </div>
         )}
-        {/* Removing a photo (ticket 6a865f60). Which verb you get depends on
+        {/* Removing a photo. Which verb you get depends on
             whether the photo is still only yours: once it is the wine's
             picture in the shared registry, taking it down changes other
             people's pages, so it becomes a report an admin decides. */}
         {(onDelete || onReport) && (() => {
-          // The gallery now says `mine` itself (audit 2026-09 D05-1: uploader
-          // ids no longer travel); the uploadedBy comparison stays for any
-          // older payload shape.
+          // The gallery says `mine` itself (uploader ids do not travel); the
+          // uploadedBy comparison stays for an older payload shape.
           const mine = currentImage.mine === true || (currentUserId && currentImage.uploadedBy != null && String(currentImage.uploadedBy) === String(currentUserId));
           const canDelete = mine && !currentImage.assignedToWine;
+          // Without the default star it takes the corner, not the star's
+          // place-keeping spot over the status badge.
+          const actionClass = `carousel-action-btn${onSetDefault ? '' : ' carousel-action-btn--corner'}`;
           if (canDelete && onDelete) {
             return (
               <button
                 type="button"
-                className="carousel-action-btn"
+                className={actionClass}
                 onClick={() => onDelete(currentImage)}
                 aria-label="Delete this photo"
                 title="Delete this photo"
@@ -96,7 +99,7 @@ function ImageCarousel({ images, size = 'medium', vintage, defaultImageId, onSet
           return (
             <button
               type="button"
-              className="carousel-action-btn"
+              className={actionClass}
               onClick={() => onReport(currentImage)}
               aria-label="Report this photo"
               title="Report this photo"

@@ -86,6 +86,15 @@ connectDB().then(async () => {
   // A config that cannot be read keeps its code defaults; the boot goes on.
   await loadRuntimeConfig();
 
+  // The day this install started recording when accounts are used: set once,
+  // the first time a version with User.lastActiveAt boots (services/lastActive).
+  // The inactive-account rule never counts an account as unused from earlier.
+  try {
+    await require('./src/services/lastActive').ensureTrackingSince();
+  } catch (err) {
+    console.error('[boot] Could not record the last-active tracking start:', err.message);
+  }
+
   // Migration: drop old non-partial cellar name index so Mongoose can create the
   // updated partial one (user_1_name_1 with partialFilterExpression: {deletedAt: null}).
   // Only drop when the existing index actually lacks the partial filter — the new
@@ -103,9 +112,9 @@ connectDB().then(async () => {
     // Collection doesn't exist yet (first deploy) — nothing to do
   }
 
-  // Migration: remove explicit rfidTag nulls written by the old unlink flow.
-  // The unique sparse index indexes explicit nulls, so a second null would
-  // fail with E11000; the unlink route now $unsets the field instead.
+  // Migration: remove explicit rfidTag nulls from stored racks. The unique
+  // sparse index indexes explicit nulls, so a second null would fail with
+  // E11000; the unlink route $unsets the field, it never writes null.
   try {
     const mongoose = require('mongoose');
     const res = await mongoose.connection.collection('racks')
@@ -117,7 +126,7 @@ connectDB().then(async () => {
     // Collection doesn't exist yet — nothing to do
   }
 
-  // Migration: photos learn their bottle's vintage (support ticket 2026-10-09).
+  // Migration: photos learn their bottle's vintage.
   // Rows written before the field carry no `vintage` key; after this, every
   // row does, so a later boot finds nothing to do.
   try {
@@ -155,8 +164,8 @@ connectDB().then(async () => {
   // scan is an unanchored regex over the whole registry, so it runs ONCE: a
   // SiteConfig marker records a complete run (names created since get their
   // keys at creation), and a run with failures leaves no marker and retries
-  // next boot (audit 2026-10-14). A restore from backup brings the marker
-  // back with the data it describes.
+  // next boot. A restore from backup brings the marker back with the data it
+  // describes.
   try {
     const SiteConfig = require('./src/models/SiteConfig');
     const MARKER = 'migration.starGradeRekey';
@@ -179,10 +188,69 @@ connectDB().then(async () => {
     console.error('[migration] Star-grade re-key failed (will retry next boot):', err.message);
   }
 
+  // Barcodes onto the wine (services/barcodeRegistry.js), once: every barcode
+  // members' bottles carry is attached to the public wine most of them name.
+  // The unique index is built before the server listens, so one barcode can
+  // only land on one wine; the backfill itself runs in the background, since
+  // the lookup falls back to members' bottles until it is done.
+  try {
+    const SiteConfig = require('./src/models/SiteConfig');
+    const MARKER = 'migration.barcodesOnWine';
+    if (!(await SiteConfig.exists({ key: MARKER }))) {
+      await require('./src/models/WineDefinition').init();
+      require('./src/services/barcodeRegistry').backfillBarcodes()
+        .then(async (r) => {
+          console.log(`[migration] Barcodes onto the wine: ${JSON.stringify(r)}`);
+          await SiteConfig.updateOne(
+            { key: MARKER },
+            { $set: { value: { at: new Date(), ...r }, updatedAt: new Date() } },
+            { upsert: true },
+          );
+        })
+        .catch((err) => console.error('[migration] Barcodes onto the wine failed (will retry next boot):', err.message));
+    }
+  } catch (err) {
+    console.error('[migration] Barcodes onto the wine: the index could not be built (will retry next boot):', err.message);
+  }
+
   try {
     await searchService.initialize();
   } catch (err) {
     console.warn('Meilisearch initialization failed, continuing with MongoDB search:', err.message);
+  }
+
+  // The classification taxonomy (src/data/classifications.json) on a registry
+  // that has none yet: a fresh install, or the first boot after the feature
+  // shipped. Idempotent; the migration script re-seeds on --apply.
+  try {
+    const seeded = await require('./src/services/classificationOps').ensureClassificationSeed();
+    if (seeded.seeded) console.log(`[seed] classification taxonomy: ${seeded.created} rows`);
+  } catch (err) {
+    console.error('[seed] classification taxonomy failed (will retry next boot):', err.message);
+  }
+
+  // The standard wine-record fields (ABV, Closure), each one the registry has
+  // no row for yet — a fresh install, or an install whose admin had added
+  // fields of their own before this shipped. A name the admin already decided
+  // about is never touched. Idempotent.
+  try {
+    const keys = await require('./src/services/registryKeySeed').ensureStandardKeys();
+    if (keys.seeded) console.log(`[seed] standard registry fields: ${keys.created}`);
+  } catch (err) {
+    console.error('[seed] standard registry fields failed (will retry next boot):', err.message);
+  }
+
+  // The label sweetness terms (src/data/sweetness-terms.json) on a registry
+  // that has none yet — the same rule as the classification seed above.
+  try {
+    const sweetnessOps = require('./src/services/sweetnessOps');
+    const terms = await sweetnessOps.ensureSweetnessSeed();
+    if (terms.seeded) console.log(`[seed] sweetness terms: ${terms.created} rows`);
+    // Warm from the first request: the display name reads a term's other
+    // spellings from the in-memory copy (sweetnessOps termSpellings).
+    await sweetnessOps.loadTerms();
+  } catch (err) {
+    console.error('[seed] sweetness terms failed (will retry next boot):', err.message);
   }
 
   // Purge expired soft-deleted reply texts on startup and every 24h

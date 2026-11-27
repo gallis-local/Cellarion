@@ -11,6 +11,7 @@ const { logAudit } = require('../services/audit');
 const eventBus = require('../services/eventBus');
 const { revokeOAuthConnectionsForUser } = require('../services/mcpOAuth');
 const { CURRENT_PRIVACY_POLICY_VERSION } = require('../config/legal');
+const { errorBody } = require('../config/errorCodes');
 const rateLimitsConfig = require('../config/rateLimits');
 const { sendVerificationEmail, sendPasswordResetEmail, sendAccountLockoutAlert, EMAIL_VERIFICATION_ENABLED } = require('../services/mailgun');
 const { isAccountLocked, isAccountLockedNow, recordLoginFailure, resetLoginAttempts } = require('../utils/loginAttempts');
@@ -25,13 +26,14 @@ const {
   removeSession, revokeAllSessions, sessionForCookie, hashRefreshToken,
 } = require('../services/authTokens');
 const { resolvePendingShares } = require('../services/pendingShares');
+const { setSignupBinding, hasSignupBinding, clearSignupBinding } = require('../services/signupBinding');
 const { createDemoAccountWithinCeiling } = require('../services/demoAccount');
 
 const router = express.Router();
 
 // Dummy hash compared on login when the identifier matches no account, so the
 // response time is indistinguishable from a real wrong-password compare and
-// cannot be used for account enumeration (L-1). It MUST be generated at
+// cannot be used for account enumeration. It MUST be generated at
 // User.BCRYPT_COST (12) — a cheaper hash compares ~4x faster and reopens the
 // timing oracle. Regenerate if the cost ever changes:
 //   node -e "console.log(require('bcrypt').hashSync(require('crypto').randomBytes(32).toString('hex'), 12))"
@@ -40,8 +42,8 @@ if (bcrypt.getRounds(DUMMY_HASH) !== User.BCRYPT_COST) {
   throw new Error(`DUMMY_HASH cost ${bcrypt.getRounds(DUMMY_HASH)} != BCRYPT_COST ${User.BCRYPT_COST} — regenerate DUMMY_HASH in routes/auth.js`);
 }
 
-// Enumeration-timing parity for /forgot-password + /resend-verification
-// (security audit L-8). The "account found" branch pays a token-generation +
+// Enumeration-timing parity for /forgot-password + /resend-verification.
+// The "account found" branch pays a token-generation +
 // user.save() write that the early-return branch skips, making a real account
 // measurably slower — a timing oracle the equalized login flow already closed.
 // A no-op write against a fresh random _id matches nothing (writes no data) but
@@ -119,7 +121,7 @@ router.post('/register', authLimiter, async (req, res) => {
     // fails with a 400 instead of throwing on .toLowerCase() (same guard as login)
     if (typeof username !== 'string' || typeof email !== 'string' || typeof password !== 'string'
         || !username || !email || !password) {
-      return res.status(400).json({ error: 'Username, email, and password are required' });
+      return res.status(400).json(errorBody('registration_fields_required'));
     }
 
     // Constrain the username: 3–30 chars, and only letters/numbers/._- . This
@@ -130,11 +132,11 @@ router.post('/register', authLimiter, async (req, res) => {
     // (utils/deletedUser.js) gets the same answer, so nothing says it is special.
     const uname = typeof username === 'string' ? username.trim() : '';
     if (uname.length < 3 || uname.length > 30 || !/^[a-z0-9_.-]+$/i.test(uname) || isReservedUsername(uname)) {
-      return res.status(400).json({ error: 'Username must be 3–30 characters and use only letters, numbers, dots, underscores, or hyphens.' });
+      return res.status(400).json(errorBody('username_invalid'));
     }
 
     if (!consentPrivacyPolicy || !consentDataProcessing) {
-      return res.status(400).json({ error: 'You must accept the privacy policy and consent to data processing to register' });
+      return res.status(400).json(errorBody('consent_required'));
     }
 
     // Check if user already exists (use generic message to prevent account enumeration).
@@ -147,7 +149,7 @@ router.post('/register', authLimiter, async (req, res) => {
     if (existingUser) {
       // The code lets the app say what to try next in the user's language; it
       // is the same for a taken username and a taken email (no enumeration).
-      return res.status(400).json({ error: 'Registration failed. Please check your details and try again.', code: 'REGISTRATION_REJECTED' });
+      return res.status(400).json(errorBody('REGISTRATION_REJECTED'));
     }
 
     // Create new user
@@ -184,6 +186,10 @@ router.post('/register', authLimiter, async (req, res) => {
         { username: user.username, email: user.email }
       );
 
+      // This browser registered the account: its verification link may sign
+      // the member in here, and only here (services/signupBinding).
+      setSignupBinding(res, user._id);
+
       return res.status(202).json({
         message: 'Registration successful. Please check your email to verify your account.',
         email: user.email
@@ -202,10 +208,10 @@ router.post('/register', authLimiter, async (req, res) => {
     // Resolve any pending cellar shares for this email
     resolvePendingShares(user).catch(() => {});
 
-    // persistent, as /login and /refresh answer it: without it the app read the
-    // new account's session as browser-only and discarded the profile kept for
-    // an offline start (release audit 2026-09-27, L). Registration issues a
-    // "remember me" session (issueTokens' default).
+    // persistent, as /login and /refresh answer it: without it the app reads
+    // the new account's session as browser-only and discards the profile kept
+    // for an offline start. Registration issues a "remember me" session
+    // (issueTokens' default).
     res.status(201).json({
       token: accessToken,
       user: user.toJSON(),
@@ -219,7 +225,7 @@ router.post('/register', authLimiter, async (req, res) => {
     // Two registrations racing for one username/email: the loser collides on
     // the unique index. Same answer as the pre-check, not a 500.
     if (error.code === 11000) {
-      return res.status(400).json({ error: 'Registration failed. Please check your details and try again.', code: 'REGISTRATION_REJECTED' });
+      return res.status(400).json(errorBody('REGISTRATION_REJECTED'));
     }
     console.error('Registration error:', error);
     res.status(500).json({ error: 'Registration failed' });
@@ -271,7 +277,7 @@ router.post('/login', authLimiter, async (req, res) => {
     // 500 (and a NoSQL operator would otherwise reach the query). Coercing to
     // string both fixes the crash and neutralises operator injection.
     if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
-      return res.status(400).json({ error: 'Username and password are required' });
+      return res.status(400).json(errorBody('credentials_required'));
     }
 
     // Find user by username or email. Trimmed: a phone keyboard adds a space
@@ -300,11 +306,11 @@ router.post('/login', authLimiter, async (req, res) => {
         { type: 'user', id: user._id },
         { username: user.username }
       );
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(401).json(errorBody('invalid_credentials'));
     }
 
     if (!user) {
-      // Audit 2026-09 D04-4: the typed identifier is attacker-chosen text and
+      // The typed identifier is attacker-chosen text and
       // often a real e-mail from a breach list; every admin can read the audit
       // log. Keep what forensics needs — shape + a short hash to correlate
       // repeats — never the raw string.
@@ -313,7 +319,7 @@ router.post('/login', authLimiter, async (req, res) => {
         identifierType: typed.includes('@') ? 'email' : 'username',
         identifierHash: crypto.createHash('sha256').update(typed).digest('hex').slice(0, 16),
       });
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(401).json(errorBody('invalid_credentials'));
     }
 
     if (!isMatch) {
@@ -341,7 +347,7 @@ router.post('/login', authLimiter, async (req, res) => {
         { type: 'user', id: user._id },
         { username: user.username }
       );
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(401).json(errorBody('invalid_credentials'));
     }
 
     // Block login until email is verified (only when verification is enabled)
@@ -350,11 +356,7 @@ router.post('/login', authLimiter, async (req, res) => {
         { type: 'user', id: user._id },
         { username: user.username }
       );
-      return res.status(403).json({
-        error: 'Please verify your email address before logging in.',
-        code: 'EMAIL_NOT_VERIFIED',
-        email: user.email
-      });
+      return res.status(403).json(errorBody('EMAIL_NOT_VERIFIED', { email: user.email }));
     }
 
     // Successful login: clear any failed-attempt counter the user had built up.
@@ -364,6 +366,8 @@ router.post('/login', authLimiter, async (req, res) => {
     }
 
     const accessToken = await issueTokens(user, res, { rememberMe: rememberMe !== false, client: clientHint(req) });
+    // A signup binding has done its job once someone signs in on this browser.
+    if (req.cookies?.signupBinding) clearSignupBinding(res);
 
     logAudit(req, 'auth.login.success',
       { type: 'user', id: user._id },
@@ -384,24 +388,24 @@ router.post('/login', authLimiter, async (req, res) => {
   }
 });
 
-// GET /api/auth/verify-email?token=:token - Verify email address
-// POST (not GET) and issues NO session (security audit M-1). The email link
-// points at the SPA page /verify-email?token=…, which now POSTs the token here
-// from same-origin JS. This closes two holes in the old session-issuing GET:
-//   - login-CSRF / session-fixation: a cross-site GET to the old endpoint (or
-//     to the SPA page) let an attacker's verification token Set-Cookie the
-//     attacker's refresh cookie into a victim's browser (SameSite=Lax does not
-//     block storing it), silently logging the victim into the attacker's
-//     account. A POST is not triggerable by a plain cross-site navigation, and
-//     issuing no session removes the fixation entirely — the user logs in
-//     normally afterward.
+// POST /api/auth/verify-email - Verify email address
+// POST, not GET. The email link points at the SPA page
+// /verify-email?token=…, which POSTs the token here from same-origin JS:
 //   - one-time-token burn by mail-security prefetchers: link scanners issue
-//     GETs, not the SPA's POST, so they no longer consume the token.
+//     GETs, not the SPA's POST, so they do not consume the token.
+//   - login-CSRF / session-fixation: anyone can get a browser to open the SPA
+//     page with THEIR token, so a session issued here for whoever opens the
+//     link would silently sign a victim in to the attacker's account. A
+//     session is therefore issued ONLY when the request carries the signup
+//     binding of this very account — the httpOnly cookie its registration set
+//     in that browser (services/signupBinding). An attacker cannot put that
+//     cookie in someone else's browser. Everywhere else the link only
+//     verifies, and the member signs in normally afterward.
 router.post('/verify-email', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   const { token } = req.body || {};
 
-  // typeof, not truthiness (security audit 2026-07-25 L-2): a JSON body value
+  // typeof, not truthiness: a JSON body value
   // like {"token":{"$ne":null}} is truthy, and crypto's update() then throws a
   // TypeError that the catch below turns into a 500 with a full stack trace.
   // Nothing is exploitable — it throws BEFORE the Mongo query, so no operator
@@ -415,8 +419,10 @@ router.post('/verify-email', async (req, res) => {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     const user = await User.findOne({ emailVerificationTokenHash: tokenHash });
 
-    if (!user || !user.validateEmailVerificationToken(token)) {
-      return res.status(400).json({ error: 'Invalid or expired verification token' });
+    // A system account (the "[deleted]" sentinel) is never verified or signed
+    // in through a link, whatever token its row may hold.
+    if (!user || isReservedUsername(user.username) || !user.validateEmailVerificationToken(token)) {
+      return res.status(400).json(errorBody('verification_token_invalid'));
     }
 
     user.emailVerified = true;
@@ -432,8 +438,36 @@ router.post('/verify-email', async (req, res) => {
     // Resolve any pending cellar shares for this email
     resolvePendingShares(user).catch(() => {});
 
-    // No session is issued here — the client sends the user to log in.
-    res.json({ verified: true, message: 'Email verified successfully. Please log in.' });
+    // The browser that registered this account signs straight in (see the
+    // route comment). Not a demo or a locked account, nor one being deleted.
+    // A binding for another account (this browser registered one of its own)
+    // is left in place for that account's link.
+    const bound = hasSignupBinding(req, user._id);
+    if (bound) clearSignupBinding(res);
+    const signIn = bound && !user.isDemo && !user.deletionScheduledFor && !isAccountLocked(user);
+    if (!signIn) {
+      return res.json({ verified: true, message: 'Email verified successfully. Please log in.' });
+    }
+
+    // The email IS verified at this point: a failed sign-in falls back to the
+    // plain answer (log in normally) instead of reporting a failed verification.
+    let accessToken;
+    try {
+      if (resetLoginAttempts(user)) {
+        try { await user.save(); } catch (err) { console.warn('Failed to reset login-attempt counter:', err.message); }
+      }
+      accessToken = await issueTokens(user, res, { rememberMe: true, client: clientHint(req) });
+    } catch (err) {
+      console.error('Sign-in after email verification failed:', err.message);
+      return res.json({ verified: true, message: 'Email verified successfully. Please log in.' });
+    }
+    logAudit(req, 'auth.login.success',
+      { type: 'user', id: user._id },
+      { username: user.username, via: 'email_verification' }
+    );
+    const userJson = user.toJSON();
+    userJson.isSuperAdmin = checkIsSuperAdmin(req, user.email);
+    res.json({ verified: true, token: accessToken, persistent: true, user: userJson });
   } catch (error) {
     console.error('Email verification error:', error);
     res.status(500).json({ error: 'Email verification failed' });
@@ -454,10 +488,12 @@ router.post('/resend-verification', resendLimiter, async (req, res) => {
   const genericResponse = { message: 'If that email exists and is unverified, a new link has been sent.' };
 
   try {
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
 
-    if (!user || user.emailVerified || !EMAIL_VERIFICATION_ENABLED) {
-      await equalizeLookupTiming(); // L-8: match the found-branch write cost
+    // A system account answers like an unknown address: its links would only
+    // land in an outgoing-mail log, where whoever reads it could sign in as it.
+    if (!user || isReservedUsername(user.username) || user.emailVerified || !EMAIL_VERIFICATION_ENABLED) {
+      await equalizeLookupTiming(); // match the found-branch write cost
       return res.status(200).json(genericResponse);
     }
 
@@ -482,12 +518,13 @@ router.post('/resend-verification', resendLimiter, async (req, res) => {
 
 // Rate limiters for refresh — 30 per 15 min for one refresh token.
 //
-// Keyed on the token, not the address (scaling audit 2026-09-25): many people
+// Keyed on the token, not the address: many people
 // can share one address — a mobile carrier's NAT, an office — and a per-IP
 // bucket made their refreshes compete, with a 429 for whoever came last.
 // Every successful refresh rotates the token, so this bounds a client retrying
 // the SAME token (a retry loop against a failing server), which is what needs
-// bounding. A request without a cookie falls back to its address.
+// bounding. A request without a cookie never reaches the limiters (see
+// noCookieIsNotAnAttempt below); the address fallback stays for safety.
 const refreshKey = (req) => {
   const raw = req.cookies?.refreshToken;
   return raw ? `rt:${hashRefreshToken(raw).slice(0, 32)}` : `ip:${rateLimitKey(req)}`;
@@ -515,8 +552,19 @@ const refreshIpLimiter = rateLimit({
   }
 });
 
+// A probe with no cookie is not an attempt at anything: the app sends one on
+// every cold start to learn whether a session exists, so every signed-out
+// visitor, and every crawler that executes the app, sends one per page view.
+// Answered before the limiters so it is counted nowhere — counted, a crawler
+// rendering public wine pages tripped the 30-per-address bucket within a
+// minute and was answered 429 for the rest of its crawl.
+const noCookieIsNotAnAttempt = (req, res, next) => {
+  if (!req.cookies?.refreshToken) return res.status(401).json({ error: 'No refresh token' });
+  next();
+};
+
 // POST /api/auth/refresh - Issue new access token using httpOnly refresh token cookie
-router.post('/refresh', refreshIpLimiter, refreshLimiter, async (req, res) => {
+router.post('/refresh', noCookieIsNotAnAttempt, refreshIpLimiter, refreshLimiter, async (req, res) => {
   const incomingToken = req.cookies?.refreshToken;
   if (!incomingToken) {
     return res.status(401).json({ error: 'No refresh token' });
@@ -570,15 +618,15 @@ router.post('/refresh', refreshIpLimiter, refreshLimiter, async (req, res) => {
     const accessToken = await issueTokens(user, res, { session });
 
     // persistent: whether this device's session is a "remember me" one. The
-    // cookie is httpOnly, so the app cannot see it — offline mode (#1355) only
+    // cookie is httpOnly, so the app cannot see it — offline mode only
     // allows an offline start for a session that survives closing the browser.
     res.json({ token: accessToken, persistent: session.persistent !== false });
   } catch (error) {
     // A server-side failure — the database mid-restart during a deploy, a
     // save racing a login on another device — says nothing about the
     // session. Answer "try again" and KEEP the cookie: nothing was rotated,
-    // so the token the client holds is still the live one. This used to
-    // clear the cookie and answer 401, signing people out on any hiccup.
+    // so the token the client holds is still the live one. Clearing it here
+    // would sign people out on any hiccup.
     console.error('Refresh error:', error);
     res.setHeader('Retry-After', '5');
     res.status(503).json({ error: 'Could not refresh the session right now, please try again' });
@@ -633,8 +681,8 @@ router.post('/change-password', requireAuth, requireNonDemo, authLimiter, async 
       client: clientHint(req),
     });
     // Revoke connected AI assistants (OAuth consent grants) — a third-party
-    // grant must not outlive the "secure my account" action (security report
-    // 2026-08-27). Personal API tokens (HA, climate) keep PAT semantics.
+    // grant must not outlive the "secure my account" action. Personal API
+    // tokens (HA, climate) keep PAT semantics.
     const revokedConnections = await revokeOAuthConnectionsForUser(user._id);
 
     logAudit(req, 'auth.change_password',
@@ -660,11 +708,11 @@ router.post('/change-password', requireAuth, requireNonDemo, authLimiter, async 
 router.post('/logout', async (req, res) => {
   try {
     // Who is signing out: the bearer token when there is a valid one, else the
-    // httpOnly refresh cookie itself. An offline session (#1355) has no access
-    // token; when this route required one, logging out there wiped the device
-    // but left the server session and cookie alive — the next online start
-    // signed the same account straight back in. The cookie is SameSite=Lax,
-    // so another site cannot post this with it.
+    // httpOnly refresh cookie itself. An offline session has no access
+    // token; requiring one would wipe the device but leave the server session
+    // and cookie alive, and the next online start would sign the same account
+    // straight back in. The cookie is SameSite=Lax, so another site cannot
+    // post this with it.
     const raw = req.cookies?.refreshToken;
     const hash = raw ? hashRefreshToken(raw) : null;
     let user = null;
@@ -701,8 +749,10 @@ router.post('/logout', async (req, res) => {
     // keeps the cookie out of that request — but the browser would still honour
     // a deletion header in the response, signing the user out at their next
     // refresh (and, read as a rejection, wiping their offline copy). With no
-    // cookie there is nothing to clear (audit 2026-09-27 M5).
+    // cookie there is nothing to clear.
     if (hash) clearRefreshCookie(res);
+    // Signing out of a shared browser leaves no signup binding behind either.
+    if (req.cookies?.signupBinding) clearSignupBinding(res);
     res.json({ message: 'Logged out' });
   } catch (error) {
     console.error('Logout error:', error);
@@ -753,10 +803,11 @@ router.post('/forgot-password', forgotLimiter, async (req, res) => {
   }
 
   try {
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
 
-    if (!user) {
-      await equalizeLookupTiming(); // L-8: match the found-branch write cost
+    // A system account answers like an unknown address (see resend-verification).
+    if (!user || isReservedUsername(user.username)) {
+      await equalizeLookupTiming(); // match the found-branch write cost
       return res.status(200).json(genericResponse);
     }
 
@@ -785,7 +836,7 @@ router.post('/forgot-password', forgotLimiter, async (req, res) => {
 router.post('/reset-password', authLimiter, async (req, res) => {
   const { token, password } = req.body;
 
-  // typeof on the token for the same reason as /verify-email (L-2). `password`
+  // typeof on the token for the same reason as /verify-email. `password`
   // needs no guard here — Mongoose casts/validates it and answers 400.
   if (typeof token !== 'string' || !token || !password) {
     return res.status(400).json({ error: 'Token and new password are required' });
@@ -795,8 +846,8 @@ router.post('/reset-password', authLimiter, async (req, res) => {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     const user = await User.findOne({ passwordResetTokenHash: tokenHash });
 
-    if (!user || !user.validatePasswordResetToken(token)) {
-      return res.status(400).json({ error: 'Invalid or expired reset token' });
+    if (!user || isReservedUsername(user.username) || !user.validatePasswordResetToken(token)) {
+      return res.status(400).json(errorBody('reset_token_invalid'));
     }
 
     user.password = password;
@@ -812,8 +863,8 @@ router.post('/reset-password', authLimiter, async (req, res) => {
     await user.save();
     // Revoke connected AI assistants (OAuth consent grants): a password reset
     // is the user's explicit account-recovery signal, so a phished third-party
-    // grant must not survive it (security report 2026-08-27). Personal API
-    // tokens (HA, climate) carry a null oauthClientId and keep PAT semantics.
+    // grant must not survive it. Personal API tokens (HA, climate) carry a
+    // null oauthClientId and keep PAT semantics.
     const revokedConnections = await revokeOAuthConnectionsForUser(user._id);
 
     logAudit(req, 'auth.password_reset',

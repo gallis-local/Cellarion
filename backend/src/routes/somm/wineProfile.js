@@ -46,11 +46,11 @@ router.get('/schema', requireSommOrAdmin, (req, res) => {
 /**
  * PUT /api/somm/wine-profile/:wineId
  * Correct a wine's AI-generated tasting profile — and its structural type and
- * grapes (support ticket d4a1aef5). Sommelier/admin only.
+ * grapes. Sommelier/admin only.
  *
  * Field-level: an absent key leaves the field alone, an explicit null clears
- * it. That is deliberate — the ticket asks for the ability to drop prose the
- * curator does not trust while keeping the structured descriptors that are
+ * it. That is deliberate — a curator must be able to drop prose they
+ * do not trust while keeping the structured descriptors that are
  * right (and which, unlike the prose, are what the embedding text is built
  * from, so nulling a description costs semantic search nothing).
  *
@@ -58,7 +58,7 @@ router.get('/schema', requireSommOrAdmin, (req, res) => {
  * permanently exempts it from enrichmentJob re-generation in both modes, and
  * stamps profileReviewedAt so the row also leaves the admin low-confidence
  * queue. A write that ONLY clears does neither — the wine stays eligible for
- * re-enrichment (ticket d49ca3af). Type/grape corrections never touch the
+ * re-enrichment. Type/grape corrections never touch the
  * profile's provenance; grape names resolve against the taxonomy match-only.
  */
 router.put('/:wineId', requireSommOrAdmin, async (req, res) => {
@@ -79,7 +79,7 @@ router.put('/:wineId', requireSommOrAdmin, async (req, res) => {
     }
 
     const wine = await WineDefinition.findById(req.params.wineId);
-    // A user's private draft is nobody's curation work (draft design 2026-09-12).
+    // A user's private draft is nobody's curation work.
     if (!wine || wine.draft === true) return res.status(404).json({ error: 'Wine not found' });
 
     // A colour the wine's (resulting) type cannot carry is refused, not
@@ -92,10 +92,10 @@ router.put('/:wineId', requireSommOrAdmin, async (req, res) => {
     await wine.save();
 
     // The structured descriptors feed buildEmbeddingText, so both indexes are
-    // now stale. Meili is nudged directly; the vectors are re-embedded inline —
-    // relying on "the next incremental run" was wrong because NO run is
-    // scheduled, so a correction stayed invisible to semantic search until a
-    // manual job (mirrors enrichmentJob's own post-write re-embed).
+    // now stale. Meili is nudged directly; the vectors are re-embedded inline,
+    // so a correction reaches semantic search at once rather than at the weekly
+    // incremental sweep (services/scheduler) — mirrors enrichmentJob's own
+    // post-write re-embed.
     searchService.indexWine(wine._id).catch(() => {});
     require('../../services/embeddingJob').reembedActiveVintages(wine._id).catch(() => {});
 
@@ -114,10 +114,14 @@ router.put('/:wineId', requireSommOrAdmin, async (req, res) => {
       colour: wine.colour || null,
       grapes: wine.grapes,
       // The write path says when it stored a different name than was sent
-      // (synonym/static-map canonicalisation — ticket 2026-08-11).
+      // (synonym/static-map canonicalisation).
       grapeSubstitutions,
     });
   } catch (error) {
+    // Two saves of the same wine at once: the second finds it changed under it.
+    if (error.name === 'VersionError') {
+      return res.status(409).json({ error: 'This wine was modified by another request. Please refresh and try again.' });
+    }
     console.error('Update wine profile error:', error);
     res.status(500).json({ error: 'Failed to update tasting profile' });
   }

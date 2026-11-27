@@ -6,29 +6,29 @@ import { searchWines, resolveWine, identifyWineByText, lookupBarcode, getWine } 
 import { adoptRegistryWine } from '../api/bridge';
 import { getRacks } from '../api/racks';
 import { track } from '../utils/track';
-import DialogBox from '../components/DialogBox';
 import useLabelScanner from '../hooks/useLabelScanner';
 import useTapToFocus from '../hooks/useTapToFocus';
-import CameraFocusRing from '../components/CameraFocusRing';
 import useBarcodeWatch from '../hooks/useBarcodeWatch';
-import { CURRENCIES } from '../config/currencies';
-import { BOTTLE_SIZES, bottleSizeLabel } from '../config/bottleSizes';
-import { validatePriceSanity } from '../utils/priceValidation';
 import { validateDrinkWindowFields, DRINK_YEAR_MIN, DRINK_YEAR_MAX } from '../utils/drinkStatus';
-import ImageUpload from '../components/ImageUpload';
-import ImageGallery from '../components/ImageGallery';
 import RatingInput from '../components/RatingInput';
 import WineImage from '../components/WineImage';
 import SimilarWinesModal from '../components/SimilarWinesModal';
 import AddBottleCustomFields, { buildPersonalDataPayload } from '../components/bottle/AddBottleCustomFields';
-import { WINE_TYPES } from '../config/wineTypes';
-import { swatchType, wineTypeLabel, isStyleType, colourLabel, WINE_COLOURS } from '../utils/wineColour';
+import { swatchType, wineTypeLabel } from '../utils/wineColour';
 import './AddBottle.css';
+import ScanWineCard from '../components/addBottle/ScanWineCard';
+import ManualWineForm from '../components/addBottle/ManualWineForm';
+import BottleCoreFields from '../components/addBottle/BottleCoreFields';
+import BottlePhotoSection from '../components/addBottle/BottlePhotoSection';
+import LabelCameraModal from '../components/addBottle/LabelCameraModal';
+import ScanLabelButtons from '../components/ScanLabelButtons';
+import AddBottleDialogs from '../components/addBottle/AddBottleDialogs';
 import { backLabel } from '../utils/backLabel';
 import { useBackToClose } from '../utils/useBackToClose';
 import { bottleNoticeName } from '../components/BottleUndoNotice';
 import { handOverBack } from '../hooks/useHandedOverState';
 import { afterPopupEntryGone, isOnPopupEntry } from '../utils/useBackToClose';
+import { parseVintageInput } from '../utils/vintage';
 
 // How this device last started adding a bottle: 'camera' (the label photo, the
 // default) or 'search' (typing the name). Per device on purpose — the same
@@ -147,7 +147,7 @@ function AddBottle() {
     consumedRating: '',
     consumedRatingScale: user?.preferences?.ratingScale || '5'
   });
-  // Custom fields typed on the form (user ticket 6ab05cca). Held here, written
+  // Custom fields typed on the form. Held here, written
   // only by the bottle POST — an abandoned form mints no keys and no entries,
   // the same discipline the wine itself follows. savedPersonalKeys is the
   // user's existing vocabulary, kept alongside so the payload builder can send
@@ -162,11 +162,11 @@ function AddBottle() {
   const [customFieldNotice, setCustomFieldNotice] = useState(null);
   const [uploadedImages, setUploadedImages] = useState([]);
   // How many public photos the registry holds, KEYED BY WINE ID. A single
-  // counter was wrong twice over: a passive reset effect runs a render late, so
-  // the first commit after a wine switch painted the previous wine's answer
-  // ("we already have a photo" for a wine that has none), and an out-of-order
-  // response could overwrite the current wine's count with a stale one. Keying
-  // makes both unrepresentable. Absent key = not fetched yet.
+  // counter would be wrong twice over: a passive reset effect runs a render
+  // late, so the first commit after a wine switch would paint the previous
+  // wine's answer ("we already have a photo" for a wine that has none), and an
+  // out-of-order response could overwrite the current wine's count with a
+  // stale one. Keying makes both unrepresentable. Absent key = not fetched yet.
   const [wineImageCounts, setWineImageCounts] = useState({});
   // Open when the mode was carried over, so its ticked box is in sight.
   const [showDetails, setShowDetails] = useState(startMode === 'onOrder' || startMode === 'history');
@@ -178,8 +178,7 @@ function AddBottle() {
 
   // Adding several bottles at once is precisely when missing these fields hurts:
   // the alternative is opening every bottle afterwards and typing the same note
-  // again. A support ticket arrived describing exactly that, from someone who
-  // never found the panel — so for a multi-bottle add we open it for them.
+  // again, and the panel is easy to miss — so for a multi-bottle add we open it.
   useEffect(() => {
     if (numBottles > 1 && !detailsTouchedRef.current) setShowDetails(true);
   }, [numBottles]);
@@ -193,9 +192,9 @@ function AddBottle() {
   // bottle of the batch — tracked here rather than by loop index, which a
   // retry resuming mid-batch would read as "already sent" when it never was.
   const wineFieldsSentRef = useRef(false);
-  // Post-add placing offer (issue #1055): { ids, count } once the save landed
+  // Post-add placing offer: { ids, count } once the save landed
   // in a cellar that has racks. Skippable, never blocking — "Not now" goes to
-  // the cellar page exactly as before.
+  // the cellar page, as an add into a cellar without racks does.
   const [placePrompt, setPlacePrompt] = useState(null);
   const imagesLinkedRef = useRef(false);
 
@@ -219,13 +218,13 @@ function AddBottle() {
   // ── Back-label rescue ──
   // Offered ONLY when the front pass came back incomplete (`extracted.partial`)
   // or unreadable (a 422, which still hands back a scanImageId). Optional and
-  // dismissible: skipping it must behave exactly as it did before this existed,
-  // and the form stays fully editable throughout.
+  // dismissible: skipping it must leave the add exactly as if it was never
+  // offered, and the form stays fully editable throughout.
   const [backOffer, setBackOffer] = useState(false);
   const [backScanImageId, setBackScanImageId] = useState(null);
   // The cross-field rule id when the scanned producer looks like a place or
-  // label text (v1.111.0); the ref holds the exact prefilled string so the
-  // back-label rescue can replace it if — and only if — the user left it alone.
+  // label text; the ref holds the exact prefilled string so the back-label
+  // rescue can replace it if — and only if — the user left it alone.
   const [producerSuspect, setProducerSuspect] = useState(null);
   const suspectProducerValueRef = useRef(null);
   // What the two labels disagreed about. Shown as a non-blocking note and
@@ -251,14 +250,14 @@ function AddBottle() {
     // commit can stamp it on the wine. If the extraction was wrong, that photo
     // is what lets a curator fix the registry entry later.
     setScanImageId(data.scanImageId || null);
-    // A HALF-READ label (one of name/producer empty) is a 200 now, not an
-    // error: the back label is offered as an optional way to fill the rest.
+    // A HALF-READ label (one of name/producer empty) is a 200, not an error:
+    // the back label is offered as an optional way to fill the rest.
     const partial = data.extracted?.partial === true;
     setBackOffer(partial);
     setBackScanImageId(null);
     setScanConflicts([]);
-    // A SUSPECT producer (the box holds a place or label text, not a winery —
-    // v1.111.0) is why this scan is partial even though every field is filled.
+    // A SUSPECT producer (the box holds a place or label text, not a winery)
+    // is why this scan is partial even though every field is filled.
     // The flag drives a visible note, and the ref remembers the exact string
     // so a back-scan producer may REPLACE it — but only while the user hasn't
     // edited the box (their typing always outranks both labels).
@@ -266,8 +265,8 @@ function AddBottle() {
     suspectProducerValueRef.current = data.extracted?.producer_suspect
       ? (data.extracted.producer || '') : null;
     if (partial) {
-      // Straight to the EDITABLE form, prefilled — never the read-only card
-      // (release-audit M-1): the card renders a blank title and its confirm
+      // Straight to the EDITABLE form, prefilled — never the read-only card:
+      // the card renders a blank title and its confirm
       // button can only 400 on the missing name/country. The form's own
       // validation speaks the user's language, producer stays optional, and
       // the back-label offer sits right above it.
@@ -348,7 +347,7 @@ function AddBottle() {
         if (!typed && fromMerged[key]) next[key] = fromMerged[key];
       }
       // A SUSPECT front producer is the one prefill the back label may
-      // REPLACE (audit M-1: fill-blanks-only left the flagged string in the
+      // REPLACE (fill-blanks-only left the flagged string in the
       // box and made the rescue inert) — but only while the box still holds
       // the exact prefilled string; any edit by the user outranks both labels.
       if (suspectValue
@@ -366,10 +365,10 @@ function AddBottle() {
   }, [scanResult]);
 
   const {
-    labelCam, labelScanning, labelFacing, setLabelFacing,
+    labelCam, labelScanning, setLabelFacing,
     labelVideoRef, labelCanvasRef,
     startCamera: startLabelCamera, startBackCamera: startBackLabelCamera,
-    stopCamera: stopLabelCamera, capturePhoto: captureLabelPhoto
+    stopCamera: stopLabelCamera, capturePhoto: captureLabelPhoto, scanFile: scanLabelFile
   } = useLabelScanner(apiFetch, {
     onScanSuccess: handleScanSuccess,
     onScanError: handleScanError,
@@ -508,11 +507,11 @@ function AddBottle() {
     imagesLinkedRef.current = false;
     wineFieldsSentRef.current = false;
     // A fresh new-wine choice starts with the draft toggle off — the earlier
-    // answer belonged to a different wine (audit 2026-09-12).
+    // answer belonged to a different wine.
     setCreateAsDraft(false);
     setPendingNewWine(wineData);
     // colour rides along: step 2 draws the wine the user just described.
-    setSelectedWine({ name: wineData.name, producer: wineData.producer, type: wineData.type, colour: wineData.colour || null });
+    setSelectedWine({ name: wineData.name, producer: wineData.producer, type: wineData.type, colour: wineData.colour || null, nonWine: wineData.category === 'other' });
     setBottleData(prev => ({ ...prev, vintage: carriedVintage || '' }));
     setScanResult(null);
     setLabelImage(null);
@@ -528,7 +527,7 @@ function AddBottle() {
   }, [clearAi]);
 
   // Resolve confirmed wine data against the registry (READ-ONLY — nothing is
-  // created in step 1 any more), handling the three response shapes: matched
+  // created in step 1), handling the three response shapes: matched
   // wine, soft-zone candidates, or no match (→ the data rides to the commit).
   const resolveSelectedWine = useCallback(async (wineData, carriedVintage, opts = {}) => {
     setError(null);
@@ -567,7 +566,7 @@ function AddBottle() {
       // resolve did not (the scan matcher looks from 0.75, the resolver's
       // "did you mean?" floor is 0.85). Ask instead of minting a duplicate.
       // The scan's match NEVER links by itself: it is one more candidate the
-      // user picks, exactly like the resolver's own (issue #1134).
+      // user picks, exactly like the resolver's own.
       if (opts.fallback?.wine) {
         setSoftCandidates([{ wine: opts.fallback.wine, score: opts.fallback.confidence || 0 }]);
         setSoftPending({ wineData, carriedVintage, queryLabel });
@@ -584,29 +583,27 @@ function AddBottle() {
   }, [apiFetch, t, applyResolvedWine, applyPendingNewWine, search]);
 
   // Confirm scan result — resolve the wine and go to bottle details. The
-  // label image is NOT part of the wine payload (the old find-or-create route
-  // ignored it, and it must not bloat the bottle commit): bottle photos go
+  // label image is NOT part of the wine payload (the resolve route ignores
+  // it, and it must not bloat the bottle commit): bottle photos go
   // through the separate /api/images upload + link-to-bottle flow.
   //
-  // Resolve on WHAT THE LABEL SAID — never on the matched row (issue #1134).
-  // This used to substitute `match.wine`'s name/producer/appellation wholesale
-  // whenever the scan matcher returned anything at all, which it does from
-  // 0.75. The card above still showed `extracted.name`, so a wine filed under
-  // its neighbour looked completely correct: a Mosel estate's Spätlese Alte
-  // Reben, Auslese and Spätlese Feinherb all committed to the Feinherb row and
-  // nothing on screen said so. Handing the scanned identity to the resolver
-  // puts the decision back on the one ladder that has a visible answer for
-  // every band — link at >=0.95, ASK between 0.85 and 0.95, and the scan's own
-  // match offered below that (see resolveSelectedWine).
+  // Resolve on WHAT THE LABEL SAID — never on the matched row. The scan
+  // matcher returns a match from 0.75 while the card above shows
+  // `extracted.name`, so taking `match.wine`'s name/producer/appellation
+  // would file a wine under its neighbour with nothing on screen saying so
+  // (an estate's Spätlese, Auslese and Spätlese Feinherb all on the Feinherb
+  // row). Handing the scanned identity to the resolver puts the decision on
+  // the one ladder that has a visible answer for every band — link at
+  // >=0.95, ASK between 0.85 and 0.95, and the scan's own match offered
+  // below that (see resolveSelectedWine).
   const handleConfirmScan = useCallback(async () => {
     const { extracted, match } = scanResult;
-    // country/type GAP-FILL from the matched row — never identity. The old
-    // matched branch substituted the whole identity, but it also quietly
-    // healed labels that state no country (registry rows always have one;
-    // the resolve endpoint hard-requires it) and typeless extractions
-    // (findOrCreateWine defaults an empty type to 'red'). Keep exactly that
-    // healing: the match fills only what the label did NOT state, and
-    // name/producer/appellation stay the label's own words.
+    // country/type GAP-FILL from the matched row — never identity. It heals
+    // labels that state no country (registry rows always have one; the
+    // resolve endpoint hard-requires it) and typeless extractions
+    // (findOrCreateWine defaults an empty type to 'red'): the match fills
+    // only what the label did NOT state, and name/producer/appellation stay
+    // the label's own words.
     await resolveSelectedWine(
       {
         name: extracted.name,
@@ -640,7 +637,7 @@ function AddBottle() {
   }, [scanResult]);
 
   // Confirm from the manual edit form.
-  // Producer is deliberately NOT required: an unreadable label used to be a
+  // Producer is deliberately NOT required: an unreadable label must not be a
   // dead end here, and the whole point of the pending-identity flow is that the
   // bottle saves anyway. A producerless payload simply can't score a registry
   // match (producer is 45% of the dedup composite), so the resolve returns
@@ -677,12 +674,11 @@ function AddBottle() {
 
   // Explicit search (Enter key or button). Registry search ONLY — no AI.
   //
-  // This used to fire identifyWineByText in parallel on every search, which
-  // both spent AI budget per keystroke-batch and (before identify-text became
-  // read-only) minted a registry wine for every guess, whether or not the user
-  // took it. AI is now something the user asks for via the "Can't find your
-  // wine?" row below, which also means the fast library results paint
-  // immediately instead of waiting behind a slower AI call.
+  // An AI call per search would spend AI budget on every keystroke-batch,
+  // whether or not the user takes its guess. AI is something the user asks
+  // for via the "Can't find your wine?" row below, which also means the fast
+  // library results paint immediately instead of waiting behind a slower AI
+  // call.
   const handleSearch = useCallback(() => {
     if (!search.trim()) { setWines([]); return; }
     const query = search.trim();
@@ -824,11 +820,15 @@ function AddBottle() {
     try {
       const res = await adoptRegistryWine(apiFetch, item.registryId);
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.wine) throw new Error(data.error || 'adopt failed');
+      if (!res.ok || !data.wine) throw Object.assign(new Error(data.error || 'adopt failed'), { code: data.code });
       setRegistryWines(prev => prev.filter(r => r.registryId !== item.registryId));
       handleSelectWine(data.wine);
-    } catch {
-      setAiSearchError(t('addBottle.registryAdoptFailed', 'The shared registry could not be reached. Try again in a minute, or add the wine by hand.'));
+    } catch (err) {
+      // A conflict is not "try again": a wine with this identity here is already
+      // linked to another registry wine, and the server says what to do.
+      setAiSearchError(err?.code === 'conflict' && err.message
+        ? err.message
+        : t('addBottle.registryAdoptFailed', 'The shared registry could not be reached. Try again in a minute, or add the wine by hand.'));
     } finally {
       setAdoptingId(null);
     }
@@ -845,7 +845,7 @@ function AddBottle() {
         <div className="wine-meta">
           {item.country && <span>{item.country}</span>}
           {item.region && <span>• {item.region}</span>}
-          {item.type && <span className={`wine-type-pill ${swatchType(item)}`}>{wineTypeLabel(item, t)}</span>}
+          {(item.type || item.nonWine) && <span className={`wine-type-pill ${swatchType(item)}`}>{wineTypeLabel(item, t)}</span>}
         </div>
         {item.grapes?.length > 0 && (
           <p className="wine-grapes">{item.grapes.join(', ')}</p>
@@ -858,9 +858,8 @@ function AddBottle() {
   );
 
   // The registry wine this scan matched, when it matched one. The scan card
-  // used to read `match` only inside handleConfirmScan, so a matched scan and
-  // an unmatched one looked identical and our existing photo was never shown —
-  // the user re-photographed a wine we already had a picture of. Showing it
+  // shows its photo, so a matched scan does not look like an unmatched one
+  // and nobody re-photographs a wine we already have a picture of. Showing it
   // next to their own shot also makes a WRONG match obvious while they are
   // still holding the bottle, which is the cheapest correction signal we get.
   const scanMatchedWine = scanResult?.match?.wine || null;
@@ -912,7 +911,7 @@ function AddBottle() {
         bottleId: first._id,
         imageIds: uploadedImages.map(img => img._id)
       })
-    }).catch(err => {
+    }).then(res => { if (!res.ok) throw new Error(`the server answered ${res.status}`); }).catch(err => {
       imagesLinkedRef.current = false; // let a retry attempt the link again
       console.error('Failed to link images:', err);
     });
@@ -923,11 +922,10 @@ function AddBottle() {
   const foundByBarcode = !!barcodeWineId && selectedWine?._id === barcodeWineId;
 
   // What the page that lists the new bottles says — "“X 2019” added" with
-  // "Add another bottle" (components/BottleAddedNotice). A newcomer adding a
-  // few wines in a row had to find the add button again after every save
-  // (newcomer walkthrough 2026-10-15). The name is the wine the server filed
-  // the bottles under (a "did you mean?" pick at commit can differ from what
-  // was typed).
+  // "Add another bottle" (components/BottleAddedNotice), so someone adding a
+  // few wines in a row need not find the add button again after every save.
+  // The name is the wine the server filed the bottles under (a "did you
+  // mean?" pick at commit can differ from what was typed).
   const addedNotice = () => {
     const created = createdBottlesRef.current.filter(Boolean);
     const first = created[0] || {};
@@ -941,9 +939,9 @@ function AddBottle() {
   // Where the bottles now are, said there. Opened from that very list (its
   // add buttons pass `cameFrom`), the page goes BACK to it — the list keeps
   // its place and Back from it leaves it, where a second copy of the list
-  // made the first Back dead (release audit 2026-10-16) — and the notice is
-  // handed over through sessionStorage. Otherwise the add page is replaced,
-  // so Back never lands on an emptied form.
+  // would make the first Back dead — and the notice is handed over through
+  // sessionStorage. Otherwise the add page is replaced, so Back never lands
+  // on an emptied form.
   // From a closing pop-up ("Place them now?", "did you mean?", the custom-
   // field notice) it first waits until that pop-up's own Back entry is gone;
   // still on it after the wait, going back would only close that entry, so
@@ -965,7 +963,7 @@ function AddBottle() {
   const goToCellarAdded = () => leaveTo(`/cellars/${cellarId}`);
   const leavePlacePrompt = () => { setPlacePrompt(null); goToCellarAdded(); };
   // Leaving without saving (Cancel, the back link): back to the list it came
-  // from too — a pushed copy of it made the first Back land on the emptied
+  // from too — a pushed copy of it would make the first Back land on the emptied
   // form. Bottles already saved (a save that stopped part-way) are said there.
   const leaveUnsaved = (e) => {
     if (createdBottlesRef.current.some(Boolean)) {
@@ -987,14 +985,13 @@ function AddBottle() {
   // can hold it back for one dialog and then resume exactly the same flow.
   const finishAdd = async () => {
     linkUploadedImages();
-    // Offer to place the new bottles now when the cellar has racks (issue
-    // #1055). One read; any failure to answer simply skips the offer.
+    // Offer to place the new bottles now when the cellar has racks. One read;
+    // any failure to answer simply skips the offer.
     const newIds = createdBottlesRef.current.map(b => b?._id).filter(Boolean);
     let hasRacks = false;
     // Bottles added straight into the drinking history are consumed — a
-    // consumed bottle has no place in a rack (audit 2026-09-14 M). Nor does
-    // one on order: it is placed once it arrives, and its list is where the
-    // user goes next.
+    // consumed bottle has no place in a rack. Nor does one on order: it is
+    // placed once it arrives, and its list is where the user goes next.
     if (onOrder && !addToHistory) {
       leaveTo(`/cellars/${cellarId}/on-order`);
       return;
@@ -1036,14 +1033,14 @@ function AddBottle() {
       : msg;
     // Custom fields the server refused on bottles that DID land. Declared
     // outside the try so the network-failure path below can report them too:
-    // a later create that throws used to lose them with the attempt (release
-    // audit 2026-09-27, L).
+    // a later create that throws must not lose them with the attempt.
     const fieldWarnings = [];
 
     try {
       const base = {
         cellar: cellarId,
         ...bottleData,
+        vintage: parseVintageInput(bottleData.vintage, t),
         price: bottleData.price ? parseFloat(bottleData.price) : undefined,
         occasion: bottleData.occasion || undefined,
         drinkFrom: bottleData.drinkFrom ? parseInt(bottleData.drinkFrom, 10) : undefined,
@@ -1068,7 +1065,7 @@ function AddBottle() {
         } : {})
       };
 
-      // Custom fields (user ticket 6ab05cca). A BOTTLE-level field rides every
+      // Custom fields. A BOTTLE-level field rides every
       // POST — each bottle gets its own copy, which is the point of the level.
       // A WINE-level field attaches to the shared wine record, so it rides
       // only the first POST of the batch; sending it N times would ask the
@@ -1136,7 +1133,7 @@ function AddBottle() {
             partialError(data.error || t('addBottle.addFailed'), createdBottles.length),
             ...fieldWarnings,
           ].join(' — '));
-          // Release-audit MEDIUM: a mint-gate 400 ("Riquewihr is a village,
+          // A mint-gate 400 ("Riquewihr is a village,
           // not a producer") lands here AFTER the wine form is gone. When the
           // failed POST carried newWine and nothing was created yet, reopen
           // step 1's manual form seeded with the typed fields so the user
@@ -1147,7 +1144,7 @@ function AddBottle() {
             setStep(1);
           }
           // The alert renders at the top of a long form — without the scroll
-          // a failed submit reads as "the button did nothing" (audit LOW).
+          // a failed submit reads as "the button did nothing".
           window.scrollTo(0, 0);
           linkUploadedImages();
           return;
@@ -1180,8 +1177,8 @@ function AddBottle() {
       if (fieldWarnings.length > 0) {
         // The photos belong to bottles that now exist: link them before the
         // dialog, not on its Close button — leaving the page any other way
-        // stranded them without a bottle (the orphan rows in the admin queue;
-        // audit 2026-09-27 M1). Idempotent, so finishAdd's call is a no-op.
+        // would strand them without a bottle (orphan rows in the admin
+        // queue). Idempotent, so finishAdd's call is a no-op.
         linkUploadedImages();
         setCustomFieldNotice(fieldWarnings);
         return;
@@ -1231,53 +1228,12 @@ function AddBottle() {
   return (
     <div className="add-bottle-page">
       {/* Label-scan camera modal */}
-      {labelCam.open && (
-        <div className="camera-modal">
-          <div className="camera-container" onPointerDown={tapFocus.onPointerDown}>
-            {labelCam.error ? (
-              <div className="camera-error-overlay">
-                <p>{labelCam.error}</p>
-                <button type="button" className="btn btn-secondary" onClick={closeCamera}>Close</button>
-              </div>
-            ) : (
-              <>
-                <video ref={labelVideoRef} autoPlay playsInline muted className="camera-video" />
-                <CameraFocusRing ring={tapFocus.ring} />
-                {labelScanning ? (
-                  <div className="label-scan-overlay">
-                    <div className="label-scan-spinner" />
-                    <span>{t('addBottle.scanReading')}</span>
-                  </div>
-                ) : (
-                  <>
-                    <div className="camera-overlay">
-                      <div className="label-guide-frame" />
-                      <p className="overlay-hint">
-                        {barcodeMode
-                          ? t('addBottle.barcodeOnlyHint', 'Point the camera at the barcode — it is read automatically.')
-                          : barcodeNoted
-                            ? t('addBottle.barcodeNoted', 'New barcode — thank you! Now photograph the front label, and the barcode will be saved for the next person.')
-                            : t('addBottle.scanHint')}
-                      </p>
-                    </div>
-                    <div className="camera-controls">
-                      <button type="button" className="camera-btn camera-btn-close" onClick={closeCamera} aria-label="Close camera">✕</button>
-                      {/* No shutter in barcode-only mode: nothing is photographed. */}
-                      {!barcodeMode && (
-                        <button type="button" className="camera-btn camera-btn-capture" onClick={captureLabelPhoto} aria-label="Scan label">
-                          <span className="capture-ring" aria-hidden="true"></span>
-                        </button>
-                      )}
-                      <button type="button" className="camera-btn camera-btn-switch" onClick={() => setLabelFacing(f => f === 'environment' ? 'user' : 'environment')} aria-label="Switch camera">⟲</button>
-                    </div>
-                  </>
-                )}
-              </>
-            )}
-          </div>
-          <canvas ref={labelCanvasRef} style={{ display: 'none' }} />
-        </div>
-      )}
+      <LabelCameraModal
+        labelCam={labelCam} tapFocus={tapFocus} closeCamera={closeCamera}
+        labelVideoRef={labelVideoRef} labelScanning={labelScanning} t={t} barcodeMode={barcodeMode}
+        barcodeNoted={barcodeNoted} captureLabelPhoto={captureLabelPhoto}
+        setLabelFacing={setLabelFacing} labelCanvasRef={labelCanvasRef}
+      />
 
       <div className="add-bottle-header">
         <Link to={`/cellars/${cellarId}`} className="back-link" onClick={leaveUnsaved}>
@@ -1332,8 +1288,8 @@ function AddBottle() {
             </p>
           )}
 
-          {/* WHY this scan is partial when every box is filled (audit M-2):
-              the producer looks like label text, not a winery. Says which box
+          {/* WHY this scan is partial when every box is filled: the
+              producer looks like label text, not a winery. Says which box
               to check; never blocks anything. */}
           {producerSuspect && (
             <p className="scan-back-conflicts">
@@ -1342,186 +1298,23 @@ function AddBottle() {
           )}
 
           {/* ── Scan result: unified wine card ──────────────────────────── */}
-          {scanResult && !showManualForm && (
-            <div className="scan-wine-card">
-              <div className={`scan-wine-image-wrap${scanMatchedWine?.image ? ' scan-wine-image-wrap--compare' : ''}`}>
-                <figure className="scan-wine-shot">
-                  {/* Wrapped so both shots have an identically sized slot: a
-                      failed image is hidden by WineImage's onError, and without
-                      a fixed box its column would collapse and knock the two
-                      captions off one baseline. */}
-                  <div className="scan-wine-shot-img-wrap">
-                    {labelImage
-                      ? <img src={labelImage} alt={scanResult.extracted.name} className="scan-wine-label-img" />
-                      : <div className={`wine-row-placeholder scan-wine-placeholder ${scanResult.extracted.type || 'unknown'}`} />
-                    }
-                  </div>
-                  {scanMatchedWine?.image && (
-                    <figcaption className="scan-wine-shot-caption">{t('addBottle.scanYourPhoto')}</figcaption>
-                  )}
-                </figure>
-                {scanMatchedWine?.image && (
-                  <figure className="scan-wine-shot">
-                    <WineImage
-                      image={scanMatchedWine.image}
-                      alt={scanMatchedWine.name}
-                      className="scan-wine-label-img"
-                      wrapClass="scan-wine-shot-img-wrap"
-                      credit={scanMatchedWine.imageCredit}
-                      creditClass="wine-row-credit"
-                      wineType={swatchType(scanMatchedWine)}
-                      placeholder="wine-row-placeholder scan-wine-placeholder"
-                    />
-                    <figcaption className="scan-wine-shot-caption">{t('addBottle.scanRegistryPhoto')}</figcaption>
-                  </figure>
-                )}
-              </div>
-              <div className="scan-wine-body">
-                {/* NAMES the matched row (issue #1134). It used to read only
-                    "Already in the registry" while the card showed the scanned
-                    name — so a wine about to be filed under its neighbour in
-                    the same range looked perfect. The registry-photo compare
-                    beside it is the other half of the answer, and small
-                    estates have no photo, which left this badge as the only
-                    signal there was a match at all. */}
-                {scanMatchedWine && (
-                  <div className="ai-result-badge scan-wine-badge">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2a4 4 0 0 1 4 4c0 1.95-1.4 3.58-3.25 3.93L12 22"/><path d="M8 6a4 4 0 0 1 8 0"/><path d="M17 12H7"/></svg>
-                    {t('addBottle.scanRegistryMatch', {
-                      name: scanMatchedWine.name,
-                      percent: Math.round((scanResult.match?.confidence || 0) * 100),
-                    })}
-                  </div>
-                )}
-                <h2 className="scan-wine-name">{scanResult.extracted.name}</h2>
-                <p className="scan-wine-producer">{scanResult.extracted.producer}</p>
-                {scanResult.extracted.confidence != null && (
-                  <div style={{ marginBottom: '0.5rem' }}>
-                    <span className="scan-confidence">
-                      {Math.round(scanResult.extracted.confidence * 100)}% confident
-                    </span>
-                  </div>
-                )}
-                <div className="wine-meta" style={{ marginBottom: '0.5rem' }}>
-                  {scanResult.extracted.country && <span>{scanResult.extracted.country}</span>}
-                  {scanResult.extracted.region && <span>• {scanResult.extracted.region}</span>}
-                  {scanResult.extracted.appellation && <span>• {scanResult.extracted.appellation}</span>}
-                  <span className={`wine-type-pill ${scanResult.extracted.type || 'unknown'}`}>
-                    {scanResult.extracted.type || t('common.unknown')}
-                  </span>
-                </div>
-                {scanResult.extracted.grapes?.length > 0 && (
-                  <p className="wine-grapes">{scanResult.extracted.grapes.join(', ')}</p>
-                )}
-                {scanResult.extracted.vintage && (
-                  <p className="scan-vintage-note">
-                    {t('addBottle.scanVintageDetected', { year: scanResult.extracted.vintage })}
-                  </p>
-                )}
-                <div className="scan-wine-actions">
-                  <button
-                    type="button"
-                    className="btn btn-success"
-                    onClick={handleConfirmScan}
-                    disabled={findingWine}
-                  >
-                    {findingWine ? t('addBottle.scanSaving') : t('addBottle.scanConfirmWine')}
-                  </button>
-                  <button type="button" className="btn-not-right" onClick={handleNotRightWine}>
-                    {t('addBottle.scanNotRight')}
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
+          <ScanWineCard
+            scanResult={scanResult} showManualForm={showManualForm}
+            scanMatchedWine={scanMatchedWine} labelImage={labelImage} t={t}
+            handleConfirmScan={handleConfirmScan} findingWine={findingWine}
+            handleNotRightWine={handleNotRightWine}
+          />
 
           {/* ── Scan result: manual edit form (user said "not the right wine") ── */}
-          {/* Manual edit form. No longer gated on scanResult: the AI-suggestion
+          {/* Manual edit form. Not gated on scanResult: the AI-suggestion
               card reuses it for "Not the right wine" and for supplying a
               country the model didn't give. */}
-          {showManualForm && pendingWineData && (
-            <div className="scan-result-panel">
-              {labelImage && (
-                <div className="scan-manual-image-wrap">
-                  <img src={labelImage} alt="" className="scan-manual-label-img" />
-                </div>
-              )}
-              <div className="grid-2">
-                <div className="form-group">
-                  <label>{t('addBottle.scanWineName')} *</label>
-                  <input type="text" value={pendingWineData.name}
-                    onChange={e => setPendingWineData(p => ({ ...p, name: e.target.value }))} required />
-                </div>
-                <div className="form-group">
-                  {/* No `*` and no `required`: an unreadable producer must not
-                      block the add. The bottle saves; the wine goes to the
-                      sommelier queue and comes back completed. */}
-                  <label>{t('addBottle.scanProducer')}</label>
-                  <input type="text" value={pendingWineData.producer}
-                    placeholder={t('addBottle.scanProducerOptionalPlaceholder')}
-                    onChange={e => setPendingWineData(p => ({ ...p, producer: e.target.value }))} />
-                </div>
-                <div className="form-group">
-                  <label>{t('addBottle.scanCountry')} *</label>
-                  <input type="text" value={pendingWineData.country}
-                    onChange={e => setPendingWineData(p => ({ ...p, country: e.target.value }))} required />
-                </div>
-                <div className="form-group">
-                  <label>{t('addBottle.scanRegion')}</label>
-                  <input type="text" value={pendingWineData.region}
-                    onChange={e => setPendingWineData(p => ({ ...p, region: e.target.value }))} />
-                </div>
-                <div className="form-group">
-                  <label>{t('addBottle.scanAppellation')}</label>
-                  <input type="text" value={pendingWineData.appellation}
-                    onChange={e => setPendingWineData(p => ({ ...p, appellation: e.target.value }))} />
-                </div>
-                <div className="form-group">
-                  <label>{t('addBottle.scanType')}</label>
-                  <select value={pendingWineData.type}
-                    onChange={e => setPendingWineData(p => ({
-                      ...p,
-                      type: e.target.value,
-                      // A colour belongs to sparkling/dessert/fortified only.
-                      ...(isStyleType(e.target.value) ? {} : { colour: '' }),
-                    }))}>
-                    {/* Unknown is a real answer: the scan and the AI now return
-                        null rather than defaulting to red (ticket 6a85ad44), so
-                        the form must be able to carry that through instead of
-                        making the user pick a colour to get past it. */}
-                    <option value="">{t('common.unknown')}</option>
-                    {WINE_TYPES.map(wt => <option key={wt} value={wt}>{wt}</option>)}
-                  </select>
-                </div>
-                {/* Only where the type does not already say the colour. Left
-                    "not stated", a rosé name ("Brut Rosé") still fills it in. */}
-                {isStyleType(pendingWineData.type) && (
-                  <div className="form-group">
-                    <label htmlFor="new-wine-colour">{t('wineColour.label', 'Colour')}</label>
-                    <select id="new-wine-colour" value={pendingWineData.colour || ''}
-                      onChange={e => setPendingWineData(p => ({ ...p, colour: e.target.value }))}>
-                      <option value="">{t('wineColour.notStated', 'Not stated')}</option>
-                      {WINE_COLOURS.map(c => <option key={c} value={c}>{colourLabel(c, t)}</option>)}
-                    </select>
-                  </div>
-                )}
-                <div className="form-group form-group-full">
-                  <label>{t('addBottle.scanGrapes')}</label>
-                  <input type="text" value={pendingWineData.grapes}
-                    onChange={e => setPendingWineData(p => ({ ...p, grapes: e.target.value }))}
-                    placeholder={t('addBottle.scanGrapesPlaceholder')} />
-                </div>
-              </div>
-              <div className="scan-result-actions">
-                <button type="button" className="btn btn-success" onClick={handleConfirmManualWine} disabled={findingWine}>
-                  {findingWine ? t('addBottle.scanSaving') : t('addBottle.scanConfirmWine')}
-                </button>
-                <button type="button" className="btn btn-ghost" onClick={handleScanReset}>
-                  {t('addBottle.scanSearchManually')}
-                </button>
-              </div>
-            </div>
-          )}
+          <ManualWineForm
+            showManualForm={showManualForm} pendingWineData={pendingWineData}
+            labelImage={labelImage} t={t} setPendingWineData={setPendingWineData}
+            handleConfirmManualWine={handleConfirmManualWine} findingWine={findingWine}
+            handleScanReset={handleScanReset}
+          />
 
           {/* ── Camera-first prompt ──────────────────────────────────────── */}
           {!scanResult && !showTextSearch && !showManualForm && !labelCam.open && (
@@ -1535,9 +1328,7 @@ function AddBottle() {
                 <p className="camera-prompt-hint">
                   {t('addBottle.scanPromptHint', 'Take a photo of the label — we\'ll identify the wine and add it to the registry if it doesn\'t exist yet.')}
                 </p>
-                <button type="button" className="btn btn-primary" onClick={startLabelCamera}>
-                  {t('addBottle.startCamera', 'Start Camera')}
-                </button>
+                <ScanLabelButtons cameraLabel={t('addBottle.startCamera', 'Start Camera')} onCamera={startLabelCamera} onFile={scanLabelFile} />
               </div>
               <button type="button" className="wine-select-manual-link" onClick={() => setShowTextSearch(true)}>
                 {t('addBottle.searchManuallyInstead', 'Type the name instead →')}
@@ -1588,9 +1379,9 @@ function AddBottle() {
                 </p>
               )}
 
-              {/* A finished search with nothing in it used to render nothing at
-                  all — say so, so the AI row and "Enter it yourself" below read
-                  as the next step rather than as noise. */}
+              {/* A finished search with nothing in it says so, so the AI row
+                  and "Enter it yourself" below read as the next step rather
+                  than as noise. */}
               {searchDone && wines.length === 0 && registryWines.length === 0
                 && !aiSearching && !aiIdentified && !aiMatch && (
                 <p className="wine-search-no-results" role="status">
@@ -1639,9 +1430,9 @@ function AddBottle() {
                       </div>
                     </div>
                     <div className="ai-result-actions">
-                      {/* Busy state is load-bearing: this is now an async
-                          registry write, and a double-tap could otherwise
-                          create two rows. */}
+                      {/* Busy state is load-bearing: this is an async
+                          registry lookup, and a double-tap would otherwise
+                          send it twice. */}
                       <button
                         type="button"
                         className={`btn ${aiCandidates.length > 0 ? 'btn-secondary' : 'btn-success'}`}
@@ -1672,9 +1463,9 @@ function AddBottle() {
                 </div>
               )}
 
-              {/* ── Search results list. Never hidden by the AI card any more:
-                   hiding it is how the AI's guess used to beat the correct
-                   registry row. Rows already shown above are filtered out. ── */}
+              {/* ── Search results list. Never hidden by the AI card: hiding
+                   it would let the AI's guess beat the correct registry
+                   row. Rows already shown above are filtered out. ── */}
               {!aiSearching && wines.length > 0 && (
                 <div className="wines-list">
                   {wines
@@ -1776,10 +1567,10 @@ function AddBottle() {
           {/* A wine the registry does not know yet will be MINTED with this
               bottle. Offer to keep it private first: a draft is editable by
               its creator without the correction queue, hidden from everyone
-              else, and published when they are done (support ticket
-              2026-09-12). Only shown on that path — an existing wine is
+              else, and published when they are done.
+              Only shown on that path — an existing wine is
               already shared. */}
-          {pendingNewWine && (
+          {pendingNewWine && pendingNewWine.category !== 'other' && (
             <label className="draft-wine-toggle">
               <input
                 type="checkbox"
@@ -1796,162 +1587,18 @@ function AddBottle() {
 
           <form onSubmit={handleSubmit}>
             {/* ── Core fields ── */}
-            <div className="grid-2" style={{ marginTop: '1.25rem' }}>
-              <div className="form-group">
-                <label>{t('common.vintage')} *</label>
-                <input
-                  type="text"
-                  value={bottleData.vintage}
-                  onChange={(e) => setBottleData({ ...bottleData, vintage: e.target.value })}
-                  placeholder={t('addBottle.vintagePlaceholder')}
-                  pattern="^(?:[Nn][Vv]|[Uu]nknown|(?:19|20)\d{2})$"
-                  title={t('addBottle.vintagePattern')}
-                  maxLength={7}
-                  required
-                  autoFocus
-                />
-              </div>
-
-              <div className="form-group">
-                <label>{t('addBottle.numberOfBottles')}</label>
-                <input
-                  type="number"
-                  inputMode="numeric"
-                  value={numBottles}
-                  onChange={(e) => setNumBottles(Math.max(1, parseInt(e.target.value) || 1))}
-                  onFocus={(e) => e.target.select()}
-                  min="1"
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>{t('common.price')}</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={bottleData.price}
-                  onChange={(e) => setBottleData({ ...bottleData, price: e.target.value })}
-                  placeholder="0.00"
-                />
-                {(() => {
-                  const warns = validatePriceSanity({
-                    price: parseFloat(bottleData.price),
-                    currency: bottleData.currency || 'USD',
-                  });
-                  if (warns.length === 0) return null;
-                  return (
-                    <ul className="price-warnings">
-                      {warns.map(w => (
-                        <li key={w.code} className={`price-warning price-warning--${w.severity}`}>
-                          {t(`addBottle.priceWarning.${w.code}`, w.context)}
-                        </li>
-                      ))}
-                    </ul>
-                  );
-                })()}
-              </div>
-
-              <div className="form-group">
-                <label>{t('common.currency')}</label>
-                {/* Each option carries its code as value, and the list is
-                    never translated: browser page translation rewrote the
-                    option TEXT "EUR" as "EURO", and an option without a value
-                    sends its text (2026-10-13). */}
-                <select
-                  translate="no"
-                  value={bottleData.currency}
-                  onChange={(e) => setBottleData({ ...bottleData, currency: e.target.value })}
-                >
-                  {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
-                </select>
-              </div>
-
-              <div className="form-group">
-                <label>{t('addBottle.bottleSize')}</label>
-                <select
-                  value={bottleData.bottleSize}
-                  onChange={(e) => setBottleData({ ...bottleData, bottleSize: e.target.value })}
-                >
-                  {BOTTLE_SIZES.map((s) => (
-                    <option key={s.code} value={s.code}>{bottleSizeLabel(s.code, t)}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="form-group">
-                <label>{t('addBottle.ratingLabel')}</label>
-                <RatingInput
-                  value={bottleData.rating}
-                  scale={bottleData.ratingScale}
-                  onChange={v => setBottleData({ ...bottleData, rating: v ?? '' })}
-                  onScaleChange={s => setBottleData({ ...bottleData, ratingScale: s, rating: '' })}
-                  allowScaleOverride
-                />
-              </div>
-            </div>
+            <BottleCoreFields
+              t={t} bottleData={bottleData} setBottleData={setBottleData} numBottles={numBottles}
+              setNumBottles={setNumBottles}
+            />
 
             {/* ── Bottle photo — compact section ── */}
-            <div className="photo-section">
-              <div className="photo-section-header">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="photo-section-icon">
-                  <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-                  <circle cx="12" cy="13" r="4"/>
-                </svg>
-                <span className="photo-section-title">{t('addBottle.bottlePhotos')}</span>
-              </div>
-              {/* What the registry already holds for this wine. Shown BEFORE the
-                  uploader so a user who would have re-photographed a wine we can
-                  already illustrate can see that first. The prompt is softened,
-                  never removed: ~89% of the registry's official images started
-                  as a user's bottle photo, and most wines still have none. */}
-              {selectedWineId && (
-                // The wrapper's margin is applied only when something rendered:
-                // ImageGallery returns null while loading and when empty, and
-                // most wines have no photo, so an unconditional class left a
-                // gap in the common case. Keyed so a wine switch remounts.
-                <div className={registryHasPhotos ? 'photo-existing' : undefined}>
-                  <ImageGallery
-                    key={selectedWineId}
-                    wineDefinitionId={selectedWineId}
-                    size="small"
-                    onLoaded={(count) => setWineImageCounts(prev => ({ ...prev, [selectedWineId]: count }))}
-                  />
-                </div>
-              )}
-              {photoPromptReady && (
-                <p className="photo-section-lead">
-                  {registryHasPhotos ? t('addBottle.photosExisting') : t('addBottle.photosNone')}
-                </p>
-              )}
-              <ImageUpload
-                wineDefinitionId={selectedWine?._id}
-                onUploadComplete={(img) => setUploadedImages(prev => [...prev, img])}
-              />
-              <p className="photo-section-notice">{t('addBottle.photosNotice')}</p>
-            </div>
-
-            {/* The registry learns barcodes only from bottles added with one, so
-                ask — once, quietly, at the one step every add path reaches. Below
-                the fields and the photo, next to the other way to help: a
-                newcomer's first job here is the vintage (newcomer walkthrough
-                2026-10-15). The thanks lands where the scan was asked for. */}
-            {!foundByBarcode && (
-              <div className="barcode-ask">
-                {barcode ? (
-                  <p className="selected-wine-barcode-note">
-                    {t('addBottle.barcodeThanks', 'Thank you — the barcode is saved with this bottle, so the next member who scans it finds this wine straight away.')}
-                  </p>
-                ) : (
-                  <div className="barcode-help">
-                    <p>{t('addBottle.barcodeHelp', "Help the community: we're building Cellarion's barcode list together, and it's still small. Scan the barcode on this bottle, and the next member who scans it will find this wine straight away.")}</p>
-                    <button type="button" className="btn btn-ghost btn-small" onClick={startBarcodeScan}>
-                      {t('addBottle.barcodeHelpBtn', 'Scan barcode')}
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
+            <BottlePhotoSection
+              t={t} selectedWineId={selectedWineId} registryHasPhotos={registryHasPhotos}
+              setWineImageCounts={setWineImageCounts} photoPromptReady={photoPromptReady}
+              selectedWine={selectedWine} setUploadedImages={setUploadedImages}
+              foundByBarcode={foundByBarcode} barcode={barcode} startBarcodeScan={startBarcodeScan}
+            />
 
             {/* ── More details toggle ── */}
             <button
@@ -2138,18 +1785,18 @@ function AddBottle() {
                   <p className="help-text">{t('addBottle.drinkWindowHint')}</p>
                 </div>
 
-                {/* ── Custom fields (user ticket 6ab05cca) ──
+                {/* ── Custom fields ──
                     ABV and anything else the label carries, typed while the
                     bottle is still in hand. The same personal typed data the
-                    bottle page writes (#986) — this is a second entry point to
-                    it, not a second store. Nothing is written until the bottle
+                    bottle page writes — this is a second entry point to it,
+                    not a second store. Nothing is written until the bottle
                     POST carries it, so an abandoned form leaves no rows. */}
                 <div className="form-group">
                   <label>{t('addBottle.customFields', 'Custom fields')}</label>
                   <AddBottleCustomFields
                     apiFetch={apiFetch}
                     wineId={selectedWine?._id}
-                    vintage={bottleData.vintage}
+                    vintage={parseVintageInput(bottleData.vintage, t)}
                     rows={customFields}
                     onChange={setCustomFields}
                     onKeysLoaded={setSavedPersonalKeys}
@@ -2284,60 +1931,11 @@ function AddBottle() {
         />
       )}
 
-      {/* A custom field the server refused. The bottles were added — say so
-          plainly, name what was dropped, and carry on. */}
-      {customFieldNotice && (
-        <div className="modal-overlay">
-          <DialogBox
-            className="modal-box"
-            onClose={() => { setCustomFieldNotice(null); afterPopupEntryGone(finishAdd); }}
-            label={t('addBottle.customFieldsNotSaved', 'Some custom fields were not saved')}
-          >
-            <h2>{t('addBottle.customFieldsNotSaved', 'Some custom fields were not saved')}</h2>
-            <p>{t('addBottle.customFieldsNotSavedBody', 'The bottles were added. These fields were not — you can add them on the bottle page.')}</p>
-            <ul>
-              {customFieldNotice.map(w => <li key={w}>{w}</li>)}
-            </ul>
-            <div className="modal-actions">
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={() => { setCustomFieldNotice(null); afterPopupEntryGone(finishAdd); }}
-              >
-                {t('common.close')}
-              </button>
-            </div>
-          </DialogBox>
-        </div>
-      )}
-
-      {/* Post-add placing offer (issue #1055) — skippable, never blocking */}
-      {placePrompt && (
-        <div className="modal-overlay" onClick={leavePlacePrompt}>
-          <DialogBox
-            className="modal-box"
-            onClick={e => e.stopPropagation()}
-            onClose={leavePlacePrompt}
-            label={t('addBottle.placePrompt.title', { count: placePrompt.count })}
-          >
-            <h2>{t('addBottle.placePrompt.title', { count: placePrompt.count })}</h2>
-            <p>{t('addBottle.placePrompt.body')}</p>
-            <div className="modal-actions">
-              <button type="button" className="btn btn-secondary" onClick={leavePlacePrompt}>
-                {t('addBottle.placePrompt.notNow')}
-              </button>
-              <button
-                type="button"
-                className="btn btn-primary"
-                data-testid="place-now"
-                onClick={() => navigate(`/cellars/${cellarId}/racks`, { state: { placeQueue: placePrompt.ids } })}
-              >
-                {t('addBottle.placePrompt.placeNow')}
-              </button>
-            </div>
-          </DialogBox>
-        </div>
-      )}
+      <AddBottleDialogs
+        customFieldNotice={customFieldNotice} setCustomFieldNotice={setCustomFieldNotice}
+        finishAdd={finishAdd} t={t} placePrompt={placePrompt} leavePlacePrompt={leavePlacePrompt}
+        navigate={navigate} cellarId={cellarId}
+      />
     </div>
   );
 }

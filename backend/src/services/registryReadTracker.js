@@ -1,6 +1,6 @@
 /**
- * Distinct-wines-per-reader-per-day counter (registry lockdown 2026-09-06,
- * layer L4). See models/RegistryReadDay.js for what it measures and why.
+ * Distinct-wines-per-reader-per-day counter. See models/RegistryReadDay.js
+ * for what it measures and why.
  *
  * Two operations:
  *   recordRead(reader, wineId)  — count one read; returns the reader's
@@ -53,7 +53,7 @@ function limits() {
 async function recordRead(reader, wineId) {
   if (!reader || !wineId) return null;
   // One id or many: a search returns ten identities in a single call, and
-  // those are reads of the registry too (bridge audit 2026-09-08).
+  // those are reads of the registry too.
   const ids = (Array.isArray(wineId) ? wineId : [wineId]).filter(Boolean);
   if (!ids.length) return null;
   // No database, no counter (fail open, and fast): a disconnected model would

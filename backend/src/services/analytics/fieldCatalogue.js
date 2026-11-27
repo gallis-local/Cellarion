@@ -1,5 +1,5 @@
 /**
- * The analytics field catalogue (#987 Phase 0).
+ * The analytics field catalogue.
  *
  * Every analysable attribute is declared here EXACTLY ONCE; the query engine,
  * the /api/analytics/catalogue endpoint, the table's column picker and the
@@ -16,8 +16,8 @@
  *   unit         display unit ('currency' is special: converted per query)
  *   role         'dimension' | 'measure' | 'both'
  *   aggregations measures only: subset of count|sum|avg|min|max
- *   sortable     server-side sortable in rows mode (KV + computed fields are
- *                honestly false until the $lookup work in R-B)
+ *   sortable     server-side sortable in rows mode (computed and rack fields,
+ *                and the array refs grapes/classifications, are not)
  *   groupable    usable as a grouped-mode dimension
  *   filterable   accepts filters (nearly everything)
  *   enumOptions  enum type only
@@ -26,6 +26,7 @@
  *                'taxonomy' — a ref on WineDefinition resolved by name
  *                             (taxonomyModel names the collection)
  *                'computed' — derived per page row after hydration
+ *                'rack'     — the rack holding the bottle (from Rack.slots)
  *                'personal' | 'registry' — typed key/value (dynamic entries)
  *   path         the Mongo path the source reads ('wd.' prefix = joined wine)
  *
@@ -42,7 +43,7 @@ const RegistryDataKey = require('../../models/RegistryDataKey');
 // is compiled as gte+lte; 'in' takes an array of enum options. The FIRST op
 // is what the filter builder preselects, so text leads with 'contains': a
 // typed producer filter should find "Gaja" by "gaj", not demand the exact
-// name (support ticket 2026-09-05).
+// name.
 const OPS_BY_TYPE = {
   text: ['contains', 'eq', 'neq'],
   integer: ['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'between'],
@@ -63,9 +64,9 @@ const STATIC_FIELDS = [
   dim({ key: 'wine.type', label: 'Wine type', domain: 'wine', type: 'enum', source: 'wine', path: 'wd.type', enumOptions: ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'] }),
   dim({ key: 'wine.appellation', label: 'Appellation', domain: 'wine', type: 'text', source: 'wine', path: 'wd.appellation' }),
   dim({ key: 'wine.classification', label: 'Classification', domain: 'wine', type: 'text', source: 'wine', path: 'wd.classification' }),
-  // Taxonomy refs: the stored value is an ObjectId; sorting joins the name
-  // (R-B). Filters resolve the typed name to ids first. taxonomyCollection is
-  // the raw collection name the sort $lookup reads.
+  // Taxonomy refs: the stored value is an ObjectId; sorting joins the name.
+  // Filters resolve the typed name to ids first. taxonomyCollection is the raw
+  // collection name the sort $lookup reads.
   dim({ key: 'wine.country', label: 'Country', domain: 'wine', type: 'text', source: 'taxonomy', path: 'wd.country', taxonomyModel: 'Country', taxonomyCollection: 'countries' }),
   dim({ key: 'wine.region', label: 'Region', domain: 'wine', type: 'text', source: 'taxonomy', path: 'wd.region', taxonomyModel: 'Region', taxonomyCollection: 'regions' }),
   // Grapes is an ARRAY ref — a filter means "has this grape". Neither sortable
@@ -73,6 +74,18 @@ const STATIC_FIELDS = [
   // ("[Grenache, Syrah]" ≠ "Grenache"), which reads as data and lies. Per-grape
   // grouping needs an $unwind stage — a later slice, honestly flagged out.
   dim({ key: 'wine.grapes', label: 'Grapes', domain: 'wine', type: 'text', source: 'taxonomy', path: 'wd.grapes', taxonomyModel: 'Grape', sortable: false, groupable: false }),
+  dim({ key: 'wine.classifications', label: 'Classification', domain: 'wine', type: 'text', source: 'taxonomy', path: 'wd.classifications', taxonomyModel: 'Classification', sortable: false, groupable: false }),
+  // The sweetness the LABEL states (models/SweetnessTerm), a single ref — so
+  // unlike grapes and classifications it groups: "how many dry Rieslings".
+  // Filters and groups resolve to the term's NAME ("Trocken"); the band behind
+  // it needs a $lookup of the row's `band`, which the engine's taxonomy path
+  // does not do — a later slice, honestly flagged out.
+  dim({ key: 'wine.labelSweetness', label: 'Label sweetness', domain: 'wine', type: 'text', source: 'taxonomy', path: 'wd.labelSweetness', taxonomyModel: 'SweetnessTerm', taxonomyCollection: 'sweetnessterms' }),
+  // The sweetness the wine READS as on one scale for still and sparkling
+  // wines, worked out per row from the record and never stored
+  // (services/sweetnessCategory) — so a column only: grouping or filtering on
+  // it would need the reading inside the pipeline.
+  dim({ key: 'wine.sweetnessCategory', label: 'Sweetness category', domain: 'wine', type: 'enum', source: 'computed', path: null, sortable: false, groupable: false, filterable: false, enumOptions: ['dry', 'off-dry', 'medium-sweet', 'sweet'] }),
 
   // Inventory
   dim({ key: 'bottle.vintage', label: 'Vintage', domain: 'inventory', type: 'text', source: 'bottle', path: 'vintage' }),
@@ -81,17 +94,16 @@ const STATIC_FIELDS = [
   dim({ key: 'bottle.cellar', label: 'Cellar', domain: 'inventory', type: 'text', source: 'computed', path: 'cellar', sortable: false, groupable: true }),
   dim({ key: 'bottle.location', label: 'Rack location', domain: 'inventory', type: 'text', source: 'bottle', path: 'location' }),
   // The rack a bottle actually sits in, and the rack's group (the room or
-  // appliance the user named — support ticket 2026-09-06). Joined from
+  // appliance the user named). Joined from
   // Rack.slots, so a sort would need the join on every row: sortable is off;
   // grouping and filtering are the point ("what is in the basement").
   dim({ key: 'rack.name', label: 'Rack', domain: 'inventory', type: 'text', source: 'rack', path: 'name', sortable: false }),
   dim({ key: 'rack.group', label: 'Rack group', domain: 'inventory', type: 'text', source: 'rack', path: 'group', sortable: false }),
   dim({ key: 'bottle.occasion', label: 'Occasion note', domain: 'inventory', type: 'text', source: 'bottle', path: 'occasion' }),
   dim({ key: 'bottle.reservedFor', label: 'Reserved for', domain: 'inventory', type: 'text', source: 'bottle', path: 'reservedFor' }),
-  // Date fields are not groupable (audit 2026-08-19 F9): without calendar
-  // bucketing, $group on a timestamp makes one bucket per bottle — 200 rows
-  // of count:1 is a wall, not an answer. Month bucketing is the dashboards
-  // slice's problem; until then the flag is honest.
+  // Date fields are not groupable: without calendar bucketing, $group on a
+  // timestamp makes one bucket per bottle — 200 rows of count:1 is a wall,
+  // not an answer.
   dim({ key: 'bottle.addedAt', label: 'Date added', domain: 'inventory', type: 'date', source: 'bottle', path: 'createdAt', groupable: false }),
 
   // Purchase
@@ -100,12 +112,12 @@ const STATIC_FIELDS = [
   dim({ key: 'purchase.date', label: 'Purchase date', domain: 'purchase', type: 'date', source: 'bottle', path: 'purchaseDate', groupable: false }),
   dim({ key: 'purchase.location', label: 'Purchase location', domain: 'purchase', type: 'text', source: 'bottle', path: 'purchaseLocation' }),
 
-  // Ratings live in ONE scale everywhere on this surface: stars (audit
-  // 2026-08-19 F3). Values are stored per-bottle in '5'/'20'/'100' scales —
-  // mixed after imports — so raw filter/sort/display made a 60-point Parker
-  // outrank a 5-star bottle. Filters take stars, sort orders by the
-  // star-converted expression, hydration returns stars, grouped measures
-  // aggregate stars — all generated from the same ratingUtils anchor table.
+  // Ratings live in ONE scale everywhere on this surface: stars, unless the
+  // request names the viewer's own. Values are stored per-bottle in
+  // '5'/'20'/'100' scales — mixed after imports — so a raw filter/sort/display
+  // would let a 60-point Parker outrank a 5-star bottle. Filters, the sort,
+  // hydration and grouped measures all convert through the same ratingUtils
+  // anchor table.
   measure({ key: 'rating.current', label: 'My rating (stars)', domain: 'rating', type: 'decimal', source: 'bottle', path: 'rating', scalePath: 'ratingScale', normalized: true, aggregations: ['avg', 'min', 'max'] }),
   measure({ key: 'rating.consumed', label: 'Rating at consumption (stars)', domain: 'rating', type: 'decimal', source: 'bottle', path: 'consumedRating', scalePath: 'consumedRatingScale', normalized: true, aggregations: ['avg', 'min', 'max'] }),
 
@@ -117,9 +129,9 @@ const STATIC_FIELDS = [
   dim({ key: 'open.openedAt', label: 'Opened date', domain: 'open', type: 'date', source: 'bottle', path: 'openedAt', groupable: false }),
   dim({ key: 'open.preservation', label: 'Preservation', domain: 'open', type: 'enum', source: 'bottle', path: 'preservationMethod', enumOptions: ['coravin', 'inert-gas', 'vacuum', 'sparkling-stopper', 'recorked'] }),
 
-  // Maturity. Two layers, and the labels say which is which (support ticket
-  // 2026-09-10 — a cellar relying on curated windows read all-null dates
-  // next to status "peak" and took the null for missing data):
+  // Maturity. Two layers, and the labels say which is which — a cellar
+  // relying on curated windows reads all-null own dates next to status
+  // "peak", and must not take the null for missing data:
   //   maturity.drinkFrom / drinkTo / peakFrom / peakUntil — the user's OWN
   //     per-bottle overrides (integers, filter/sortable). Null whenever the
   //     bottle relies on the sommelier profile, so a filter on them only
@@ -130,8 +142,8 @@ const STATIC_FIELDS = [
   //   maturity.status — the derived verdict, computed per row.
   dim({ key: 'maturity.drinkFrom', label: 'My drink from (year)', domain: 'maturity', type: 'integer', source: 'bottle', path: 'drinkFrom' }),
   dim({ key: 'maturity.drinkTo', label: 'My drink to (year)', domain: 'maturity', type: 'integer', source: 'bottle', path: 'drinkTo' }),
-  // The peak pair (writable per bottle) was missing here, so a lot could not
-  // be checked for matching peaks in one query (support ticket 2026-09-07).
+  // The peak pair (writable per bottle) is listed so a lot can be checked
+  // for matching peaks in one query.
   dim({ key: 'maturity.peakFrom', label: 'My peak from (year)', domain: 'maturity', type: 'integer', source: 'bottle', path: 'peakFrom' }),
   dim({ key: 'maturity.peakUntil', label: 'My peak until (year)', domain: 'maturity', type: 'integer', source: 'bottle', path: 'peakUntil' }),
   dim({ key: 'maturity.windowFrom', label: 'Effective drink from (year)', domain: 'maturity', type: 'integer', source: 'computed', path: null, sortable: false, groupable: false, filterable: false }),
@@ -139,8 +151,8 @@ const STATIC_FIELDS = [
   dim({ key: 'maturity.windowPeakFrom', label: 'Effective peak from (year)', domain: 'maturity', type: 'integer', source: 'computed', path: null, sortable: false, groupable: false, filterable: false }),
   dim({ key: 'maturity.windowPeakUntil', label: 'Effective peak until (year)', domain: 'maturity', type: 'integer', source: 'computed', path: null, sortable: false, groupable: false, filterable: false }),
   dim({ key: 'maturity.windowSource', label: 'Window source', domain: 'maturity', type: 'enum', source: 'computed', path: null, sortable: false, groupable: false, filterable: false, enumOptions: ['personal', 'profile'] }),
-  // enumOptions mirror what classifyMaturity actually returns (audit F7) —
-  // 'unknown' is this module's own fallback for rows with no window at all.
+  // enumOptions mirror what classifyMaturity actually returns — 'unknown' is
+  // the query engine's own fallback for rows with no window at all.
   dim({ key: 'maturity.status', label: 'Drink status', domain: 'maturity', type: 'enum', source: 'computed', path: null, sortable: false, groupable: false, filterable: false, enumOptions: ['not-ready', 'early', 'peak', 'late', 'declining', 'unknown'] }),
 ];
 
@@ -159,7 +171,7 @@ function kvEntry(kind, doc) {
     unit: doc.unit || null,
     role: numeric ? 'both' : 'dimension',
     aggregations: numeric ? ['avg', 'min', 'max', 'sum'] : [],
-    // Sort and non-numeric grouping join the entries collection (R-B).
+    // Sort and non-numeric grouping join the entries collection.
     // Numeric KV stays measure-only as a dimension: every distinct reading
     // would be its own bucket — a wall, not an answer.
     sortable: true,

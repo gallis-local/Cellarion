@@ -1,7 +1,7 @@
 /**
  * `needsReview` — which user-minted taxonomy rows actually want a decision.
  *
- * WHY (2026-08-31): `pendingReview` is set on EVERY region and grape a user
+ * WHY: `pendingReview` is set on EVERY region and grape a user
  * write mints and cleared only by an admin clicking approve, so the queue grows
  * automatically and drains by hand. Measured on production: of 164 regions
  * minted in one month, 161 were in genuine use and exactly one was junk. At a
@@ -18,9 +18,9 @@
 process.env.JWT_SECRET = 'test-secret';
 
 jest.mock('../../services/search', () => ({
-  getIsAvailable: jest.fn(() => false), fullSync: jest.fn(), fullSyncBottles: jest.fn(),
-  indexWine: jest.fn(), removeWine: jest.fn(), bulkIndexWines: jest.fn(),
-  bulkIndexBottles: jest.fn(), waitForTasks: jest.fn(),
+  getIsAvailable: jest.fn(() => false), fullSync: jest.fn(),
+  indexWine: jest.fn(), removeWine: jest.fn(),
+  waitForTasks: jest.fn(),
 }));
 jest.mock('../../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../../services/taxonomyMerge', () => ({ mergeGrapes: jest.fn(), mergeRegions: jest.fn(), mergeCountries: jest.fn() }));

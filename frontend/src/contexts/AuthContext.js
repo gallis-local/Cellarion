@@ -16,13 +16,14 @@ export const API_MUTATION_EVENT = 'cellarion-api-mutation';
 const notifyApiMutation = (url) => {
   try { window.dispatchEvent(new CustomEvent(API_MUTATION_EVENT, { detail: { url: String(url || '') } })); } catch { /* noop */ }
 };
-import i18n, { hasLanguagePreview } from '../i18n';
+import i18n, { chooseLanguage, hasLanguagePreview } from '../i18n';
 import { getSignupSource } from '../utils/signupSource';
 import { markSessionExpired, clearSessionExpired } from '../utils/sessionExpired';
 import { removeStored } from '../utils/safeStorage';
 import { track } from '../utils/track';
-import { guessCurrency } from '../utils/localeDefaults';
+import { guessCurrency, guessTemperatureUnit } from '../utils/localeDefaults';
 import { saveLocaleDefaults } from '../api/auth';
+import { httpError, friendlyError } from '../utils/friendlyError';
 
 const AuthContext = createContext();
 
@@ -40,7 +41,7 @@ function markRefreshInFlight(on) {
   } catch { /* storage blocked — no guard, as before */ }
 }
 
-// Offline mode (#1355): how long a start waits for a refresh / profile on a
+// Offline mode: how long a start waits for a refresh / profile on a
 // weak signal before opening offline from the kept profile.
 const START_WAIT_MS = 5000;
 const TIMED_OUT = Symbol('timed-out');
@@ -50,8 +51,8 @@ const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * What a refresh answer says about the session. Only the server saying no
  * (401, or another 4xx that no retry can change) ends it. A 429 or a 5xx says
  * the server can't answer right now — a deploy restarting it (502/503 for a
- * few seconds), a hiccup, a rate limit — and used to sign people out exactly
- * like a rejection (scaling audit 2026-09-25).
+ * few seconds), a hiccup, a rate limit — and must not sign people out like a
+ * rejection.
  * @returns {'ok' | 'rejected' | 'unavailable'}
  */
 export function refreshOutcome(status) {
@@ -95,6 +96,11 @@ async function waitForUnloadedRefresh() {
   await new Promise((resolve) => setTimeout(resolve, Math.min(REFRESH_WAIT_MAX_MS, REFRESH_MARK_TTL_MS - age)));
 }
 
+// The sentence a failed sign-in, registration or email check shows: a coded
+// server error in the person's language, a rate limit or a server outage in
+// words they can act on, or else the server's own reason.
+const authFailureMessage = (error) => friendlyError(error, i18n.t.bind(i18n));
+
 export const useAuth = () => {
   const context = useContext(AuthContext);
   if (!context) {
@@ -136,7 +142,7 @@ export const AuthProvider = ({ children }) => {
   };
 
   const clearToken = () => {
-    // Clean up any legacy stored tokens from previous versions
+    // Tokens live in memory only: remove any still left in web storage
     removeStored('token');
     removeStored('token', 'session');
     removeStored('sessionOnly', 'session');
@@ -156,7 +162,7 @@ export const AuthProvider = ({ children }) => {
     // A logout made with no network is finished at the next start
     // (restoreSession) — but a sign-in in between makes it moot: the old
     // cookie is gone, and the next start would post that logout with THIS
-    // account's cookie, ending the new session (release audit 2026-09-27, L).
+    // account's cookie, ending the new session.
     markPendingLogout(false);
     // A session again: the login page's "Your session ended" has done its job.
     clearSessionExpired();
@@ -183,7 +189,7 @@ export const AuthProvider = ({ children }) => {
     if (userData?.localeDefaultsPending) return;
     const preferred = userData?.preferences?.language;
     if (preferred && findLanguage(preferred)) {
-      i18n.changeLanguage(preferred);
+      chooseLanguage(preferred);
     }
   };
 
@@ -204,9 +210,9 @@ export const AuthProvider = ({ children }) => {
   // tabs) race the rotation and the loser is spuriously logged out. The Web
   // Locks API serializes across tabs of the same origin: the waiter re-runs
   // with the cookie its predecessor just rotated in, which is valid.
-  // (Sessions are per DEVICE server-side since 2026-09-04, so signing in on
-  // another device no longer invalidates this browser's cookie; the race
-  // above is the only remaining way two refreshes can collide.)
+  // (Sessions are per DEVICE server-side, so signing in on another device
+  // does not invalidate this browser's cookie; the race above is the only
+  // way two refreshes can collide.)
   // How the last refresh ended: 'ok', 'rejected' (the server said no — the
   // session is dead), 'network' (no answer at all — the device is offline) or
   // 'unavailable' (the server answered but couldn't serve: a deploy, a 5xx,
@@ -214,11 +220,11 @@ export const AuthProvider = ({ children }) => {
   // see onRefreshFailed below.
   const refreshOutcomeRef = useRef('ok');
 
-  // A reload in the middle of a refresh used to sign the user out: the server
-  // had already rotated the cookie, the page that asked was gone before the
-  // response (and its new cookie) arrived, and the reloaded page presented
+  // A reload in the middle of a refresh must not sign the user out: the server
+  // has already rotated the cookie, the page that asked is gone before the
+  // response (and its new cookie) arrives, and the reloaded page presents
   // the rotated-away token — which the server answers with 401 and a cleared
-  // cookie. Likely with offline mode (#1355): the app refreshes the moment the
+  // cookie. Likely with offline mode: the app refreshes the moment the
   // signal returns, which is exactly when people pull to refresh. Two guards:
   //  - keepalive: the request outlives the page, so its cookie still lands;
   //  - a timestamp in localStorage while a refresh is in flight: a page that
@@ -322,11 +328,11 @@ export const AuthProvider = ({ children }) => {
   );
 
   // ------------------------------------------------------------------
-  // On mount: restore session from localStorage
+  // On mount: restore the session (refresh cookie, or the offline profile)
   // ------------------------------------------------------------------
 
   useEffect(() => {
-    // Migrate: clear any legacy stored tokens from previous versions
+    // Tokens live in memory only: remove any still left in web storage
     removeStored('token');
     removeStored('token', 'session');
     removeStored('sessionOnly', 'session');
@@ -538,7 +544,7 @@ export const AuthProvider = ({ children }) => {
 
       const data = await response.json();
       if (!response.ok) {
-        const err = new Error(data.error || 'Registration failed');
+        const err = httpError(response, data);
         err.code = data.code;
         throw err;
       }
@@ -556,7 +562,7 @@ export const AuthProvider = ({ children }) => {
       // Verification enabled — user must confirm email before logging in
       return { success: true, email: data.email, requiresVerification: true };
     } catch (error) {
-      return { success: false, error: error.message, code: error.code };
+      return { success: false, error: authFailureMessage(error), code: error.code };
     }
   };
 
@@ -571,7 +577,7 @@ export const AuthProvider = ({ children }) => {
 
       const data = await response.json();
       if (!response.ok) {
-        const err = new Error(data.error || 'Login failed');
+        const err = httpError(response, data);
         err.code = data.code;
         err.email = data.email;
         throw err;
@@ -581,7 +587,7 @@ export const AuthProvider = ({ children }) => {
       applySession(data.token, data.user);
       return { success: true };
     } catch (error) {
-      return { success: false, error: error.message, code: error.code, email: error.email };
+      return { success: false, error: authFailureMessage(error), code: error.code, email: error.email };
     }
   };
 
@@ -616,19 +622,26 @@ export const AuthProvider = ({ children }) => {
 
   const verifyEmail = async (token) => {
     try {
-      // POST the token (security audit M-1): the endpoint verifies the email
-      // and issues NO session, so the user logs in normally afterward — this
-      // removes the old GET's login-CSRF/session-fixation and prefetch-burn.
+      // POST the token. The endpoint signs the member in
+      // only in the browser that registered the account (its httpOnly signup
+      // binding cookie rides on this request); anywhere else it only verifies
+      // and the member logs in normally afterward.
       const response = await fetch('/api/auth/verify-email', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ token })
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Verification failed');
-      return { success: true };
+      if (!response.ok) throw httpError(response, data, i18n.t('auth.verificationFailed'));
+      if (data.token && data.user) {
+        sessionPersistentRef.current = data.persistent === true;
+        applySession(data.token, data.user);
+        return { success: true, signedIn: true };
+      }
+      return { success: true, signedIn: false };
     } catch (error) {
-      return { success: false, error: error.message };
+      return { success: false, error: authFailureMessage(error) };
     }
   };
 
@@ -665,7 +678,8 @@ export const AuthProvider = ({ children }) => {
     const generation = sessionGenRef.current;
     const language = i18n.resolvedLanguage || i18n.language;
     const currency = guessCurrency();
-    saveLocaleDefaults(apiFetch, { language, ...(currency ? { currency } : {}) })
+    const temperatureUnit = guessTemperatureUnit();
+    saveLocaleDefaults(apiFetch, { language, ...(currency ? { currency } : {}), temperatureUnit })
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         // Signed out (or into another account) while this was in flight: the
@@ -733,7 +747,9 @@ export const AuthProvider = ({ children }) => {
     updatePreferences,
     acceptPolicy,
     apiFetch,
-    setUser
+    // What a page calls after a save that echoes the user (the profile form):
+    // the stamp-keeping replace, not the raw setter.
+    setUser: replaceUser
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

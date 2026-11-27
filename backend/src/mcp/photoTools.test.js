@@ -1,6 +1,6 @@
 /**
- * Photos over MCP (support ticket 2026-09-06): the connector could write a
- * photo but never read one back. Pins the read path — get_bottle → photos,
+ * Photos over MCP: a connector that can write a photo must also be able to
+ * read one back. Pins the read path — get_bottle → photos,
  * has_photo on search_bottles rows, the registry image on get_wine — and the
  * richer attach_bottle_image answer (photos_before, shows_on_bottles, state,
  * the wine_id alternative). The photo-state service itself is unit-tested in
@@ -24,19 +24,29 @@ jest.mock('../models/Rack', () => ({ find: jest.fn(), findOne: jest.fn(), countD
 jest.mock('../models/User', () => ({ findById: jest.fn() }));
 jest.mock('../models/WishlistItem', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../models/JournalEntry', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
-// get_wine reads the correction queue for signed-in callers (support ticket
-// 2026-09-12) — mocked as "nothing pending" so the real model never buffers.
+// get_wine reads the correction queue for signed-in callers — mocked as
+// "nothing pending" so the real model never buffers.
 jest.mock('../models/WineCorrectionProposal', () => ({
   findOne: jest.fn(() => ({ select: () => ({ lean: async () => null }) })),
 }));
 jest.mock('../models/WineDefinition', () => ({ find: jest.fn(), findById: jest.fn(), findOne: jest.fn() }));
+// The sweetness category is read from real rows in
+// routes/sweetnessCategory.surfaces.mongo.test.js; here its reader answers
+// "nothing read", so the mocked wine model is not asked for it.
+jest.mock('../services/sweetnessCategory', () => ({
+  ...jest.requireActual('../services/sweetnessCategory'),
+  readSweetnessCategories: jest.fn(async () => new Map()),
+}));
+// get_bottle reads the vintage's window for its serving line (utils/servingUtils);
+// unmocked, the query waits on mongoose's buffer and the test times out.
+jest.mock('../models/WineVintageProfile', () => ({ find: jest.fn(() => ({ lean: () => Promise.resolve([]) })) }));
 // get_bottle's open-curator-question lookup — "none", so the real model never buffers.
 jest.mock('../models/WineOwnerInquiry', () => ({
   findOne: jest.fn(() => ({ select: () => ({ lean: async () => null }) })),
 }));
 jest.mock('../models/WineEmbedding', () => ({ findOne: jest.fn() }));
 jest.mock('../models/McpActionLog', () => ({ create: jest.fn(), findOne: jest.fn(), findOneAndUpdate: jest.fn() }));
-jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn() }));
+jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn() }));
 jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), buildEmptyStats: jest.fn() }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('./mutationBudget', () => ({ takeMutationSlot: jest.fn(() => true), WRITE_WINDOW_MS: 900000 }));
@@ -231,7 +241,7 @@ describe('attach_bottle_image id rules (audit 2026-09-07)', () => {
   });
 });
 
-// get_photo (support ticket 2026-09-07): the pixels behind the URLs, under the
+// get_photo: the pixels behind the URLs, under the
 // photo-list visibility rule. photoBytes is mocked — its own suite pins the
 // downscale; here the TOOL's who-may-see-what and its two-block answer are
 // what is pinned.

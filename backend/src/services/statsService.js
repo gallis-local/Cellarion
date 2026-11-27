@@ -2,11 +2,26 @@ const { getOrCreateDailySnapshot, convertCurrency } = require('../utils/exchange
 const { toNormalized, bottleRating, RATING_BANDS, emptyBands, ratingBand } = require('../utils/ratingUtils');
 const { classifyMaturity, classifyPersonalWindow, buildProfileMap, resolveWindowForBottle } = require('../utils/maturityUtils');
 
+// The type a bottle is counted under: 'other' for a drink that is not wine
+// (the non-wine category), 'unknown' while the colour is not recorded.
+const statType = (wd) => (wd?.nonWine === true ? 'other' : (wd?.type || 'unknown'));
+
 const avgOf = (sum, count) => (count > 0 ? Math.round((sum / count) * 10) / 10 : null);
 
+// One shape for the maturity buckets: the overall counts, each cellar's row
+// and the empty answer all start here, so their keys cannot drift apart.
+const emptyMaturity = () => ({ declining: 0, late: 0, peak: 0, early: 0, notReady: 0, noProfile: 0 });
+
+// The Regret Index: the share of the bottles WITH a drink window that are
+// past it, in whole percent; 0 when no bottle has a window.
+function regretIndexOf(m) {
+  const withWindow = m.declining + m.late + m.peak + m.early + m.notReady;
+  return withWindow > 0 ? Math.round((m.declining / withWindow) * 100) : 0;
+}
+
 /**
- * The rating distribution three ways (support ticket 2026-10-11: someone who
- * rates only when drinking saw an empty "Rating distribution"): the bottles
+ * The rating distribution three ways (someone who rates only when drinking
+ * must not see an empty "Rating distribution"): the bottles
  * in the cellar, the history — bottles drunk, gifted or sold, each with the
  * rating given when drinking, else the one on the bottle
  * (utils/ratingUtils.bottleRating) — and all of them, each bottle once.
@@ -68,7 +83,7 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
   const byBottleSize  = {};
   const byPurchaseYear = {};
   const byProducer    = {};
-  const maturity      = { declining: 0, late: 0, peak: 0, early: 0, notReady: 0, noProfile: 0 };
+  const maturity      = emptyMaturity();
   const maturityCoverage = { sommSet: 0, none: 0 };
   const cellarMap     = {};
   const topValueArr   = [];
@@ -95,7 +110,7 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
       byRating[ratingBand(ownRating)]++;
     }
 
-    const type = wd?.type || 'unknown';
+    const type = statType(wd);
     byType[type] = (byType[type] || 0) + 1;
 
     const country = wd?.country?.name || 'Unknown';
@@ -147,13 +162,14 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
       (resolvedWindow.earlyFrom != null || resolvedWindow.peakFrom != null || resolvedWindow.peakUntil != null);
 
     const maturityStatus = classifyMaturity(b, profileMap);
+    // The bucket counts here and again in the bottle's cellar row below, so
+    // the cellars' counts always add up to these.
+    const maturityKey = !maturityStatus ? 'noProfile'
+      : maturityStatus === 'not-ready' ? 'notReady' : maturityStatus;
+    maturity[maturityKey]++;
     if (maturityStatus) {
-      const key = maturityStatus === 'not-ready' ? 'notReady' : maturityStatus;
-      maturity[key]++;
       healthScoreSum += HEALTH_SCORES[maturityStatus] ?? 0;
       healthScoreCount++;
-    } else {
-      maturity.noProfile++;
     }
 
     // Coverage note ("N with sommelier profiles") counts ONLY a usable reviewed
@@ -195,12 +211,12 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
         id:            b._id?.toString(),
         // cellarId travels WITH the bottle id because a bottle's page is
         // /cellars/:cellarId/bottles/:bottleId — the id alone cannot address
-        // it. The HA card never noticed: it calls the API, not a URL.
+        // it. The HA card does not need it: it calls the API, not a URL.
         cellarId:      b.cellar?.toString(),
         name:          wd?.name      || 'Unknown',
         producer:      wd?.producer  || '',
         vintage:       b.vintage     || 'NV',
-        type:          wd?.type      || 'unknown',
+        type:          statType(wd),
         price:         b.price ? Math.round((toTarget(b.price, b.currency || 'USD') ?? 0) * 100) / 100 : null,
         status:        maturityStatus,
       });
@@ -209,13 +225,13 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
     const cid = b.cellar.toString();
     if (!cellarMap[cid]) {
       const cel = cellars.find(x => x._id.toString() === cid);
-      // id lets the Statistics cellar breakdown link straight to the cellar
-      // (forum request, turbulent3964 2026-08-29). Falls back to the map key,
-      // which IS the cellar id — so the link works even when the cellar doc
-      // wasn't in the fetched list.
-      cellarMap[cid] = { id: cid, name: cel?.name || 'Cellar', count: 0, value: 0, wines: new Set() };
+      // id lets the Statistics cellar breakdown link straight to the cellar.
+      // Falls back to the map key, which IS the cellar id — so the link works
+      // even when the cellar doc wasn't in the fetched list.
+      cellarMap[cid] = { id: cid, name: cel?.name || 'Cellar', count: 0, value: 0, wines: new Set(), maturity: emptyMaturity() };
     }
     cellarMap[cid].count++;
+    cellarMap[cid].maturity[maturityKey]++;
     if (b.price) {
       const v = toTarget(b.price, b.currency || 'USD');
       if (v != null) cellarMap[cid].value += v;
@@ -226,10 +242,9 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
       const v = toTarget(b.price, b.currency || 'USD');
       // id + cellarId: same reason as the urgency ladder's — together they
       // address the bottle's page (/cellars/:cellarId/bottles/:id), where the
-      // owner sees its rack slot and label photo (forum request,
-      // turbulent3964 2026-08-29). Optional-chained so a missing id omits the
-      // field rather than crashing; the UI then renders plain text.
-      if (v != null) topValueArr.push({ id: b._id?.toString(), cellarId: b.cellar?.toString(), name: wd.name || 'Unknown', producer: wd.producer || '', vintage: b.vintage || 'NV', type: wd.type || 'unknown', price: Math.round(v * 100) / 100 });
+      // owner sees its rack slot and label photo. Optional-chained so a missing
+      // id omits the field rather than crashing; the UI then renders plain text.
+      if (v != null) topValueArr.push({ id: b._id?.toString(), cellarId: b.cellar?.toString(), name: wd.name || 'Unknown', producer: wd.producer || '', vintage: b.vintage || 'NV', type: statType(wd), price: Math.round(v * 100) / 100 });
     }
   }
 
@@ -257,7 +272,7 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
     consumptionByReason[reason] = (consumptionByReason[reason] || 0) + 1;
 
     const cwd = b.wineDefinition;
-    if (cwd?.type) consumedByType[cwd.type] = (consumedByType[cwd.type] || 0) + 1;
+    if (cwd?.type || cwd?.nonWine === true) consumedByType[statType(cwd)] = (consumedByType[statType(cwd)] || 0) + 1;
     if (cwd?.region?.name) consumedByRegion[cwd.region.name] = (consumedByRegion[cwd.region.name] || 0) + 1;
     if (cwd?.country?.name) consumedByCountry[cwd.country.name] = (consumedByCountry[cwd.country.name] || 0) + 1;
     if (cwd?.producer) consumedByProducer[cwd.producer] = (consumedByProducer[cwd.producer] || 0) + 1;
@@ -285,9 +300,16 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
       historyRatings.sum += own; historyRatings.count++;
     }
 
+    // Held from the purchase, else from the day the bottle was added. A bottle
+    // drunk more than a day BEFORE that (a drinking history logged after the
+    // fact, from another app) has no known holding time and stays out of the
+    // chart; the one day of slack keeps a same-day add-and-drink, whose
+    // date-only consumedAt is noon UTC, in the first bucket.
     const anchor = b.purchaseDate || b.createdAt;
-    if (b.consumedAt && anchor) {
-      const daysHeld = (new Date(b.consumedAt) - new Date(anchor)) / MS_PER_DAY;
+    const daysHeld = b.consumedAt && anchor
+      ? (new Date(b.consumedAt) - new Date(anchor)) / MS_PER_DAY
+      : null;
+    if (daysHeld !== null && daysHeld >= -1) {
       const bucket = daysHeld < 365 ? '<1yr' : daysHeld < 730 ? '1–2yr' : daysHeld < 1825 ? '2–5yr' : daysHeld < 3650 ? '5–10yr' : '10+yr';
       holdingBuckets[bucket].count++;
       if (b.consumedRating) {
@@ -298,7 +320,7 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
     }
 
     if (reason === 'drank' && b.consumedRating && b.price) {
-      const type     = b.wineDefinition?.type || 'unknown';
+      const type     = statType(b.wineDefinition);
       const priceCvt = toTarget(b.price, b.currency || 'USD');
       if (priceCvt && priceCvt > 0) {
         const normCR = toNormalized(b.consumedRating, b.consumedRatingScale || '5');
@@ -315,7 +337,7 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
       regretItems.push({
         name:           wd?.name  || 'Unknown',
         vintage:        b.vintage || 'NV',
-        type:           wd?.type  || 'unknown',
+        type:           statType(wd),
         rating:         toNormalized(b.rating,         b.ratingScale         || '5'),
         consumedRating: toNormalized(b.consumedRating, b.consumedRatingScale || '5'),
         delta:          toNormalized(b.consumedRating, b.consumedRatingScale || '5') - toNormalized(b.rating, b.ratingScale || '5'),
@@ -327,8 +349,7 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
   const healthScore = healthScoreCount > 0 ? Math.round(healthScoreSum / healthScoreCount) : null;
   const healthGrade = healthScore === null ? null : healthScore >= 85 ? 'A' : healthScore >= 70 ? 'B' : healthScore >= 55 ? 'C' : healthScore >= 40 ? 'D' : 'F';
 
-  const bottlesWithProfile = maturity.declining + maturity.late + maturity.peak + maturity.early + maturity.notReady;
-  const regretIndex = bottlesWithProfile > 0 ? Math.round((maturity.declining / bottlesWithProfile) * 100) : 0;
+  const regretIndex = regretIndexOf(maturity);
 
   const maturityForecast = forecastYears.map(y => ({ year: y, count: forecastCounts[y] || 0, isCurrent: y === currentYear }));
 
@@ -421,7 +442,13 @@ async function computeOverview({ activeBottles, consumedBottles, cellars, target
     consumedByCountry,
     consumedByGrape,
     consumedByProducer,
-    cellarBreakdown: Object.values(cellarMap).map(c => ({ id: c.id, name: c.name, bottleCount: c.count, value: Math.round(c.value * 100) / 100, uniqueWines: c.wines.size })).sort((a, b) => b.bottleCount - a.bottleCount),
+    // `maturity` and `regretIndex` per cellar feed the Statistics page's
+    // "by cellar" table. They are left out of the public API document
+    // (openapi/document.js) on purpose: documented fields are a contract.
+    cellarBreakdown: Object.values(cellarMap).map(c => ({
+      id: c.id, name: c.name, bottleCount: c.count, value: Math.round(c.value * 100) / 100, uniqueWines: c.wines.size,
+      maturity: c.maturity, regretIndex: regretIndexOf(c.maturity),
+    })).sort((a, b) => b.bottleCount - a.bottleCount),
     maturityForecast,
     urgencyLadder: urgencyArr.slice(0, 10),
     holdingTime,
@@ -453,7 +480,7 @@ function buildEmptyStats(currency, targetRatingScale) {
     byVintage: [], byRating: emptyBands(),
     ratingViews: ratingViews({ byRating: emptyBands(), sum: 0, count: 0 }, { byRating: emptyBands(), sum: 0, count: 0 }),
     byBottleSize: {}, byPurchaseYear: [],
-    maturity:   { declining: 0, late: 0, peak: 0, early: 0, notReady: 0, noProfile: 0 },
+    maturity:   emptyMaturity(),
     maturityCoverage: { sommSet: 0, none: 0 },
     topValueBottles: [], consumptionByYear: [],
     consumptionByReason: { drank: 0, gifted: 0, sold: 0, other: 0 },

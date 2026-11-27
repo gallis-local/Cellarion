@@ -45,6 +45,10 @@
   right: 0;
   z-index: 41;
   min-width: 190px;
+  /* As wide as the longest item, so it does not wrap inside the narrow
+     button it hangs from, but never wider than the screen. */
+  width: max-content;
+  max-width: calc(100vw - 2rem);
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
@@ -73,9 +77,18 @@
   font-size: 0.9rem;
   font-family: var(--font-body);
   text-align: left;
+  text-decoration: none;
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background var(--transition-fast);
+}
+
+/* The icon in a fixed column: emoji and text symbols such as ⚑ differ in
+   width, and the labels should start at the same place. */
+.bd-overflow-item > span[aria-hidden="true"]:first-child {
+  flex: none;
+  width: 1.25rem;
+  text-align: center;
 }
 
 .bd-overflow-item:hover {
@@ -425,6 +438,7 @@
 .bd-wine-placeholder.sparkling{ background: var(--wine-sparkling); }
 .bd-wine-placeholder.dessert  { background: var(--wine-dessert); }
 .bd-wine-placeholder.fortified{ background: var(--wine-fortified); }
+.bd-wine-placeholder.other{ background: var(--color-border); }
 
 .bd-wine-meta {
   padding: 1rem 0.25rem 0;
@@ -462,13 +476,16 @@
 .wine-type-pill.sparkling{ background: var(--wine-sparkling); color: var(--color-info); }
 .wine-type-pill.dessert  { background: var(--wine-dessert); color: #b07ad0; }
 .wine-type-pill.fortified{ background: var(--wine-fortified); color: var(--color-success); }
+.wine-type-pill.other    { background: var(--color-surface-hover); color: var(--color-text-secondary); }
+.bd-not-wine { margin-top: 0.75rem; }
+.bd-not-wine-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
 
 /* ── Details card ── */
 .bd-details {
   margin-bottom: 1rem;
 }
 
-/* Folding cards, as on the vintage page (2026-10-14). Each wrapper carries
+/* Folding cards, as on the vintage page. Each wrapper carries
    the 1rem gap: the shared folding rules zero a wrapped card's top margin
    (tasting profile and reviews had one), and the personal-data and history
    cards had none, so they sat flush against each other. A wrapper whose card
@@ -504,7 +521,7 @@
 
 /* The record keeps the divider and spacing every section of this card has.
    Inside its fold wrapper it is the only div, so it matched
-   .bd-section:last-of-type and lost them (audit 2026-10-14); the wrapper
+   .bd-section:last-of-type and lost them; the wrapper
    carries them now, folded or not. */
 .bd-details > .cblock--nested {
   margin-bottom: 1rem;
@@ -1017,6 +1034,15 @@
   font-size: 0.85rem;
 }
 
+/* The way to a window of one's own: a line under the sommelier's window. */
+.bd-own-window-offer {
+  margin-top: 0.5rem;
+}
+
+.bd-section-label + .bd-own-window-offer {
+  margin-top: 0;
+}
+
 /* ── Reservation ("spoken for") ── */
 .bd-reservation {
   display: flex;
@@ -1434,7 +1460,7 @@
   cursor: help;
 }
 
-/* Curator-verified provenance (#985) — the trustworthy state reads green */
+/* Curator-verified provenance — the trustworthy state reads green */
 .bd-ai-tag--curator {
   background: var(--color-success-bg, rgba(46, 125, 50, 0.12));
   color: var(--color-success, #2e7d32);

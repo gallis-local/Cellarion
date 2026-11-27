@@ -1,5 +1,5 @@
 /**
- * The auto-mode grouping controls (support ticket 2026-09-12): up to three
+ * The auto-mode grouping controls: up to three
  * nested levels picked one under the other, the collapse toggle that only
  * matters once there is a second level, the legacy groupBy kept in sync, and
  * the live preview rendering the nested headings from unsaved state.
@@ -98,5 +98,17 @@ describe('WineListEditor grouping levels', () => {
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Preview' })); });
     expect(screen.queryByText('$95')).not.toBeInTheDocument();
     expect(screen.getAllByText('Last bottle')).toHaveLength(1); // Barolo has stock 1, Rioja 3
+  });
+
+  test('the layout tab can show how many bottles there are of each wine, and the preview counts them', async () => {
+    render(<WineListEditor />);
+    await screen.findByTestId('group-level-0');
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Preview' })); });
+    expect(screen.queryByText(/\d bottles?$/)).not.toBeInTheDocument();
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Layout' })); });
+    fireEvent.click(screen.getByLabelText(/Show how many bottles/));
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Preview' })); });
+    expect(screen.getByText(/· 1 bottle$/)).toBeInTheDocument(); // Barolo
+    expect(screen.getByText(/· 3 bottles$/)).toBeInTheDocument(); // Rioja
   });
 });

@@ -8,6 +8,7 @@ import BottleCard from '../components/BottleCard';
 import { ratingRangeLabel, ratingBandName, toMaturityArray, MATURITY_I18N_KEY } from '../utils/filterLabels';
 import { friendlyError, httpError } from '../utils/friendlyError';
 import './Bottles.css';
+import { formatVintage } from '../utils/vintage';
 
 const FILTER_KEYS = [
   'search', 'type', 'country', 'region', 'appellation', 'grapes',
@@ -35,11 +36,11 @@ const STATUS_LABELS = {
 const PAGE_SIZE = 30;
 
 /**
- * Cross-cellar bottle list — typically reached by clicking a chart
- * segment on the Statistics page. The filter to apply is encoded in the
- * URL query params and the page is essentially read-only: the user lands
- * here with a specific filter pre-applied and can clear individual chips
- * or all of them to broaden the view.
+ * Cross-cellar bottle list — reached by clicking a chart segment on the
+ * Statistics page, or from the "Search" nav link. The filter to apply is
+ * encoded in the URL query params and the page is essentially read-only:
+ * the user lands here with a specific filter pre-applied (or types a search)
+ * and can clear individual chips or all of them to broaden the view.
  *
  * The set of bottles shown matches the Statistics page's scope: only
  * cellars the user OWNS (shared/read-only cellars are excluded), so a
@@ -122,6 +123,49 @@ function Bottles() {
     setSearchParams(new URLSearchParams(), { replace: true });
   };
 
+  // The search box mirrors the `search` filter: typing is local until submit,
+  // and the box follows the address when a chip or "Clear all" removes it.
+  const [searchDraft, setSearchDraft] = useState(filters.search || '');
+  useEffect(() => { setSearchDraft(filters.search || ''); }, [filters.search]);
+
+  // "/" jumps to the search box, unless the person is already typing somewhere.
+  const searchInput = useRef(null);
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.target.closest?.('input, textarea, select, [contenteditable]')) return;
+      // An open dialog (the policy prompt, a modal) keeps the keyboard.
+      if (document.querySelector('[aria-modal="true"]')) return;
+      e.preventDefault();
+      searchInput.current?.focus();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
+
+  const submitSearch = (e) => {
+    e.preventDefault();
+    const next = new URLSearchParams(searchParams);
+    const query = searchDraft.trim();
+    if (query) next.set('search', query); else next.delete('search');
+    next.delete('page');
+    setSearchParams(next, { replace: true });
+  };
+
+  // Scope of the search: bottles still in the cellar (the API default, so it
+  // stays out of the address), everything, or only those already drunk/gone.
+  const statusScope = filters.status || 'active';
+  const changeStatusScope = (e) => {
+    const next = new URLSearchParams(searchParams);
+    if (e.target.value === 'active') next.delete('status'); else next.set('status', e.target.value);
+    // What is typed in the box counts too: type a name, then pick where to
+    // look, and the list answers both.
+    const query = searchDraft.trim();
+    if (query) next.set('search', query); else next.delete('search');
+    next.delete('page');
+    setSearchParams(next, { replace: true });
+  };
+
   // Build a friendly label for each active filter chip. We resolve
   // country/region/grape names from the populated bottle data we already
   // received, so we don't need an extra taxonomy fetch.
@@ -157,7 +201,7 @@ function Bottles() {
       });
       labels.grapes = t('bottles.chipGrape', 'Grape: {{value}}', { value: names.join(', ') });
     }
-    if (filters.vintage) labels.vintage = t('bottles.chipVintage', 'Vintage: {{value}}', { value: filters.vintage });
+    if (filters.vintage) labels.vintage = t('bottles.chipVintage', 'Vintage: {{value}}', { value: formatVintage(filters.vintage, t) });
     if (filters.producer) labels.producer = t('bottles.chipProducer', 'Producer: {{value}}', { value: filters.producer });
     if (filters.bottleSize) labels.bottleSize = t('bottles.chipSize', 'Size: {{value}}', { value: filters.bottleSize });
     // Rating bounds arrive normalised (0–100) and read back in the user's scale.
@@ -190,19 +234,51 @@ function Bottles() {
 
   return (
     <div className="bottles-page">
-      <div className="bottles-header">
-        <div className="bottles-header-text">
+      <div className="page-header">
+        <div>
           <h1>{t('bottles.title', 'All bottles')}</h1>
-          <p className="bottles-subtitle">
+          <p className="page-subtitle">
             {loading
               ? t('bottles.loading', 'Loading…')
               : t('bottles.summary', '{{count}} of {{total}} bottles', { count: data.count, total })}
           </p>
         </div>
-        <Link to="/statistics" className="btn btn-secondary btn-small">
-          {t('bottles.backToStats', '← Back to Statistics')}
-        </Link>
+        <div className="header-actions">
+          <Link to="/statistics" className="btn btn-secondary btn-small">
+            {t('bottles.backToStats', '← Back to Statistics')}
+          </Link>
+        </div>
       </div>
+
+      <form className="bottles-search" role="search" onSubmit={submitSearch}>
+        <input
+          ref={searchInput}
+          type="search"
+          className="bottles-search-input"
+          value={searchDraft}
+          onChange={(e) => setSearchDraft(e.target.value)}
+          placeholder={t('bottles.searchPlaceholder', 'Search name, producer, region, grape…')}
+          aria-label={t('bottles.searchLabel', 'Search all your bottles')}
+        />
+        <select
+          className="bottles-search-scope"
+          value={statusScope}
+          onChange={changeStatusScope}
+          aria-label={t('bottles.scopeLabel', 'Which bottles to search')}
+        >
+          <option value="active">{t('bottles.scopeActive', 'In cellar')}</option>
+          <option value="all">{t('bottles.scopeAll', 'Everything')}</option>
+          <option value="consumed">{t('bottles.scopeConsumed', 'Drunk or gone')}</option>
+          {!['active', 'all', 'consumed'].includes(statusScope) && (
+            <option value={statusScope}>
+              {t(`bottles.statusLabels.${statusScope}`, STATUS_LABELS[statusScope] || statusScope)}
+            </option>
+          )}
+        </select>
+        <button type="submit" className="btn btn-primary">
+          {t('bottles.searchButton', 'Search')}
+        </button>
+      </form>
 
       {chips.length > 0 && (
         <div className="bottles-chips-row">

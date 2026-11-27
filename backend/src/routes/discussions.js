@@ -13,7 +13,7 @@ const User = require('../models/User');
 const WineDefinition = require('../models/WineDefinition');
 const BlogPost = require('../models/BlogPost');
 const { stripHtml, escapeRegex } = require('../utils/sanitize');
-const { sanitizeForumHtml, visibleTextLength } = require('../utils/sanitizeHtml');
+const { sanitizeForumHtml, visibleTextLength, visibleText } = require('../utils/sanitizeHtml');
 const { logAudit } = require('../services/audit');
 const { incrementCred, decrementCred } = require('../utils/cellarCred');
 const {
@@ -86,12 +86,10 @@ router.get('/', optionalAuth, async (req, res) => {
       //
       // English ALSO matches threads with no language field at all. A Mongoose
       // default applies when a document is created, never to documents that
-      // already exist — so the release that added this field left every
-      // pre-existing thread unmatched, and the English forum rendered empty on
-      // production until the rows were backfilled (2026-08-31). The backfill
-      // is done; this makes the query correct on its own, so a restored
-      // snapshot or a document written around the schema cannot empty the
-      // forum again. `null` matches missing fields in MongoDB.
+      // already exist, so a thread can lack the field. Matching the missing
+      // field keeps the query correct on its own: a restored snapshot or a
+      // document written around the schema cannot empty the English forum.
+      // `null` matches missing fields in MongoDB.
       filter.language = languageFilter === DEFAULT_LANGUAGE
         ? { $in: [DEFAULT_LANGUAGE, null] }
         : { $eq: languageFilter };
@@ -125,12 +123,12 @@ router.get('/', optionalAuth, async (req, res) => {
     // Meilisearch path: fuzzy match on title/body/authorName/wineName,
     // hydrate hits from MongoDB to keep the response shape consistent.
     //
-    // Skipped when a blogPost scope is present (audit 2026-08-21 M-2): the
-    // Meili index doesn't carry blogPost, so this branch used to ignore the
-    // filter and a q+blogPost request silently widened from "threads about
-    // this post" to "all threads matching q" — answering a different question
-    // than the one asked. Exact scope beats fuzzy relevance for a post's own
-    // thread list, and the Mongo path below applies both together honestly.
+    // Skipped when a blogPost scope is present: the Meili index doesn't carry
+    // blogPost, so this branch would ignore the filter and a q+blogPost request
+    // would silently widen from "threads about this post" to "all threads
+    // matching q" — answering a different question than the one asked. Exact
+    // scope beats fuzzy relevance for a post's own thread list, and the Mongo
+    // path below applies both together honestly.
     if (query && !filter.blogPost && searchService.getIsAvailable()) {
       try {
         const { ids, estimatedTotalHits } = await searchService.searchDiscussions(query, {
@@ -499,9 +497,9 @@ router.post('/', requireAuth, requireNonDemo, async (req, res) => {
       // ABSOLUTE pendingIdentity gate — not the creator-aware one. A discussion
       // is anonymously readable (optionalAuth), its wine is populated into the
       // response, baked into the anonymously-searchable discussion Meili index
-      // and rendered for CRAWLERS by routes/og.js. So even the row's own
+      // and rendered for CRAWLERS by routes/og/discussions.js. So even the row's own
       // creator must not be able to publish it: attaching is what would make a
-      // hidden half-identified wine public (security audit). Refused at WRITE
+      // hidden half-identified wine public. Refused at WRITE
       // time, which closes every downstream read path at once.
       const wineExists = await WineDefinition.exists({ _id: wineOid, pendingIdentity: { $ne: true } });
       if (!wineExists) return res.status(400).json({ error: 'Wine not found' });
@@ -601,7 +599,7 @@ router.delete('/:idOrSlug', requireAuth, requireModeratorOrAdmin, async (req, re
     const replyIdList = replyIds.map(r => r._id);
 
     // Collect the Cellar-Cred these documents awarded BEFORE deleting them so
-    // the hard delete reverses the awards symmetrically (L-19): +2 to the
+    // the hard delete reverses the awards symmetrically: +2 to the
     // discussion author, +1 per live reply to its author, +1 per non-self
     // reaction to the reacted reply's author. Soft-deleted replies already had
     // their reply-created point reversed at soft-delete time, so they are
@@ -787,13 +785,13 @@ router.post('/:idOrSlug/replies', requireAuth, requireNonDemo, async (req, res) 
         // Strip the quoted body to plain text before truncating — slicing raw
         // HTML would split tags ("<stro|ng>") and break rendering. The quote
         // is rendered in a styled blockquote, so plain text is the right form.
-        const quotedPlain = stripHtml(quotedReply.body || '');
+        const quotedPlain = visibleText(quotedReply.body || '');
         const snippetBody = quotedPlain.length > 300
           ? quotedPlain.slice(0, 300) + '…'
           : quotedPlain;
         // authorId is persisted alongside the denormalised name snapshot so
         // GDPR erasure can find and anonymise quote.authorName on OTHER
-        // users' replies when the quoted author deletes their account (L-17).
+        // users' replies when the quoted author deletes their account.
         quotedAuthorId = quotedReply.author?._id || null;
         quoteData = {
           replyId: quotedReply._id,
@@ -868,7 +866,7 @@ router.post('/:idOrSlug/replies', requireAuth, requireNonDemo, async (req, res) 
     const replierName = replier?.displayName || replier?.username || 'Someone';
     const link = `/community/discussions/${discussion.slug || discussion._id}`;
     const fullUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}${link}`;
-    const replyTextPreview = stripHtml(cleanBody).slice(0, 280);
+    const replyTextPreview = visibleText(cleanBody).slice(0, 280);
     const notified = new Set();
     const selfId = String(req.user.id);
 
@@ -975,10 +973,10 @@ router.post('/:idOrSlug/replies', requireAuth, requireNonDemo, async (req, res) 
       console.error('[discussions] mention/watcher resolution failed:', err.message);
     }
 
-    // Fire-and-forget, same as the old per-recipient calls — delivery must
-    // never block or fail the reply create. Every item here is triggered by the
-    // replier, so tag them with actor so GDPR erasure can remove notifications
-    // that name this user from other users' feeds on their deletion.
+    // Fire-and-forget: delivery must never block or fail the reply create.
+    // Every item here is triggered by the replier, so tag them with actor so
+    // GDPR erasure can remove notifications that name this user from other
+    // users' feeds on their deletion.
     createNotifications(notificationItems.map(i => ({ ...i, actor: req.user.id }))).catch(err =>
       console.error('[discussions] reply notification batch failed:', err.message)
     );
@@ -1058,7 +1056,7 @@ router.delete('/:discussionId/replies/:replyId', requireAuth, async (req, res) =
     reply.deletedAt = new Date();
     await reply.save();
 
-    // Reverse the +1 the reply's creation awarded (L-19) — a create/delete
+    // Reverse the +1 the reply's creation awarded — a create/delete
     // cycle nets zero. The isDeleted guard above makes this once-only (there
     // is no un-delete). Reaction cred is NOT reversed here: reactions stay on
     // the soft-deleted reply and remain toggleable, so their accounting stays
@@ -1128,7 +1126,7 @@ router.post('/:discussionId/replies/:replyId/reactions', requireAuth, requireNon
 
     if (existing) {
       const del = await DiscussionReaction.deleteOne({ _id: existing._id });
-      // Symmetric cred (L-19): the reaction awarded +1 to the reply author, so
+      // Symmetric cred: the reaction awarded +1 to the reply author, so
       // removing it takes the point back — a react/un-react toggle loop nets
       // zero instead of +1 per cycle (×8 kinds). Guarded by deletedCount so a
       // concurrent double-un-react can't double-reverse; self-reactions never
@@ -1235,8 +1233,8 @@ router.patch('/:idOrSlug/pin', requireAuth, requireModeratorOrAdmin, async (req,
 //
 // The sanctioned response to a thread written in the wrong section: English is
 // the default forum, and someone posting in their own language there has
-// mis-filed rather than misbehaved, so a moderator MOVES it (Johan,
-// 2026-08-31). Deliberately not a delete, not a lock, and not a notification —
+// mis-filed rather than misbehaved, so a moderator MOVES it. Deliberately
+// not a delete, not a lock, and not a notification —
 // the thread and its replies are untouched, and the author is not told off for
 // a filing decision they were never asked to make.
 //

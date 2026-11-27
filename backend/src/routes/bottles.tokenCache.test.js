@@ -1,7 +1,7 @@
 /**
  * GET /api/bottles — answering API-token polling from memory.
  *
- * Scaling audit 2026-09-25: Home Assistant asks `?maturity=…&limit=…` every
+ * Home Assistant asks `?maturity=…&limit=…` every
  * few minutes and after every change nudge, and the maturity path loads and
  * classifies the whole collection per request. Pinned here: a token request
  * with an unchanged data version is answered from memory; a change (the data
@@ -20,7 +20,7 @@ jest.mock('../middleware/auth', () => ({
   },
   requireNonDemo: (req, res, next) => next(),
 }));
-jest.mock('../services/search', () => ({ getIsAvailable: () => false, search: async () => ({ ids: [] }), indexBottle: jest.fn(), removeBottle: jest.fn() }));
+jest.mock('../services/search', () => ({ getIsAvailable: () => false, search: async () => ({ ids: [] }) }));
 jest.mock('../services/bottleLot', () => ({ findLotSiblingIds: jest.fn().mockResolvedValue([]) }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../services/embeddingJob', () => ({ embedSinglePair: jest.fn().mockResolvedValue(undefined) }));
@@ -36,7 +36,7 @@ jest.mock('../utils/maturityUtils', () => ({
   buildProfileMap: jest.fn().mockResolvedValue(new Map()),
   classifyMaturity: jest.fn(() => 'peak'),
 }));
-jest.mock('./cellars', () => ({ attachBottleImageUrls: async (bottles) => bottles }));
+jest.mock('../services/bottleImageUrls', () => ({ attachBottleImageUrls: async (bottles) => bottles }));
 
 jest.mock('../models/Cellar', () => ({ find: jest.fn() }));
 jest.mock('../models/WineDefinition', () => ({ find: jest.fn() }));

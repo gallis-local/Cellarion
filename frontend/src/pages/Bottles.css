@@ -1,26 +1,6 @@
 .bottles-page {
-  max-width: 1200px;
+  max-width: var(--page-width-wide);
   margin: 0 auto;
-  padding: 1.5rem 1rem 3rem;
-}
-
-.bottles-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1rem;
-  margin-bottom: 1rem;
-}
-
-.bottles-header h1 {
-  margin: 0;
-  font-size: 1.6rem;
-}
-
-.bottles-subtitle {
-  margin: 0.25rem 0 0;
-  color: var(--color-text-muted, #9A9484);
-  font-size: 0.95rem;
 }
 
 .bottles-chips-row {
@@ -35,9 +15,8 @@
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
-  /* Theme tokens, like the cellar view's chips: the old fixed light-beige
-     text was unreadable on the light theme's pale fill (support ticket
-     2026-09-19). */
+  /* Theme tokens, like the cellar view's chips: a fixed light-beige text
+     is unreadable on the light theme's pale fill. */
   background: var(--color-primary-light);
   color: var(--color-primary);
   border: 1px solid var(--color-border);
@@ -123,4 +102,55 @@
 .bottles-page-indicator {
   color: var(--color-text-muted, #9A9484);
   font-size: 0.9rem;
+}
+
+.bottles-search {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.bottles-search-input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  /* 16px: anything smaller makes iOS Safari zoom the page on focus. */
+  font-size: 16px;
+  min-height: 44px;
+}
+
+.bottles-search-input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.bottles-search-scope {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  /* 16px: anything smaller makes iOS Safari zoom the page on focus. */
+  font-size: 16px;
+  min-height: 44px;
+}
+
+/* Phone: the box gets its own row; scope and button share the one below. */
+@media (max-width: 600px) {
+  .bottles-search {
+    flex-wrap: wrap;
+  }
+
+  .bottles-search-input {
+    flex-basis: 100%;
+  }
+
+  .bottles-search-scope {
+    flex: 1;
+    min-width: 0;
+  }
 }

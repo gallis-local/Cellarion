@@ -1,11 +1,11 @@
 /**
  * Same wine, different label form.
  *
- * Somm ticket e9b346ba (2026-08-23). One import file carried the same wine
- * more than once under variant names and nothing collided: `normalizedKey` is
- * exact, and the fuzzy scorer never got close. Measured against the 17 pairs a
- * curator merged by hand that day, EVERY pair scored below 0.85 — the floor of
- * even the "did you mean?" soft zone — spread across 0.58 to 0.85:
+ * The same wine can arrive more than once under variant names without
+ * colliding: `normalizedKey` is exact, and the fuzzy scorer never gets close.
+ * Measured against pairs a curator merged by hand, EVERY pair scored below
+ * 0.85 — the floor of even the "did you mean?" soft zone — spread across 0.58
+ * to 0.85:
  *
  *   Bin 389 / Bin 389 Cabernet Shiraz .................. 0.717
  *   RWT / RWT Shiraz ................................... 0.721
@@ -134,7 +134,7 @@ function isLabelVariant(a, b, grapeTokens) {
       && !subset(ra.varieties, rb.varieties) && !subset(rb.varieties, ra.varieties)) {
     return { match: false, reason: 'each name states a different variety — a range, not a duplicate' };
   }
-  // The same guard on the OTHER axis a range varies along (issue #1134): a
+  // The same guard on the OTHER axis a range varies along: a
   // Mosel estate bottles one vineyard as Kabinett, Spätlese and Auslese, and
   // each Prädikat again as trocken / feinherb. Today the reduction already
   // separates them — style words are not in FURNITURE, so they survive into
@@ -142,7 +142,8 @@ function isLabelVariant(a, b, grapeTokens) {
   // words read exactly like furniture ("trocken" is not a wine's name), and
   // the first person to add them to the strip list would collapse a producer's
   // whole range onto one row with nothing to stop it.
-  const styleConflict = conflictingStyleTerms(a.name, b.name);
+  // Both rows go in whole: a recorded label sweetness counts beside the name.
+  const styleConflict = conflictingStyleTerms(a, b);
   if (styleConflict) {
     return { match: false, reason: `${styleConflict} — a range, not a duplicate` };
   }
@@ -159,4 +160,4 @@ function isLabelVariant(a, b, grapeTokens) {
   return { match: true, reason: `same reduced name "${[...ra.core].sort().join(' ')}"` };
 }
 
-module.exports = { isLabelVariant, reduceName, grapeTokenSet, FURNITURE };
+module.exports = { isLabelVariant, reduceName, grapeTokenSet };

@@ -5,15 +5,16 @@ import { SCALE_META, toNormalized, fromNormalized } from '../utils/ratingUtils';
 import {
   MATURITY_FILTER_OPTIONS, NEEDS_ATTENTION, MATURITY_I18N_KEY, MATURITY_STATS_KEY, toMaturityArray,
 } from '../utils/filterLabels';
+import { SWEETNESS_CATEGORIES, SWEETNESS_FILTER_VALUES, sweetnessFilterLabel } from '../utils/sweetnessCategory';
 import './BottleFilterModal.css';
 
 const COLLAPSED_LIMIT = 8;
 
 // Rating bounds live in the filter state as NORMALISED 0–100 strings (the wire
 // format every list endpoint speaks), but the person types in their own scale
-// — 3.8★, 16.5/20, 91pts — at the scale's own precision (support ticket
-// 2026-09-12: ratings are stored to one decimal, the old 2+/3+/4+ dropdown
-// rounded to whole stars). Text is local until blur/Enter so a half-typed
+// — 3.8★, 16.5/20, 91pts — at the scale's own precision (star and 20-point
+// ratings carry one decimal, which a whole-star choice cannot express). Text is
+// local until blur/Enter so a half-typed
 // "3." is never round-tripped through the conversion mid-keystroke.
 function RatingRangeInputs({ minNorm, maxNorm, scale, onChange }) {
   const { t } = useTranslation();
@@ -179,7 +180,7 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
   const clearAll = () => {
     onApply({
       ...filters,
-      type: [], country: [], region: [], appellation: [], grapes: [], vintage: [],
+      type: [], country: [], region: [], appellation: [], grapes: [], vintage: [], sweetnessCategory: [],
       minRating: '', maxRating: '', maturity: [], unplaced: '', reserved: '', storage: ''
     });
   };
@@ -187,14 +188,14 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
   const maturitySelected = toMaturityArray(filters.maturity);
   const activeCount = (filters.type?.length || 0) + (filters.country?.length || 0) +
     (filters.region?.length || 0) + (filters.appellation?.length || 0) + (filters.grapes?.length || 0) +
-    (filters.vintage?.length || 0) + (filters.minRating || filters.maxRating ? 1 : 0) + (maturitySelected.length ? 1 : 0) +
+    (filters.vintage?.length || 0) + (filters.sweetnessCategory?.length || 0) +
+    (filters.minRating || filters.maxRating ? 1 : 0) + (maturitySelected.length ? 1 : 0) +
     (filters.unplaced ? 1 : 0) + (filters.reserved ? 1 : 0) + (filters.storage ? 1 : 0);
 
   // A pill's count: how many bottles choosing it gives, with the other
   // fields' choices kept. Every pill of the cellar stays listed (allFacets),
-  // so a second country can still be added — a selected field used to show
-  // the whole cellar's counts instead, as if no other filter were on
-  // (support report 2026-10-16).
+  // so a second country can still be added — a selected field must not show
+  // the whole cellar's counts instead, as if no other filter were on.
   // No counts sent at all (a rack / storage filter the search cannot count):
   // no numbers and nothing dimmed.
   const countsFor = (facetKey) => (facets ? facets[facetKey] || {} : null);
@@ -223,6 +224,37 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
                     />
                   );
                 })}
+            </FilterSection>
+          );
+        })()}
+
+        {/* Sweetness — the category each wine reads as (dry … sweet, one
+            scale for still and sparkling), in scale order, then the wines that
+            state none. Only the values this cellar holds; closed until one is
+            chosen, like the longer sections below. A cellar where no wine
+            reads as a category has no section: "Not stated" alone would
+            list every wine. */}
+        {(() => {
+          const held = SWEETNESS_FILTER_VALUES.filter(v => allFacets?.sweetnessCategory?.[v] > 0);
+          const chosen = filters.sweetnessCategory || [];
+          if (!held.some(v => SWEETNESS_CATEGORIES.includes(v)) && chosen.length === 0) return null;
+          const counts = countsFor('sweetnessCategory');
+          return (
+            <FilterSection label={t('cellarDetail.sweetnessLabel', 'Sweetness')} icon="🍯" defaultExpanded={chosen.length > 0}>
+              {SWEETNESS_FILTER_VALUES.filter(v => held.includes(v) || chosen.includes(v)).map(value => {
+                const count = counts ? counts[value] || 0 : null;
+                const selected = chosen.includes(value);
+                return (
+                  <FilterPill
+                    key={value}
+                    label={sweetnessFilterLabel(t, value)}
+                    count={count || null}
+                    selected={selected}
+                    dimmed={!selected && count === 0}
+                    onClick={() => toggle('sweetnessCategory', value)}
+                  />
+                );
+              })}
             </FilterSection>
           );
         })()}
@@ -378,7 +410,7 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
         )}
 
         {/* Stored in — a rack group (a room, a fridge) or one rack; single
-            choice, server-side after search (support ticket 2026-09-06). */}
+            choice, server-side after search. */}
         {Array.isArray(storage) && storage.length > 0 && (() => {
           const groups = [...new Set(storage.map(r => r.group).filter(Boolean))];
           const current = filters.storage || '';
@@ -417,7 +449,7 @@ function BottleFilterModal({ filters, onApply, onClose, facets, baseFacets, face
 
         {/* Maturity — several buckets at once, OR-combined, plus the one
             combination almost every owner asks for: "needs attention" = Late
-            + Declining (support ticket 2026-09-12). Counts come from the
+            + Declining. Counts come from the
             cellar statistics, not the facets (maturity is computed per row,
             so Meilisearch cannot facet it) — they describe the whole cellar,
             not the current filter combination, and a zero still shows so an

@@ -10,6 +10,7 @@ const { runRecommendationEmailScrub } = require('./recommendationRetentionJob');
 const { runMcpSnapshotScrub } = require('./mcpSnapshotRetentionJob');
 const { runScanImageRetentionSweep } = require('./scanImageRetentionJob');
 const { runWineDraftExpirySweep } = require('./wineDraftExpiryJob');
+const { runUncheckedWineSweep } = require('./uncheckedWineSweepJob');
 const { runSearchIndexReconcile } = require('./searchReconcileJob');
 const { runSecurityAlertCheck } = require('./securityAlertJob');
 const { runAiCapAlertCheck } = require('./aiCapAlertJob');
@@ -21,6 +22,8 @@ const { runRegistryReadReport } = require('./registryReadReportJob');
 const embeddingJob = require('./embeddingJob');
 const registryBridge = require('./registryBridge');
 const { runReceiptRetentionSweep } = require('./receiptArchive');
+const { runDeprecationReminders } = require('./apiDeprecationNotices');
+const { runInactiveAccounts } = require('./inactiveAccounts');
 
 /**
  * Start all scheduled cron jobs.
@@ -94,9 +97,8 @@ function startScheduler() {
     } catch (err) {
       console.error('[scheduler] Recently-deleted purge failed:', err);
     }
-    // Audit 2026-09 S3-3: the original text of a soft-deleted forum reply is
-    // kept 30 days for moderation and was then kept forever — the purge
-    // helper existed but nothing called it.
+    // The original text of a soft-deleted forum reply is kept 30 days for
+    // moderation, then cleared (DiscussionReply.purgeExpiredDeletes).
     try {
       await DiscussionReply.purgeExpiredDeletes();
     } catch (err) {
@@ -139,13 +141,11 @@ function startScheduler() {
   });
 
   // Search-index reconciliation: daily at 02:37 (container clock; the whole
-  // schedule assumes it). The old 02:15 slot leaned on "the Sunday 02:00 jobs
-  // are done in 15 minutes", which nothing enforces on a 4 GB box
-  // (release-audit L-2) — 02:37 buys the margin without touching any other
-  // slot, and the off-minute keeps fleet load off the :00/:15/:30 marks.
-  // Deletes index documents whose Mongo row is gone; prod 2026-08-13 had 567
-  // such rows in the bottles index after a restore, producing "0 of 14" over
-  // MCP. Read-mostly and delete-only — see services/searchReconcileJob.
+  // schedule assumes it): late enough that the Sunday 02:00 jobs need not be
+  // done within minutes, which nothing enforces on a small box, and the
+  // off-minute keeps fleet load off the :00/:15/:30 marks. Deletes index
+  // documents whose Mongo row is gone (a restore rewinds the database but not
+  // the index). Read-mostly and delete-only — see services/searchReconcileJob.
   cron.schedule('37 2 * * *', async () => {
     console.log('[scheduler] Running search-index reconciliation…');
     try {
@@ -218,8 +218,7 @@ function startScheduler() {
   // Registry health: weekly on Monday at 05:00 UTC (quiet slot — Sunday has
   // the value/price jobs, 06:00 has drink-window). Read-only counts over the
   // registry's detection nets; notifies admins only when a metric regresses
-  // against the previous run (strategy 2026-07-29 R6 — every net existed but
-  // nothing ran them on a schedule).
+  // against the previous run.
   cron.schedule('0 5 * * 1', async () => {
     console.log('[scheduler] Running registry health check…');
     try {
@@ -247,10 +246,10 @@ function startScheduler() {
     }
   });
 
-  // Registry readers report (registry lockdown 2026-09-06, L4): daily at
-  // 05:15 UTC, after the day's counters have closed. Lists yesterday's top
-  // readers by distinct wines and notifies admins about anyone past the alert
-  // level — the alarm the canaries are the evidence for.
+  // Registry readers report: daily at 05:15 UTC, after the day's counters
+  // have closed. Lists yesterday's top readers by distinct wines and notifies
+  // admins about anyone past the alert level — the alarm the canaries are the
+  // evidence for.
   cron.schedule('15 5 * * *', async () => {
     console.log('[scheduler] Running registry readers report…');
     try {
@@ -288,8 +287,57 @@ function startScheduler() {
     }
   });
 
+  // Registry Bridge contributions (self-hosted installs): hourly at :47, apart
+  // from the :29 request sync and the Monday 06:30 refresh, whose registry
+  // calls would otherwise share one minute's burst limit. Link the approved
+  // offers, record the declined ones, then send what is queued as far as
+  // today's allowance goes (services/registryContributionOps). A no-op when
+  // REGISTRY_BRIDGE_KEY is not set.
+  cron.schedule('47 * * * *', async () => {
+    if (!registryBridge.isEnabled()) return;
+    const contributions = require('./registryContributionOps');
+    try {
+      await contributions.syncContributions();
+    } catch (err) {
+      console.error('[scheduler] Registry bridge contribution sync failed:', err);
+    }
+    try {
+      await contributions.sendQueued();
+    } catch (err) {
+      console.error('[scheduler] Registry bridge contribution send failed:', err);
+    }
+  });
+
+  // API deprecation reminders: daily at 08:11 UTC, morning in Europe, on an
+  // off-minute. Reminds the owners of tokens still calling a route on its way
+  // out as the sunset nears (config/apiDeprecations), at most once per token
+  // and reminder; past the sunset it only clears the token markers
+  // (services/apiDeprecationNotices).
+  cron.schedule('11 8 * * *', async () => {
+    try {
+      const r = await runDeprecationReminders();
+      if (r?.sent || r?.cleared) console.log('[scheduler] API deprecation reminders:', JSON.stringify(r));
+    } catch (err) {
+      console.error('[scheduler] API deprecation reminders failed:', err);
+    }
+  });
+
+  // Inactive accounts: daily at 09:13 UTC, so a notice arrives in the European
+  // morning. Off until an admin turns it on, and idle while email is not
+  // configured (services/inactiveAccounts).
+  cron.schedule('13 9 * * *', async () => {
+    try {
+      const r = await runInactiveAccounts();
+      if (r?.first || r?.final || r?.deleted || r?.cleared || r?.failed) {
+        console.log('[scheduler] Inactive accounts:', JSON.stringify(r));
+      }
+    } catch (err) {
+      console.error('[scheduler] Inactive accounts failed:', err);
+    }
+  });
+
   // Private-draft expiry: hourly, because the 24-hour warning before an empty
-  // draft is deleted cannot be honoured by a daily pass (draft design 2026-09-12).
+  // draft is deleted cannot be honoured by a daily pass.
   cron.schedule('23 * * * *', async () => {
     try {
       const r = await runWineDraftExpirySweep();
@@ -301,7 +349,20 @@ function startScheduler() {
     }
   });
 
-  console.log('[scheduler] Cron jobs registered (wine-draft-expiry hourly :23, drink-window daily 06:00 UTC, new-member-emails daily 17:00 UTC (off until turned on), value-snapshot weekly Sun 01:00 UTC, community-price weekly Sun 02:00 UTC, search-reconcile daily 02:37, user-deletion daily 03:00 UTC, cellar-retention daily 04:00 UTC, recommendation-email-scrub daily 04:30 UTC, label-scan-retention daily 04:45 UTC, security-spike every 15 min, climate-offline every 15 min, ai-cap-alert every 15 min offset, demo-sweep every 15 min offset, registry-health weekly Mon 05:00 UTC, embed-sweep weekly Mon 05:30 UTC, bridge-refresh weekly Mon 06:30 UTC)');
+  // Wines waiting for a curator's check that no bottle points at any more
+  // (an import redone, a cellar deleted): daily at 05:10 UTC, after the
+  // cellar-retention and trash purges of the night have released their
+  // bottles.
+  cron.schedule('10 5 * * *', async () => {
+    try {
+      const r = await runUncheckedWineSweep();
+      if (r.removed || r.errors) console.log('[scheduler] Unchecked-wine sweep:', JSON.stringify(r));
+    } catch (err) {
+      console.error('[scheduler] Unchecked-wine sweep failed:', err);
+    }
+  });
+
+  console.log('[scheduler] Cron jobs registered (wine-draft-expiry hourly :23, unchecked-wine-sweep daily 05:10 UTC, drink-window daily 06:00 UTC, new-member-emails daily 17:00 UTC (off until turned on), value-snapshot weekly Sun 01:00 UTC, community-price weekly Sun 02:00 UTC, search-reconcile daily 02:37, user-deletion daily 03:00 UTC, cellar-retention daily 04:00 UTC, recommendation-email-scrub daily 04:30 UTC, label-scan-retention daily 04:45 UTC, security-spike every 15 min, climate-offline every 15 min, ai-cap-alert every 15 min offset, demo-sweep every 15 min offset, registry-health weekly Mon 05:00 UTC, embed-sweep weekly Mon 05:30 UTC, bridge-refresh weekly Mon 06:30 UTC, bridge-contributions hourly :47, api-deprecation-reminders daily 08:11 UTC, inactive-accounts daily 09:13 UTC (off until turned on))');
 }
 
 /**

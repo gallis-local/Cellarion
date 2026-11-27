@@ -1,5 +1,5 @@
 /**
- * runPromotionFollowThrough under sommelier-owned wine data (2026-09-24).
+ * runPromotionFollowThrough under sommelier-owned wine data.
  *
  * enrichmentOnAdd 'off' has meant "the AI writes nothing automatically" since
  * 2026-08-22, but completing a pending wine or publishing a draft — both run
@@ -16,7 +16,6 @@ jest.mock('./labelScanAccess', () => ({ stampPromotedScanRetention: jest.fn().mo
 jest.mock('./crossFieldScan', () => ({ detectCrossFieldForValues: jest.fn().mockResolvedValue(null) }));
 jest.mock('./search', () => ({
   indexWine: jest.fn().mockResolvedValue(undefined),
-  bulkIndexBottles: jest.fn().mockResolvedValue(undefined),
 }));
 jest.mock('./embeddingJob', () => ({ reembedActiveVintages: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('./enrichmentJob', () => ({ enrichWineById: jest.fn().mockResolvedValue(undefined) }));

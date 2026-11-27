@@ -1,6 +1,6 @@
 /**
- * Public key vocabulary + values, user surface (#985 Slice B) — thin HTTP
- * wrappers over services/registryDataOps.js (shared with the MCP tools).
+ * Public key vocabulary + values, user surface — thin HTTP wrappers over
+ * services/registryDataOps.js (shared with the MCP tools).
  */
 const express = require('express');
 const { requireAuth, requireNonDemo } = require('../middleware/auth');
@@ -34,7 +34,7 @@ router.post('/keys', requireNonDemo, async (req, res, next) => {
     const { name, type, unit, enumOptions, rationale } = req.body || {};
     const result = await ops.proposeKey(req.user.id, { name, type, unit, enumOptions, rationale }, { via: 'web', req });
     if (!result.ok) return sendFail(res, result);
-    res.status(201).json({ key: result.key });
+    res.status(201).json({ key: result.key, applied: !!result.applied });
   } catch (err) {
     next(err);
   }
@@ -70,9 +70,14 @@ router.post('/wine/:id', requireNonDemo, async (req, res, next) => {
     );
     if (!result.ok) return sendFail(res, result);
     // Registry Bridge (self-hosted installs): a value on a wine copied from
-    // the shared registry is also suggested there. Fire-and-forget.
-    registryBridge.forwardValueFor(req.params.id, { keyId, keyName, value, reason, evidenceUrl, vintage }).catch(() => {});
-    res.status(201).json({ value: result.value });
+    // the shared registry is also suggested there. Fire-and-forget. The key
+    // travels by the canonical name the service resolved, never by the
+    // member's own spelling or a translation of it.
+    const canonical = result.value?.key?.name;
+    registryBridge.forwardValueFor(req.params.id, {
+      keyId, keyName: canonical || keyName, value, reason, evidenceUrl, vintage,
+    }).catch(() => {});
+    res.status(201).json({ value: result.value, applied: !!result.applied });
   } catch (err) {
     next(err);
   }

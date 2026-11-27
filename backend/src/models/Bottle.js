@@ -57,12 +57,12 @@ const bottleSchema = new mongoose.Schema({
     uppercase: true,
     trim: true,
     // Every write path (form, MCP, import, restore) stores an alias as its
-    // code: "EURO" → "EUR" (config/currencies). No enum here — older imports
+    // code: "EURO" → "EUR" (config/currencies). No enum here — stored rows can
     // hold codes outside the supported list, and a save of such a bottle must
     // keep working; the routes refuse a NEW unsupported code instead.
     // ⚠️ Mongoose runs this setter on QUERY FILTERS too: Bottle.find({
     // currency: 'EURO' }) searches for 'EUR'. To find rows stored under an
-    // alias, use Bottle.collection or an aggregation (release audit 2026-10-13).
+    // alias, use Bottle.collection or an aggregation.
     set: normalizeCurrency,
     maxlength: [10, 'Currency code too long']
   },
@@ -93,9 +93,9 @@ const bottleSchema = new mongoose.Schema({
   },
   // The retail barcode scanned when this bottle was added, in the canonical
   // form utils/barcode.normalizeBarcode returns. The member's own data
-  // (exported and deleted with the bottle); bottles carrying a barcode are
-  // also how the same wine is recognised when another member scans it
-  // (services/barcodeLookup) — counted, never shown with whose they are.
+  // (exported and deleted with the bottle). It also teaches the shared
+  // registry which wine the code belongs to (services/barcodeRegistry.js puts
+  // the code on the wine, counted, never with whose bottle taught it).
   barcode: {
     type: String,
     match: /^\d{8,14}$/,
@@ -160,15 +160,14 @@ const bottleSchema = new mongoose.Schema({
       }
     ]
   },
-  // Optional PEAK inside the personal window (ticket 6a94655283, 2026-08-31):
-  // "drinkable ≠ peak". Without these, the whole drinkFrom..drinkTo span
-  // classifies as one long Peak — a wine enjoyable for ten years with a
-  // four-year best stretch cannot be expressed except by lying about one of
-  // them. With a peak set, the personal window classifies in the same five
-  // stages the sommelier WineVintageProfile has always had: not-ready →
-  // early (drinkFrom..peakFrom) → peak → late (peakUntil..drinkTo) →
-  // declining. Bottle-level like drinkFrom/drinkTo — the user's own opinion,
-  // never the shared registry's.
+  // Optional PEAK inside the personal window: "drinkable ≠ peak". Without
+  // these, the whole drinkFrom..drinkTo span classifies as one long Peak — a
+  // wine enjoyable for ten years with a four-year best stretch cannot be
+  // expressed except by lying about one of them. With a peak set, the personal
+  // window classifies in the same five stages as the sommelier
+  // WineVintageProfile: not-ready → early (drinkFrom..peakFrom) → peak → late
+  // (peakUntil..drinkTo) → declining. Bottle-level like drinkFrom/drinkTo — the
+  // user's own opinion, never the shared registry's.
   peakFrom: {
     type: Number,
     min: [1900, 'Peak-from year must be 1900 or later'],
@@ -298,6 +297,18 @@ const bottleSchema = new mongoose.Schema({
   // Set by the daily notifier when the open-bottle expiry alert fires, so it
   // fires exactly once per opening. Reset on open / undo-open.
   openBottleNotifiedAt: { type: Date, default: null },
+  // The rack slot the bottle left when it was opened with "Take it out of the
+  // rack" (a recorked bottle on the counter, not a Coravin back in its slot).
+  // Undoing the open puts it back there while that slot is still free and the
+  // bottle has not been placed anew. Null when it stayed in its slot. Cleared
+  // on undo-open and on consume.
+  openedFromSlot: {
+    type: new mongoose.Schema({
+      rack: { type: mongoose.Schema.Types.ObjectId, ref: 'Rack', required: true },
+      position: { type: Number, required: true },
+    }, { _id: false }),
+    default: null,
+  },
   // Drink-window notification tracking — set by the daily notifier job
   drinkWindowNotifiedStatus: { type: String, default: null },
   drinkWindowNotifiedAt:     { type: Date,   default: null },
@@ -320,8 +331,10 @@ const bottleSchema = new mongoose.Schema({
 // Compound indexes for efficient queries
 bottleSchema.index({ user: 1, cellar: 1, wineDefinition: 1 });
 bottleSchema.index({ wineDefinition: 1 }); // For reverse lookup
-// Barcode → wine recognition (services/barcodeLookup). Partial: only the few
-// bottles added by scanning carry one, so the index stays small.
+// Barcode → wine recognition (services/barcodeLookup, services/barcodeRegistry).
+// Partial: only the few bottles added by scanning carry one, so the index stays
+// small. A query uses it only when it states the filter: { $type: 'string' }
+// next to the code, as both services do.
 bottleSchema.index({ barcode: 1, wineDefinition: 1 }, { partialFilterExpression: { barcode: { $type: 'string' } } });
 bottleSchema.index({ cellar: 1, vintage: 1 }); // For filtering by vintage
 bottleSchema.index({ cellar: 1, rating: 1 }); // For filtering by rating

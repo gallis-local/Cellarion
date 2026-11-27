@@ -37,7 +37,7 @@ jest.mock('../models/PriceTrackingSkip', () => ({ find: jest.fn(), findOne: jest
 jest.mock('../models/WineCorrectionProposal', () => ({ create: jest.fn(), findById: jest.fn(), deleteOne: jest.fn() }));
 jest.mock('../models/WineOwnerInquiry', () => ({ populate: jest.fn(), aggregate: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../utils/rackGeometry', () => ({ getMaxPosition: jest.fn(() => 12) }));
-jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn(), indexWine: jest.fn().mockResolvedValue(undefined), bulkIndexBottles: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), indexWine: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), buildEmptyStats: jest.fn() }));
 jest.mock('../services/vectorStore', () => ({ getPoints: jest.fn(), searchSimilar: jest.fn() }));
 jest.mock('../config/aiConfig', () => ({ get: jest.fn(() => ({ vectorIndex: 'v1' })) }));
@@ -61,6 +61,7 @@ jest.mock('../services/pendingWineOps', () => ({
   queryPendingWines: jest.fn(),
   validatePendingFix: jest.fn(),
   applyPendingFix: jest.fn(),
+  mergePendingInto: jest.fn(),
   loadPendingWine: jest.fn(),
   CREATED_VIA_FILTERS: ['ui', 'import', 'mcp', 'ai'],
   FIELD_MAX: 200,
@@ -90,7 +91,7 @@ const Bottle = require('../models/Bottle');
 const McpActionLog = require('../models/McpActionLog');
 const { logAudit } = require('../services/audit');
 const {
-  queryPendingWines, validatePendingFix, applyPendingFix, loadPendingWine,
+  queryPendingWines, validatePendingFix, applyPendingFix, mergePendingInto, loadPendingWine,
 } = require('../services/pendingWineOps');
 const { allTools, toolsForScopes } = require('./registry');
 require('./tools');
@@ -175,7 +176,7 @@ describe('list_pending_wines', () => {
 
     expect(queryPendingWines).toHaveBeenCalledWith(
       { limit: 20, offset: 0, createdVia: undefined, includeUnavailable: false });
-    expect(body.summary).toMatch(/7 wine\(s\) awaiting an identity/);
+    expect(body.summary).toMatch(/7 wine\(s\) in the pending queue/);
     expect(body.data[0]).toMatchObject({
       wine_id: W1, name: 'Kaefferkopf', producer: null,
       bottle_count: 1, scan_image_id: String(SCAN), has_images: true,
@@ -199,7 +200,7 @@ describe('list_pending_wines', () => {
  *   { status: 'approved', visibility: 'public', … } — the PUBLIC gallery, the
  *     same filter GET /api/images/wine/:id serves the web. Any wine.
  *   { $or: [{ wineDefinition }, { bottle }] }       — the owners' own photos.
- *     PENDING wines only (security audit M-1).
+ *     PENDING wines only.
  */
 const primeImageQueries = ({ gallery = [], owners = [] } = {}) => {
   BottleImage.find.mockImplementation((q) =>
@@ -245,7 +246,7 @@ describe('get_pending_wine_images — the point of the feature', () => {
       expect(Buffer.from(img.data, 'base64').toString()).toBe('downscaled-jpeg-bytes');
     }
     // The scanned LABEL is the primary evidence and comes first. `private`
-    // rides along (audit M-1): these are the owner's own photos, released to
+    // rides along: these are the owner's own photos, released to
     // curation for one purpose, and the payload says so.
     expect(parse(res).data.images[0]).toEqual({ image_id: String(SCAN), kind: 'label-scan', side: 'front', private: true });
   });
@@ -354,7 +355,7 @@ describe('get_pending_wine_images — the point of the feature', () => {
   });
 
   /**
-   * M-1 (security audit) — this tool ships other people's PRIVATE bottle photos
+   * This tool ships other people's PRIVATE bottle photos
    * as base64 to an EXTERNAL model. The only thing that justifies it is a
    * curator reading a label they have been asked to identify, so the wine must
    * still be pending. Without the gate any somm token could pull the private
@@ -807,5 +808,147 @@ describe('the back label reaches curation, labelled', () => {
 
     expect(row.scan_image_back_id).toBeNull();
     expect(row).not.toHaveProperty('front_back_disagreements');
+  });
+});
+
+/**
+ * Wines from a member's cellar file that wait for a curator's check
+ * (models/WineDefinition.uncheckedIdentity), on the MCP surface the sommelier
+ * works from. They sit in the same queue, are published only by an explicit
+ * check, and a second member's row of a wine already published is ended by a
+ * merge the refusal itself points to.
+ */
+describe('wines from a member\u2019s file, waiting for a check', () => {
+  const TWIN = oid('7');
+  const waitingRow = { ...ROW, producer: 'Cave de Kaysersberg', createdVia: 'import', unchecked: true, scanImageId: null, bottleImageIds: [], imageUrls: {} };
+  const waitingWine = { _id: W1, name: 'Kaefferkopf', producer: 'Cave de Kaysersberg', appellation: null, type: 'white', pendingIdentity: true, uncheckedIdentity: true };
+
+  test('the list marks them, counts them, and can list only them', async () => {
+    queryPendingWines.mockResolvedValue({ rows: [waitingRow], total: 1, pendingTotal: 9, uncheckedTotal: 4 });
+
+    const body = parse(await tool('list_pending_wines').handler({ kind: 'needs_check', limit: 20, offset: 0 }, SOMM_CTX));
+
+    expect(queryPendingWines).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs_check' }));
+    expect(body.data[0]).toMatchObject({ wine_id: W1, waiting_for_check: true, created_via: 'import', has_images: false });
+    expect(body.summary).toMatch(/9 wine\(s\) in the pending queue/);
+    expect(body.summary).toMatch(/4 of them from a member's file, waiting for a check/);
+  });
+
+  test('a row that is not waiting says so, and the count is left out when there are none', async () => {
+    const body = parse(await tool('list_pending_wines').handler({ limit: 20, offset: 0 }, SOMM_CTX));
+    expect(body.data[0].waiting_for_check).toBeUndefined();
+    expect(body.summary).not.toMatch(/waiting for a check/);
+  });
+
+  test('identity_checked rides to the shared validator and publishes the wine', async () => {
+    validatePendingFix.mockReturnValue({ ok: true, clean: { identityChecked: true } });
+    loadPendingWine.mockResolvedValue({ ok: true, wine: waitingWine });
+    applyPendingFix.mockResolvedValue({
+      ok: true, promoted: true, diff: { identityChecked: { from: false, to: true } },
+      wine: { ...waitingWine, pendingIdentity: false, uncheckedIdentity: false },
+    });
+
+    const body = parse(await tool('fix_pending_wine').handler({ wine_id: W1, identity_checked: true }, SOMM_CTX));
+
+    expect(validatePendingFix).toHaveBeenCalledWith({ identityChecked: true });
+    expect(body.data).toMatchObject({ promoted: true, waiting_for_check: false, changed: ['identityChecked'] });
+    expect(body.summary).toMatch(/now live in the registry/);
+  });
+
+  test('only true is accepted: a check is not taken back', () => {
+    const schema = tool('fix_pending_wine').inputSchema.identity_checked;
+    expect(schema.safeParse(true).success).toBe(true);
+    expect(schema.safeParse(false).success).toBe(false);
+    expect(schema.safeParse(undefined).success).toBe(true);
+  });
+
+  test('a correction without the check says the wine is still waiting, and how to publish it', async () => {
+    validatePendingFix.mockReturnValue({ ok: true, clean: { appellation: 'Alsace Grand Cru' } });
+    loadPendingWine.mockResolvedValue({ ok: true, wine: waitingWine });
+    applyPendingFix.mockResolvedValue({ ok: true, promoted: false, diff: { appellation: { from: null, to: 'Alsace Grand Cru' } }, wine: waitingWine });
+
+    const body = parse(await tool('fix_pending_wine').handler({ wine_id: W1, appellation: 'Alsace Grand Cru' }, SOMM_CTX));
+
+    expect(body.data).toMatchObject({ promoted: false, still_pending: true, waiting_for_check: true });
+    expect(body.summary).toMatch(/still waiting for a check/);
+    expect(body.data.note).toMatch(/identity_checked: true/);
+    // Not the producerless wording: this wine has its producer.
+    expect(body.summary).not.toMatch(/missing a producer/);
+  });
+
+  test('a check refused as a duplicate names the published wine and points to the merge', async () => {
+    validatePendingFix.mockReturnValue({ ok: true, clean: { identityChecked: true } });
+    loadPendingWine.mockResolvedValue({ ok: true, wine: waitingWine });
+    applyPendingFix.mockResolvedValue({
+      ok: false, code: 'conflict', message: 'This fix would make the wine identical to an existing registry wine.',
+      duplicate: { wineId: TWIN, name: 'Kaefferkopf', producer: 'Cave de Kaysersberg', appellation: null, published: true },
+    });
+
+    const { error } = parse(await tool('fix_pending_wine').handler({ wine_id: W1, identity_checked: true }, SOMM_CTX));
+
+    expect(error.code).toBe('conflict');
+    expect(error.message).toContain(`wine_id ${TWIN}`);
+    expect(error.message).toContain('Cave de Kaysersberg — Kaefferkopf');
+    expect(error.message).toMatch(/merge_pending_wine with into_wine_id/);
+    expect(McpActionLog.create).not.toHaveBeenCalled();
+  });
+
+  test('a duplicate that is itself still pending is not offered as a merge target', async () => {
+    validatePendingFix.mockReturnValue({ ok: true, clean: { producer: 'Cave de Kaysersberg' } });
+    loadPendingWine.mockResolvedValue({ ok: true, wine: waitingWine });
+    applyPendingFix.mockResolvedValue({
+      ok: false, code: 'conflict', message: 'Identical to an existing wine.',
+      duplicate: { wineId: TWIN, name: 'Kaefferkopf', producer: 'Cave de Kaysersberg', published: false },
+    });
+
+    const { error } = parse(await tool('fix_pending_wine').handler({ wine_id: W1, producer: 'Cave de Kaysersberg' }, SOMM_CTX));
+    expect(error.message).toMatch(/itself still pending/);
+    expect(error.message).not.toMatch(/call merge_pending_wine with into_wine_id/);
+  });
+
+  describe('merge_pending_wine', () => {
+    beforeEach(() => {
+      loadPendingWine.mockResolvedValue({ ok: true, wine: waitingWine });
+      mergePendingInto.mockResolvedValue({ ok: true, bottlesMoved: 6, target: { _id: TWIN, name: 'Kaefferkopf', producer: 'Cave de Kaysersberg' } });
+    });
+
+    test('is a curator write tool: invisible to members and to a read-only token, refused if reached', async () => {
+      expect(toolsForScopes(['read', 'write'], ['user']).map((t) => t.name)).not.toContain('merge_pending_wine');
+      expect(toolsForScopes(['read'], ['somm']).map((t) => t.name)).not.toContain('merge_pending_wine');
+      expect(toolsForScopes(['read', 'write'], ['somm']).map((t) => t.name)).toContain('merge_pending_wine');
+      const res = await tool('merge_pending_wine').handler({ wine_id: W1, into_wine_id: TWIN }, USER_CTX);
+      expect(parse(res).error.code).toBe('forbidden_scope');
+      expect(mergePendingInto).not.toHaveBeenCalled();
+    });
+
+    test('moves the bottles onto the published wine through the shared service and logs the action', async () => {
+      const body = parse(await tool('merge_pending_wine').handler({ wine_id: W1, into_wine_id: TWIN }, SOMM_CTX));
+
+      expect(mergePendingInto).toHaveBeenCalledWith(waitingWine, TWIN, { req: SOMM_CTX.req });
+      expect(body.data).toMatchObject({ merged_wine_id: W1, into_wine_id: TWIN, bottles_moved: 6 });
+      expect(body.summary).toMatch(/merged into Cave de Kaysersberg — Kaefferkopf \(6 bottle\(s\) moved\)/);
+      expect(McpActionLog.create).toHaveBeenCalledWith(expect.objectContaining({
+        tool: 'merge_pending_wine', action: 'somm_pending_merge',
+        detail: { wineId: W1, intoWineId: TWIN, bottlesMoved: 6 },
+      }));
+    });
+
+    test('only a row of the pending queue can be merged away, and a refused merge logs nothing', async () => {
+      loadPendingWine.mockResolvedValue({ ok: false, code: 'conflict', message: 'That wine is not in the pending-identity queue' });
+      expect(parse(await tool('merge_pending_wine').handler({ wine_id: W1, into_wine_id: TWIN }, SOMM_CTX)).error.code).toBe('conflict');
+      expect(mergePendingInto).not.toHaveBeenCalled();
+
+      loadPendingWine.mockResolvedValue({ ok: true, wine: waitingWine });
+      mergePendingInto.mockResolvedValue({ ok: false, code: 'conflict', message: 'The target is not a published wine.' });
+      expect(parse(await tool('merge_pending_wine').handler({ wine_id: W1, into_wine_id: TWIN }, SOMM_CTX)).error.code).toBe('conflict');
+      expect(McpActionLog.create).not.toHaveBeenCalled();
+    });
+
+    test('says what it is for and that it cannot be undone', () => {
+      const t = tool('merge_pending_wine');
+      expect(t.description).toMatch(/SAME wine/);
+      expect(t.description).toMatch(/Not undoable/);
+      expect(t.annotations.destructiveHint).toBe(true);
+    });
   });
 });

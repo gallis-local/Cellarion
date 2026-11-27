@@ -1,5 +1,5 @@
-// Data-portability export tools (plan §3.3 export_cellar, §3.18 get_account_export,
-// Appendix A "Cellar export + GDPR account export" → Phase 1).
+// Data-portability export tools: export_cellar and get_account_export (the
+// GDPR account export).
 //
 // These tools do NOT return the export inline — an export is a file, not model
 // context (the cellar payload caps at 50k documents, the account export spans
@@ -7,9 +7,9 @@
 // caller's context window and, for the account export, hand the user's full PII
 // to the third-party AI. So each tool returns a compact summary + a short-lived
 // download URL (services/exportLinks.js): the user opens it, the bytes go from
-// us to their disk, and the model never sees them. Plan principle #7.
+// us to their disk, and the model never sees them.
 //
-// Scope split is deliberate and stricter than the plan's casual annotations:
+// Scope split is deliberate:
 //   export_cellar      → read   (cellar data — already reachable via read tools)
 //   get_account_export → write  (account-wide PII: email, audit log, support
 //                                tickets, discussions — a superset the `read`
@@ -32,7 +32,7 @@ const exportLinks = () => require('../../services/exportLinks');
 
 // Public origin for the download URL. The link path (/api/mcp/export/…) is
 // served by the backend but fronted at the public origin (Traefik routes /api),
-// so FRONTEND_URL is the right base — same convention as routes/og.js etc.
+// so FRONTEND_URL is the right base — same convention as routes/og/shared.js etc.
 function publicBase() {
   return (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
 }
@@ -52,7 +52,7 @@ registerTool({
   // NOT read-only for the client: every call MINTS a bearer download link.
   // Clients treat readOnlyHint as "no confirmation needed", which is exactly
   // what a prompt-injected agent needs to mint the link silently and pass it
-  // to an attacker through any outbound tool argument (audit 2026-09 M02-1).
+  // to an attacker through any outbound tool argument.
   // One write-budget slot per call is the right price for that.
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   inputSchema: {
@@ -106,7 +106,7 @@ registerTool({
     'Limited to once per day. For just the wine collection, prefer export_cellar.',
   scope: 'write',
   // NOT read-only for the client — see export_cellar: the full-PII export
-  // link must go through the client's confirmation step (audit 2026-09 M02-1).
+  // link must go through the client's confirmation step.
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   inputSchema: {},
   handler: async (args, ctx) => {

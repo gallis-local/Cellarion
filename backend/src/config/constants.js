@@ -3,6 +3,8 @@
  * Import from here instead of re-declaring in each file.
  */
 
+const { shapeSweetnessStyle } = require('../utils/sweetnessStyle');
+
 // Bottle statuses that indicate the bottle has been removed from the active cellar
 const CONSUMED_STATUSES = ['drank', 'gifted', 'sold', 'other'];
 
@@ -15,26 +17,11 @@ const ORDERED_STATUS = 'ordered';
 
 // Every status that is NOT in the cellar right now. "In the cellar" queries
 // filter { status: { $nin: NOT_IN_CELLAR_STATUSES } }: a $nin rather than
-// 'active' so a legacy row without a status still counts, as it always has.
+// 'active' so a legacy row without a status still counts.
 const NOT_IN_CELLAR_STATUSES = [...CONSUMED_STATUSES, ORDERED_STATUS];
 
 // Milliseconds in a single day — used for drink-window calculations
 const MS_PER_DAY = 86400000;
-
-// Standard Mongoose populate shape for WineDefinition — used across bottles, cellars, stats.
-// Array form also populates pendingWineRequest so pending bottles show their requested name.
-// The label-scan evidence fields are EXCLUDED here for the same reason
-// GET /api/wines/:id and the wishlist $unset exclude them (v1.109.0 LOW-3):
-// since v1.111.0 every scan-originated mint carries them for its 7-day
-// correction window, and a bottle payload of a SHARED published wine must not
-// hand any owner the pointers plus the "front said X, back said Y" label text
-// (release-audit M-4). Curation reads them through its own gated surfaces.
-const SCAN_EVIDENCE_EXCLUDE = '-scanImage -scanImageBack -scanFieldConflicts';
-
-const WINE_POPULATE = [
-  { path: 'wineDefinition', select: SCAN_EVIDENCE_EXCLUDE, populate: ['country', 'region', 'grapes'] },
-  { path: 'pendingWineRequest', select: 'wineName producer' }
-];
 
 // The registry fields a member (anyone but admin/somm) never receives from a
 // wine read: the label-scan evidence, the dedup keys, the verification record,
@@ -42,11 +29,22 @@ const WINE_POPULATE = [
 // how (createdBy, contribution, createdVia — the registry never shows who
 // contributed). Curators read them through their own surfaces. Every member
 // wine read builds on this one list: GET /api/wines and /:id, the wishlist
-// list, the barcode lookup, the wine-request list and WINE_LIST_SELECT.
+// list, the barcode lookup, the wine-request list, WINE_LIST_SELECT and the
+// bottle answers (WINE_POPULATE).
 const MEMBER_WINE_HIDDEN_FIELDS = [
   'scanImage', 'scanImageBack', 'scanFieldConflicts', 'normalizedKey', 'canonicalKey',
   'verifiedChecks', 'identityProvenance', 'productNumber', 'previousSlugs', 'canary',
   'createdBy', 'contribution', 'createdVia',
+  // A self-hosted install's offer of the wine to the shared registry: request
+  // ids and the registry's notes, read through /api/bridge/contributions.
+  'registryContribution',
+  // The label-sweetness curation marks: a curator's "the word is the name"
+  // flag and the review marker. Curation internals, like verifiedChecks.
+  'sweetnessReview', 'sweetnessInName',
+  // The wine's retail barcodes (services/barcodeRegistry.js). select:false
+  // keeps them out of find(); an aggregate or $lookup ignores that and leans
+  // on this list.
+  'barcodes',
 ];
 const excludeFields = (fields) => fields.map((f) => `-${f}`).join(' ');
 const MEMBER_WINE_EXCLUDE = excludeFields(MEMBER_WINE_HIDDEN_FIELDS);
@@ -54,6 +52,35 @@ const MEMBER_WINE_EXCLUDE = excludeFields(MEMBER_WINE_HIDDEN_FIELDS);
 // loaded document: createdBy stays loaded for the gate, and the route deletes
 // it from the payload afterwards.
 const MEMBER_WINE_EXCLUDE_KEEP_CREATOR = excludeFields(MEMBER_WINE_HIDDEN_FIELDS.filter((f) => f !== 'createdBy'));
+
+// The bottle reads below ask for the wine's sweetness style (the path is
+// select: false on the model: a read that does not ask never sees it),
+// populate its term with the label term's own fields — and its id, which a
+// save of the populated wine still needs — and send it in the outgoing shape:
+// a document through its toJSON, a lean read through this transform
+// (utils/sweetnessStyle shapeSweetnessStyle leaves a document alone). These
+// reads ask for the field, so a row that predates it answers null.
+const WITH_SWEETNESS_STYLE = '+sweetnessStyle';
+const SWEETNESS_STYLE_POPULATE = { path: 'sweetnessStyle.term', select: 'name band scale regulated' };
+const shapeLeanWine = (wine) => shapeSweetnessStyle(wine, { asked: true });
+
+// The wine of ONE bottle, as the bottle page and every bottle write answer
+// send it: the whole record with its profile, minus the member-hidden fields
+// above. Anyone with access to the cellar reads these answers, a viewer
+// included, so they follow the same list as the bottle lists.
+const winePopulate = (select) => [
+  {
+    path: 'wineDefinition', select: `${select} ${WITH_SWEETNESS_STYLE}`,
+    populate: ['country', 'region', 'grapes', { path: 'classifications', select: 'name kind' }, { path: 'labelSweetness', select: 'name band scale regulated -_id' }, SWEETNESS_STYLE_POPULATE],
+    transform: shapeLeanWine,
+  },
+  { path: 'pendingWineRequest', select: 'wineName producer' }
+];
+const WINE_POPULATE = winePopulate(MEMBER_WINE_EXCLUDE);
+// The same, for the one read that must know whose private draft the wine is
+// (GET /api/bottles/:id): createdBy is loaded, and the route removes it from
+// the answer once it has said "mine" or not.
+const WINE_POPULATE_KEEP_CREATOR = winePopulate(MEMBER_WINE_EXCLUDE_KEEP_CREATOR);
 
 // List/stats variant of WINE_POPULATE: excludes the heavy fields no list view
 // or aggregate reads (aiProfile alone is several KB of prose per wine). A page
@@ -65,8 +92,11 @@ const WINE_LIST_SELECT = `-aiProfile -lwin -productNumberShort ${MEMBER_WINE_EXC
 const WINE_POPULATE_LIST = [
   {
     path: 'wineDefinition',
-    select: WINE_LIST_SELECT,
-    populate: ['country', 'region', 'grapes']
+    select: `${WINE_LIST_SELECT} ${WITH_SWEETNESS_STYLE}`,
+    // The label sweetness term as the API shape ({ name, band, scale,
+    // regulated }) — a card shows it beside the name once the word has left it.
+    populate: ['country', 'region', 'grapes', { path: 'labelSweetness', select: 'name band scale regulated -_id' }, SWEETNESS_STYLE_POPULATE],
+    transform: shapeLeanWine,
   },
   { path: 'pendingWineRequest', select: 'wineName producer' }
 ];
@@ -75,17 +105,20 @@ const WINE_POPULATE_LIST = [
 // the cellar page's filters show: the name (the filters use the id); slug and
 // code kept for links and flags, colour for grape dots. The full rows carry
 // long descriptions, copied onto every bottle — most of a big grouped cellar
-// page (scaling audit 2026-09-25, item 11). The cellar page and the offline
-// copy use it: the offline screens render the very same components from it.
+// page. The cellar page and the offline copy use it: the offline screens
+// render the very same components from it.
 const WINE_POPULATE_CARDS = [
   {
     path: 'wineDefinition',
-    select: WINE_LIST_SELECT,
+    select: `${WINE_LIST_SELECT} ${WITH_SWEETNESS_STYLE}`,
     populate: [
       { path: 'country', select: 'name slug code' },
       { path: 'region', select: 'name slug country' },
       { path: 'grapes', select: 'name slug color' },
+      { path: 'labelSweetness', select: 'name band scale regulated -_id' },
+      SWEETNESS_STYLE_POPULATE,
     ],
+    transform: shapeLeanWine,
   },
   { path: 'pendingWineRequest', select: 'wineName producer' },
 ];
@@ -154,12 +187,12 @@ const DISCUSSION_MAX_LENGTHS = { title: 200, body: 5000, replyBody: 3000 };
 // The token scopes that reach the PERSONAL MCP surface (POST /api/mcp) — the
 // single source for the JWT-session grant, the OAuth grantable set, and the
 // admin usage-view connection filter, so adding a scope can't silently miss
-// one of the three (grand-audit M7). NOT the same as ApiToken.TOKEN_SCOPES,
-// which also includes 'climate' (device-only, never an MCP connection).
+// one of the three. NOT the same as ApiToken.TOKEN_SCOPES, which also
+// includes 'climate' (device-only, never an MCP connection).
 const MCP_PERSONAL_SCOPES = ['read', 'consume', 'write'];
 
 // Support-ticket categories — single source for the model enum, the
-// accountOps validation, and the MCP tool's input schema (grand-audit M9).
+// accountOps validation, and the MCP tool's input schema.
 // 'beta' is feedback on a feature in early access, sent from the feature's
 // own "Give feedback" button with the feature's key (config/featureFlags).
 const SUPPORT_CATEGORIES = ['bug', 'help', 'feature', 'other', 'beta'];
@@ -169,18 +202,32 @@ const SUPPORT_CATEGORIES = ['bug', 'help', 'feature', 'other', 'beta'];
 // Remembered per account as preferences.cellarSort, validated in accountOps
 // and offered by the MCP update_preferences tool. 'quantity' orders the
 // grouped list by how many identical bottles a card holds ('-quantity': most
-// first) — the cards, not single bottles (routes/cellars.js sortGroupsByQuantity).
+// first) — the cards, not single bottles (services/cellarGroupedPage.js
+// sortGroupsByQuantity).
 const CELLAR_SORTS = ['-createdAt', 'createdAt', 'name', '-name', 'vintage', '-vintage', 'price', '-price', '-quantity', 'quantity', 'maturity'];
 
 // The blocks of the wine and vintage page a member can fold away: its three
 // sections and the cards with a title of their own (the frontend's
 // utils/collapsedBlocks.js keeps the same list). Remembered per account as
 // preferences.collapsedBlocks — so a fold follows the member to any device —
-// and validated in accountOps (beta feedback 2026-10-12).
+// and validated in accountOps.
 const COLLAPSIBLE_BLOCKS = [
   'vintage.wine', 'vintage.vintage', 'vintage.bottles',
   'vintage.tasting', 'vintage.record', 'vintage.personal', 'vintage.history', 'vintage.reviews',
 ];
+
+// ─── Label sweetness ─────────────────────────────────────────────────────────
+
+// Whether the label sweetness write rule (services/sweetnessWrite
+// assignSweetness) reads the sweetness word off a name being written and moves
+// it into the field ("Riesling Kabinett trocken" → "Riesling Kabinett" +
+// trocken). OFF: no term is ever read off a name and no name is changed; only
+// an explicit term sets one (the display name stays right, because
+// appendSweetnessTerm appends a term only where the name does not already
+// carry it in a spelling the rule reads). Off while the stored names still
+// carry their words: on before those are migrated, new names would lose the
+// word and old ones keep it — a half-stripped registry. Read at call time.
+const SWEETNESS_EXTRACT_FROM_NAME = false;
 
 module.exports = {
   CELLAR_SORTS,
@@ -192,8 +239,11 @@ module.exports = {
   SUPPORT_CATEGORIES,
   MS_PER_DAY,
   WINE_POPULATE,
+  WINE_POPULATE_KEEP_CREATOR,
   WINE_POPULATE_LIST,
   WINE_POPULATE_CARDS,
+  WITH_SWEETNESS_STYLE,
+  SWEETNESS_STYLE_POPULATE,
   WINE_LIST_SELECT,
   MEMBER_WINE_HIDDEN_FIELDS,
   MEMBER_WINE_EXCLUDE_KEEP_CREATOR,
@@ -208,4 +258,5 @@ module.exports = {
   DISCUSSIONS_PER_PAGE,
   DISCUSSIONS_MAX_PER_PAGE,
   DISCUSSION_MAX_LENGTHS,
+  SWEETNESS_EXTRACT_FROM_NAME,
 };

@@ -1,36 +1,56 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import Modal from '../Modal';
 import TypedValueInput, { TYPES, formatTypedValue } from '../TypedValueInput';
 import GrapeTokenInput, { foldGrapeName } from '../GrapeTokenInput';
+import GrapePicker from '../GrapePicker';
 import ContributePrompt from './ContributePrompt';
+import SweetnessStyleRow, { hasSweetnessRow } from './SweetnessStyleRow';
 import { createWineProposal, getMyWineProposals } from '../../api/wineProposals';
 import { getWinePublicData, suggestWineValue, proposeRegistryKey } from '../../api/registryData';
+import { useContributionReviewed } from '../../utils/contributionReview';
 import useTaxonomyNames from '../../hooks/useTaxonomyNames';
 import useGrapeNames from '../../hooks/useGrapeNames';
+import useClassifications from '../../hooks/useClassifications';
 import { taxonomyName } from '../../utils/taxonomyName';
 import { WINE_COLOURS, isStyleType, recordedColour, wineTypeLabel, colourLabel } from '../../utils/wineColour';
 import './WineRecordSection.css';
+import { formatVintage } from '../../utils/vintage';
 
 /**
- * The full public record of a wine, blanks included (#985 Slice A).
- * A visible gap is what invites a contribution — blank fields render as
- * "not recorded", and every field carries a "suggest a fix" action that files
- * into the admin-reviewed WineCorrectionProposal queue. Nothing a user does
- * here writes to the registry; approval stays a human act.
+ * The full public record of a wine, blanks included. A visible gap is what
+ * invites a contribution — blank fields render as "not recorded", and every
+ * field carries a "suggest a fix" action that files into the admin-reviewed
+ * WineCorrectionProposal queue (applied at once only on a server whose admin
+ * turned contribution review off).
  *
- * Type and grapes are part of the record too (support ticket 2026-09-17). They
- * used to live outside it — grapes in a section of their own with a free-text
- * "suggest grapes" box that only appeared when the list was EMPTY, so a wrong
- * or incomplete grape list had no route at all. One record, one way to fix it.
+ * Type and grapes are part of the record too, so a wrong or incomplete grape
+ * list has the same route to a fix as every other field — not a separate
+ * section that only takes suggestions while the list is EMPTY. One record,
+ * one way to fix it.
  */
 
 // Every field a suggestion may carry (must match wineProposalOps FIELDS +
 // EXTRA_FIELDS), in reading order: who and what, then where.
 const RECORD_FIELDS = ['producer', 'name', 'type', 'grapes', 'appellation', 'region', 'country', 'classification'];
+// A drink that is not wine (the Other category) has no grapes, appellation or
+// classification to record: those rows are not shown for it.
+const NOT_WINE_HIDDEN = new Set(['grapes', 'appellation', 'classification']);
 const WINE_TYPES = ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'];
 const GRAPES_MAX = 12;
 const REASON_MIN = 10;
+// The proposal route's limit for one field (FIELD_MAX in services/wineProposalOps).
+const FIELD_TEXT_MAX = 200;
+// The kinds of classification tier, in the order the registry writes a wine's
+// tiers (classificationOps KIND_ORDER), with the English for each label.
+const TIER_KINDS = {
+  vineyard_rank: 'Vineyard rank',
+  ripeness: 'Ripeness tier',
+  ageing: 'Ageing tier',
+  other: 'Other (producer’s own)',
+};
+const KIND_RANK = Object.keys(TIER_KINDS);
+const kindRank = (k) => (KIND_RANK.includes(k) ? KIND_RANK.indexOf(k) : KIND_RANK.length);
 
 const PencilIcon = () => (
   <svg className="wr-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -44,7 +64,7 @@ const sameGrapes = (a, b) => {
   return x.length === y.length && x.every((v, i) => v === y[i]);
 };
 
-function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingGrapes = false, suggestSignal = 0 }) {
+function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingGrapes = false, suggestSignal = 0, onWineChanged }) {
   const { t, i18n } = useTranslation();
   // The reader's language rides along on the fetch, and a key comes back
   // with a displayName in it when a translation exists. `name` stays the
@@ -64,19 +84,27 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
   const [proposed, setProposed] = useState('');
   const [proposedType, setProposedType] = useState('');
   // The colour of a sparkling/dessert/fortified wine — asked only once the
-  // chosen type is one of those (support ticket 2026-09-17).
+  // chosen type is one of those.
   const [proposedColour, setProposedColour] = useState('');
   const [proposedGrapes, setProposedGrapes] = useState([]); // [{ name, isNew? }]
+  // The tier ids chosen in the classification picker; null until the picker is
+  // touched, which reads as "the tiers the wine carries" (the list arrives
+  // after the form opens, so they cannot be chosen at open).
+  const [proposedTiers, setProposedTiers] = useState(null);
+  const tiersLabelId = useId();
   const [reason, setReason] = useState('');
   const [evidenceUrl, setEvidenceUrl] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [sentField, setSentField] = useState(null);
+  // The last suggestion went live at once (a server that does not review).
+  const [sentApplied, setSentApplied] = useState(false);
+  const reviewed = useContributionReviewed();
   // Most users never file a fix — the per-row actions stay hidden behind ONE
-  // section-level toggle so the record reads clean (Johan, 2026-08-17).
+  // section-level toggle so the record reads clean.
   const [suggestMode, setSuggestMode] = useState(false);
   const sectionRef = useRef(null);
-  // Public key vocabulary + values (#985 Slice B)
+  // Public key vocabulary + values
   const [publicFields, setPublicFields] = useState([]);
   const [valueModal, setValueModal] = useState(null); // { field } from publicFields
   const [valueInput, setValueInput] = useState('');
@@ -124,7 +152,7 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
   // The counter is an EVENT, not a state: only a CHANGE acts. The page keeps it
   // for the whole visit and this section remounts whenever the edit form has
   // been shown — acting on the mounted value re-opened the mode and scrolled
-  // the page after every later edit (pre-deploy audit 2026-09-18).
+  // the page after every later edit.
   const seenSignal = useRef(suggestSignal);
   useEffect(() => {
     if (suggestSignal === seenSignal.current) return;
@@ -150,17 +178,22 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
 
   // Focus goes INTO the suggest dialog and Tab stays there (trapFocus below).
   // The trap lands on the first control — right for a text field, wrong for the
-  // grape form, whose first control is a chip's "remove" button: there the
-  // dialog itself takes focus, so a screen reader reads the title and a phone
-  // does not throw its keyboard over a form whose first job is often a tap.
+  // grape form and the tier picker, whose first control is a chip's "remove"
+  // button or a search box: there the dialog itself takes focus, so a screen
+  // reader reads the title and a phone does not throw its keyboard over a form
+  // whose first job is often a tap.
   const formRef = useRef(null);
   useEffect(() => {
-    if (modal?.field === 'grapes') formRef.current?.closest('[role="dialog"]')?.focus();
+    if (modal?.field === 'grapes' || modal?.field === 'classification') {
+      formRef.current?.closest('[role="dialog"]')?.focus();
+    }
   }, [modal?.field]);
 
   const displayNames = useTaxonomyNames();
   // Fetched when the grapes form opens, not with the page: most visits never do.
   const grapeList = useGrapeNames(apiFetch, modal?.field === 'grapes');
+  // The same for the classification tiers.
+  const tierList = useClassifications(apiFetch, modal?.field === 'classification');
 
   if (!wine) return null;
 
@@ -169,9 +202,8 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
   // What the registry actually STORES. This is what the suggest-a-fix form
   // shows as "currently recorded", and it must stay canonical: a French reader
   // shown "Vallée du Rhône" as the current value would reasonably propose a
-  // French correction to it — which is precisely the proposal (6a959b9d) that
-  // led to this feature, and telling him the stored value is "Rhône Valley"
-  // is what would have prevented it. Same for grapes: the canonical variety,
+  // French correction to it, and showing the stored value "Rhône Valley" is
+  // what prevents that. Same for grapes: the canonical variety,
   // not the regional label the page shows ("Tinta Roriz" is stored Tempranillo).
   const values = {
     producer: wine.producer || null,
@@ -193,6 +225,33 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
     country: taxonomyName(wine.country, displayNames) || null,
     region: taxonomyName(wine.region, displayNames) || null,
   };
+
+  // The classification tiers the picker offers, as the admin wine form offers
+  // them — the wine's country's own and the ones no single country owns,
+  // labelled by kind — plus every tier the wine carries already, so a
+  // recorded tier is never selected out of sight. What the wine carries: its
+  // rows (populated, or bare ids), and the names in the string derived from
+  // them for a payload without the rows.
+  const recordedTierIds = new Set((Array.isArray(wine.classifications) ? wine.classifications : [])
+    .map((c) => String(c?._id || c)));
+  const recordedTierNames = new Set(String(values.classification || '').split(',')
+    .map((s) => s.trim().toLowerCase()).filter(Boolean));
+  const isRecordedTier = (c) => recordedTierIds.has(String(c._id)) || recordedTierNames.has(c.name.toLowerCase());
+  const wineCountryId = (wine.country && typeof wine.country === 'object' ? wine.country._id : wine.country) || null;
+  const tierOptions = tierList.classifications && tierList.classifications
+    .filter((c) => !c.country || !wineCountryId
+      || String(c.country._id || c.country) === String(wineCountryId) || isRecordedTier(c))
+    .map((c) => ({
+      _id: String(c._id),
+      name: c.name,
+      kind: c.kind,
+      color: t(`wineRecord.classificationKind.${c.kind}`, TIER_KINDS[c.kind] || c.kind),
+    }));
+  const recordedTiers = tierOptions ? tierOptions.filter(isRecordedTier).map((o) => o._id) : [];
+  // The picker once there is something to pick from; while the list loads, a
+  // line saying so; the text field when it failed or offers nothing.
+  const tierPicker = !!tierOptions && tierOptions.length > 0;
+  const tierLoading = !tierOptions && !tierList.error;
 
   const typeLabel = (v) => (v ? t(`statistics.typeLabels.${v}`, v.charAt(0).toUpperCase() + v.slice(1)) : null);
   const isBlank = (f) => (f === 'grapes' ? values.grapes.length === 0 : !values[f]);
@@ -232,12 +291,21 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
     setProposedType(keepType ? values.type : '');
     setProposedColour(keepType ? (values.colour || '') : '');
     setProposedGrapes(values.grapes.map((name) => ({ name })));
+    setProposedTiers(null);
     setReason('');
     setEvidenceUrl('');
     setError(null);
   };
 
   // What this form would send, or null while nothing has actually changed.
+  // The chosen tiers as the proposal route reads them: names, comma-separated,
+  // in the order the registry writes them.
+  const tiersText = (ids) => tierOptions
+    .filter((o) => ids.includes(o._id))
+    .sort((a, b) => kindRank(a.kind) - kindRank(b.kind))
+    .map((o) => o.name)
+    .join(', ');
+
   const draftFields = () => {
     if (!modal) return null;
     const f = modal.field;
@@ -257,8 +325,53 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
       const fresh = proposedGrapes.filter((g) => g.isNew).map((g) => g.name);
       return { grapes: names, ...(fresh.length ? { newGrapes: fresh } : {}) };
     }
+    if (f === 'classification' && tierPicker) {
+      // Untouched means as recorded, and the same tiers in another order are
+      // no change either.
+      if (!proposedTiers) return null;
+      const chosen = tierOptions.filter((o) => proposedTiers.includes(o._id));
+      const same = chosen.length === recordedTiers.length && chosen.every((o) => recordedTiers.includes(o._id));
+      if (!chosen.length || same) return null;
+      // Past the route's field limit the server would refuse it, so nothing is
+      // sent and the form says why.
+      const text = tiersText(proposedTiers);
+      if (text.length > FIELD_TEXT_MAX) return null;
+      return { classification: text };
+    }
     const next = proposed.trim();
     return next && next !== (values[f] || '') ? { [f]: next } : null;
+  };
+
+  // What a filed suggestion changes on this page, for the form below and for
+  // the sweetness row's own form (SweetnessStyleRow).
+  const recordFiled = (body, fields, field) => {
+    setSentField(field);
+    if (body.applied) {
+      // Applied already — a server that does not review, or a sweetness style
+      // on a wine that had none: nothing is pending. Re-read the wine so the
+      // record shows the change.
+      setSentApplied(true);
+      if (onWineChanged) onWineChanged();
+      return;
+    }
+    setSentApplied(false);
+    // `newGrapes` qualifies the list; it is not a field of the record.
+    const sent = { ...fields };
+    delete sent.newGrapes;
+    // The server answers with the whole pending suggestion — canonical
+    // grape names, and every field of it when this filing amended one.
+    const stored = body.proposal?.proposedFields;
+    // `stored` is authoritative when present: after an amendment it holds
+    // every field; after a FRESH filing (my earlier suggestion was decided
+    // while this page was open) it holds only the new ones — merging the
+    // stale local fields back in would show a decided suggestion as
+    // pending. The local merge is only the fallback for a bare answer.
+    setMine((prev) => {
+      const before = prev.find((p) => p.status === 'pending')?.proposedFields || {};
+      const merged = stored || { ...(body.amended === false ? {} : before), ...sent };
+      return [{ status: 'pending', proposedFields: merged }, ...prev.filter((p) => p.status !== 'pending')];
+    });
+    setSlot((s) => s || { mine: true, fields: Object.keys(sent) });
   };
 
   const submit = async (e) => {
@@ -276,24 +389,7 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
       });
       const body = await res.json().catch(() => ({}));
       if (res.ok) {
-        // `newGrapes` qualifies the list; it is not a field of the record.
-        const sent = { ...fields };
-        delete sent.newGrapes;
-        // The server answers with the whole pending suggestion — canonical
-        // grape names, and every field of it when this filing amended one.
-        const stored = body.proposal?.proposedFields;
-        setSentField(modal.field);
-        // `stored` is authoritative when present: after an amendment it holds
-        // every field; after a FRESH filing (my earlier suggestion was decided
-        // while this page was open) it holds only the new ones — merging the
-        // stale local fields back in kept showing a decided suggestion as
-        // pending. The local merge is only the fallback for a bare answer.
-        setMine((prev) => {
-          const before = prev.find((p) => p.status === 'pending')?.proposedFields || {};
-          const merged = stored || { ...(body.amended === false ? {} : before), ...sent };
-          return [{ status: 'pending', proposedFields: merged }, ...prev.filter((p) => p.status !== 'pending')];
-        });
-        setSlot((s) => s || { mine: true, fields: Object.keys(sent) });
+        recordFiled(body, fields, modal.field);
         setModal(null);
       } else {
         setError(body.error || t('common.networkError', 'Network error. Please try again.'));
@@ -308,6 +404,15 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
   const fieldLabel = (f) => t(`wineRecord.field_${f}`, f.charAt(0).toUpperCase() + f.slice(1));
 
   const formatPublicValue = (field) => formatTypedValue(field.key, field.value, t);
+
+  const openValueModal = (field) => {
+    setValueModal({ field });
+    setValueInput('');
+    setValueReason('');
+    setValueScope(bottleVintage ? 'vintage' : 'wine');
+    setValueVintage('');
+    setError(null);
+  };
 
   const submitValue = async (e) => {
     e.preventDefault();
@@ -359,7 +464,10 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
       const body = await res.json().catch(() => ({}));
       if (res.ok) {
         setKeyModal(false);
+        setSentApplied(!!body.applied);
         setSentField('newKey');
+        // Accepted at once on a server that does not review: the field is there now.
+        if (body.applied) await loadPublicData();
       } else {
         setError(body.error || t('common.networkError', 'Network error. Please try again.'));
       }
@@ -395,7 +503,7 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
   const typeChoices = WINE_TYPES.filter((v) => v !== values.type || isStyleType(v));
   // The colour choice is KEPT while a still type is selected (the row is
   // hidden and draftFields ignores it): arrow keys select as they move, and a
-  // pass through "Rosé" on the way back to "Sparkling" used to wipe it.
+  // pass through "Rosé" on the way back to "Sparkling" must not wipe it.
   const chooseType = (v) => setProposedType(v);
   // Tapping the chosen colour again takes the choice back — to the recorded
   // colour, or to none.
@@ -441,7 +549,7 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
           </button>
         )}
       </div>
-      {/* The one-line framing stays for everyone (audit: read-only viewers
+      {/* The one-line framing stays for everyone (read-only viewers would
           otherwise lose the only explanation of what this shared data is);
           the suggest mode swaps it for the instruction, set apart so the
           change of mode is seen. */}
@@ -449,11 +557,15 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
         <p className="wr-intro wr-intro--suggest">
           {blockedByOther
             ? t('wineRecord.blockedByOther', 'Another member’s suggestion for this wine is waiting for a curator. You can suggest a fix as soon as it has been decided.')
-            : t('wineRecord.intro', 'Spot something wrong or missing? Tap Fix or Add next to it — a curator reviews every suggestion before it goes live.')}
+            : reviewed
+              ? t('wineRecord.intro', 'Spot something wrong or missing? Tap Fix or Add next to it — a curator reviews every suggestion before it goes live.')
+              : t('wineRecord.introUnreviewed', 'Spot something wrong or missing? Tap Fix or Add next to it — your change goes live at once.')}
         </p>
       ) : (
         <p className="wr-intro">
-          {t('wineRecord.introShort', 'The shared registry’s record of this wine, curator-reviewed.')}
+          {reviewed
+            ? t('wineRecord.introShort', 'The shared registry’s record of this wine, curator-reviewed.')
+            : t('wineRecord.introShortUnreviewed', 'The shared registry’s record of this wine.')}
         </p>
       )}
 
@@ -469,7 +581,7 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
       )}
 
       <div className={`wr-grid${suggestMode ? ' wr-grid--suggest' : ''}`}>
-        {RECORD_FIELDS.map((f) => (
+        {(wine?.nonWine === true ? RECORD_FIELDS.filter((f) => !NOT_WINE_HIDDEN.has(f)) : RECORD_FIELDS).map((f) => (
           <div key={f} className="wr-row">
             <span className="wr-key">{fieldLabel(f)}</span>
             {renderValue(f)}
@@ -495,9 +607,23 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
             )}
           </div>
         ))}
+        {/* The label's sweetness term, or the term the wine is known by: a
+            row with a form of its own, since a style is a term, a source and
+            the page that names it. */}
+        {hasSweetnessRow(wine) && (
+          <SweetnessStyleRow
+            wine={wine}
+            canSuggest={canSuggest}
+            suggestMode={suggestMode}
+            blocked={blockedByOther}
+            pending={pendingValues.sweetnessStyle || null}
+            apiFetch={apiFetch}
+            onFiled={(body, fields) => recordFiled(body, fields, 'sweetnessStyle')}
+          />
+        )}
       </div>
-      {/* ── Public data fields (#985 Slice B): the accepted vocabulary with
-          published values; blanks invite value suggestions ── */}
+      {/* ── Public data fields: the accepted vocabulary with published
+          values; blanks invite value suggestions ── */}
       {(publicFields.length > 0 || (canSuggest && suggestMode)) && (
         <>
           <span className="bd-section-label" style={{ marginTop: '0.8rem' }}>
@@ -516,8 +642,8 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
                         play, so the reader knows a year-specific figure could
                         still be added). */}
                     {shown && field.resolvedFrom === 'vintage' && (
-                      <span className="wr-scope" title={t('wineRecord.scopeVintageTitle', 'Recorded for the {{year}} vintage specifically', { year: field.resolvedVintage })}>
-                        {field.resolvedVintage}
+                      <span className="wr-scope" title={t('wineRecord.scopeVintageTitle', 'Recorded for the {{year}} vintage specifically', { year: formatVintage(field.resolvedVintage, t) })}>
+                        {formatVintage(field.resolvedVintage, t)}
                       </span>
                     )}
                     {shown && field.resolvedFrom === 'wine' && bottleVintage && (
@@ -525,13 +651,13 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
                         {t('wineRecord.scopeWine', 'all vintages')}
                       </span>
                     )}
-                    {/* Who contributed a value is stored, never shown (Johan,
-                        2026-09-18): the record is the registry's, not a byline
-                        — and the server no longer sends the name at all. */}
+                    {/* Who contributed a value is stored, never shown: the
+                        record is the registry's, not a byline — and the
+                        server does not send the name at all. */}
                   </span>
                   {/* ANY pending suggestion (yours or someone's) holds the
                       key's single review slot — show status, never a button
-                      that can only 409 (audit: second-suggester dead-end). */}
+                      that can only 409. */}
                   {canSuggest && (field.mySuggestion || field.hasPendingSuggestion) ? (
                     <span className="wr-pending" title={field.mySuggestion
                       ? t('wineRecord.pendingTitle', 'Your suggestion is awaiting curator review')
@@ -542,19 +668,24 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
                     <button
                       type="button"
                       className="wr-suggest-btn"
-                      onClick={() => {
-                        setValueModal({ field });
-                        setValueInput('');
-                        setValueReason('');
-                        setValueScope(bottleVintage ? 'vintage' : 'wine');
-                        setValueVintage('');
-                        setError(null);
-                      }}
+                      onClick={() => openValueModal(field)}
                       aria-label={t('wineRecord.suggestValueFor', 'Suggest a value for {{field}}', { field: keyLabel(field.key) })}
                     >
                       {shown && field.resolvedFrom === 'wine' && bottleVintage
                         ? t('wineRecord.addVintageValue', 'Add {{year}} value', { year: bottleVintage })
                         : shown ? t('wineRecord.fix', 'Fix') : t('wineRecord.suggestValue', 'Add value')}
+                    </button>
+                  ) : canSuggest && !shown ? (
+                    // A blank public figure is a contribution anyone holding
+                    // the bottle can make — offered quietly, without the fix
+                    // mode, which reads like reporting an error.
+                    <button
+                      type="button"
+                      className="wr-text-btn"
+                      onClick={() => openValueModal(field)}
+                      aria-label={t('wineRecord.suggestValueFor', 'Suggest a value for {{field}}', { field: keyLabel(field.key) })}
+                    >
+                      {t('wineRecord.add', 'Add')}
                     </button>
                   ) : null}
                 </div>
@@ -575,7 +706,9 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
 
       {sentField && (
         <p role="status" className="wr-thanks">
-          {t('wineRecord.thanks', 'Thank you — your suggestion is in the review queue. We’ll notify you when a curator has decided.')}
+          {sentApplied
+            ? t('wineRecord.thanksApplied', 'Thank you — your change is live.')
+            : t('wineRecord.thanks', 'Thank you — your suggestion is in the review queue. We’ll notify you when a curator has decided.')}
         </p>
       )}
 
@@ -665,6 +798,34 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
                       </div>
                     )}
                   </>
+                ) : modal.field === 'classification' && (tierPicker || tierLoading) ? (
+                  // Only curated tiers are accepted, so they are chosen from
+                  // the list, not typed: a typed one would fail only once sent.
+                  <div className="form-group">
+                    <span className="wr-group-label" id={tiersLabelId}>{t('wineRecord.proposed', 'Should be')}</span>
+                    {tierPicker ? (
+                      <div role="group" aria-labelledby={tiersLabelId}>
+                        <GrapePicker
+                          grapes={tierOptions}
+                          selected={proposedTiers || recordedTiers}
+                          onChange={setProposedTiers}
+                          placeholder={t('wineRecord.classificationSearch', 'Search the classification tiers…')}
+                          noMatchLabel={t('wineRecord.classificationNoMatch', 'No tier matches. Only the tiers in this list can be recorded.')}
+                          allSelectedLabel={t('wineRecord.classificationAllSelected', 'Every tier in the list is selected.')}
+                        />
+                        {proposedTiers && tiersText(proposedTiers).length > FIELD_TEXT_MAX && (
+                          <p className="wr-help" role="status">
+                            {t('wineRecord.classificationTooLong', 'Too many tiers for one suggestion: together they may be 200 characters at most.')}
+                          </p>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="wr-help">{t('common.loading', 'Loading...')}</p>
+                    )}
+                    <p className="wr-help">
+                      {t('wineRecord.classificationHelp', 'This becomes the wine’s complete classification: remove what’s wrong, add what’s missing. DOCG, DOC or AOC is not a tier — it follows from the appellation.')}
+                    </p>
+                  </div>
                 ) : (
                   <div className="form-group">
                     <label htmlFor="wr-proposed">{t('wineRecord.proposed', 'Should be')}</label>
@@ -676,6 +837,20 @@ function WineRecordSection({ wine, canSuggest, apiFetch, vintage, promptMissingG
                       maxLength={200}
                       required
                     />
+                    {/* Without the tier list the tier is typed; the server
+                        checks it against the taxonomy when it is sent. */}
+                    {modal.field === 'classification' && (
+                      <p className="wr-help wr-help--note">
+                        {tierList.error ? (
+                          <>
+                            {t('wineRecord.classificationLoadFailed', 'Couldn’t load the list of tiers. Type the tier as the label states it.')}{' '}
+                            <button type="button" className="wr-text-btn" onClick={tierList.retry}>
+                              {t('common.retry', 'Retry')}
+                            </button>
+                          </>
+                        ) : t('wineRecord.classificationNoTiers', 'The registry lists no classification tiers for this wine’s country. Type the tier as the label states it.')}
+                      </p>
+                    )}
                   </div>
                 )}
               </>

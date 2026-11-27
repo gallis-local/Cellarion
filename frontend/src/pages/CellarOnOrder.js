@@ -17,6 +17,7 @@ import {
 } from '../utils/onOrder';
 import './CellarDetail.css';
 import './CellarOnOrder.css';
+import { formatVintage } from '../utils/vintage';
 
 /**
  * Bottles bought for this cellar that have not arrived yet (status
@@ -253,8 +254,8 @@ function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onA
   const saving = useRef(false);
   // A raise that stopped part-way added bottles this list does not show
   // yet: until it has been read again, `count` is stale and a retry would
-  // add the whole difference again (release audit 2026-10-16 — 2 → 7 ended
-  // at 10). Save waits for the re-read; the count then is the live one.
+  // add the whole difference again (2 → 7 would end above 7). Save waits for
+  // the re-read; the count then is the live one.
   const [staleAt, setStaleAt] = useState(null);
   useEffect(() => { if (staleAt !== null && count !== staleAt) setStaleAt(null); }, [count, staleAt]);
   const waitingForList = staleAt !== null && staleAt === count;
@@ -331,7 +332,7 @@ function OnOrderGroup({ group, cellarId, canEdit, onArrived, onMonthChanged, onA
           </h3>
           {producer && <p className="on-order-producer">{producer}</p>}
           <div className="on-order-meta">
-            <span>{first.vintage || 'NV'}</span>
+            <span>{formatVintage(first.vintage || 'NV', t)}</span>
             {first.bottleSize && first.bottleSize !== '750ml' && <span>· {first.bottleSize}</span>}
             <span className="on-order-qty">· {t('onOrder.qty', { count })}</span>
             {first.price != null && first.price !== '' && (

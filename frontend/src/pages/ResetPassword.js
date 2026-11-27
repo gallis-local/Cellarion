@@ -2,10 +2,12 @@ import { useEffect, useId, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import AuthLogo from '../components/AuthLogo';
+import { messageForResponse } from '../utils/friendlyError';
+import { PASSWORD_POLICY } from '../utils/accountRules';
 import './Login.css';
 
 function ResetPassword() {
-  // Labels tied to their inputs, so screen readers announce them (pre-release audit 2026-10-14).
+  // Labels tied to their inputs, so screen readers announce them.
   const passwordId = useId();
   const confirmId = useId();
   const { t } = useTranslation();
@@ -19,7 +21,7 @@ function ResetPassword() {
 
   // Read the one-time token ONCE, then take it out of the address bar so it
   // does not linger in browser history, in the Referer of any outbound link,
-  // or in an analytics pageview (audit 2026-09 F03-6). State survives the URL
+  // or in an analytics pageview. State survives the URL
   // change; the form posts the captured value.
   const [token] = useState(() => searchParams.get('token'));
   useEffect(() => {
@@ -31,6 +33,11 @@ function ResetPassword() {
     e.preventDefault();
     if (password !== confirm) {
       setErrorMessage(t('auth.passwordsNoMatch'));
+      return;
+    }
+    // The server's refusal of a weak password is English; say it here first.
+    if (!PASSWORD_POLICY.test(password)) {
+      setErrorMessage(t('auth.passwordRuleError'));
       return;
     }
     setStatus('submitting');
@@ -47,7 +54,7 @@ function ResetPassword() {
         setTimeout(() => navigate('/login', { replace: true }), 2000);
       } else {
         setStatus('error');
-        setErrorMessage(data.error || t('auth.resetFailed'));
+        setErrorMessage(messageForResponse(res, data, t('auth.resetFailed'), t));
       }
     } catch {
       setStatus('error');

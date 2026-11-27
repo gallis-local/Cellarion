@@ -9,7 +9,7 @@ const ImageGallery = lazy(() => import('../ImageGallery'));
 // `vintageImage` / `vintageImageCredit`: the vintage's official photo, shown
 // before the wine's registry image, which may be another year's label.
 // `otherVintageImage`: the viewer's own photo of another vintage, only when
-// the wine has no image at all (support ticket 2026-10-09).
+// the wine has no image at all.
 function HeroImage({ bottle, wine, defaultImage, pendingImage, vintageImage, vintageImageCredit, otherVintageImage, isPending, displayName, canEdit, onSetDefault }) {
   const { t } = useTranslation();
   const [galleryEmpty, setGalleryEmpty] = useState(false);
@@ -18,7 +18,7 @@ function HeroImage({ bottle, wine, defaultImage, pendingImage, vintageImage, vin
   const [failedSrc, setFailedSrc] = useState(null);
   const photoSrc = defaultImage || pendingImage || vintageImage || wine?.image || otherVintageImage;
 
-  // Show carousel using bottleId — the API now returns both bottle-specific
+  // Show carousel using bottleId — the API returns both bottle-specific
   // and approved wine-level images, so the user can pick any as their default
   if (bottle?._id && !galleryEmpty) {
     return (
@@ -63,7 +63,7 @@ function HeroImage({ bottle, wine, defaultImage, pendingImage, vintageImage, vin
 
   // No image at all: a drawn bottle with the wine's name on its label — for a
   // bottle still waiting on its wine request, the name the member asked for
-  // (release audit 2026-10-13: it drew a blank label).
+  // (it drew a blank label).
   const request = bottle?.pendingWineRequest;
   const labelWine = wine || (request && {
     name: request.wineName,

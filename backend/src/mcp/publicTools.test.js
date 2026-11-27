@@ -25,8 +25,8 @@ jest.mock('../models/Rack', () => ({ find: jest.fn(), findOne: jest.fn() }));
 jest.mock('../models/User', () => ({ findById: jest.fn() }));
 jest.mock('../models/WishlistItem', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../models/JournalEntry', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
-// get_wine reads the correction queue for signed-in callers (support ticket
-// 2026-09-12) — mocked as "nothing pending" so the real model never buffers.
+// get_wine reads the correction queue for signed-in callers — mocked as
+// "nothing pending" so the real model never buffers.
 jest.mock('../models/WineCorrectionProposal', () => ({
   findOne: jest.fn(() => ({ select: () => ({ lean: async () => null }) })),
 }));
@@ -37,7 +37,7 @@ jest.mock('../models/BlogPost', () => ({ find: jest.fn(), findOne: jest.fn(), co
 jest.mock('../models/Notification', () => ({ find: jest.fn(), countDocuments: jest.fn(), updateOne: jest.fn(), updateMany: jest.fn() }));
 jest.mock('../models/ClimateDevice', () => ({ find: jest.fn() }));
 jest.mock('../models/McpActionLog', () => ({ create: jest.fn(), findOne: jest.fn(), findOneAndUpdate: jest.fn() }));
-jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn() }));
+jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn() }));
 jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), buildEmptyStats: jest.fn() }));
 jest.mock('../services/vectorStore', () => ({ getVector: jest.fn(), search: jest.fn() }));
 jest.mock('../config/aiConfig', () => ({ get: jest.fn(() => ({ vectorIndex: 'v1' })) }));
@@ -131,6 +131,24 @@ describe('drink_window_for', () => {
     expect(JSON.stringify(body)).not.toMatch(/sommNotes/);
   });
 
+  // status_now is the app's own reading of the window, in this tool's words
+  // (not_ready, early, peak, late, past). The first five are the cases a
+  // shorter rule read differently from the bottle page.
+  test.each([
+    ['an early phase still open, the peak without a start', { earlyFrom: THIS_YEAR - 2, earlyUntil: THIS_YEAR + 1, peakUntil: THIS_YEAR + 5 }, 'early'],
+    ['the gap between peak and late belongs to the peak', { peakFrom: THIS_YEAR - 5, peakUntil: THIS_YEAR - 1, lateFrom: THIS_YEAR + 2, lateUntil: THIS_YEAR + 5 }, 'peak'],
+    ['a late phase with no end stays late', { peakFrom: THIS_YEAR - 8, peakUntil: THIS_YEAR - 4, lateFrom: THIS_YEAR - 3 }, 'late'],
+    ['an early phase alone, once begun', { earlyFrom: THIS_YEAR - 1 }, 'early'],
+    ['a late phase alone cannot be read', { lateFrom: THIS_YEAR - 1, lateUntil: THIS_YEAR + 3 }, null],
+    ['before the window', { earlyFrom: THIS_YEAR + 2, peakFrom: THIS_YEAR + 5 }, 'not_ready'],
+    ['after the window', { peakFrom: THIS_YEAR - 9, peakUntil: THIS_YEAR - 5, lateFrom: THIS_YEAR - 4, lateUntil: THIS_YEAR - 1 }, 'past'],
+  ])('status_now: %s', async (_label, window, expected) => {
+    WineDefinition.findById.mockReturnValue(chain(WINE));
+    WineVintageProfile.find.mockReturnValue(chain([{ vintage: '2015', relative: false, ...window }]));
+    const res = await tool('drink_window_for').handler({ wine_id: oid('f') }, SIGNED_IN);
+    expect(parse(res).data.vintages[0].status_now).toBe(expected);
+  });
+
   test('relative (NV) profiles report offsets with no now-status', async () => {
     WineDefinition.findById.mockReturnValue(chain(WINE));
     WineVintageProfile.find.mockReturnValue(chain([
@@ -140,6 +158,13 @@ describe('drink_window_for', () => {
     const v = parse(res).data.vintages[0];
     expect(v.unit).toBe('years_after_purchase');
     expect(v.status_now).toBeNull();
+  });
+
+  test('the vintage is read as the profiles store it: "nv" in any case asks for the NV row', async () => {
+    WineDefinition.findById.mockReturnValue(chain(WINE));
+    WineVintageProfile.find.mockReturnValue(chain([]));
+    await tool('drink_window_for').handler({ wine_id: oid('f'), vintage: ' nv ' }, SIGNED_IN);
+    expect(WineVintageProfile.find.mock.calls.at(-1)[0]).toMatchObject({ status: 'reviewed', vintage: 'NV' });
   });
 
   test('no curated profile → honest empty with estimate warning; bad/missing wine handled', async () => {
@@ -160,26 +185,46 @@ describe('drink_window_for', () => {
 });
 
 describe('guides', () => {
-  test('list_guides: published-only filter, tag pass-through, public_url shape', async () => {
+  test('list_guides: published originals only, tag pass-through, public_url shape', async () => {
     BlogPost.countDocuments.mockResolvedValue(1);
     BlogPost.find.mockReturnValue(chain([
       { slug: 'drink-windows-101', title: 'Drink Windows 101', excerpt: 'x', tags: ['aging'], publishedAt: new Date() },
     ]));
     const res = await tool('list_guides').handler({ tag: 'Aging' }, ANON);
     const body = parse(res);
-    expect(BlogPost.find).toHaveBeenCalledWith({ status: 'published', tags: 'aging' });
+    expect(BlogPost.find).toHaveBeenCalledWith({ status: 'published', translationOf: null, tags: 'aging' });
     expect(body.data[0].public_url).toBe('https://cellarion.app/blog/drink-windows-101');
+    // A post with no language is English, and has no translations.
+    expect(body.data[0].language).toBe('en');
+    expect(body.data[0].translations).toEqual([]);
+  });
+
+  test('list_guides: a translation is listed under its original, not as an article of its own', async () => {
+    const original = new mongoose.Types.ObjectId();
+    BlogPost.countDocuments.mockResolvedValue(1);
+    BlogPost.find
+      .mockReturnValueOnce(chain([{ _id: original, slug: 'drink-windows-101', title: 'Drink Windows 101', tags: [], publishedAt: new Date() }]))
+      .mockReturnValueOnce(chain([{ slug: 'dricka-i-tid', language: 'sv', translationOf: original }]));
+    const body = parse(await tool('list_guides').handler({}, ANON));
+    expect(BlogPost.find).toHaveBeenLastCalledWith({ status: 'published', translationOf: { $in: [original] } });
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0].translations).toEqual([
+      { language: 'sv', slug: 'dricka-i-tid', public_url: 'https://cellarion.app/blog/dricka-i-tid' },
+    ]);
   });
 
   test('read_guide: published-only, slug lowercased, truncation warning on huge content', async () => {
     BlogPost.findOne.mockReturnValue(chain({
       slug: 's', title: 'T', excerpt: null, tags: [], publishedAt: new Date(), content: 'x'.repeat(30001),
     }));
+    BlogPost.find.mockReturnValue(chain([]));
     let res = await tool('read_guide').handler({ slug: '  MY-Guide ' }, ANON);
     let body = parse(res);
     expect(BlogPost.findOne).toHaveBeenCalledWith({ slug: 'my-guide', status: 'published' });
     expect(body.data.content).toHaveLength(30000);
     expect(body.warnings.join(' ')).toMatch(/truncated/i);
+    expect(body.data.language).toBe('en');
+    expect(body.data.other_languages).toEqual([]);
 
     BlogPost.findOne.mockReturnValue(chain(null));
     res = await tool('read_guide').handler({ slug: 'draft-post' }, ANON);

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import {
-  adminGetWineRequests, adminResolveWineRequest, adminRejectWineRequest,
+  adminGetWineRequests, adminGetWineRequestPhotos, adminResolveWineRequest, adminRejectWineRequest,
   adminGetCountries, adminGetGrapes, adminGetRegions, adminGetAppellations,
 } from '../api/admin';
 import { searchWines, getAiWineInfo } from '../api/wines';
@@ -12,6 +12,22 @@ import safeUrl from '../utils/safeUrl';
 import displayableImage from '../utils/displayableImage';
 import { WINE_COLOURS, isStyleType, colourLabel } from '../utils/wineColour';
 import './AdminRequests.css';
+
+// What a request's hints may hold, in the order they are shown.
+const HINT_KEYS = ['country', 'region', 'appellation', 'type', 'classification', 'colour', 'sweetness', 'lwin'];
+
+// A contributed window as the curator reads it: "early 2023–2026 · peak 2026–2034".
+function proposedWindowText(w, t) {
+  const phases = [
+    [t('admin.requests.phaseEarly', 'early'), w.earlyFrom, w.earlyUntil],
+    [t('admin.requests.phasePeak', 'peak'), w.peakFrom, w.peakUntil],
+    [t('admin.requests.phaseLate', 'late'), w.lateFrom, w.lateUntil],
+  ];
+  return phases
+    .filter(([, from, until]) => from != null || until != null)
+    .map(([label, from, until]) => `${label} ${from ?? '…'}–${until ?? '…'}`)
+    .join(' · ');
+}
 
 function AdminRequests() {
   const { t } = useTranslation();
@@ -51,6 +67,13 @@ function AdminRequests() {
   useEffect(() => {
     selectedIdRef.current = selected?._id ?? null;
   }, [selected]);
+
+  // The create form as it is now, for an async chain that lands after the
+  // admin has typed on (the AI lookup reads the name and producer from here).
+  const wineDataRef = useRef(resolveData.wineData);
+  useEffect(() => {
+    wineDataRef.current = resolveData.wineData;
+  }, [resolveData.wineData]);
 
   // Debounce timer + monotonic request id for the duplicate check, so
   // per-keystroke requests are coalesced and stale responses discarded.
@@ -173,20 +196,36 @@ function AdminRequests() {
     }, 350);
   };
 
+  // The inline photos of the request just opened. A request opened after it
+  // wins: the answer for an earlier one is dropped (selectedIdRef).
+  const loadPhotos = async (id) => {
+    try {
+      const res = await adminGetWineRequestPhotos(apiFetch, id);
+      if (!res.ok) return;
+      const photos = await res.json();
+      if (selectedIdRef.current !== id) return;
+      setSelected((prev) => (prev && prev._id === id ? { ...prev, image: photos.image, backImage: photos.backImage } : prev));
+    } catch {
+      // Not shown is all it costs: the approval uses the stored photo either way.
+    }
+  };
+
   const handleSelectRequest = (request) => {
     setSelected(request);
     setRegions([]);
     // The requester chose the image value. Only a link or one of our upload
     // paths is offered to the approval form — never an inline image (too big
-    // for the field) and never an unrecognised shape (audit 2026-09 F06-1).
+    // for the field) and never an unrecognised shape.
     const requestImage = displayableImage(request.image);
     const prefillImage = requestImage && !requestImage.startsWith('data:') ? requestImage : '';
     // A photo attached to the request (inline) is offered as a checkbox
-    // instead: kept, the server stores it as the new wine's picture file.
-    const hasRequestPhoto = !!requestImage && requestImage.startsWith('data:');
-    // A back label photo (#1460) is offered for the wine's public photos the
+    // instead: kept, the server stores it as the new wine's picture file. The
+    // list flags an inline photo rather than carrying it (hasInlineImage);
+    // the bytes are loaded below, only to be shown.
+    const hasRequestPhoto = !!request.hasInlineImage || (!!requestImage && requestImage.startsWith('data:'));
+    // A back label photo is offered for the wine's public photos the
     // same way — on by default, the server publishes it as a gallery photo.
-    const hasBackPhoto = !!displayableImage(request.backImage)?.startsWith('data:');
+    const hasBackPhoto = !!request.hasInlineBackImage || !!displayableImage(request.backImage)?.startsWith('data:');
     setResolveData({
       mode: request.requestType === 'grape_suggestion' ? 'apply_grapes' : 'create',
       adminNotes: '',
@@ -215,16 +254,28 @@ function AdminRequests() {
     setLinkResults([]);
     setAiLookup({ loading: false, error: null });
     selectedIdRef.current = request._id;
+    if (request.hasInlineImage || request.hasInlineBackImage) loadPhotos(request._id);
     prefillFromHints(request);
   };
 
-  // What the import FILE said about the wine (request.hints — country,
-  // region, appellation, type) pre-fills the create form the same way an AI
-  // lookup does, so the curator starts from the file's geography instead of
-  // re-deriving it (support ticket 2026-09-05). Bails if another request was
-  // selected while the region list was loading (selectedIdRef is the page's
-  // existing "which request is open" ref).
+  // What an import file said about the wine, or what a self-hosted install
+  // holds for a wine it contributed (request.hints — country, region,
+  // appellation, type — and the grape names) pre-fills the create form the
+  // same way an AI lookup does, so the curator starts from it instead of
+  // re-deriving it. Bails if another request was selected while the region
+  // list was loading (selectedIdRef is the page's existing "which request is
+  // open" ref).
   const prefillFromHints = async (request) => {
+    // Grape names pre-select the varieties the taxonomy knows by exactly that
+    // name, as the AI lookup does; any other name stays shown as text above
+    // the form, never guessed.
+    if (request.requestType !== 'grape_suggestion' && request.suggestedGrapes?.length && grapes.length) {
+      const ids = [...new Set(request.suggestedGrapes
+        .map((name) => grapes.find((g) => g.name.toLowerCase() === String(name).toLowerCase()))
+        .filter(Boolean)
+        .map((g) => g._id))];
+      if (ids.length) setResolveData((prev) => ({ ...prev, wineData: { ...prev.wineData, grapes: ids } }));
+    }
     const hints = request.hints;
     if (!hints || !(hints.country || hints.region || hints.appellation || hints.type)) return;
     const patch = {};
@@ -265,23 +316,21 @@ function AdminRequests() {
         return;
       }
       const wine = data.wine;
-      const newWineData = {
-        ...resolveData.wineData,
-        type: wine.type || resolveData.wineData.type,
-        appellation: wine.appellation || '',
-        region: '',
-      };
+      // Only the fields the lookup answers. They are merged into the form as
+      // it is when the lookup lands, so what the admin typed meanwhile stays.
+      const found = { appellation: wine.appellation || '', region: '' };
+      if (wine.type) found.type = wine.type;
 
       const country = countries.find(c => c.name.toLowerCase() === wine.country?.toLowerCase());
       if (country) {
-        newWineData.country = country._id;
+        found.country = country._id;
         const regRes = await adminGetRegions(apiFetch, country._id);
         const regData = await regRes.json();
         if (stale()) return;
         if (regRes.ok) {
           setRegions(regData.regions);
           const region = regData.regions.find(r => r.name.toLowerCase() === wine.region?.toLowerCase());
-          if (region) newWineData.region = region._id;
+          if (region) found.region = region._id;
           const appParams = new URLSearchParams({ country: country._id });
           if (region) appParams.set('region', region._id);
           const appRes = await adminGetAppellations(apiFetch, appParams);
@@ -292,14 +341,14 @@ function AdminRequests() {
       }
 
       if (wine.grapes?.length > 0) {
-        newWineData.grapes = wine.grapes
+        found.grapes = wine.grapes
           .map(gName => grapes.find(g => g.name.toLowerCase() === gName.toLowerCase()))
           .filter(Boolean)
           .map(g => g._id);
       }
 
-      setResolveData(prev => ({ ...prev, mode: 'create', wineData: newWineData }));
-      checkDuplicates(newWineData.name, newWineData.producer);
+      setResolveData(prev => ({ ...prev, mode: 'create', wineData: { ...prev.wineData, ...found } }));
+      checkDuplicates(wineDataRef.current.name, wineDataRef.current.producer);
       setAiLookup({ loading: false, error: null });
     } catch {
       if (stale()) return;
@@ -484,10 +533,10 @@ function AdminRequests() {
                       {selected.suggestedGrapes.join(', ')}
                     </p>
                   )
-                ) : (
+                ) : (selected.sourceUrl || selected.sourceUrls?.length > 0) && (
                   <p className="request-links">
                     <strong>{t('common.source')}:</strong>{' '}
-                    {/* Every link the requester gave (#1460); older requests know one. */}
+                    {/* Every link the requester gave; older requests know one. */}
                     {(Array.isArray(selected.sourceUrls) && selected.sourceUrls.length ? selected.sourceUrls : [selected.sourceUrl])
                       .filter(Boolean)
                       .map((url, index) => (
@@ -498,11 +547,33 @@ function AdminRequests() {
                       ))}
                   </p>
                 )}
-                {selected.hints && (selected.hints.country || selected.hints.region || selected.hints.appellation || selected.hints.type) && (
+                {selected.hints && HINT_KEYS.some((k) => selected.hints[k]) && (
                   <p>
-                    <strong>{t('admin.requests.fromFile', 'From the import file')}:</strong>{' '}
-                    {[selected.hints.country, selected.hints.region, selected.hints.appellation, selected.hints.type].filter(Boolean).join(' · ')}
+                    {/* Over the bridge, hints come with a wine a self-hosted install
+                        contributed (the last four only from there); otherwise from
+                        an import file. Not on the create form: added to the wine
+                        after it is created, where they apply. */}
+                    <strong>{selected.via === 'bridge' ? t('admin.requests.fromInstall', 'From the self-hosted install') : t('admin.requests.fromFile', 'From the import file')}:</strong>{' '}
+                    {HINT_KEYS.map((k) => selected.hints[k]).filter(Boolean).join(' · ')}
                   </p>
+                )}
+                {selected.requestType !== 'grape_suggestion' && selected.suggestedGrapes?.length > 0 && (
+                  <p>
+                    <strong>{t('admin.requests.grapes', 'Grapes')}:</strong> {selected.suggestedGrapes.join(', ')}
+                  </p>
+                )}
+                {selected.proposedWindows?.length > 0 && (
+                  <div>
+                    <p>
+                      <strong>{t('admin.requests.proposedWindows', 'Drink windows from the install')}:</strong>{' '}
+                      {t('admin.requests.proposedWindowsNote', 'Approving the wine puts these in the maturity queue as suggestions. Nothing is published until a curator reviews them.')}
+                    </p>
+                    <ul>
+                      {selected.proposedWindows.map((w) => (
+                        <li key={w.vintage}>{w.vintage}: {proposedWindowText(w, t)}</li>
+                      ))}
+                    </ul>
+                  </div>
                 )}
                 {(displayableImage(selected.image) || displayableImage(selected.backImage)) && (
                   <div className="request-photos">
@@ -512,7 +583,7 @@ function AdminRequests() {
                         {displayableImage(selected.backImage) && <figcaption>{t('admin.requests.frontLabel', 'Front')}</figcaption>}
                       </figure>
                     )}
-                    {/* The back label (#1460): evidence for the reviewer, never the wine's picture. */}
+                    {/* The back label: evidence for the reviewer, never the wine's picture. */}
                     {displayableImage(selected.backImage) && (
                       <figure>
                         <img src={displayableImage(selected.backImage)} alt={t('admin.requests.backLabel', 'Back label')} className="wine-image-preview" />
@@ -754,7 +825,7 @@ function AdminRequests() {
                             }}
                             placeholder="https://..."
                           />
-                          {displayableImage(selected.image)?.startsWith('data:') && !resolveData.wineData.image && (
+                          {(selected.hasInlineImage || displayableImage(selected.image)?.startsWith('data:')) && !resolveData.wineData.image && (
                             <label className="request-photo-toggle">
                               <input
                                 type="checkbox"
@@ -768,7 +839,7 @@ function AdminRequests() {
                               <span>{t('admin.requests.useRequestPhoto', "Use the photo from the request as the wine's picture")}</span>
                             </label>
                           )}
-                          {displayableImage(selected.backImage)?.startsWith('data:') && (
+                          {(selected.hasInlineBackImage || displayableImage(selected.backImage)?.startsWith('data:')) && (
                             <label className="request-photo-toggle">
                               <input
                                 type="checkbox"

@@ -1,12 +1,12 @@
 import { useState, useEffect, useMemo, useRef, Suspense } from 'react';
 import { lazy } from '../utils/lazyWithReload';
-import { useParams, Link } from 'react-router-dom';
+import { useParams, useLocation, Link } from 'react-router-dom';
 import BottleUndoNotice, { bottleNoticeName } from '../components/BottleUndoNotice';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { useFeature } from '../utils/featureFlags';
 import { getCellarVintage } from '../api/cellars';
-import { getBottle } from '../api/bottles';
+import { getBottle, bulkUpdateBottles } from '../api/bottles';
 import { lookupMaturityProfile, lookupPriceHistory } from '../api/somm';
 import AuthImage from '../components/AuthImage';
 import BottlePlaceholder from '../components/BottlePlaceholder';
@@ -14,7 +14,12 @@ import CollapsibleBlock, { CollapseToggle } from '../components/CollapsibleBlock
 import { useCollapsedBlocks } from '../utils/collapsedBlocks';
 import Modal from '../components/Modal';
 import CellarPageHeader from '../components/CellarPageHeader';
+import { cellarListFrom } from '../utils/useBackHere';
 import MaturityPhaseTable from '../components/bottle/MaturityPhaseTable';
+import MaturityTimeline from '../components/bottle/MaturityTimeline';
+import DrinkWindowEditor from '../components/bottle/DrinkWindowEditor';
+import { editorStart, personalPhaseLabels } from '../components/bottle/PersonalWindowTimeline';
+import BetaBadge from '../components/BetaBadge';
 import LotHistory from '../components/bottle/LotHistory';
 import PersonalDataCard from '../components/bottle/PersonalDataCard';
 import TastingProfileCard from '../components/bottle/TastingProfileCard';
@@ -25,8 +30,8 @@ import PriceHistoryTimeline from '../components/bottle/PriceHistoryTimeline';
 import PriceTrackingToggle from '../components/bottle/PriceTrackingToggle';
 import { fetchRates } from '../utils/currency';
 import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
-import { getMaturityStatus, maturityBadgeText } from '../utils/drinkStatus';
-import { bottleAnchorYear } from '../utils/maturityUtils';
+import { getMaturityStatus, maturityBadgeText, getPersonalWindowStatus, personalWindowBadgeText } from '../utils/drinkStatus';
+import { bottleAnchorYear, getMaturityPhases, getPersonalWindowPhases } from '../utils/maturityUtils';
 import { totalsByCurrency } from '../utils/onOrder';
 import { isReserved, reservationSummary } from '../utils/reservation';
 import { glassesLeft, daysLeft, freshnessStatus } from '../utils/openBottle';
@@ -37,6 +42,8 @@ import { slotLabel } from '../utils/slotLabel';
 import './CellarDetail.css';
 import './BottleDetail.css';
 import './CellarVintage.css';
+import { formatVintage } from '../utils/vintage';
+import { useContributionReviewed } from '../utils/contributionReview';
 
 const DrinkOneModal = lazy(() => import('../components/DrinkOneModal'));
 const AddToPickListModal = lazy(() => import('../components/AddToPickListModal'));
@@ -64,20 +71,19 @@ const safeDecode = (s) => {
  * One wine and vintage in a cellar. The same page whether the cellar holds
  * one bottle of the vintage or forty, reached by tapping any entry in the
  * cellar list, and always in the same order: the wine, the vintage, the
- * bottles — with Drink, Edit vintage and Add in a bar that stays in reach
- * (support ticket 2026-10-09, follow-up).
+ * bottles — with Drink, Edit vintage and Add in a bar that stays in reach.
  *
- * Began in early access; out for everyone since 2026-10-13, and the classic
- * layout and its flag are gone. Its data comes from GET
+ * Its data comes from GET
  * /api/cellars/:id/vintages/…, and every save goes through the routes the
  * other screens use (bulk update, consume, add bottles).
  */
 function CellarVintage() {
   const { t, i18n } = useTranslation();
+  const reviewed = useContributionReviewed();
   const { id, wineId, vintage: vintageParam } = useParams();
   const { apiFetch, user } = useAuth();
-  // Blocks the member folded away, remembered on the account (beta feedback
-  // 2026-10-12): the three sections, and the cards with a title of their own.
+  // Blocks the member folded away, remembered on the account: the three
+  // sections, and the cards with a title of their own.
   const { isCollapsed, toggle, expand } = useCollapsedBlocks();
   const blockProps = (blockId, label) => ({ id: blockId, label, collapsed: isCollapsed(blockId), onToggle: () => toggle(blockId) });
   const [data, setData] = useState(null);
@@ -85,7 +91,7 @@ function CellarVintage() {
   const [error, setError] = useState(null);
   const [profile, setProfile] = useState(null);
   const [profileLoaded, setProfileLoaded] = useState(false);
-  const [modal, setModal] = useState(null); // 'drink' | 'pickList' | 'edit' | 'add' | 'report' | 'reportWine' | 'recommend' | 'barcode'
+  const [modal, setModal] = useState(null); // 'drink' | 'pickList' | 'edit' | 'editWindow' | 'add' | 'report' | 'reportWine' | 'recommend' | 'barcode'
   const [priceHistory, setPriceHistory] = useState(null);
   const [rates, setRates] = useState(null);
   const [galleryEmpty, setGalleryEmpty] = useState(false);
@@ -105,9 +111,27 @@ function CellarVintage() {
   const [drunkNotice, setDrunkNotice] = useState(null);
   useEffect(() => { setDrunkNotice(null); }, [id, wineId, vintageParam]);
   useEffect(() => { if (notice) setDrunkNotice(null); }, [notice]);
+  // Early access (flag maturityTimeline): the vintage's own window slid on
+  // the timeline's bar, in place. It belongs to this vintage's bottles.
+  const [windowEdit, setWindowEdit] = useState(null);
+  useEffect(() => { setWindowEdit(null); }, [id, wineId, vintageParam]);
+  // Closing the editor hands the keyboard back to the window's action.
+  const windowActionRef = useRef(null);
+  const windowRefocus = useRef(false);
+  useEffect(() => {
+    if (windowEdit || !windowRefocus.current) return;
+    windowRefocus.current = false;
+    windowActionRef.current?.focus();
+  }, [windowEdit]);
 
   const vintage = safeDecode(vintageParam || 'NV');
   const pagePath = `/cellars/${id}/vintages/${wineId}/${encodeURIComponent(vintage)}`;
+  // Opened from the cellar list (this cellar's, or another's with "all my
+  // cellars" chosen): back leads to that list as it was left, and the bottles
+  // opened from here hand it on, so Drink, Delete or Move there lands on it too.
+  const location = useLocation();
+  const cellarList = cellarListFrom(location.state);
+  const listIsThisCellar = !cellarList || /^\/cellars\/([^/?#]+)/.exec(cellarList)?.[1] === id;
 
   // Whether a long list is unfolded, remembered for this page in this tab:
   // back from one of its bottles, the list is as the user left it.
@@ -178,16 +202,16 @@ function CellarVintage() {
   const cellar = data?.cellar || null;
   const canEdit = !!cellar && ['owner', 'editor'].includes(cellar.userRole);
   // Early access (flag pickLists): put bottles of this wine and year on a
-  // pick list from here, not only from each bottle's own page (beta feedback
-  // 2026-10-14). Same rule as the bottle page: an owner or editor, bottles
-  // still in the cellar.
+  // pick list from here, not only from each bottle's own page. Same rule as
+  // the bottle page: an owner or editor, bottles still in the cellar.
   const pickListsOn = useFeature('pickLists');
+  const timelineOn = useFeature('maturityTimeline');
   const pickable = bottles.filter((b) => b.status === 'active');
   const canPickList = pickListsOn && canEdit && pickable.length > 0;
   const canSuggest = !!wine && !user?.isDemo && wine.draft !== true;
   const canAdd = canEdit && !!wine && !user?.isDemo && (bottles.length > 0 || !!data?.historyBottleId);
   const first = bottles[0] || null;
-  const title = wine ? `${wine.name} ${vintage}` : t('cellarVintage.title', 'Vintage');
+  const title = wine ? `${wine.name} ${formatVintage(vintage, t)}` : t('cellarVintage.title', 'Vintage');
   // Photos are filed under a bottle and its vintage (BottleImage.vintage), so
   // a photo added here goes through a bottle of this vintage — one still in
   // the cellar, else the last one drunk — and shows on every bottle of it.
@@ -236,9 +260,8 @@ function CellarVintage() {
     .join(' + ');
   const pricedCount = bottles.filter((b) => Number(b.price) > 0).length;
 
-  // The stock line at the head of the bottle list: where they sit, what is
-  // on order or was drunk, what was paid — in the singular for one ("slot
-  // 147", "Paid", beta feedback 2026-10-10).
+  // The stock line at the head of the bottle list: where they sit, what is on
+  // order or was drunk, what was paid — singular for one ("slot 147", "Paid").
   const stockItems = [
     ...placements.map((r) => (
       <span key={`rack-${r.id}`} className="cvb-summary-item">
@@ -277,13 +300,19 @@ function CellarVintage() {
   const windowDiffers = windowFields.some((s) => s.kind === 'differs');
   const [from, to, peakFrom, peakUntil] = windowFields.map((s) => (s.kind === 'shared' ? s.value : null));
   const notes = sharedState('notes');
+  // The shared window in whole years, as the bottle page reads a bottle's
+  // own: the early-access timeline draws it. None while the bottles differ.
+  const toYear = (v) => (v === null ? null : parseInt(v, 10));
+  const ownWindow = windowDiffers ? null : getPersonalWindowStatus({
+    drinkFrom: toYear(from), drinkTo: toYear(to), peakFrom: toYear(peakFrom), peakUntil: toYear(peakUntil),
+  });
 
   const anchorYear = bottleAnchorYear(first);
   // An NV window is meaningful only in relative mode (offsets from purchase)
   // and with a year to measure from — the bottle page's rule (ViewDetails).
   // An old absolute NV profile waits for review; a relative one with no
-  // bottle left to anchor it shows no years at all (release audit 2026-10-16:
-  // offsets read as years said "Declining", "0–1").
+  // bottle left to anchor it shows no years at all (offsets read as years
+  // would say "Declining", "0–1").
   const isNv = String(vintage || '').toUpperCase() === 'NV';
   const nvUnanchored = isNv && !!profile?.relative && !Number.isFinite(anchorYear);
   const profileReviewed = profile?.status === 'reviewed' && (!isNv || !!profile.relative);
@@ -294,6 +323,8 @@ function CellarVintage() {
   const heroOwn = first?.defaultImageUrl || first?.pendingImageUrl || null;
   const heroRegistry = first?.vintageImageUrl || wine?.image || null;
   const heroSrc = heroOwn || heroRegistry || first?.otherVintageImageUrl || null;
+  // A photo in the wine card (the gallery, else the hero), not the drawn bottle.
+  const showsPhoto = (!!photoBottleId && !galleryEmpty) || (!!heroSrc && heroSrc !== failedHero);
   const heroCredit = heroOwn || !heroRegistry ? null : (first?.vintageImageUrl ? first?.vintageImageCredit : wine?.imageCredit);
 
   const handleDrunk = (bottle, reason) => {
@@ -373,6 +404,48 @@ function CellarVintage() {
   const canEditVintage = canEdit && bottles.length > 0;
   const hasActions = canDrink || canEditVintage || canAdd || hasMore;
 
+  // The way to the vintage's own window, for whoever may edit it: Edit
+  // vintage opened at its drink-window years, or in early access the sliding
+  // editor in place — from the window the bottles share, else from the
+  // sommelier's reviewed years, else from this year.
+  const thisYear = new Date().getFullYear();
+  const ownLabels = personalPhaseLabels(t);
+  const openWindowEditor = () => {
+    if (!timelineOn) { setModal('editWindow'); return; }
+    const sommPhases = profileReviewed && !nvUnanchored ? getMaturityPhases(profile, ownLabels, anchorYear) : [];
+    setWindowEdit(editorStart({ personalWindow: ownWindow, sommPhases, vintageYear: parseInt(vintage, 10), labels: ownLabels, year: thisYear }));
+  };
+  const closeWindowEditor = () => { windowRefocus.current = true; setWindowEdit(null); };
+  // Saved on every bottle of the vintage here through the bulk route Edit
+  // vintage uses: a bottle it may not change is skipped and counted, as there.
+  const saveVintageWindow = async (fields) => {
+    try {
+      const res = await bulkUpdateBottles(apiFetch, bottles.map((b) => b._id), fields);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, error: body.error || t('bulk.failed') };
+      const skipped = (body.skipped || []).length;
+      setNotice(skipped
+        ? `${t('bulk.doneInfo', { count: body.done ?? 0 })} ${t('bulk.windowSkippedInfo', { count: skipped })}`
+        : t('cellarVintageBeta.savedNote', 'Saved for the vintage.'));
+    } catch {
+      return { ok: false, error: t('bulk.failed') };
+    }
+    // The editor closes on the page as reloaded, where its action now is.
+    await load();
+    return { ok: true, stored: fields };
+  };
+  // A quiet link after the window's words: a middle dot after the years
+  // ("2025–2045 · Change"), a space after a whole sentence ("Not set yet.").
+  // Offered once the sommelier's window has loaded: the editor starts from it.
+  const windowLink = (label, { ariaLabel, afterSentence = false } = {}) => canEditVintage && profileLoaded && (
+    <span>
+      {afterSentence ? ' ' : ' · '}
+      <button ref={windowActionRef} type="button" className="cvb-inline-link" aria-label={ariaLabel} onClick={openWindowEditor}>
+        {label}
+      </button>
+    </span>
+  );
+
   const moreMenu = (where) => hasMore && (
     <div className={`bd-overflow-wrap${where === 'bar' ? ' bd-overflow-wrap--mobile' : ''}`}>
       <button
@@ -426,8 +499,8 @@ function CellarVintage() {
         </div>
       )}
       <CellarPageHeader
-        backTo={`/cellars/${id}`}
-        backLabel={t('history.backTo', { cellarName: cellar?.name || '…' })}
+        backTo={cellarList || `/cellars/${id}`}
+        backLabel={listIsThisCellar ? t('history.backTo', { cellarName: cellar?.name || '…' }) : t('bottleDetail.backToCellar', 'Back to cellar')}
         title={title}
         loading={loading}
         userColor={cellar?.userColor}
@@ -445,8 +518,7 @@ function CellarVintage() {
       />
 
       {/* No cellar menu here: it belongs to the cellar, not to the wine, and
-          "Back to the cellar" above already leads there (beta feedback
-          2026-10-10). */}
+          "Back to the cellar" above already leads there. */}
 
       {notice && (
         <div className="alert alert-success cellar-vintage-notice" role="status">
@@ -471,7 +543,8 @@ function CellarVintage() {
         <>
           <div className="cvb-grid">
             {/* 1. The wine: who made it, where, the grapes, the description. */}
-            <section className="cvb-col" aria-labelledby="cvb-wine-title">
+            <div className="cvb-col">
+            <section aria-labelledby="cvb-wine-title">
               <div className="cvb-h2-row">
                 <h2 id="cvb-wine-title" className="cvb-h2">{t('cellarVintageBeta.wineTitle', 'The wine')}</h2>
                 <CollapseToggle
@@ -507,7 +580,10 @@ function CellarVintage() {
                         <BottlePlaceholder wine={wine} vintage={vintage} title={title} />
                       </div>
                     )}
-                    {canPhoto && (
+                    {/* With a photo shown, "Add a photo" is in the ⋮ menu: a
+                        button under it would only take room from the wine.
+                        With none, it is the way in. */}
+                    {canPhoto && !showsPhoto && (
                       <button type="button" className="btn btn-secondary btn-small cvb-add-photo" onClick={() => setPhotoOpen(true)}>
                         <span aria-hidden="true">🖼️</span> {t('cellarVintageBeta.addPhotoShort', 'Add a photo')}
                       </button>
@@ -518,7 +594,7 @@ function CellarVintage() {
                     <div className="cvb-wine-line">
                       {[wine.producer, wine.region?.name, wine.country?.name].filter(Boolean).join(' · ')}
                     </div>
-                    {wine.type && <span className={`wine-type-pill ${swatchType(wine)}`}>{wineTypeLabel(wine, t)}</span>}
+                    {(wine.type || wine.nonWine) && <span className={`wine-type-pill ${swatchType(wine)}`}>{wineTypeLabel(wine, t)}</span>}
                   </div>
                 </div>
               )}
@@ -535,22 +611,24 @@ function CellarVintage() {
                       apiFetch={apiFetch}
                       promptMissingGrapes={canEdit}
                       suggestSignal={suggestSignal}
+                      onWineChanged={load}
                     />
                   </section>
                 </CollapsibleBlock>
               )}
               </div>
             </section>
+            </div>
 
             <div className="cvb-col">
               {/* 2. The vintage: the sommelier's window, what you keep for it. */}
               <section aria-labelledby="cvb-vintage-title">
                 <div className="cvb-h2-row">
-                  <h2 id="cvb-vintage-title" className="cvb-h2">{t('cellarVintageBeta.vintageTitle', 'This vintage: {{vintage}}', { vintage })}</h2>
+                  <h2 id="cvb-vintage-title" className="cvb-h2">{t('cellarVintageBeta.vintageTitle', 'This vintage: {{vintage}}', { vintage: formatVintage(vintage, t) })}</h2>
                   <CollapseToggle
                     collapsed={isCollapsed('vintage.vintage')}
                     onToggle={() => toggle('vintage.vintage')}
-                    label={t('cellarVintageBeta.vintageTitle', 'This vintage: {{vintage}}', { vintage })}
+                    label={t('cellarVintageBeta.vintageTitle', 'This vintage: {{vintage}}', { vintage: formatVintage(vintage, t) })}
                     controls="cvb-vintage-body"
                   />
                 </div>
@@ -567,8 +645,22 @@ function CellarVintage() {
                       </div>
                     ) : (
                       <div className="bd-maturity-reviewed">
-                        {maturityStatus && <span className={`maturity-badge maturity-badge--${maturityStatus.status}`}>{maturityBadgeText(maturityStatus, t)}</span>}
-                        {!nvUnanchored && <MaturityPhaseTable profile={profile} anchorYear={anchorYear} />}
+                        {timelineOn && !nvUnanchored ? (
+                          <>
+                            <BetaBadge feature="maturityTimeline" note={t('bottleDetail.maturityTimelineBeta', 'The drink window as a timeline is in early access.')} />
+                            <MaturityTimeline
+                              profile={profile}
+                              anchorYear={anchorYear}
+                              status={maturityStatus}
+                              details={<MaturityPhaseTable profile={profile} anchorYear={anchorYear} />}
+                            />
+                          </>
+                        ) : (
+                          <>
+                            {maturityStatus && <span className={`maturity-badge maturity-badge--${maturityStatus.status}`}>{maturityBadgeText(maturityStatus, t)}</span>}
+                            {!nvUnanchored && <MaturityPhaseTable profile={profile} anchorYear={anchorYear} />}
+                          </>
+                        )}
                         {profile.sommNotes && <p className="bd-maturity-notes">{profile.sommNotes}</p>}
                       </div>
                     )}
@@ -577,17 +669,63 @@ function CellarVintage() {
                     <span className="bd-section-label">{t('cellarVintage.yourWindow', 'Your drink window')}</span>
                     {bottles.length === 0 ? (
                       <span className="cvb-muted">{t('cellarVintageBeta.noBottlesForWindow', 'Kept on the bottles; none left in this cellar.')}</span>
+                    ) : windowEdit ? (
+                      <DrinkWindowEditor
+                        initial={windowEdit.initial}
+                        axis={windowEdit.axis}
+                        labels={ownLabels}
+                        year={thisYear}
+                        canRemove={!!ownWindow}
+                        openSides={windowEdit.openSides}
+                        save={saveVintageWindow}
+                        // One window for every bottle here: the editor says how
+                        // many, as Edit vintage does.
+                        intro={t('editVintage.intro', { count: bottles.length })}
+                        saveLabel={t('editVintage.submit', 'Save for the vintage')}
+                        onCancel={closeWindowEditor}
+                        onSaved={closeWindowEditor}
+                      />
                     ) : windowDiffers ? (
-                      <span className="cvb-muted">{t('cellarVintageBeta.windowDiffers', 'Differs between the bottles. Edit vintage sets one for all of them.')}</span>
-                    ) : from || to || peakFrom || peakUntil ? (
-                      <span>
-                        {from || to ? `${from || '…'}–${to || '…'}` : null}
-                        {(peakFrom || peakUntil) && (
-                          <span className="cellar-vintage-peak">{from || to ? ' · ' : ''}{t('cellarVintage.peak', 'peak {{range}}', { range: `${peakFrom || '…'}–${peakUntil || '…'}` })}</span>
-                        )}
+                      <span className="cvb-muted">
+                        {t('cellarVintageBeta.windowDiffers', 'Differs between the bottles. Edit vintage sets one for all of them.')}
+                        {windowLink(t('cellarVintageBeta.windowSetForAll', 'Set one window for all'), { afterSentence: true })}
                       </span>
+                    ) : !(from || to || peakFrom || peakUntil) ? (
+                      <span className="cvb-muted">
+                        {t('cellarVintageBeta.notSet', 'Not set yet.')}
+                        {windowLink(t('bottleDetail.windowSetOwn', 'Set your own window'), { afterSentence: true })}
+                      </span>
+                    ) : timelineOn && ownWindow ? (
+                      // The bottle page's own-window timeline, its status on the marker.
+                      <>
+                        <MaturityTimeline
+                          phases={getPersonalWindowPhases(ownWindow, ownLabels, thisYear)}
+                          status={ownWindow}
+                          statusLabel={personalWindowBadgeText(ownWindow, t)}
+                          year={thisYear}
+                        />
+                        {canEditVintage && (
+                          <button
+                            ref={windowActionRef}
+                            type="button"
+                            className="bd-somm-notes-btn dwe-link"
+                            onClick={openWindowEditor}
+                            aria-label={t('bottleDetail.windowAdjustLabel', 'Adjust your drink window')}
+                          >
+                            {t('bottleDetail.windowAdjust', 'Adjust')}
+                          </button>
+                        )}
+                      </>
                     ) : (
-                      <span className="cvb-muted">{t('cellarVintageBeta.notSet', 'Not set yet.')}</span>
+                      <span>
+                        <span>
+                          {from || to ? `${from || '…'}–${to || '…'}` : null}
+                          {(peakFrom || peakUntil) && (
+                            <span className="cellar-vintage-peak">{from || to ? ' · ' : ''}{t('cellarVintage.peak', 'peak {{range}}', { range: `${peakFrom || '…'}–${peakUntil || '…'}` })}</span>
+                          )}
+                        </span>
+                        {windowLink(t('bottleDetail.windowChange', 'Change'), { ariaLabel: t('bottleDetail.windowChangeLabel', 'Change your drink window') })}
+                      </span>
                     )}
                   </div>
                   <div className="cvb-block">
@@ -651,7 +789,7 @@ function CellarVintage() {
                   paid — once, at the head of the list (the page label above
                   already says how many) — then one row each with what differs
                   between them. A long list starts folded: the stock line is
-                  the glance, the rows are a tap away (beta feedback 2026-10-10). */}
+                  the glance, the rows are a tap away. */}
               <section aria-labelledby="cvb-bottles-title">
                 <div className="cvb-h2-row">
                   <h2 id="cvb-bottles-title" className="cvb-h2">{t('cellarVintage.bottlesTitle', 'Your bottles')}</h2>
@@ -688,7 +826,7 @@ function CellarVintage() {
                       {!bottlesFolded && (
                         <ul id="cvb-bottle-list" className="cvb-bottle-list">
                           {bottles.map((b) => (
-                            <BottleRow key={b._id} bottle={b} cellarId={id} fromPath={pagePath} showNote={notes.kind === 'differs'} />
+                            <BottleRow key={b._id} bottle={b} cellarId={id} fromPath={pagePath} cellarList={cellarList} showNote={notes.kind === 'differs'} />
                           ))}
                         </ul>
                       )}
@@ -751,10 +889,11 @@ function CellarVintage() {
         {modal === 'pickList' && (
           <AddToPickListModal choices={pickable} onClose={() => setModal(null)} onDone={() => setModal(null)} />
         )}
-        {modal === 'edit' && (
+        {(modal === 'edit' || modal === 'editWindow') && (
           <EditVintageModal
             bottles={bottles}
             title={title}
+            focus={modal === 'editWindow' ? 'drinkWindow' : null}
             onClose={() => setModal(null)}
             onDone={() => { setModal(null); setNotice(t('cellarVintageBeta.savedNote', 'Saved for the vintage.')); load(); }}
           />
@@ -763,7 +902,13 @@ function CellarVintage() {
           <AddMoreBottlesModal
             bottle={addTemplate}
             onClose={() => setModal(null)}
-            onAdded={(n) => { setModal(null); setNotice(t('bottleDetail.addMore.success', { count: n })); load(); }}
+            onAdded={(n, vintage) => {
+              setModal(null);
+              setNotice(vintage && vintage !== addTemplate.vintage
+                ? t('bottleDetail.addMore.successOtherVintage', { count: n, vintage: formatVintage(vintage, t) })
+                : t('bottleDetail.addMore.success', { count: n }));
+              load();
+            }}
           />
         )}
         {(modal === 'report' || modal === 'reportWine') && wine && (
@@ -811,7 +956,9 @@ function CellarVintage() {
               onUploadComplete={refreshPhotos}
               onProcessingComplete={refreshPhotos}
             />
-            <p className="cvb-photo-hint">{t('bottleDetail.imageNotice', 'Images are reviewed by an admin before being added to the shared wine registry, where they will be visible to all Cellarion users.')}</p>
+            <p className="cvb-photo-hint">{reviewed
+            ? t('bottleDetail.imageNotice', 'Images are reviewed by an admin before being added to the shared wine registry, where they will be visible to all Cellarion users.')
+            : t('bottleDetail.imageNoticeUnreviewed', 'Photos are added to the wine registry as soon as you upload them, where everyone on this server can see them.')}</p>
             <div className="modal-actions">
               <button type="button" className="btn btn-primary" onClick={closePhoto}>{t('common.done', 'Done')}</button>
             </div>
@@ -831,7 +978,7 @@ function CellarVintage() {
  * bought, open or spoken for, and its own note when the bottles do not share
  * one. The row opens the bottle's own page, which leads back here.
  */
-function BottleRow({ bottle, cellarId, fromPath, showNote }) {
+function BottleRow({ bottle, cellarId, fromPath, cellarList, showNote }) {
   const { t, i18n } = useTranslation();
   const slot = slotLabel(bottle.rackInfo, t);
   const facts = [
@@ -846,7 +993,7 @@ function BottleRow({ bottle, cellarId, fromPath, showNote }) {
 
   return (
     <li>
-      <Link to={`/cellars/${cellarId}/bottles/${bottle._id}`} state={{ fromVintage: fromPath }} className="cvb-bottle">
+      <Link to={`/cellars/${cellarId}/bottles/${bottle._id}`} state={cellarList ? { fromVintage: fromPath, cellarList } : { fromVintage: fromPath }} className="cvb-bottle">
         <span className="cvb-bottle-main">
           <span className="cvb-bottle-slot"><span aria-hidden="true">📍</span> {slot}</span>
           {facts.length > 0 && <span className="cvb-bottle-facts">{facts.join(' · ')}</span>}

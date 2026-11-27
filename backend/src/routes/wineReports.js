@@ -2,7 +2,6 @@ const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
 const WineReport = require('../models/WineReport');
-const WineDefinition = require('../models/WineDefinition');
 const { findVisibleWine } = require('../services/wineVisibility');
 const { requireAuth, requireNonDemo } = require('../middleware/auth');
 const { logAudit } = require('../services/audit');
@@ -41,7 +40,7 @@ router.post('/', requireAuth, requireNonDemo, async (req, res) => {
     }
     // The frontend only offers the suggestion inputs for wrong_info, but a
     // client is not a trust boundary — and stale state CAN leak a suggestion
-    // onto another reason (audit 2026-07-29 R7-#5). Enforce the pairing here.
+    // onto another reason. Enforce the pairing here.
     if (hasField && reason !== 'wrong_info') {
       return res.status(400).json({ error: 'A suggested correction is only valid with the "wrong info" reason' });
     }
@@ -115,9 +114,9 @@ router.post('/', requireAuth, requireNonDemo, async (req, res) => {
 // GET /api/wine-reports/my — list the authenticated user's own wine reports
 router.get('/my', requireAuth, async (req, res) => {
   try {
-    // Explicit projection: this route used to return the whole document, so
-    // every field added to the schema became user-visible by default. Name
-    // what the reporter gets so a future internal field is opt-in, not opt-out.
+    // Explicit projection: with the whole document, every field added to the
+    // schema would become user-visible by default. Name what the reporter
+    // gets so a future internal field is opt-in, not opt-out.
     const reports = await WineReport.find({ user: req.user.id })
       .select('wineDefinition duplicateOf reason details suggestedField suggestedValue status adminResponse respondedAt createdAt')
       .sort({ createdAt: -1 })

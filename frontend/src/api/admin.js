@@ -184,6 +184,14 @@ export const adminApproveRegion = (apiFetch, regionId) =>
 export const adminApproveGrape = (apiFetch, grapeId) =>
   apiFetch(`/api/admin/taxonomy/grapes/${grapeId}/approve`, { method: 'POST' });
 
+/** Record that an admin reviewed a member-added classification tier. */
+export const adminApproveClassification = (apiFetch, id) =>
+  apiFetch(`/api/admin/taxonomy/classifications/${id}/approve`, { method: 'POST' });
+
+/** Record that an admin reviewed a member-added label sweetness term. */
+export const adminApproveSweetnessTerm = (apiFetch, id) =>
+  apiFetch(`/api/admin/taxonomy/sweetness-terms/${id}/approve`, { method: 'POST' });
+
 // Force a full Meilisearch rebuild from the running process — the restore
 // runbook's missing step (a stale index silently disables the dedup net).
 export const adminReindexSearch = (apiFetch) =>
@@ -197,8 +205,8 @@ export const adminMergeTaxonomy = (apiFetch, tab, fromId, toId) =>
     body: JSON.stringify({ fromId, toId }),
   });
 
-// The registry name-check scan (historical path name — it now runs every
-// default rule in backend utils/nameChecks.js, not just producer-in-name).
+// The registry name-check scan: despite its path name it runs every default
+// rule in backend utils/nameChecks.js, not just producer-in-name.
 export const adminGetProducerInNameWines = (apiFetch, params) =>
   apiFetch(`/api/admin/wines/producer-in-name?${params}`);
 
@@ -277,6 +285,11 @@ export const adminDeleteTaxonomy = (apiFetch, endpoint, id) =>
 // ── Wine Requests ─────────────────────────────────────────────────────────────
 export const adminGetWineRequests = (apiFetch, params) =>
   apiFetch(`/api/admin/wine-requests${params}`);
+
+// GET /api/admin/wine-requests/:id/photos — { image, backImage } in full. The
+// list carries only hasInlineImage / hasInlineBackImage for an inline photo.
+export const adminGetWineRequestPhotos = (apiFetch, id) =>
+  apiFetch(`/api/admin/wine-requests/${id}/photos`);
 
 export const adminResolveWineRequest = (apiFetch, id, data) =>
   apiFetch(`/api/admin/wine-requests/${id}/resolve`, {
@@ -392,6 +405,15 @@ export const superadminSetPromptCaching = (apiFetch, enabled) =>
     body: JSON.stringify({ enabled: !!enabled }),
   });
 
+// The language for the AI-written wine texts: a code GET /api/superadmin/ai
+// lists in aiTextLanguages, or '' for off (English only).
+export const superadminSetAiTextLanguage = (apiFetch, language) =>
+  apiFetch('/api/superadmin/ai/text-language', {
+    method: 'PATCH',
+    headers: J,
+    body: JSON.stringify({ language }),
+  });
+
 // ── MCP (usage overview + kill switches) ─────────────────────────────────────
 export const adminGetMcpUsage = (apiFetch, days = 30) =>
   apiFetch(`/api/admin/mcp/usage?days=${days}`);
@@ -500,11 +522,50 @@ export const adminSaveContactEmail = (apiFetch, contactEmail) =>
 // The one email a new member gets two days after joining (backend
 // services/newMemberEmails). GET → { enabled, since, mailConfigured,
 // sentLast30Days: { cellar, empty } }; PATCH { enabled } → { enabled, since }.
+// Whether this server reviews contributions before they go live
+// (backend config/contributionReview): { enabled, updatedAt, canChange, waiting }.
+export const adminGetContributionReview = (apiFetch) =>
+  apiFetch('/api/admin/settings/contribution-review');
+
+export const adminSaveContributionReview = (apiFetch, enabled) =>
+  apiFetch('/api/admin/settings/contribution-review', {
+    method: 'PATCH',
+    headers: J,
+    body: JSON.stringify({ enabled }),
+  });
+
+// How imports treat new wines (backend config/importPolicy):
+// { aiLookup, checkNewWines, updatedAt, canChange, reviewOn, checking, waiting }.
+export const adminGetImportPolicy = (apiFetch) =>
+  apiFetch('/api/admin/settings/import-policy');
+
+// `change` is { aiLookup } or { checkNewWines } (or both); the one not sent keeps its value.
+export const adminSaveImportPolicy = (apiFetch, change) =>
+  apiFetch('/api/admin/settings/import-policy', {
+    method: 'PATCH',
+    headers: J,
+    body: JSON.stringify(change),
+  });
+
 export const adminGetNewMemberEmails = (apiFetch) =>
   apiFetch('/api/admin/settings/new-member-emails');
 
 export const adminSaveNewMemberEmails = (apiFetch, enabled) =>
   apiFetch('/api/admin/settings/new-member-emails', {
+    method: 'PATCH',
+    headers: J,
+    body: JSON.stringify({ enabled }),
+  });
+
+// ── Settings (inactive accounts) ──────────────────────────────────────────────
+// Deleting accounts nobody uses (backend services/inactiveAccounts). GET →
+// { enabled, since, mailConfigured, rule, today: { first, final, delete,
+// waiting, exempt }, last30Days }; PATCH { enabled } → { enabled, since }.
+export const adminGetInactiveAccounts = (apiFetch) =>
+  apiFetch('/api/admin/settings/inactive-accounts');
+
+export const adminSaveInactiveAccounts = (apiFetch, enabled) =>
+  apiFetch('/api/admin/settings/inactive-accounts', {
     method: 'PATCH',
     headers: J,
     body: JSON.stringify({ enabled }),
@@ -525,6 +586,6 @@ export const adminRevokeBridgeKey = (apiFetch, id, reason) =>
     body: JSON.stringify({ reason }),
   });
 
-// "This is THE photo of this wine's vintage" (support ticket 2026-10-09).
+// "This is THE photo of this wine's vintage".
 export const adminSetVintageOfficialImage = (apiFetch, id) =>
   apiFetch(`/api/admin/images/${id}/set-vintage-official`, { method: 'PUT' });

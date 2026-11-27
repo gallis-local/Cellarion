@@ -1,11 +1,12 @@
-import { useState, useEffect, useCallback, Suspense } from 'react';
+import { useState, useEffect, useCallback, useRef, Suspense } from 'react';
 import { lazy } from '../utils/lazyWithReload';
 import { friendlyError, httpError } from '../utils/friendlyError';
 import { Link, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { getValueHistory } from '../api/stats';
-import { TYPE_COLORS, COUNTRY_COLORS, GRAPE_COLORS, fmt, fmtRating, fmtCurrency } from '../components/charts/chartHelpers';
+import { TYPE_COLORS, COUNTRY_COLORS, GRAPE_COLORS, fmt, fmtRating, fmtCurrency, filteredBottlesUrl } from '../components/charts/chartHelpers';
+import scrollBelowNavbar from '../utils/scrollBelowNavbar';
 import DonutChart from '../components/charts/DonutChart';
 import HBarChart from '../components/charts/HBarChart';
 import VintageBarChart from '../components/charts/VintageBarChart';
@@ -23,6 +24,7 @@ import ConsumptionChart from '../components/charts/ConsumptionChart';
 import PurchaseHistoryChart from '../components/charts/PurchaseHistoryChart';
 import TopValueList from '../components/charts/TopValueList';
 import CellarBreakdownViz from '../components/charts/CellarBreakdownViz';
+import CellarMaturityTable from '../components/charts/CellarMaturityTable';
 import BottleSizeChart from '../components/charts/BottleSizeChart';
 import ValueOverTimeChart from '../components/ValueOverTimeChart';
 import './Statistics.css';
@@ -70,24 +72,23 @@ function Statistics() {
   // Each chart segment hands us a value; we encode it into a URL that lists
   // just those bottles. Bottles you still have open in the cellar view,
   // widened to every cellar you own (?scope=owned) — the same list, filters,
-  // sorting, grouping and photos as a cellar (support ticket 2026-09-19: the
-  // separate drill-down list had none of that). The consumption charts list
+  // sorting, grouping and photos as a cellar, which a separate drill-down
+  // list would not have. The consumption charts list
   // DRUNK bottles, which the cellar view does not show, so they keep /bottles.
   const drillCellarId = stats?.cellarBreakdown?.[0]?.id || null;
   const goWithFilter = useCallback((params) => {
-    const qs = new URLSearchParams();
-    for (const [k, v] of Object.entries(params)) {
-      if (v == null || v === '') continue;
-      qs.set(k, String(v));
-    }
-    const consumed = 'status' in params || 'consumedYear' in params;
-    if (!consumed && drillCellarId) {
-      qs.set('scope', 'owned');
-      navigate(`/cellars/${drillCellarId}?${qs.toString()}`);
-    } else {
-      navigate(`/bottles?${qs.toString()}`);
-    }
+    navigate(filteredBottlesUrl(params, { cellarId: drillCellarId, scope: 'owned' }));
   }, [navigate, drillCellarId]);
+
+  // The health card's phase counts lead to the Maturity Status card: it
+  // scrolls into view and its heading takes focus, so a keyboard or screen
+  // reader user lands where a sighted one looks.
+  const maturitySectionRef = useRef(null);
+  const maturityHeadingRef = useRef(null);
+  const showMaturity = useCallback(() => {
+    scrollBelowNavbar(maturitySectionRef.current);
+    maturityHeadingRef.current?.focus({ preventScroll: true });
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -183,11 +184,10 @@ function Statistics() {
             grapes: overview.totalGrapes,
           })}
         </p>
-        {/* Ten charts have deep-linked to a filtered bottle list since they
-            were built, but the only affordance was a cursor change and a hover
-            tint — a forum user with 63 bottles asked for a feature that was
-            already there (turbulent3964 2026-08-29). One hint under the
-            subtitle beats repeating a note on every clickable card. */}
+        {/* The charts deep-link to a filtered bottle list, but their only
+            affordance is a cursor change and a hover tint, easy to miss. One
+            hint under the subtitle beats repeating a note on every clickable
+            card. */}
         <p className="stats-hint">{t('statistics.clickHint')}</p>
         <p className="stats-hint"><Link to="/dashboard">{t('statistics.dashboardLink', 'Build your own tables and charts in the Dashboard →')}</Link></p>
       </div>
@@ -200,7 +200,7 @@ function Statistics() {
           sub={t('statistics.kpi.grapeVarieties', { count: overview.totalGrapes })} accentColor="#6EC6C6" />
         <KPICard icon={'\u2b50'} label={t('statistics.kpi.avgRating')}
           // Every rating, as the rating card's "All": a drunk bottle with the
-          // rating given when drinking (support ticket 2026-10-11).
+          // rating given when drinking.
           value={(ratingViews?.all?.avg ?? overview.avgRating) != null ? fmtRating(ratingViews?.all?.avg ?? overview.avgRating, targetScale) : '\u2014'}
           accentColor="#D4C87A" />
         <KPICard icon={'\ud83d\udcc5'} label={t('statistics.kpi.avgVintageAge')}
@@ -246,6 +246,7 @@ function Statistics() {
             healthScore={overview.healthScore}
             healthGrade={overview.healthGrade}
             maturity={maturity}
+            onShowMaturity={showMaturity}
           />
         </div>
         <div className={`stats-card stats-card--regret${overview.regretIndex >= 15 ? ' stats-card--regret-alert' : ''}`}>
@@ -353,8 +354,8 @@ function Statistics() {
         </div>
 
         {/* Drinking Windows */}
-        <div className="stats-card">
-          <h2 className="stats-card-title">{t('statistics.sections.maturityStatus')}</h2>
+        <div className="stats-card" ref={maturitySectionRef}>
+          <h2 className="stats-card-title" ref={maturityHeadingRef} tabIndex={-1}>{t('statistics.sections.maturityStatus')}</h2>
           <MaturityViz
             maturity={maturity}
             maturityCoverage={maturityCoverage}
@@ -362,6 +363,9 @@ function Statistics() {
             onSegmentClick={(status) => goWithFilter({ maturity: status })}
           />
         </div>
+
+        {/* Maturity by cellar: renders its own card, only for two or more cellars */}
+        <CellarMaturityTable cellars={cellarBreakdown} />
 
         {/* Vintage Distribution */}
         <div className="stats-card stats-card--full">

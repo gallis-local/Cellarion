@@ -82,6 +82,15 @@ async function request(path, { method = 'GET', body, timeoutMs = TIMEOUT_MS } = 
       headers: {
         Authorization: `Bearer ${c.key}`,
         Accept: 'application/json',
+        // Protocol v2 (`X-Cellarion-Bridge-Protocol: 2`: the bare name and the
+        // label sweetness term as its own field, routes/bridgeV1 bridgeProtocol)
+        // is NOT requested yet. Until this install can show a term beside a
+        // name, a bare name would lose the word; on v1 the registry sends the
+        // name as the label reads it, which every screen here shows as it is.
+        // TODO before this sends the protocol 2 header: decide whether a copy
+        // untouched here follows a registry correction of its sweetness style
+        // (services/registryBridge applyRegistryStyle runs the write rule, where
+        // an equal source never replaces a stored style).
         ...(body ? { 'Content-Type': 'application/json' } : {}),
         ...(c.instanceHost ? { 'X-Cellarion-Instance': c.instanceHost } : {}),
       },
@@ -161,6 +170,10 @@ async function requestStatuses(ids) {
   return Array.isArray(r.body.requests) ? r.body.requests : [];
 }
 const forwardCorrection = (payload) => request('/corrections', { method: 'POST', body: payload });
+// A wine created on this install, offered to the registry
+// (services/registryContributionOps). The registry answers with a request id
+// that GET /requests reports on like any forwarded request.
+const forwardContribution = (payload) => request('/contributions', { method: 'POST', body: payload });
 const forwardValue = (payload) => request('/values', { method: 'POST', body: payload });
 
 /** Test hook: forget cached searches and any backoff. */
@@ -168,6 +181,6 @@ function _reset() { searchCache.clear(); blockedUntil = 0; blockedReason = null;
 
 module.exports = {
   config, isEnabled, transportState, request, search, fetchWine, changes, me,
-  forwardRequest, requestStatuses, forwardCorrection, forwardValue, _reset,
-  DEFAULT_URL, TIMEOUT_MS, SEARCH_CACHE_TTL_MS,
+  forwardRequest, requestStatuses, forwardCorrection, forwardValue, forwardContribution, _reset,
+  TIMEOUT_MS,
 };

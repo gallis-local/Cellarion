@@ -13,7 +13,7 @@ jest.mock('../models/WineDefinition', () => ({ findById: jest.fn(), findOne: jes
 jest.mock('../models/McpActionLog', () => ({ create: jest.fn(), findOne: jest.fn(), findOneAndUpdate: jest.fn() }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 // get_wine_list reads live stock + wine names through the renderer's wine
-// map (support ticket 2026-09-12); the key shape is pinned here on purpose.
+// map; the key shape is pinned here on purpose.
 jest.mock('../services/wineListData', () => ({
   entryKey: (e) => `${e.wine}|${e.vintage || 'NV'}|${e.bottleSize || '750ml'}`,
   loadWineMap: jest.fn(async () => new Map()),
@@ -69,13 +69,16 @@ const makeList = (over = {}) => ({
   ...over,
 });
 
+// A wine lookup: it asks for the sweetness style, then populates.
+const wineQuery = (doc) => { const q = { select: jest.fn(() => q), populate: jest.fn(() => Promise.resolve(doc)) }; return q; };
+
 beforeEach(() => {
   jest.clearAllMocks();
   McpActionLog.create.mockResolvedValue({});
   McpActionLog.findOne.mockReturnValue({ lean: () => Promise.resolve(null) });
   // findOne through the owner rule (ownerWineFilter above): the caller's own
   // pending rows resolve, a stranger's hidden row reads as not_found.
-  WineDefinition.findOne.mockReturnValue({ populate: jest.fn(() => Promise.resolve({ _id: WINE, name: 'Barolo Riserva', producer: 'Rinaldi' })) });
+  WineDefinition.findOne.mockReturnValue(wineQuery({ _id: WINE, name: 'Barolo Riserva', producer: 'Rinaldi' }));
 });
 
 describe('registration + scopes', () => {
@@ -129,7 +132,7 @@ describe('list_wine_lists / get_wine_list', () => {
     expect(data.glass_pricing_rule).toEqual({ glasses_per_bottle: 5, markup_percent: 20, rounding: '1' });
   });
 
-  test('get_wine_list renders an auto-mode list with the SAME nested headings as the menu, path-labelled; unresolved entries trail (support ticket 2026-09-12)', async () => {
+  test('get_wine_list renders an auto-mode list with the SAME nested headings as the menu, path-labelled; unresolved entries trail', async () => {
     const { loadWineMap } = require('../services/wineListData');
     const W2 = oid('f');
     const GONE = oid('9');
@@ -139,7 +142,7 @@ describe('list_wine_lists / get_wine_list', () => {
     ]));
     WineList.findOne.mockReturnValue(chain(makeList({
       autoGrouping: { levels: ['type', 'country', 'region'], collapseSingle: true, withinGroup: 'producer' },
-      layout: { hideOutOfStock: true, hidePrices: true, markLastBottle: true },
+      layout: { hideOutOfStock: true, hidePrices: true, markLastBottle: true, showStock: true },
       autoGroupEntries: [
         { wine: WINE, vintage: '2019', bottleSize: '750ml', listPrice: 95 },
         { wine: W2, vintage: 'NV', bottleSize: '750ml', listPrice: 30 },
@@ -154,13 +157,14 @@ describe('list_wine_lists / get_wine_list', () => {
     expect(data.grouping).toEqual({ levels: ['type', 'country', 'region'], collapse_single_group: true, within_group: 'producer' });
     expect(data.hide_prices).toBe(true);
     expect(data.mark_last_bottle).toBe(true);
+    expect(data.show_stock).toBe(true);
   });
 });
 
 describe('add_to_list', () => {
   test('unknown wine → not_found', async () => {
     WineList.findOne.mockResolvedValue(makeList());
-    WineDefinition.findOne.mockReturnValue({ populate: jest.fn(() => Promise.resolve(null)) });
+    WineDefinition.findOne.mockReturnValue(wineQuery(null));
     const res = await tool('add_to_list').handler({ list_id: LIST, wine_id: WINE }, CTX);
     expect(parse(res).error.code).toBe('not_found');
   });

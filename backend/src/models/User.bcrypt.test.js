@@ -1,5 +1,5 @@
 /**
- * Native bcrypt replaced pure-JS bcryptjs (scaling audit 2026-09-25): hash
+ * Native bcrypt replaced pure-JS bcryptjs: hash
  * and compare now run on libuv's thread pool instead of stalling the event
  * loop for every login. Every account's stored password was written by
  * bcryptjs, so these pin that nothing about signing in changes:
@@ -41,6 +41,30 @@ test('comparePassword works on a stored bcryptjs hash and on an SSO-only account
   expect(await user.comparePassword('nope')).toBe(false);
   const sso = new User({ username: 'sso', email: 'sso@example.com', authProviders: [{ provider: 'google', providerId: 'g1' }] });
   expect(await sso.comparePassword('anything')).toBe(false);
+});
+
+// The save hooks, run without a database (Kareem's own runner).
+const runSaveHooks = (doc) => new Promise((resolve, reject) => {
+  User.schema.s.hooks.execPre('save', doc, [{}], (err) => (err ? reject(err) : resolve()));
+});
+
+test('a password cleared to nothing is not hashed: the account becomes sign-in-provider only', async () => {
+  const user = new User({
+    username: 'bob', email: 'bob@example.com', password: STORED.hash,
+    authProviders: [{ provider: 'google', providerId: 'g1' }],
+  });
+  user.password = undefined;
+  await expect(runSaveHooks(user)).resolves.toBeUndefined();
+  expect(user.password).toBeUndefined();
+  await expect(user.validate()).resolves.toBeUndefined(); // no password needed with a provider
+  expect(await user.comparePassword('anything')).toBe(false);
+});
+
+test('a set password is still hashed by the hook', async () => {
+  const user = new User({ username: 'cara', email: 'cara@example.com', password: 'Fresh-Password-9!' });
+  await runSaveHooks(user);
+  expect(user.password.startsWith('$2b$')).toBe(true);
+  expect(await user.comparePassword('Fresh-Password-9!')).toBe(true);
 });
 
 test('new hashes are native $2b$ at BCRYPT_COST', async () => {

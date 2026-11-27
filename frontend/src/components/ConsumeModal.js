@@ -2,6 +2,7 @@ import { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import RatingInput from './RatingInput';
 import { useDialogA11y } from '../utils/useDialogA11y';
+import { useOverlayClose } from './Modal';
 
 // Local calendar date, YYYY-MM-DD — what <input type="date"> speaks.
 const today = () => {
@@ -15,18 +16,15 @@ const today = () => {
 //
 // onConfirm(reason, note, rating, ratingScale, consumedAt): consumedAt is the
 // day the bottle was actually drunk (YYYY-MM-DD), defaulting to today — a
-// bottle logged after the fact used to be stamped with the logging day, and
-// the only way to say otherwise was the bulk action (support ticket
-// 2026-09-13). Same field and rule as BulkConsumeModal: never in the future.
+// bottle logged after the fact would otherwise be stamped with the logging
+// day. Same field and rule as BulkConsumeModal: never in the future.
 //
 // `onJustAGlass`: the rack page and the 3D room open this dialog straight
 // from a slot, where the bottle page's own "Open bottle…" button is not at
 // hand. They pass this, and the dialog first offers "Just a glass — keep the
 // bottle" (open it and pour one glass instead of taking it out). Without it
-// — the bottle page, "Drink one" — that choice is not shown. The racks and
-// the room used to carry copies of this dialog for the sake of that one
-// button, and those copies never learned the reservation warning
-// (usability plan 2026-10-14, D2).
+// — the bottle page, "Drink one" — that choice is not shown. One dialog for
+// every caller, so none of them misses the reservation warning.
 export function ConsumeModal({ wineName, defaultRatingScale, reservationText, onConfirm, onCancel, onJustAGlass }) {
   const { t } = useTranslation();
   const [reason,       setReason]      = useState('drank');
@@ -38,6 +36,7 @@ export function ConsumeModal({ wineName, defaultRatingScale, reservationText, on
   const titleId = useId();
   const dateId = useId();
   const boxRef = useDialogA11y(onCancel);
+  const overlayClose = useOverlayClose(saving ? undefined : onCancel);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -54,7 +53,7 @@ export function ConsumeModal({ wineName, defaultRatingScale, reservationText, on
     // close it: a refusal keeps the dialog open with what was typed (the
     // racks, the room), and a stray tap must not throw that away. Escape and
     // Back still close it — those are meant.
-    <div className="modal-overlay" onClick={saving ? undefined : onCancel}>
+    <div className="modal-overlay" {...overlayClose}>
       <div className="modal-box" onClick={e => e.stopPropagation()} ref={boxRef} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
         <h2 id={titleId}>{t('bottleDetail.removeBottleTitle')}</h2>
         {wineName && <p className="modal-wine-name">{wineName}</p>}
