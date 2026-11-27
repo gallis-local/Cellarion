@@ -2,22 +2,18 @@
  * Does a published description claim a PLACE (or variety) for the wine that
  * the record does not carry — and if so, does it ASSERT it or DISCLOSE it?
  *
- * WHY (somm ticket 6a82bfb7, resolved design 2026-08-20). The enrichment
- * wrote prose like "a soft, approachable red blend from the Hunter Valley"
- * onto records whose region is deliberately null — and a curator who trusts
- * the prose reproduces the fabrication in a sommelier note, which is exactly
- * what happened on four Worthington's drink windows. 61 published AI rows
- * currently carry a description with no region, no appellation and no grapes
- * on the record.
+ * WHY. The enrichment can write prose like "a soft, approachable red blend
+ * from the Hunter Valley" onto records whose region is deliberately null —
+ * and a curator who trusts the prose reproduces the fabrication in a
+ * sommelier note and in published drink windows.
  *
- * THE AXIS IS ASSERTION vs DISCLOSURE, NOT TRUTH (the somm's correction to
- * my first framing, and they were right). The best available prose for a
- * null-region record NAMES places in order to say the place is unknown:
+ * THE AXIS IS ASSERTION vs DISCLOSURE, NOT TRUTH. The best available prose
+ * for a null-region record NAMES places in order to say the place is unknown:
  *
  *   "They also draw fruit from across the Hunter, Mudgee, Armidale and New
  *    England as well as Barossa, McLaren Vale, Eden Valley and Clare Valley,
  *    so the region is genuinely open. Grape, region and tier are all
- *    unconfirmed…"                          (Petersons — the ALLOW fixture)
+ *    unconfirmed…"                                     (the ALLOW fixture)
  *
  * A truth-blind extraction check would flag that paragraph eight times over,
  * and the cheapest way to pass would be deleting it — training enrichment
@@ -25,7 +21,7 @@
  * GRADED, never just counted:
  *
  *   'assertion'  — an ungrounded place stated as fact for the wine. The
- *                  17 Aug Maureen's line above. The class the check exists for.
+ *                  Hunter Valley line above. The class the check exists for.
  *   'disclosure' — ungrounded places, but framed by uncertainty. Reviewable,
  *                  not wrong.
  *   'ok'         — nothing ungrounded.
@@ -43,8 +39,8 @@
  * strictness with the enrichment downgrade blocker (notePlaceConflict):
  * the blocker gates generation, where a wrong profile costs an owner
  * immediately; this grades rows that are already live, some of which are
- * already doing the right thing. The somm asked for that separation
- * explicitly and it is load-bearing.
+ * already doing the right thing. That separation is deliberate and
+ * load-bearing.
  */
 
 const normPlace = (s) => String(s || '')
@@ -59,12 +55,12 @@ const normPlace = (s) => String(s || '')
 // Hunter Valley" captures as one mangled claim and swallows the real one.
 // Longest-first, with a trailing boundary — "de" listed ahead of "del" bites
 // the first two letters of "Ribera del Duero" and truncates the claim. "y"
-// added from the somm's v1.147 audit: without it "Castilla y León" broke at
-// the conjunction and reported a truncated claim.
+// is listed because without it "Castilla y León" breaks at the conjunction
+// and reports a truncated claim.
 const PLACE_CONNECTOR = "(?:della|delle|del|des|de|di|du|da|dos|das|la|les|le|los|von|van|der|den|sur|en|y)(?=\\s)";
 // Elided tokens — d'Avola, l'Étoile — start lowercase but are PART of the
-// name, not a chain break (somm 6a87053b: stopping before them captured bare
-// "Nero" out of the record's own Nero d'Avola).
+// name, not a chain break: stopping before them would capture a bare "Nero"
+// out of the record's own Nero d'Avola.
 const ELIDED_TOKEN = "[dl]['’][A-ZÀ-Þ][\\wÀ-ɏ'’-]*";
 const PREP_CLAIM = new RegExp(
   "\\b(?:from|in|at|of|across|near)\\s+(?:the\\s+)?" +
@@ -74,8 +70,8 @@ const PREP_CLAIM = new RegExp(
 
 // Keyword-suffixed claims: "Champagne appellation", "American style". The
 // continuation chain is the SAME capitalised-or-connector rule as PREP_CLAIM —
-// a free continuation captured junk like "It's a crowd-pleasing style" and
-// "Details on producer and origin" in the first prod dry run.
+// a free continuation captures junk like "It's a crowd-pleasing style" and
+// "Details on producer and origin".
 const KEYWORD_CLAIM = new RegExp(
   "\\b([A-ZÀ-Þ][\\wÀ-ɏ'’-]*(?:\\s+(?:" + PLACE_CONNECTOR + "|" + ELIDED_TOKEN + "|[A-ZÀ-Þ][\\wÀ-ɏ'’-]*)){0,3})" +
   "\\s+(?:appellation|AOC|AOP|DOCG?|region|style|styles)\\b",
@@ -93,10 +89,10 @@ const MATERIAL_NOISE = /\b(oak|barriques?|barrels?|casks?|cooperage|hogsheads?|m
 const TIER_WORD = /^(reservas?|riservas?|crianzas?|gran|brut|extra|demi-sec|sec|secco?|dolce|trocken|halbtrocken|feinherb|classico|superiore|premium|prestige|tradition|traditional|vintage|blanc|rouge|rosé|rosado|tinto|crémants?|cremants?|reserve)$/i;
 
 // Climate adjectives are weather, not origin — "Atlantic-influenced whites"
-// asserts nothing about where the wine is from (found in the v1.148 re-count).
+// asserts nothing about where the wine is from.
 const CLIMATE_WORD = /^(atlantic|mediterranean|continental)/i;
 
-// A stylistic comparison is not an origin claim (somm 6a872807): "styled in
+// A stylistic comparison is not an origin claim: "styled in
 // the Bordeaux-inspired claret tradition" compares, it does not locate.
 // Covers the hyphenated compounds (-inspired, -style, -like, -influenced),
 // bare adjectival forms (Burgundian), and supranational terms (European,
@@ -111,8 +107,7 @@ const STRONG_FRAME = /\b(could not be (?:identified|verified|confirmed)|cannot b
 // Hedges that frame only their own sentence.
 const WEAK_FRAME = /\b(likely|probably|possibly|perhaps|presumably|may be|might be|appears? to be|seems? to be|uncertain)\b/i;
 
-// Habitual markers frame only what FOLLOWS them (somm 6a872807, on rows
-// chosen independently of the artifact set): "typically built around …
+// Habitual markers frame only what FOLLOWS them: "typically built around …
 // such as X, Y or Z" describes what the style usually contains, not what is
 // in this bottle — but the same word must not launder an assertion that
 // precedes it: "…from Chile's Maipo Valley, typically blended with small
@@ -141,8 +136,8 @@ const DEMONYMS = {
 
 // A place after one of these verbs is where something was CREATED, not where
 // this wine is from — "a cold-hardy hybrid grape bred in Minnesota" on a
-// French wine (somm v1.147 audit, item 5; one row, but the shape is a verb
-// governing the phrase, so the rule is cheap and principled).
+// French wine. The shape is a verb governing the phrase, so the rule is cheap
+// and principled.
 const CREATION_VERB = /\b(?:bred|crossed|hybridi[sz]ed|developed)\s*$/i;
 
 function extractClaims(sentence) {
@@ -173,7 +168,7 @@ function extractClaims(sentence) {
 }
 
 // Strip a possessive before normalising a token — "Chile's" and "Mendoza's"
-// are the places, not new words (somm v1.147 audit, item 6).
+// are the places, not new words.
 const tokenNorm = (t) => normPlace(String(t).replace(/['’]s$/i, ''));
 
 /**
@@ -185,9 +180,9 @@ const tokenNorm = (t) => normPlace(String(t).replace(/['’]s$/i, ''));
  *          claims lists only the UNGROUNDED ones — grounded mentions are the
  *          description doing its job and are not reported.
  *
- * Grounding is TOKEN SUBTRACTION, not span substring (somm v1.147 audit,
- * item 1 — the decisive one). Span-substring let the record's country ground
- * "Chile's Maipo Valley" wholesale, silently swallowing the finer place, and
+ * Grounding is TOKEN SUBTRACTION, not span substring. Span-substring would let
+ * the record's country ground "Chile's Maipo Valley" wholesale, silently
+ * swallowing the finer place, and
  * a check that under-reports on rows it already flags gives a curator false
  * assurance — worse than over-reporting. Instead: remove every token the
  * record accounts for (its places, its grapes, its country's adjective, the
@@ -200,10 +195,10 @@ function gradeDescription(description, { region, appellation, country, grapes, p
 
   // Everything the record itself accounts for, kept as WHOLE token sequences.
   // The producer's tokens are in the same pool: a description mentioning the
-  // producer is not claiming a place, however place-like the name reads (somm
-  // item 2 — three of four disclosure rows were the producer's own name, so
-  // the whole disclosure bucket was extraction noise wearing a calibrated
-  // look). Sequences, not a token set, because grapes share tokens: with the
+  // producer is not claiming a place, however place-like the name reads —
+  // without that, the producer's own name fills the disclosure bucket with
+  // extraction noise wearing a calibrated look. Sequences, not a token set,
+  // because grapes share tokens: with the
   // record carrying Cabernet SAUVIGNON, a loose-token pool subtracts the
   // "Cabernet" out of an ungrounded Cabernet FRANC claim and reports "Franc".
   const grounds = [];
@@ -218,7 +213,7 @@ function gradeDescription(description, { region, appellation, country, grapes, p
 
   // A norm-token run sitting INSIDE a ground sequence is grounded — "Château
   // Bois" inside producer "Chateau Bois D'Arlene", bare "Nero" inside grape
-  // "Nero d'Avola" (somm 6a87053b). A truncated capture of a name the record
+  // "Nero d'Avola". A truncated capture of a name the record
   // accounts for grounds even when shorter than the name. NOT the inverse:
   // "Cabernet Franc" is not inside "Cabernet Sauvignon".
   const insideAnyGround = (runNorms) => {
@@ -255,10 +250,10 @@ function gradeDescription(description, { region, appellation, country, grapes, p
 
     for (const { text: segment, framed: sentenceFramed } of segments) {
 
-    // Variety pass FIRST (somm 6a870548): the extraction grammar catches only
-    // the variety a preposition happens to introduce — "blended with small
-    // amounts of Cabernet Franc, Petit Verdot and Merlot" reported one of
-    // three. A vocabulary scan over the whole normalised sentence reports
+    // Variety pass FIRST: the extraction grammar catches only the variety a
+    // preposition happens to introduce — "blended with small amounts of
+    // Cabernet Franc, Petit Verdot and Merlot" yields one of three. A
+    // vocabulary scan over the whole normalised sentence reports
     // every ungrounded variety regardless of position, including bare varietal
     // openers ("a full-bodied Tempranillo from…") and hyphen compounds
     // ("Syrah-led" normalises to "syrah led").
@@ -316,10 +311,9 @@ function gradeDescription(description, { region, appellation, country, grapes, p
 }
 
 // Taxonomy entries that exist ONLY for quarantined non-wine rows (cider,
-// mead — see ticket 6a86bb5f): they are legitimate grape-collection entries
-// but poison a variety vocabulary, because every tasting note mentioning
-// "green apple acidity" or "pear fruit" would report a variety claim. 17 of
-// 21 assertion rows in the first vocabulary-pass dry run were this.
+// mead): they are legitimate grape-collection entries but poison a variety
+// vocabulary, because every tasting note mentioning "green apple acidity" or
+// "pear fruit" would report a variety claim.
 const NON_VARIETY_VOCAB = new Set(['apple', 'pear', 'quince', 'honey']);
 
-module.exports = { gradeDescription, extractClaims, STRONG_FRAME, WEAK_FRAME, normPlace, NON_VARIETY_VOCAB };
+module.exports = { gradeDescription, extractClaims, normPlace, NON_VARIETY_VOCAB };

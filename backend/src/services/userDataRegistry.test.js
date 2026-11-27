@@ -9,7 +9,6 @@
 // services/search.js eagerly requires the ESM-only `meilisearch` package,
 // which Jest can't parse — mock it (same pattern as cellarImport.test.js).
 jest.mock('./search', () => ({
-  removeBottles: jest.fn(),
   indexDiscussion: jest.fn(),
 }));
 
@@ -89,6 +88,8 @@ describe('userDataRegistry', () => {
             'detail.username': '',
             'detail.sharedWith': '',
             'detail.invitedEmail': '',
+            // The API token the row was made with: it would link the anonymised rows.
+            'actor.tokenId': '',
           }),
         })
       );
@@ -338,9 +339,36 @@ describe('WineOwnerInquiry — recipient-entry erasure + asker nulling', () => {
       findSpy.mockRestore();
     }
   });
+
+  test('the export does not tell a member who has not answered that another owner did', async () => {
+    const chain = (rows) => {
+      const c = {};
+      for (const m of ['select', 'populate', 'limit']) c[m] = jest.fn(() => c);
+      c.lean = jest.fn(async () => rows);
+      return c;
+    };
+    const inquiry = (status, recipients) => ({ question: 'Q', status, wineDefinition: { producer: 'P', name: 'W' }, recipients, createdAt: 'c' });
+    const received = [
+      // Someone else answered: the stored status says so, the export must not.
+      inquiry('answered', [{ user: 'u1' }, { user: 'u2', response: 'theirs' }]),
+      // The member answered themselves: 'answered' is their own news.
+      inquiry('answered', [{ user: 'u1', response: 'mine' }, { user: 'u2' }]),
+      inquiry('closed', [{ user: 'u1' }]),
+    ];
+    const findSpy = jest.spyOn(WineOwnerInquiry, 'find')
+      .mockReturnValueOnce(chain(received))
+      .mockReturnValueOnce(chain([]));
+    try {
+      const frag = await entry.exportFragment({ userId: 'u1', truncated: {} });
+      expect(frag.ownerInquiries.received.map((r) => r.status)).toEqual(['open', 'answered', 'closed']);
+      expect(JSON.stringify(frag)).not.toContain('theirs');
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
 });
 
-// Portability of wine corrections (pre-deploy audit 2026-09-18). `amendments`
+// Portability of wine corrections. `amendments`
 // was selected but never mapped into the export. It was an edge while
 // corrections came from a connector; the bottle page files ONE field at a
 // time, so fixing a second field IS an amendment — and the reason and the
@@ -417,6 +445,49 @@ describe('SupportTicket export', () => {
       expect(frag.supportTickets[1].replies).toEqual([{ author: 'admin', message: 'Fixed', createdAt: 'r1' }]);
     } finally {
       findSpy.mockRestore();
+    }
+  });
+});
+
+// A curator's undo snapshot (McpActionLog.prev) can hold ANOTHER person's
+// data: the stamp and note of whoever wrote a drink window, the members who
+// asked for a price. Those rows belong to the curator, so the ledger purge
+// never reaches them; without these passes an undo after the erasure would
+// write the erased person back.
+describe('undo snapshots in another curator\'s ledger rows', () => {
+  const McpActionLog = require('../models/McpActionLog');
+  const WineVintageProfile = require('../models/WineVintageProfile');
+  const PriceTrackingRequest = require('../models/PriceTrackingRequest');
+  const ctx = { userId: 'u1' };
+
+  test('erasing a curator clears their stamp and note from drink-window snapshots; a bridge note stays', async () => {
+    const profileSpy = jest.spyOn(WineVintageProfile, 'updateMany').mockResolvedValue({});
+    const ledgerSpy = jest.spyOn(McpActionLog, 'updateMany').mockResolvedValue({});
+    try {
+      await REGISTRY.find(e => e.model.modelName === 'WineVintageProfile').purge(ctx);
+      const ofUser = { action: { $in: ['somm_maturity', 'somm_maturity_remove'] }, 'prev.setBy': 'u1' };
+      expect(ledgerSpy.mock.calls).toEqual([
+        [{ ...ofUser, 'prev.sommNotes': { $ne: 'From the shared registry (cellarion.app)' } },
+          { $set: { 'prev.setBy': null, 'prev.setAt': null, 'prev.sommNotes': null } }],
+        [ofUser, { $set: { 'prev.setBy': null, 'prev.setAt': null } }],
+      ]);
+    } finally {
+      profileSpy.mockRestore(); ledgerSpy.mockRestore();
+    }
+  });
+
+  test('erasing a member takes them, and the note they wrote, out of a declined price request\'s snapshot', async () => {
+    const requestSpy = jest.spyOn(PriceTrackingRequest, 'updateMany').mockResolvedValue({ modifiedCount: 1 });
+    const ledgerSpy = jest.spyOn(McpActionLog, 'updateMany').mockResolvedValue({});
+    try {
+      const out = await REGISTRY.find(e => e.model.modelName === 'PriceTrackingRequest').purge(ctx);
+      expect(ledgerSpy).toHaveBeenCalledWith(
+        { action: 'somm_price_decline', 'prev.requesters.user': 'u1' },
+        { $pull: { 'prev.requesters': { user: 'u1' } } });
+      expect(requestSpy).toHaveBeenCalledWith({ 'requesters.user': 'u1' }, { $pull: { requesters: { user: 'u1' } } });
+      expect(out).toEqual({ modifiedCount: 1 });
+    } finally {
+      requestSpy.mockRestore(); ledgerSpy.mockRestore();
     }
   });
 });

@@ -1,14 +1,12 @@
 /**
  * Which curator corrections may apply themselves, and which still need an
- * admin (2026-08-21).
+ * admin.
  *
- * WHY. Every identity correction used to wait for an admin click. Measured over
- * one full curation day: 16 proposals filed, ONE needed the gate. The other
- * fifteen were lookups ("Barolo by Cà di Bruno is in Piedmont") that spent the
- * scarcest resource in the loop — the admin's attention — and, worse,
- * serialised the curator behind it. They finished a block and idled waiting for
- * a review round trip while 231 new wines arrived from a single import the same
- * morning. The gate was not wrong; it was priced wrong.
+ * WHY. Most identity corrections are lookups ("Barolo by Cà di Bruno is in
+ * Piedmont"). Sending each past an admin spends the scarcest resource in the
+ * loop — the admin's attention — and, worse, serialises the curator behind a
+ * review round trip while new wines keep arriving. The gate is not wrong; it
+ * is priced wrong for filling a blank.
  *
  * THE LINE IS REVERSIBILITY, NOT TRUST. A proposal applies itself only when it
  * FILLS A BLANK on a field that can be edited back:
@@ -18,8 +16,8 @@
  * Everything else keeps the admin gate, for reasons that are specific rather
  * than cautious:
  *   - producer / name  drive normalizedKey and the public URL, and are the
- *                      class with measured failures (5 curator assertions
- *                      overturned by web verification, 2026-08-10)
+ *                      class where a curator's assertion is most often
+ *                      overturned by web verification
  *   - merge            performWineMerge ends in source.deleteOne() — the
  *                      absorbed record is destroyed, not tombstoned, so an
  *                      unmerge means rebuilding it by hand
@@ -27,50 +25,61 @@
  *   - OVERWRITES       replacing a value someone already curated is a
  *                      different act from filling a blank
  *
- * THE NAME CHECK is the part that earns the loosened gate. The single proposal
- * the human gate caught that day was a wine named "Rosso Veronese" receiving
- * appellation "Veneto IGT" — a different denomination from the one its own name
- * states. That is mechanisable, and it generalises: if a wine's NAME contains a
- * curated appellation, a proposal naming a DIFFERENT one is a claim about the
- * label contradicting the record, which is exactly the judgement an admin
- * should keep.
+ * THE NAME CHECK is the part that earns the loosened gate. A wine named
+ * "Rosso Veronese" receiving appellation "Veneto IGT" gets a different
+ * denomination from the one its own name states. That is mechanisable, and it
+ * generalises: if a wine's NAME contains a curated appellation, a proposal
+ * naming a DIFFERENT one is a claim about the label contradicting the record,
+ * which is exactly the judgement an admin should keep.
  *
- * Crucially the check ROUTES, it does not REFUSE. Same day, the same rule fires
- * on "Prosecco" by Two Pairs → King Valley — and there the curator was RIGHT: a
- * King Valley Glera is a real category and stamping the Italian DOC on it would
- * have been the error. A rule that blocked the mismatch would have blocked the
- * most valuable correction of the day. So a mismatch means "an admin reads
- * this", never "this is wrong".
+ * Crucially the check ROUTES, it does not REFUSE. The same rule fires on
+ * "Prosecco" by Two Pairs → King Valley — and there the curator is RIGHT: a
+ * King Valley Glera is a real category and stamping the Italian DOC on it
+ * would be the error. A rule that blocked the mismatch would block exactly
+ * such a correction. So a mismatch means "an admin reads this", never "this
+ * is wrong".
  *
- * Replayed over that day's 16: eleven apply themselves, and all three needing
- * judgement (Prosecco, Rosso Veronese, and the Monatio class — a name carrying
- * the generic designation "Vino Rosso", whose whole legal meaning is the
- * ABSENCE of a geographic indication) route to review.
- *
- * NON-WINE (2026-10-13) applies on filing too, by the same reversibility line.
- * The quarantine is a flag: the row leaves registry search and the maturity
+ * NON-WINE applies on filing too, by the same reversibility line. The
+ * quarantine is a flag: the row leaves registry search and the maturity
  * queue, every owner's bottles keep working, and an admin restores it in one
  * click (Admin → Wines → Proposals → Decided), which re-seeds the queue rows
- * the quarantine removed. What the gate cost was not: beers and ciders sat in
- * public search for hours after the curator had already named them, waiting
- * on an admin to agree with the obvious. One exception keeps the
- * gate — a row several members hold. A beer is rarely in four cellars; a real
- * wine with an odd name often is, and hiding it from all of them is an admin's
- * call.
+ * the quarantine removed. Behind the gate, beers and ciders would sit in
+ * public search for hours after the curator named them, waiting on an admin
+ * to agree with the obvious. One exception keeps the gate — a row several
+ * members hold. A beer is rarely in four cellars; a real wine with an odd
+ * name often is, and hiding it from all of them is an admin's call.
+ *
+ * THE SWEETNESS STYLE applies on filing as well, by the same line, and it is
+ * the one field a MEMBER's own filing applies on a server that reviews
+ * (memberAppliesOnFiling). It is the term a wine is known by when its label
+ * prints none: never part of the dedup key, the slug or the display name,
+ * never written without the page that names it, and cleared with one edit.
+ * What decides is the write rule itself (services/sweetnessWrite
+ * assignSweetnessStyle), asked without writing: only a style the rule would
+ * WRITE AS FILED on a wine that has none applies. What the rule refuses — a
+ * style the label's own term contradicts, a term with a legal definition
+ * named by the trade — is not filed at all (services/proposalFields
+ * settleSweetnessStyle); a second opinion on a recorded style is filed for a
+ * person. Two more cases wait, because nothing mechanical can settle them:
+ * a wine with no type, on which the rule cannot hold the style against a
+ * sweetness word in the name, and — from a member — a term with a legal
+ * definition, since "the producer says so" is the member's own statement
+ * about the link.
  */
 const Appellation = require('../models/Appellation');
 const Bottle = require('../models/Bottle');
 const Cellar = require('../models/Cellar');
 const { normalizeAppellationKey } = require('../utils/normalize');
+const { STYLE_FIELD, probeSweetnessStyle } = require('./proposalFields');
 
 // Blank-fillable, reversible, and not part of the dedup key.
-const DIRECT_FIELDS = ['appellation', 'region', 'classification'];
+const DIRECT_FIELDS = ['appellation', 'region', 'classification', STYLE_FIELD];
 
 // A non-wine flag applies on filing while at most this many members hold a
 // bottle of the row (any status — a drunk bottle is still in their history).
 // A member = the owner or a member of a cellar with a bottle of it: a
-// bottle's `user` is the cellar OWNER, so counting that made ten members of
-// one shared cellar count as one (audit 2026-10-14).
+// bottle's `user` is the cellar OWNER, so counting that would make ten
+// members of one shared cellar count as one.
 const NON_WINE_DIRECT_MAX_OWNERS = 3;
 
 async function countHoldingMembers(wineId) {
@@ -91,6 +100,8 @@ const MAX_NAME_TOKENS = 12;
 
 /** True when the wine currently carries no value for this identity field. */
 function fieldIsEmpty(wine, field) {
+  // A style is an object, set or not: the wine must be loaded with it.
+  if (field === STYLE_FIELD) return wine.sweetnessStyle == null;
   const v = field === 'region' ? wine.region : wine[field];
   if (v === undefined || v === null) return true;
   // region is a ref; a populated doc or an ObjectId both count as SET.
@@ -109,21 +120,19 @@ function idOf(v) {
  * "Chianti Classico" beats "Chianti" and the check compares like with like.
  * Returns the Appellation doc, or null when the name claims no place.
  *
- * COUNTRY-SCOPED (2026-08-21). Without this, a name-derived appellation from
- * the wrong country reads as a place claim. Found live while dry-running a
- * backfill: Nockie's "Palette Pinot Noir" is a NEW ZEALAND wine and "Palette
- * Rose" a SOUTH AFRICAN one, and Palette is an AOC in Provence. Same producer,
- * two hemispheres, one French name — "Palette" there is a range name, not a
- * place, and the backfill would have written Provence onto both.
+ * COUNTRY-SCOPED. Without this, a name-derived appellation from the wrong
+ * country reads as a place claim: Nockie's "Palette Pinot Noir" is a NEW
+ * ZEALAND wine and "Palette Rose" a SOUTH AFRICAN one, and Palette is an AOC
+ * in Provence. Same producer, two hemispheres, one French name — "Palette"
+ * there is a range name, not a place, and a backfill would write Provence
+ * onto both.
  *
- * The cost of missing it was not hypothetical in the other direction either:
- * a curator correcting that Pinot Noir to Marlborough would have been routed
- * for review because the name "disagreed", making them wait on a correction
- * that should apply instantly.
+ * It costs in the other direction too: a curator correcting that Pinot Noir
+ * to Marlborough would be routed for review because the name "disagreed",
+ * waiting on a correction that should apply instantly.
  *
  * A wine with no country cannot be checked, so the match stands — that is the
- * conservative reading (route rather than auto-apply), matching the old
- * behaviour exactly.
+ * conservative reading (route rather than auto-apply).
  */
 async function appellationImpliedByName(name, countryId) {
   const tokens = String(name || '').trim().split(/\s+/).filter(Boolean).slice(0, MAX_NAME_TOKENS);
@@ -277,15 +286,74 @@ async function classifyProposal(wine, kind, proposedFields) {
     }
   }
 
+  if (proposedFields[STYLE_FIELD]) {
+    const style = await styleWritesAsFiled(wine, proposedFields);
+    if (!style.direct) return { direct: false, reason: style.reason };
+  }
+
   return { direct: true, reason: 'Blank identity fields, reversible, consistent with the name.' };
+}
+
+/**
+ * Would the write rule write this proposed sweetness style exactly as filed?
+ * Asked without writing (services/proposalFields probeSweetnessStyle); `wine`
+ * must be loaded with sweetnessStyle. Anything the rule holds, refuses or
+ * leaves to a person is not direct, and neither is a style on a wine with no
+ * type: without a scale the rule cannot hold the style against a sweetness
+ * word in the wine's name. Returns { direct, reason, regulated } — regulated
+ * when the term has a legal definition.
+ */
+async function styleWritesAsFiled(wine, proposedFields) {
+  const probe = await probeSweetnessStyle(wine, proposedFields);
+  const regulated = !!(probe.term && probe.term.regulated);
+  if (probe.ok && probe.verdict === 'applied' && probe.scale === null) {
+    return { direct: false, regulated, reason: 'The wine has no type yet, so the style cannot be held against its name — an admin reads it.' };
+  }
+  if (probe.ok && probe.verdict === 'applied') {
+    return { direct: true, regulated, reason: 'A sourced sweetness style on a wine that has none: reversible, and no part of its identity.' };
+  }
+  return {
+    direct: false,
+    regulated,
+    reason: probe.message
+      || 'The wine already carries a sweetness term this style has to be weighed against — an admin reads that.',
+  };
+}
+
+/**
+ * May a MEMBER's field correction apply on filing, on a server that reviews
+ * contributions? One case: the pending suggestion holds a sweetness style and
+ * nothing else, the wine has no style recorded, the term is a customary one
+ * (a term with a legal definition is taken from the producer only, and who
+ * the page belongs to is for a curator to see), and the write rule would
+ * write it as filed. Every other member correction waits for a curator.
+ * `proposedFields` is the WHOLE pending row (an amendment included), `wine`
+ * loaded with sweetnessStyle. Returns { direct, reason } like classifyProposal.
+ * Caller: createFieldCorrection (services/wineProposalOps).
+ */
+async function memberAppliesOnFiling(wine, proposedFields) {
+  const fields = Object.entries(proposedFields || {})
+    .filter(([, v]) => v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && !v.length))
+    .map(([k]) => k);
+  if (fields.length !== 1 || fields[0] !== STYLE_FIELD) {
+    return { direct: false, reason: 'Only a sweetness style on its own applies on filing.' };
+  }
+  if (!fieldIsEmpty(wine, STYLE_FIELD)) {
+    return { direct: false, reason: 'The wine already has a sweetness style — replacing it is reviewed.' };
+  }
+  const verdict = await styleWritesAsFiled(wine, proposedFields);
+  if (verdict.direct && verdict.regulated) {
+    return { direct: false, reason: 'A term with a legal definition is read by a curator before it goes live.' };
+  }
+  return { direct: verdict.direct, reason: verdict.reason };
 }
 
 module.exports = {
   classifyProposal,
+  memberAppliesOnFiling,
   appellationImpliedByName,
   proposedAppellationCountryConflict,
   appellationsAgree,
-  fieldIsEmpty,
-  DIRECT_FIELDS,
   NON_WINE_DIRECT_MAX_OWNERS,
+  countHoldingMembers,
 };

@@ -9,16 +9,18 @@ import { CURRENCIES, normalizeCurrency } from '../../config/currencies';
 import { BOTTLE_SIZES, bottleSizeLabel, normalizeBottleSize } from '../../config/bottleSizes';
 import RatingInput from '../RatingInput';
 import { isOnOrder, toMonthInput } from '../../utils/onOrder';
+import { parseVintageInput, vintageInputProps } from '../../utils/vintage';
+import { useContributionReviewed } from '../../utils/contributionReview';
 
 const ImageUpload = lazy(() => import('../ImageUpload'));
 const ImageGallery = lazy(() => import('../ImageGallery'));
 
-// The fields a wine and vintage share (support ticket 2026-09-06). Only what
+// The fields a wine and vintage share. Only what
 // the user CHANGED in this save is copied to the other bottles of the lot —
 // rating, notes, reservation and rack slot never are. The drink window
 // travels as a unit: touching any of its four years copies all four, so the
-// lot ends up with ONE window rather than four uneven ones (audit
-// 2026-09-07). A price carries its currency; a currency alone counts only
+// lot ends up with ONE window rather than four uneven ones. A price carries
+// its currency; a currency alone counts only
 // when a price exists.
 const WINDOW_FIELDS = ['drinkFrom', 'drinkTo', 'peakFrom', 'peakUntil'];
 const norm = (v) => (v === '' || v === null || v === undefined ? null : v);
@@ -34,10 +36,21 @@ export function changedLotFields(original, payload) {
   return out;
 }
 
-function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = [] }) {
+function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = [], focus = null }) {
   const { t } = useTranslation();
+  const reviewed = useContributionReviewed();
   const { apiFetch, user } = useAuth();
   const galleryRef = useRef(null);
+  // Opened from the page's own drink-window link (focus 'drinkWindow'): the
+  // window's years sit below the purchase and note fields, so the form opens
+  // on them rather than at its top.
+  const windowRef = useRef(null);
+  const drinkFromRef = useRef(null);
+  useEffect(() => {
+    if (focus !== 'drinkWindow') return;
+    try { windowRef.current?.scrollIntoView({ block: 'center' }); } catch { /* old browser */ }
+    drinkFromRef.current?.focus({ preventScroll: true });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   // The error shows at the top of the form; Save is at the bottom. On a phone
   // a refused save looked like nothing happened — bring the message into view.
   const errorRef = useRef(null);
@@ -101,6 +114,7 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
       const { expectedArrival, ...formFields } = form;
       const payload = {
         ...formFields,
+        vintage: parseVintageInput(form.vintage, t),
         ...(isOnOrder(bottle) ? { expectedArrival: expectedArrival || null } : {}),
         price:  form.price  ? parseFloat(form.price)  : null,
         rating: form.rating ? parseFloat(form.rating) : null,
@@ -157,9 +171,8 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
             value={form.vintage}
             onChange={set('vintage')}
             placeholder={t('bottleDetail.vintagePlaceholder')}
-            pattern="^(?:[Nn][Vv]|[Uu]nknown|(?:19|20)\d{2})$"
+            {...vintageInputProps(t)}
             title={t('bottleDetail.vintagePattern')}
-            maxLength={7}
           />
         </div>
 
@@ -227,12 +240,13 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
         />
       </div>
 
-      <div className="form-group">
+      <div className="form-group" ref={windowRef}>
         <label>{t('addBottle.drinkWindow')}</label>
         <div className="bd-edit-grid">
           <div className="form-group">
             <label>{t('addBottle.drinkFrom')}</label>
             <input
+              ref={drinkFromRef}
               type="number"
               inputMode="numeric"
               value={form.drinkFrom}
@@ -380,7 +394,9 @@ function EditForm({ bottle, onSaved, onCancel, onImageUploaded, lotSiblingIds = 
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0, marginTop: '1px' }}>
             <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
           </svg>
-          {t('bottleDetail.imageNotice', 'Images are reviewed by an admin before being added to the shared wine registry, where they will be visible to all Cellarion users.')}
+          {reviewed
+            ? t('bottleDetail.imageNotice', 'Images are reviewed by an admin before being added to the shared wine registry, where they will be visible to all Cellarion users.')
+            : t('bottleDetail.imageNoticeUnreviewed', 'Photos are added to the wine registry as soon as you upload them, where everyone on this server can see them.')}
         </p>
       </div>
 

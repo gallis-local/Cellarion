@@ -1,5 +1,5 @@
 /**
- * Appellation spelling adoption at mint (strategy 2026-07-29, R2).
+ * Appellation spelling adoption at mint.
  *
  * Pins: curated spelling wins over the typed variant (by name OR synonym), an
  * un-curated appellation passes through verbatim (reviewed, never rejected),
@@ -161,9 +161,9 @@ describe('membership-gated decoration stripping', () => {
 });
 
 /**
- * appellationHasGeography (somm 6a8eb2a9): the producer-suspect narrowing's
+ * appellationHasGeography: the producer-suspect narrowing's
  * predicate. Deliberately about the curated ENTRY's geography, not the field
- * being populated — the somm's counter-examples pin both failure modes:
+ * being populated — two counter-examples pin both failure modes:
  * "Vin de France" (curated, nationwide, region null) and "Qualitätswein"
  * (a tier, not curated) must both return false.
  */

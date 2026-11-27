@@ -1,9 +1,8 @@
 const mongoose = require('mongoose');
-// Native bcrypt: hash/compare run on libuv's thread pool, so a login no longer
-// stalls every other request for ~0.3 s the way pure-JS bcryptjs did (scaling
-// audit 2026-09-25). Stored bcryptjs hashes ($2a$) verify unchanged, the
-// 72-byte truncation is the same, and bcryptjs can read the $2b$ hashes this
-// writes — see User.bcrypt.test.js.
+// Native bcrypt: hash/compare run on libuv's thread pool, so a login does not
+// stall every other request for ~0.3 s as pure-JS bcryptjs would. Stored
+// bcryptjs hashes ($2a$) verify unchanged, the 72-byte truncation is the same,
+// and bcryptjs can read the $2b$ hashes this writes — see User.bcrypt.test.js.
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const { CURRENT_PRIVACY_POLICY_VERSION } = require('../config/legal');
@@ -12,7 +11,7 @@ const { PLAN_NAMES } = require('../config/plans');
 // Single source of truth for the bcrypt work factor. The login route's dummy
 // hash (routes/auth.js) MUST be generated at this same cost — a cheaper dummy
 // compare responds measurably faster for unknown identifiers, reintroducing
-// the timing-based account-enumeration oracle the dummy exists to close (L-1).
+// the timing-based account-enumeration oracle the dummy exists to close.
 const BCRYPT_COST = 12;
 
 const userSchema = new mongoose.Schema({
@@ -107,6 +106,15 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: null
   },
+  // When this account first paid for support: stamped the first time a Stripe
+  // subscription puts it on a tier (routes/stripe.js applyStripePlan) and never
+  // cleared. A tier set by an admin stamps planStartedAt but never this, so it
+  // is what tells a supporter who paid from an account that was only given a
+  // tier (Admin → Statistics → Former supporters).
+  firstPaidAt: {
+    type: Date,
+    default: null
+  },
   // Set the first time this account is thanked for supporting the project, and
   // never cleared. It is the ONLY thing that stops a second send: the plan
   // webhook fires on renewals, payment-method changes and tier switches, so
@@ -157,23 +165,31 @@ const userSchema = new mongoose.Schema({
       enum: ['auto', 'room', 'rack'],
       default: 'auto'
     },
+    // How temperatures are SHOWN (serving line, climate cards). Stored values
+    // are always °C; this converts at display. Guessed once at first sign-in
+    // from the device's region (utils/localeDefaults), changed in Settings.
+    temperatureUnit: {
+      type: String,
+      enum: ['C', 'F'],
+      default: 'C'
+    },
     notifications: {
       // In-app notifications (the bell) are always on for every category —
       // they're a pull surface, not interruptive. The toggles below gate
       // outbound channels (email, push) per category.
       //
       // Defaults: drink-window alerts are about the member's own bottles, so
-      // a NEW account gets them by email (at most one a week) and push. An
-      // account created before that change keeps its stored off — the boot
-      // step drinkWindowNotifier.storeDrinkWindowDefaultsOff stores off where
-      // nothing was stored, so the new default never switches anyone on.
+      // an account is created with them on by email (at most one a week) and
+      // push. That default must not switch them on for an account with nothing
+      // stored: the boot step drinkWindowNotifier.storeDrinkWindowDefaultsOff
+      // stores off there, so the default never applies to it.
       // Community categories default ON for push (push is already
       // explicit-subscription gated, so it's safe to opt in once subscribed)
       // and OFF for email (email is the more intrusive channel — opt in if
       // you want it).
       drinkWindow: {
-        // Master toggle (back-compat with the old single boolean — still drives
-        // the in-app bell; the email/push children gate outbound channels).
+        // Master toggle: drives the in-app bell (a stored single boolean heals
+        // into it, normalizeLegacyNotifications); email/push gate outbound.
         enabled: { type: Boolean, default: true },
         email:   { type: Boolean, default: true },
         push:    { type: Boolean, default: true }
@@ -194,18 +210,18 @@ const userSchema = new mongoose.Schema({
         push:  { type: Boolean, default: true }
       },
       supportReply: {
-        // Support answered your ticket (2026-09-26). A service email about
+        // Support answered your ticket. A service email about
         // something you asked us, not a notification you opt into, so it is
-        // on by default: until now the answer only reached the in-app bell,
-        // and someone who asked and left never saw it. Settings turns it off,
+        // on by default: the in-app bell alone never reaches someone who
+        // asked and left. Settings turns it off,
         // and so does the one-click unsubscribe (utils/notifications.js).
         // No push: the bell already carries it inside the app.
         email: { type: Boolean, default: true }
       },
       ownerInquiry: {
-        // A curator's question about a wine you own a bottle of (2026-10-20).
-        // Until now it reached the bell and push only, and none of 64 open
-        // questions had an answer. Not marketing: one precise question about
+        // A curator's question about a wine you own a bottle of. The bell and
+        // push alone can leave such questions unanswered, so it is emailed too.
+        // Not marketing: one precise question about
         // the record of your own bottle, with every send rationed by the
         // curators' contact budget and at most one such email a day. On by
         // default; Settings turns it off, so do the "stop these" link in the
@@ -220,7 +236,7 @@ const userSchema = new mongoose.Schema({
       default: 'all'
     },
     // The order the cellar page's bottle list opens in: the last sort the user
-    // picked there (support ticket 2026-09-26). Absent means newest first.
+    // picked there. Absent means newest first.
     // Validated against CELLAR_SORTS in accountOps and deliberately not a
     // schema enum: every sign-in saves the user document, so retiring a sort
     // option later must never make an old stored value fail validation. The
@@ -246,8 +262,8 @@ const userSchema = new mongoose.Schema({
       default: false
     }
   },
-  // One entry per signed-in device/browser (per-device sessions, 2026-09-04):
-  // `hash` is sha256 of the opaque refresh token in that device's cookie,
+  // One entry per signed-in device/browser: `hash` is sha256 of the opaque
+  // refresh token in that device's cookie,
   // `prevHash` the hash most recently rotated away (reuse detection),
   // `client` a short device label like "Android / Chrome" — never the raw UA.
   // Rotation touches only its own entry; password change/reset and account
@@ -265,26 +281,59 @@ const userSchema = new mongoose.Schema({
     })],
     default: []
   },
-  // LEGACY single-session fields. Read once by /refresh to adopt a
-  // pre-sessions cookie into `sessions` (so the rollout signs nobody out),
-  // then nulled. Drop the three fields and their index once no row carries a
-  // refreshTokenHash.
+  // The last DAY this account was used: a sign-in, the app renewing its
+  // session (every ~15 minutes of use), or an API token or AI connector at
+  // work. It is what makes "kept for as long as your account is active"
+  // (Privacy Policy, Data retention) checkable: sessions expire after 30 days
+  // and the activity log after 90, so neither can tell a dormant account from
+  // a quiet one. A day and nothing finer (data minimisation): UTC midnight of
+  // that day. Only ever moves forward. Written by services/lastActive; never
+  // sent to the client (toJSON below), included in the GDPR export, removed
+  // with the account row. null = no use recorded; the backfill script
+  // (scripts/backfill-last-active.js) fills it from the evidence that remains.
+  lastActiveAt: {
+    type: Date,
+    default: null,
+    index: true
+  },
+  // The inactive-account timeline (services/inactiveAccounts), present only
+  // while one is running: when each of the two notices went out (written only
+  // once the mail service accepted it, or at once for an account with no
+  // confirmed address — emailed false), the deletion date they announced, the
+  // lastActiveAt the timeline is based on (unusedSince), and the claims of a
+  // run sending a notice (sendingAt, finalSendingAt) or erasing (erasingAt). Over as soon as the account is used again
+  // (lastActiveAt moves past unusedSince), and cleared when an admin turns the
+  // rule on (every timeline restarts with 30 days).
+  // Never sent to the client (toJSON); part of the export; goes with the row.
+  inactivityNotice: {
+    type: new mongoose.Schema({
+      firstSentAt: { type: Date, default: null },
+      finalSentAt: { type: Date, default: null },
+      deleteAfter: { type: Date, default: null },
+      emailed: { type: Boolean, default: false },
+      unusedSince: { type: Date, default: null },
+      sendingAt: { type: Date, default: null },
+      finalSendingAt: { type: Date, default: null },
+      erasingAt: { type: Date, default: null },
+    }, { _id: false }),
+    default: undefined
+  },
+  // LEGACY single-session fields. Only /refresh reads them, once
+  // (services/authTokens resolveRefreshSession), to adopt such a cookie into
+  // `sessions` so nobody is signed out; then they are nulled. Drop the three
+  // fields and their index once no row carries a refreshTokenHash.
   refreshTokenHash: {
     type: String,
     default: null
   },
-  // Absolute session deadline: a refresh token can be rotated only until this
-  // time, after which re-login is forced regardless of activity. Set at session
-  // start (login/register) and preserved across rotations. null = no cap yet
-  // (legacy sessions; backfilled on next refresh).
+  // The old session's absolute deadline, copied to the adopted session's
+  // expiresAt (null = no cap).
   refreshTokenExpiresAt: {
     type: Date,
     default: null
   },
-  // Whether the session's refresh cookie is persistent (remember-me) or a
-  // browser-session cookie. Set at login and read on rotation paths so
-  // /refresh doesn't silently upgrade a session cookie to persistent.
-  // null = legacy session (treated as persistent).
+  // Whether the old session's cookie was persistent (remember-me), copied to
+  // the adopted session (null counts as persistent).
   refreshTokenPersistent: {
     type: Boolean,
     default: null
@@ -307,10 +356,15 @@ const userSchema = new mongoose.Schema({
   // When the user objected to ALL Cellarion email (the one-click unsubscribe
   // link in every mail — utils/notifications.js). Every sender honours it on
   // top of the per-category switches, so a category added after they clicked
-  // (support replies, 2026-09-26) is off for them too — the objection covers
-  // email as such, not the categories that existed that day (audit
-  // 2026-09-27 M7). Cleared when they turn any email back on in Settings
+  // (support replies, for one) is off for them too — the objection covers
+  // email as such, not the categories that existed that day. Cleared when
+  // they turn any email back on in Settings
   // (services/accountOps): from then on the per-category switches decide.
+  // The exceptions are messages about the account itself, which the Privacy
+  // Policy (section 8) names: email verification and password reset (the
+  // person asked for them), the account-lockout alert (security), the one
+  // supporter thank-you (services/supporterThankYou), and the two notices
+  // before an unused account is deleted (services/inactiveAccounts).
   emailOptOutAt: {
     type: Date,
     default: null
@@ -412,8 +466,8 @@ const userSchema = new mongoose.Schema({
   // path segment of the landing page), recorded once at signup for the admin
   // stats "signups by source" table. Allow-listed and length-capped by
   // utils/signupSource.js; never sent to the client (toJSON below), included
-  // in the GDPR export, and removed with the account row. Absent on accounts
-  // created before it was recorded.
+  // in the GDPR export, and removed with the account row. Absent when signup
+  // recorded none.
   signupSource: {
     type: new mongoose.Schema({
       referrerDomain: { type: String, maxlength: 100 },
@@ -429,11 +483,11 @@ const userSchema = new mongoose.Schema({
   // true from account creation (password or SSO) until the first sign-in, when
   // the app saves the language it is showing and a currency guessed from the
   // device's region as the account's preferences (POST /api/users/me/locale-
-  // defaults), then this is removed. Without it every new account started on
-  // English + USD whatever the visitor's browser said, and a Swedish visitor
-  // was switched from Swedish to English the moment they signed up.
-  // Deliberately NO default: accounts created before it existed have no field
-  // and are never touched, so their settings stay exactly as they are.
+  // defaults), then this is removed. Without it every new account would start
+  // on English + USD whatever the visitor's browser said, switching a Swedish
+  // visitor from Swedish to English the moment they sign up.
+  // Deliberately NO default: an account without the field is never touched,
+  // so its settings stay exactly as they are.
   localeDefaultsPending: {
     type: Boolean,
     default: undefined
@@ -443,15 +497,15 @@ const userSchema = new mongoose.Schema({
     privacyPolicy: {
       accepted: { type: Boolean, default: false },
       acceptedAt: { type: Date, default: null },
-      version: { type: String, default: null }  // e.g. '2026-03'
+      version: { type: String, default: null }  // 'YYYY-MM-DD' (config/legal.js)
     },
     dataProcessing: {
       accepted: { type: Boolean, default: false },
       acceptedAt: { type: Date, default: null }
     }
   },
-  // Registry Data Terms (registry lockdown L6 / Registry Bridge, 2026-09):
-  // accepted once per version before a bridge key is issued. Not a privacy
+  // Registry Data Terms (registry lockdown / Registry Bridge): accepted once
+  // per version before a bridge key is issued. Not a privacy
   // consent — it is the licence under which registry data reaches a
   // self-hosted install. Version = config/legal.js CURRENT_REGISTRY_TERMS_VERSION.
   registryTerms: {
@@ -477,8 +531,8 @@ const userSchema = new mongoose.Schema({
     default: null
   },
   // Last time an MCP export-link for the full GDPR account export was minted.
-  // That build spans ~35 collections and can be hundreds of MB, so the MCP
-  // path (an automated caller that could loop) throttles it to once per day.
+  // That build spans dozens of collections and can be hundreds of MB, so the
+  // MCP path (an automated caller that could loop) throttles it to once per day.
   // The web route GET /api/users/me/export stays unthrottled — a human clicking
   // download is not the threat model this bounds.
   lastAccountExportAt: {
@@ -521,12 +575,15 @@ userSchema.index({ 'authProviders.provider': 1, 'authProviders.providerId': 1 })
 // the global concurrency ceiling. A partial index keyed to demo rows keeps both
 // cheap and stays empty (zero bytes) for the overwhelming majority of real users.
 userSchema.index({ demoExpiresAt: 1 }, { partialFilterExpression: { isDemo: true } });
+// The inactive-account job's "next step due" query reads accounts on a
+// timeline by their deletion date; only those few rows carry the field.
+userSchema.index({ 'inactivityNotice.deleteAfter': 1 }, { sparse: true });
 
-// Heal legacy notification-pref shapes before save. Old docs stored
-// `drinkWindow: false` (single boolean); the current schema expects
-// `{ enabled, email, push }`. Without this, Mongoose generates dotted $set
+// Heal legacy notification-pref shapes before save. A stored
+// `drinkWindow: false` (single boolean) does not fit the schema's
+// `{ enabled, email, push }`: without this, Mongoose generates dotted $set
 // sub-paths and MongoDB throws "Cannot create field 'email' in element
-// {drinkWindow: false}". See issue #390.
+// {drinkWindow: false}".
 //
 // Mutates `notif` in place. Returns the list of top-level keys that were
 // rewritten so the caller can markModified() each parent path — this forces
@@ -561,8 +618,9 @@ userSchema.pre('save', function(next) {
 
 // Hash password before saving
 userSchema.pre('save', async function(next) {
-  // Only hash if password is modified or new
-  if (!this.isModified('password')) {
+  // Only hash if password is modified or new. A password cleared to nothing
+  // (an account becoming sign-in-provider only) has nothing to hash.
+  if (!this.isModified('password') || this.password == null) {
     return next();
   }
 
@@ -660,7 +718,11 @@ userSchema.methods.toJSON = function() {
   delete obj.stripeCustomerId;
   // Admin-stats bookkeeping; the app never needs it (data minimisation).
   delete obj.signupSource;
-  // Data minimisation (I-1): internal lockout bookkeeping and the raw Stripe
+  delete obj.firstPaidAt;
+  // Retention bookkeeping, same reasoning (the export carries it).
+  delete obj.lastActiveAt;
+  delete obj.inactivityNotice;
+  // Data minimisation: internal lockout bookkeeping and the raw Stripe
   // subscription id are never needed client-side. The frontend only needs to
   // know WHETHER a subscription exists — expose that as a derived boolean.
   delete obj.failedLoginAttempts;
@@ -673,8 +735,8 @@ userSchema.methods.toJSON = function() {
   // Only the web app acts on it. An account used ONLY through an API token or
   // an MCP connector never sees the prompt: those surfaces keep working after a
   // policy bump, and the account's consent record stays on the old version
-  // until they next open the app (release audit 2026-09-27, L — recorded, not
-  // changed: blocking integrations on a re-acknowledgement is a product call).
+  // until they next open the app — on purpose: blocking integrations on a
+  // re-acknowledgement is a product call.
   const pp = obj.gdprConsent?.privacyPolicy;
   obj.requiresPolicyReconsent = !pp?.accepted || (pp?.version || null) !== CURRENT_PRIVACY_POLICY_VERSION;
   // Surface the demo flag as a clean boolean so the frontend can show the

@@ -1,4 +1,4 @@
-// bulk_add — the batch write with the plan's §5.7-L2 PREVIEW → APPLY contract:
+// bulk_add — the batch write with the PREVIEW → APPLY contract:
 // a hallucinated "add 60 bottles" is caught at the preview, before a single
 // row changes. Two calls:
 //
@@ -25,7 +25,8 @@ const { resolveRating } = require('../../utils/ratingUtils');
 const { parseCurrency } = require('../../config/currencies');
 const WineDefinition = require('../../models/WineDefinition');
 const { findVisibleWine } = require('../../services/wineVisibility');
-const { NEW_WINE_SHAPE } = require('./write');
+const { isSafeUrl } = require('../../utils/sanitize');
+const { NEW_WINE_SHAPE, resolveMcpBottleSize, SIZE_HELP, isRealDay } = require('./write');
 const { ok, fail, objectId, MSG_CELLAR_NOT_FOUND, resolveCellarAccess, wineSummary } = require('../toolUtil');
 const { logAction, trimOutstandingPreviews } = require('../actionLedger');
 const { takeMutationSlot, ipKeyFor } = require('../mutationBudget');
@@ -33,7 +34,7 @@ const { takeMutationSlot, ipKeyFor } = require('../mutationBudget');
 const MAX_ITEMS = 24; // two cases — keeps one batch well inside the write budget
 const PREVIEW_FRESH_MS = 15 * 60 * 1000;
 // Unconsumed previews kept per user; older ones are deleted when a new one is
-// made (audit 2026-09-02 D08-1). Five is plenty for an agent that previews a
+// made. Five is plenty for an agent that previews a
 // couple of batches before applying them.
 const MAX_OUTSTANDING_PREVIEWS = 5;
 // Preview is not free: it runs up to MAX_ITEMS registry resolutions and parks
@@ -46,8 +47,12 @@ const ITEM_SHAPE = z.object({
   new_wine: z.object(NEW_WINE_SHAPE).optional(),
   confirm_new_wine: z.boolean().optional(),
   vintage: z.string().max(10).optional(),
+  bottle_size: z.string().max(40).optional().describe('A volume ("1.5 L", "375ml") or a format name ("magnum", "half"); 750 ml when left out'),
   price: z.number().min(0).optional(),
   currency: z.string().regex(/^[A-Za-z]{3}$/).optional(),
+  purchase_location: z.string().max(500).optional().describe('Shop, merchant or place bought'),
+  purchase_url: z.string().max(2048).optional().describe('https link to the purchase or product page'),
+  purchase_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('Day bought, YYYY-MM-DD (today when left out)'),
   notes: z.string().max(5000).optional(),
   rating: z.number().min(0).max(100).optional(),
   rating_scale: z.enum(['5', '20', '100']).optional(),
@@ -67,9 +72,17 @@ function validateItemFields(item) {
   const r = resolveRating(item.rating, item.rating_scale);
   if (r.error) return r.error;
   // Checked here, in the preview: addBottle refuses an unsupported code, and at
-  // apply a new wine is created BEFORE the bottle (release audit 2026-10-13).
+  // apply a new wine is created BEFORE the bottle.
   const c = parseCurrency(item.currency);
   if (!c.ok) return c.error;
+  // The same three checks add_bottle makes before it mints a wine.
+  if (item.bottle_size && !resolveMcpBottleSize(item.bottle_size)) {
+    return `bottle_size "${item.bottle_size}" is not a size Cellarion can read. Use one of: ${SIZE_HELP}.`;
+  }
+  if (item.purchase_url && !isSafeUrl(item.purchase_url)) return 'purchase_url must be a valid http or https URL';
+  if (item.purchase_date !== undefined && !isRealDay(item.purchase_date)) {
+    return `purchase_date "${item.purchase_date}" is not a day in the calendar. Use YYYY-MM-DD.`;
+  }
   return null;
 }
 
@@ -85,14 +98,17 @@ async function planItem(item, userId, roles) {
     // add_bottle: own pending row yes, a stranger's no. planItem is the
     // preview AND the plan the commit executes, so gating here gates both.
     const wine = await findVisibleWine(item.wine_id, {
-      userId, roles, populate: ['country', 'region', 'grapes'],
+      userId, roles, select: '+sweetnessStyle', populate: ['country', 'region', 'grapes', { path: 'labelSweetness', select: 'name band scale regulated -_id' }, { path: 'sweetnessStyle.term', select: 'name band scale regulated' }],
     });
     if (!wine) return { status: 'invalid', error: `no registry wine ${item.wine_id}` };
-    return { status: 'ready', wine_id: String(wine._id), wine: wineSummary(wine) };
+    return { status: 'ready', wine_id: String(wine._id), wine: wineSummary(wine, { termLoaded: true, styleLoaded: true }) };
   }
 
+  if (!item.new_wine.type && item.new_wine.category !== 'other') {
+    return { status: 'invalid', error: 'new_wine.type is required unless category is "other" (a drink that is not wine)' };
+  }
   const { findOrCreateWine } = require('../../services/findOrCreateWine');
-  // producer is optional on NEW_WINE_SHAPE now; findOrCreateWine's .trim() runs
+  // producer is optional on NEW_WINE_SHAPE; findOrCreateWine's .trim() runs
   // before any option is consulted, so a preview must hand it '' not undefined.
   const res = await findOrCreateWine(
     { ...item.new_wine, producer: item.new_wine.producer || '' },
@@ -101,14 +117,14 @@ async function planItem(item, userId, roles) {
   );
   if (res.wine) {
     // Registry already knows it — upgrade the item to the existing wine.
-    return { status: 'ready', wine_id: String(res.wine._id), wine: wineSummary(res.wine), matched_existing: true };
+    return { status: 'ready', wine_id: String(res.wine._id), wine: wineSummary(res.wine, { termLoaded: true }), matched_existing: true };
   }
   if (res.candidates?.length) {
     if (item.confirm_new_wine) return { status: 'will_create', new_wine: item.new_wine, despite_candidates: true };
     return {
       status: 'blocked_similar',
       error: 'similar wines exist — pick a wine_id or set confirm_new_wine on this item',
-      candidates: res.candidates.map((c) => ({ ...wineSummary(c.wine), score: c.score })),
+      candidates: res.candidates.map((c) => ({ ...wineSummary(c.wine, { termLoaded: true }), score: c.score })),
     };
   }
   return { status: 'will_create', new_wine: item.new_wine };
@@ -122,11 +138,12 @@ registerTool({
     'with items (mode defaults to preview) — nothing is written; you get a per-item plan (matched wines, wines that ' +
     'would be newly created, problems). SHOW THE PLAN TO THE USER and get their approval. Then call again with ' +
     "mode:'apply' and the preview_id. The whole batch is one undo_last unit. Prefer resolve_wine-verified wine_ids in " +
-    'items; new_wine items follow the same registry rules as add_bottle.',
+    'items; new_wine items follow the same registry rules as add_bottle. An item may carry bottle_size and where it ' +
+    'was bought (purchase_location, purchase_url, purchase_date), as in add_bottle.',
   scope: 'write',
   // Charges the write budget ITSELF — one slot per item on apply, nothing on
   // preview — so the generic per-call charge in server.js must skip it or a
-  // 12-bottle case would cost 14 (MCP-audit M7).
+  // 12-bottle case would cost 14.
   selfBudgeted: true,
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   inputSchema: {
@@ -145,7 +162,7 @@ registerTool({
       if (!access) return fail('not_found', MSG_CELLAR_NOT_FOUND);
 
       // Charged BEFORE the registry resolutions below — they are the work a
-      // looping client would otherwise get for free (D08-1).
+      // looping client would otherwise get for free.
       if (!takeMutationSlot(String(ctx.user.id), previewCost(args.items.length), ipKeyFor(ctx))) {
         return fail('rate_limited', 'Too many previews in a short time — wait a few minutes before previewing again, or apply the last one.');
       }
@@ -155,7 +172,10 @@ registerTool({
       for (let i = 0; i < args.items.length; i++) {
         // Serial on purpose: bounded work, and registry lookups stay gentle.
         const p = await planItem(args.items[i], ctx.user.id, ctx.user.roles);
-        plan.push({ index: i, vintage: args.items[i].vintage || 'NV', ...p });
+        // The size as Cellarion read it ("magnum" → 1500ml), so the plan the
+        // user approves says what will be stored.
+        const size = args.items[i].bottle_size ? resolveMcpBottleSize(args.items[i].bottle_size) : null;
+        plan.push({ index: i, vintage: args.items[i].vintage || 'NV', ...(size ? { bottle_size: size } : {}), ...p });
       }
       const counts = plan.reduce((acc, p) => ((acc[p.status] = (acc[p.status] || 0) + 1), acc), {});
       const applyable = !plan.some((p) => p.status === 'invalid' || p.status === 'blocked_similar');
@@ -234,7 +254,8 @@ registerTool({
       try {
         let wineDoc;
         if (p.status === 'ready') {
-          wineDoc = await WineDefinition.findById(p.wine_id);
+          // The term populated, so the summary can state it (or its absence).
+          wineDoc = await WineDefinition.findById(p.wine_id).populate({ path: 'labelSweetness', select: 'name band scale regulated -_id' });
           if (!wineDoc) { failures.push({ index: i, error: 'wine disappeared' }); continue; }
         } else {
           // Soft-zone stays live at apply time UNLESS the user explicitly
@@ -242,14 +263,20 @@ registerTool({
           // that appeared since — most often a near-duplicate spelling minted
           // by an EARLIER item of this same batch — block the create instead
           // of silently bypassing the registry guard.
+          if (!item.new_wine.type && item.new_wine.category !== 'other') {
+            failures.push({ index: i, error: 'new_wine.type is required unless category is "other" (a drink that is not wine)' });
+            continue;
+          }
           const res = await findOrCreateWine(item.new_wine, ctx.user.id, {
             confirmCreate: !!p.despite_candidates, skipSiblingMatch: false, createdVia: 'mcp',
             // Same commit-path rule as add_bottle: an incomplete identity files
             // a pendingIdentity row for sommelier completion instead of losing
             // the bottle mid-batch.
             allowPending: true,
-            // Private drafts, as fixed at preview (support ticket 2026-09-12).
+            // Private drafts, as fixed at preview.
             draft: draft === true,
+            // The Other category: born outside the shared wine registry.
+            nonWine: item.new_wine.category === 'other',
           });
           if (!res.wine) { failures.push({ index: i, error: 'similar wines appeared since the preview — resolve this item individually with resolve_wine' }); continue; }
           wineDoc = res.wine;
@@ -261,8 +288,12 @@ registerTool({
         }
         const result = await addBottle(access.cellar, wineDoc, {
           vintage: item.vintage,
+          bottleSize: item.bottle_size ? resolveMcpBottleSize(item.bottle_size) : undefined,
           price: item.price,
           currency: item.currency,
+          purchaseLocation: item.purchase_location,
+          purchaseUrl: item.purchase_url,
+          purchaseDate: item.purchase_date,
           notes: item.notes,
           rating: item.rating,
           ratingScale: item.rating_scale,
@@ -270,7 +301,14 @@ registerTool({
           drinkTo: item.drink_to,
         }, ctx.req);
         if (result.error) failures.push({ index: i, error: result.error.message });
-        else added.push(String(result.bottle._id));
+        else {
+          added.push(String(result.bottle._id));
+          // category "other" on a record the registry already had as wine.
+          if (item.new_wine) {
+            const { applyOtherCategoryAfterAdd } = require('../../services/nonWineOps');
+            await applyOtherCategoryAfterAdd({ wine: wineDoc, newWine: item.new_wine, userId: ctx.user.id, req: ctx.req, via: 'mcp' });
+          }
+        }
       } catch (err) {
         failures.push({ index: i, error: err.message });
       }

@@ -72,6 +72,7 @@ const NOT_EXERCISED = {
   'getHealth 503': 'only while the process drains or has lost its database',
   'getThumbnail 200': 'needs a photo file in the uploads volume',
   'getThumbnail 503': 'only while the thumbnail renderer is saturated',
+  'moveBottle 409': 'only when another request changes the bottle at the same moment',
 };
 
 // Every operation documents 429 (the global per-address limiter); the
@@ -79,6 +80,8 @@ const NOT_EXERCISED = {
 const NOT_EXERCISED_ANY_429 = (key) => key.endsWith(' 429');
 
 const ID_ZERO = '0123456789abcdef01234567';
+// The red fixture wine's sweetness style, as every documented read sends it.
+const STYLE = { name: 'dry', band: 'dry', scale: 'still', regulated: true, source: 'producer', sourceUrl: 'https://www.example.com/chateau-exemple/wines' };
 
 let world;
 let server;
@@ -176,10 +179,31 @@ describeWithMongo('public API contract', () => {
     expect(placed.personal).toEqual([expect.objectContaining({ key: 'Closure', value: 'cork', level: 'bottle', by: 'alice' })]);
     const wine = first.body.wines[String(world.wines.red._id)];
     expect(wine.profile).not.toHaveProperty('description');
+    // The sweetness style in its documented shape, never the stored one.
+    expect(wine.sweetnessStyle).toEqual(STYLE);
+    expect(first.body.wines[String(world.wines.white._id)].sweetnessStyle).toBeNull();
+    // The category each record reads as, and what it rests on.
+    expect(wine).toMatchObject({ sweetnessCategory: 'dry', sweetnessCategoryBasis: 'style' });
+    expect(first.body.wines[String(world.wines.white._id)]).toMatchObject({ sweetnessCategory: 'dry', sweetnessCategoryBasis: 'label' });
 
     await expectContract('getInventory', 304, { token: 'read', headers: { 'If-None-Match': first.headers.etag } });
     await expectContract('getInventory', 401, { token: 'revoked' });
     await expectContract('getInventory', 403, { token: 'consume' });
+
+    // include=consumed: the drunk bottle joins in the same shape; on order stays out; its own tag.
+    const all = await expectContract('getInventory', 200, { token: 'read', query: '?include=consumed' });
+    expect(all.headers.etag).not.toBe(first.headers.etag);
+    const allIds = all.body.bottles.map((x) => x.id);
+    expect(allIds).toEqual(expect.arrayContaining([...ids, b('drunk')]));
+    expect(allIds).not.toContain(b('ordered'));
+    expect(all.body.bottles.find((x) => x.id === b('drunk'))).toMatchObject({
+      status: 'drank', maturity: null, location: null, consumed: { at: expect.any(String) },
+    });
+    expect(first.body.bottles.every((x) => x.status === 'active' && x.consumed === null)).toBe(true);
+    expect(first.body).not.toHaveProperty('consumedTotal');
+    const leftCount = all.body.bottles.filter((x) => x.status !== 'active').length;
+    expect(all.body).toMatchObject({ consumedTotal: leftCount, consumedTruncated: false });
+    await expectContract('getInventory', 400, { token: 'read', query: '?include=everything' });
   });
 
   test('inventory: the per-user limiter answers a documented 429', async () => {
@@ -219,11 +243,24 @@ describeWithMongo('public API contract', () => {
     expect(page.body.bottles).toMatchObject({ limit: 2, skip: 1, count: 2 });
     await expectContract('listBottles', 200, { token: 'read', query: '?maturity=late,declining' });
     await expectContract('listBottles', 200, { token: 'read', query: '?status=consumed&sort=-vintage' });
+    const dry = await expectContract('listBottles', 200, { token: 'read', query: '?sweetnessCategory=dry' });
+    expect(dry.body.bottles.items.length).toBeGreaterThan(0);
+    expect(dry.body.bottles.items.every((x) => x.wineDefinition.sweetnessCategory === 'dry')).toBe(true);
+    const sweet = await expectContract('listBottles', 200, { token: 'read', query: '?sweetnessCategory=sweet,not-stated' });
+    expect(sweet.body.bottles.total).toBe(0);
     await expectContract('listBottles', 401, { token: 'revoked' });
     await expectContract('listBottles', 403, { token: 'consume' });
 
     const one = await expectContract('getBottle', 200, { token: 'read', params: { bottleId: b('b1') } });
     expect(one.body.rackInfo).toMatchObject({ position: 5 });
+    // The sweetness style in its documented shape on the list (a lean read) and
+    // the detail (a toObject() copy) alike.
+    expect(one.body.bottle.wineDefinition.sweetnessStyle).toEqual(STYLE);
+    expect(one.body.bottle.wineDefinition).toMatchObject({ sweetnessCategory: 'dry', sweetnessCategoryBasis: 'style' });
+    const all = await expectContract('listBottles', 200, { token: 'read' });
+    const listed = all.body.bottles.items.find((x) => x._id === b('b1'));
+    expect(listed.wineDefinition.sweetnessStyle).toEqual(STYLE);
+    expect(all.body.bottles.items.find((x) => x._id === b('b3')).wineDefinition.sweetnessStyle).toBeNull();
     await expectContract('getBottle', 200, { token: 'read', params: { bottleId: b('b4') } });
     const cleared = await expectContract('getBottle', 200, { token: 'read', params: { bottleId: b('cleared') } });
     expect(cleared.body.bottle).toMatchObject({ location: null, notes: null, purchaseLocation: null });
@@ -275,12 +312,130 @@ describeWithMongo('public API contract', () => {
     await expectContract('consumeBottle', 404, { token: 'consume', params: { bottleId: ID_ZERO }, body: {} });
   });
 
+  // The three moves run in this order on one world: the grid starts with b2 in
+  // slot 4 and the fridge with b1 in slot 5; b3 and `late` are in no rack.
+  test('place: a free slot, a move from another rack, an occupied slot, refusals', async () => {
+    const home = String(world.cellars.home._id);
+    const grid = String(world.racks.grid._id);
+    const fridge = String(world.racks.fridge._id);
+    const slot = (position) => ({ rackId: grid, position });
+
+    const placed = await expectContract('placeBottle', 200, { token: 'write', params: slot(1), body: { bottleId: b('b3'), expectOccupant: null } });
+    expect(placed.body.displaced).toBeNull();
+    // The summary form: a slot carries the bottle's id, never the bottle.
+    expect(placed.body.rack.slots.map((s) => [s.position, s.bottle]).sort()).toEqual([[1, b('b3')], [4, b('b2')]]);
+
+    // A bottle sits in one slot: placed in the grid, b1 has left the fridge.
+    await expectContract('placeBottle', 200, { token: 'write', params: slot(2), body: { bottleId: b('b1') } });
+    const racks = await call('listRacks', { token: 'read', query: `?cellar=${home}&summary=1` });
+    expect(racks.body.racks.find((r) => r._id === fridge).slots).toEqual([]);
+
+    // An occupied slot: refused when the caller expected it free, else the
+    // bottle there leaves the rack and is named.
+    const refused = await expectContract('placeBottle', 409, { token: 'write', params: slot(4), body: { bottleId: b('late'), expectOccupant: null } });
+    expect(refused.body.code).toBe('slot_changed');
+    const swapped = await expectContract('placeBottle', 200, { token: 'write', params: slot(4), body: { bottleId: b('late') } });
+    expect(swapped.body.displaced).toBe(b('b2'));
+
+    await expectContract('placeBottle', 400, { token: 'write', params: slot(99), body: { bottleId: b('b2') } });
+    await expectContract('placeBottle', 400, { token: 'write', params: slot(3), body: { bottleId: b('ordered') } });
+    await expectContract('placeBottle', 400, { token: 'write', params: slot(3), body: { bottleId: b('drunk') } });
+    await expectContract('placeBottle', 401, { token: 'revoked', params: slot(3), body: { bottleId: b('b2') } });
+    await expectContract('placeBottle', 403, { token: 'read', params: slot(3), body: { bottleId: b('b2') } });
+    await expectContract('placeBottle', 404, { token: 'write', params: { rackId: ID_ZERO, position: 3 }, body: { bottleId: b('b2') } });
+    // A bottle of another cellar reads like one that does not exist.
+    await expectContract('placeBottle', 404, { token: 'write', params: slot(3), body: { bottleId: b('bobs') } });
+
+    // A slot number too long to be one is outside the documented path: 403,
+    // and slot 1 keeps its bottle.
+    await expectContract('placeBottle', 403, { token: 'write', params: slot('1000000000000000000000'), body: { bottleId: b('b2'), expectOccupant: null } });
+    const after = await call('listRacks', { token: 'read', query: `?cellar=${home}&summary=1` });
+    expect(after.body.racks.find((r) => r._id === grid).slots.find((s) => s.position === 1).bottle).toBe(b('b3'));
+
+    // Bob's racks: one in a cellar alice only views (403), one she cannot see (404, like a rack that does not exist).
+    const Cellar = require('../models/Cellar');
+    const Rack = require('../models/Rack');
+    const bob = world.users.bob._id;
+    const viewed = await Cellar.create({ name: 'Viewed', user: bob, members: [{ user: world.users.alice._id, role: 'viewer' }] });
+    const hidden = await Cellar.create({ name: 'Hidden', user: bob });
+    const rackIn = async (cellar) => String((await Rack.create({ cellar: cellar._id, user: bob, name: 'Shelf', type: 'grid', rows: 1, cols: 2 }))._id);
+    await expectContract('placeBottle', 403, { token: 'write', params: { rackId: await rackIn(viewed), position: 1 }, body: { bottleId: b('b2') } });
+    await expectContract('placeBottle', 404, { token: 'write', params: { rackId: await rackIn(hidden), position: 1 }, body: { bottleId: b('b2') } });
+  });
+
+  test('unplace: the bottle leaves the slot, an empty slot is fine, refusals', async () => {
+    const grid = String(world.racks.grid._id);
+    const slot = (position) => ({ rackId: grid, position });
+
+    const out = await expectContract('unplaceBottle', 200, { token: 'write', params: slot(1), query: `?expect=${b('b3')}` });
+    expect(out.body.removed).toBe(b('b3'));
+    expect(out.body.rack.slots.map((s) => s.position).sort()).toEqual([2, 4]);
+    const empty = await expectContract('unplaceBottle', 200, { token: 'write', params: slot(1) });
+    expect(empty.body.removed).toBeNull();
+
+    // Slot 2 holds b1, not the bottle the caller expected.
+    const refused = await expectContract('unplaceBottle', 409, { token: 'write', params: slot(2), query: `?expect=${b('b3')}` });
+    expect(refused.body.code).toBe('slot_changed');
+    // The grid has six slots.
+    await expectContract('unplaceBottle', 400, { token: 'write', params: slot(99) });
+    await expectContract('unplaceBottle', 401, { token: 'revoked', params: slot(2) });
+    await expectContract('unplaceBottle', 403, { token: 'consume', params: slot(2) });
+    await expectContract('unplaceBottle', 404, { token: 'write', params: { rackId: ID_ZERO, position: 2 } });
+  });
+
+  test('move: to another cellar of your own or one you edit, out of its rack; refusals', async () => {
+    const Cellar = require('../models/Cellar');
+    const attic = String((await Cellar.create({ name: 'Attic', user: world.users.alice._id }))._id);
+    const id = b('b1'); // in the grid, slot 2
+
+    const res = await expectContract('moveBottle', 200, { token: 'write', params: { bottleId: id }, body: { toCellarId: attic } });
+    // The wine as its id, like the consume answer.
+    expect(res.body.bottle).toMatchObject({ _id: id, cellar: attic, status: 'active', wineDefinition: String(world.wines.red._id) });
+    const after = await call('getBottle', { token: 'read', params: { bottleId: id } });
+    expect(after.body.rackInfo).toBeNull();
+
+    await expectContract('moveBottle', 400, { token: 'write', params: { bottleId: id }, body: { toCellarId: 'attic' } });
+    await expectContract('moveBottle', 400, { token: 'write', params: { bottleId: id }, body: { toCellarId: attic } }); // already there
+    await expectContract('moveBottle', 400, { token: 'write', params: { bottleId: id }, body: { toCellarId: 12345 } });
+    await expectContract('moveBottle', 400, { token: 'write', params: { bottleId: b('drunk') }, body: { toCellarId: attic } });
+    await expectContract('moveBottle', 401, { token: 'revoked', params: { bottleId: id }, body: { toCellarId: attic } });
+    await expectContract('moveBottle', 403, { token: 'read', params: { bottleId: id }, body: { toCellarId: attic } });
+    await expectContract('moveBottle', 404, { token: 'write', params: { bottleId: ID_ZERO }, body: { toCellarId: attic } });
+
+    // An editor of a shared cellar moves its bottles out, and back in. A
+    // bottle belongs to the owner of the cellar it is in (read from the
+    // database: the owner is not part of the documented answer).
+    const Bottle = require('../models/Bottle');
+    const ownerOf = async (id) => String((await Bottle.findById(id).select('user').lean()).user);
+    const shared = String(world.cellars.shared._id);
+    const out = await expectContract('moveBottle', 200, { token: 'write', params: { bottleId: b('bobs') }, body: { toCellarId: attic } });
+    expect(out.body.bottle).toMatchObject({ _id: b('bobs'), cellar: attic });
+    expect(await ownerOf(b('bobs'))).toBe(String(world.users.alice._id));
+    const back = await expectContract('moveBottle', 200, { token: 'write', params: { bottleId: b('bobs') }, body: { toCellarId: shared } });
+    expect(back.body.bottle).toMatchObject({ _id: b('bobs'), cellar: shared });
+    expect(await ownerOf(b('bobs'))).toBe(String(world.users.bob._id));
+
+    // A viewer moves nothing: a bottle out of the cellar is refused, and the
+    // cellar as a destination reads like one that does not exist.
+    const bob = world.users.bob._id;
+    const viewed = await Cellar.create({ name: 'Viewed for moves', user: bob, members: [{ user: world.users.alice._id, role: 'viewer' }] });
+    const viewedBottle = String((await Bottle.create({ user: bob, cellar: viewed._id, wineDefinition: world.wines.white._id, vintage: '2021' }))._id);
+    await expectContract('moveBottle', 403, { token: 'write', params: { bottleId: viewedBottle }, body: { toCellarId: attic } });
+    await expectContract('moveBottle', 404, { token: 'write', params: { bottleId: id }, body: { toCellarId: String(viewed._id) } });
+  });
+
   test('climate ingest', async () => {
     const res = await expectContract('ingestClimate', 202, {
       token: 'climate',
-      body: { readings: [{ channel: 'fridge', type: 'temperature', value: 12.4 }, { channel: 'fridge', type: 'humidity', value: 'wet' }] },
+      body: { readings: [
+        { channel: 'fridge', type: 'temperature', value: 12.4 },
+        { channel: 'fridge', type: 'humidity', value: 'wet' },
+        // The documented `unit`: °F is converted on arrival, anything else is rejected.
+        { channel: 'fridge', type: 'temperature', value: 55, unit: 'F' },
+        { channel: 'fridge', type: 'temperature', value: 12, unit: 'K' },
+      ] },
     });
-    expect(res.body).toMatchObject({ accepted: 1, rejected: 1 });
+    expect(res.body).toMatchObject({ accepted: 2, rejected: 2 });
     await expectContract('ingestClimate', 400, { token: 'climate', body: { readings: [] } });
     await expectContract('ingestClimate', 401, { token: 'revoked', body: { readings: [] } });
     await expectContract('ingestClimate', 403, { token: 'read', body: { readings: [] } });
@@ -298,7 +453,22 @@ describeWithMongo('public API contract', () => {
     await expectContract('revokeOwnToken', 403, { token: 'climate' });
   });
 
-  test('an undocumented route a token used to reach still answers, announces its end, and is counted', async () => {
+  // Until the sunset a route a token used to reach still answers, announces
+  // its end and is counted; from that day on it is refused like any route
+  // outside the reference. Each side is tested only while it is true.
+  const { SUNSET: DEPRECATION_SUNSET } = require('../config/apiDeprecations');
+  const beforeSunset = Date.now() < DEPRECATION_SUNSET.getTime();
+
+  (beforeSunset ? test.skip : test)('from the sunset on, an undocumented route a token used to reach answers 403', async () => {
+    const home = String(world.cellars.home._id);
+    const res = await fetch(`${base}/api/cellars/${home}/statistics`, {
+      headers: { Authorization: `Bearer ${world.tokens.read.raw}` },
+    });
+    expect(res.status).toBe(403);
+    expect(res.headers.get('deprecation')).toBeNull();
+  });
+
+  (beforeSunset ? test : test.skip)('an undocumented route a token used to reach still answers, announces its end, and is counted', async () => {
     const ApiDeprecatedUse = require('../models/ApiDeprecatedUse');
     const { SUNSET } = require('../config/apiDeprecations');
     const home = String(world.cellars.home._id);
@@ -323,6 +493,20 @@ describeWithMongo('public API contract', () => {
     expect(junk.status).toBeGreaterThanOrEqual(400);
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(await ApiDeprecatedUse.countDocuments()).toBe(1);
+
+    // The token that called is marked with the route, and its owner is told
+    // once, whatever it calls next (services/apiDeprecationNotices).
+    const ApiToken = require('../models/ApiToken');
+    const Notification = require('../models/Notification');
+    const told = () => Notification.countDocuments({ user: world.users.alice._id, type: 'api_deprecation' });
+    for (let i = 0; i < 40 && (await told()) === 0; i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    const mark = (await ApiToken.findById(world.tokens.read.doc._id).lean()).deprecatedUse;
+    expect(mark).toMatchObject({ sunset: SUNSET, routes: ['GET /api/cellars/:id/statistics'] });
+    expect(mark.notifiedAt).toBeInstanceOf(Date);
+    expect(await told()).toBe(1);
+    await fetch(`${base}/api/cellars/${home}/statistics`, { headers: { Authorization: `Bearer ${world.tokens.read.raw}` } });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(await told()).toBe(1);
   });
 
   test('a path in another letter case cannot reach what tokens are kept from', async () => {

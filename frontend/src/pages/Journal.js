@@ -8,6 +8,7 @@ import { getJournalEntries, deleteJournalEntry } from '../api/journal';
 import ConfirmModal from '../components/ConfirmModal';
 import LoadError from '../components/LoadError';
 import './Journal.css';
+import { formatVintage } from '../utils/vintage';
 
 const JournalEntryForm = lazy(() => import('../components/JournalEntryForm'));
 
@@ -108,7 +109,7 @@ export default function Journal() {
   };
 
   // A refused or failed delete throws, so the confirm dialog stays open and
-  // says why — it used to close as if the entry had gone.
+  // says why instead of closing as if the entry had gone.
   const handleDelete = async (id) => {
     const res = await deleteJournalEntry(apiFetch, id);
     if (!res.ok) throw httpError(res, await res.json().catch(() => null));
@@ -132,11 +133,13 @@ export default function Journal() {
 
   return (
     <div className="journal-page">
-      <div className="journal-header">
+      <div className="page-header">
         <h1>{t('journal.title', 'Wine Journal')}</h1>
-        <button className="btn btn-primary" onClick={() => { setEditEntry(null); setFormOpen(true); }}>
-          + {t('journal.newEntry', 'New Entry')}
-        </button>
+        <div className="header-actions">
+          <button className="btn btn-primary" onClick={() => { setEditEntry(null); setFormOpen(true); }}>
+            + {t('journal.newEntry', 'New Entry')}
+          </button>
+        </div>
       </div>
 
       {/* Filters */}
@@ -233,7 +236,7 @@ export default function Journal() {
                                 <div className="journal-card__pairing-wine">
                                   <span className="journal-card__pairing-icon">{t('journal.wine', 'Wine')}</span>
                                   <span className="journal-card__pairing-text">
-                                    {wineName || '—'}{vintage ? ` ${vintage}` : ''}
+                                    {wineName || '—'}{vintage ? ` ${formatVintage(vintage, t)}` : ''}
                                   </span>
                                 </div>
                               </div>

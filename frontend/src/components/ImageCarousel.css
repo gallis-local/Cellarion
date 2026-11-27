@@ -193,7 +193,7 @@
   }
 }
 
-/* Delete / report control (ticket 6a865f60). Sits left of the default star so
+/* Delete / report control. Sits left of the default star so
    the two never overlap, and reveals on hover exactly like it — a destructive
    control should not shout on a page you are only reading. Kept visible on
    :focus-visible so it is reachable by keyboard, where "hover" never happens. */
@@ -226,6 +226,11 @@
   color: #fff;
 }
 
+/* No default star (a gallery that cannot set one): the corner is free. */
+.carousel-action-btn--corner {
+  right: 6px;
+}
+
 /* Touch has no hover: on coarse pointers the control is always available. */
 @media (hover: none) {
   .carousel-action-btn { opacity: 1; }
@@ -249,12 +254,12 @@
   gap: 0.5rem;
 }
 
-/* The owner's own photo: its review state as a pill (discussion #1227). */
+/* The owner's own photo: its review state as a pill. */
 .carousel-state { position: absolute; top: 6px; left: 6px; font-size: 0.65rem; font-weight: 600; letter-spacing: 0.02em; padding: 2px 8px; border-radius: 999px; background: rgba(0, 0, 0, 0.62); color: #fff; pointer-events: none; }
 .carousel-state-published { background: rgba(47, 122, 58, 0.88); }
 .carousel-state-review { background: rgba(161, 92, 0, 0.88); }
 
-/* A wine-level photo of another vintage names its year (ticket 2026-10-09). */
+/* A wine-level photo of another vintage names its year. */
 .carousel-vintage {
   position: absolute;
   top: 0.5rem;

@@ -3,13 +3,10 @@ const { requireAuth, requireNonDemo } = require('../middleware/auth');
 const JournalEntry = require('../models/JournalEntry');
 const Bottle = require('../models/Bottle');
 const WineDefinition = require('../models/WineDefinition');
-const { logAudit } = require('../services/audit');
-// Entry sanitisation / ref validation / create / delete live in
+// Entry sanitisation, ref validation, create, update and delete live in
 // services/journalOps.js — ONE implementation shared with the MCP
 // capture_tasting_note tool, so the two surfaces cannot drift.
-const {
-  sanitizeEntry, validatePairingRefs, createEntry, deleteEntry, OCCASIONS,
-} = require('../services/journalOps');
+const { createEntry, updateEntry, deleteEntry, OCCASIONS } = require('../services/journalOps');
 const { escapeRegex } = require('../utils/sanitize');
 const { isValidId } = require('../utils/validation');
 const { CONSUMED_STATUSES } = require('../config/constants');
@@ -18,7 +15,7 @@ const router = express.Router();
 router.use(requireAuth);
 
 /**
- * Read-time privacy gate for populated people[].user (audit L-5). A private
+ * Read-time privacy gate for populated people[].user. A private
  * profile's username/displayName must not be resolvable by tagging its
  * ObjectId in a journal entry — that would re-open the enumeration oracle
  * users.js GET /public/:userId closes. Private users (other than the
@@ -56,7 +53,7 @@ router.get('/wine-search', async (req, res) => {
     // mongoSearch): a quarantined non-wine row and a pendingIdentity row are
     // not pickable registry content. Without them this regex-over-the-whole-
     // registry picker was the one authenticated surface handing out pending
-    // wine IDS — which other tools then accept as a wine_id (security audit).
+    // wine IDS — which other tools then accept as a wine_id.
     const matchedWines = await WineDefinition.find({
       $or: [{ name: regex }, { producer: regex }],
       pendingIdentity: { $ne: true },
@@ -69,10 +66,10 @@ router.get('/wine-search', async (req, res) => {
 
     // Active bottles ("your cellar") AND the ones already drunk, as a separate
     // section, newest consumption first. A tasting journal is a record of
-    // wines one has drunk, and the picker used to offer only what was still
-    // in the rack — so every finished single bottle fell back to typed text
-    // with no producer, no vintage and no reference (chfish ticket 6aa6c200,
-    // 2026-09-13). Recently consumed bottles are the likeliest subject.
+    // wines one has drunk; a picker offering only what is still in the rack
+    // would leave every finished single bottle as typed text with no producer,
+    // no vintage and no reference. Recently consumed bottles are the likeliest
+    // subject.
     const [bottles, consumedBottles] = matchedWineIds.length
       ? await Promise.all([
           Bottle.find({ user: req.user.id, status: 'active', wineDefinition: { $in: matchedWineIds } })
@@ -183,21 +180,13 @@ router.post('/', requireNonDemo, async (req, res) => {
 // PUT /api/journal/:id — update an entry
 router.put('/:id', async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
+    const result = await updateEntry(req.user.id, req.params.id, req.body, req);
+    if (result.notFound) return res.status(404).json({ error: 'Entry not found' });
+    if (result.error) return res.status(result.error.status).json({ error: result.error.message });
 
-    const entry = await JournalEntry.findOne({ _id: req.params.id, user: req.user.id });
-    if (!entry) return res.status(404).json({ error: 'Entry not found' });
-
-    const clean = sanitizeEntry(req.body);
-    await validatePairingRefs(clean, req.user.id);
-    Object.assign(entry, clean);
-    await entry.save();
-
-    const populated = await JournalEntry.findById(entry._id)
+    const populated = await JournalEntry.findById(result.entry._id)
       .populate(POPULATE_PAIRINGS)
       .lean();
-
-    logAudit(req, 'journal.update', { type: 'journal', id: entry._id });
 
     res.json({ entry: redactPeople(populated, req.user.id) });
   } catch (err) {

@@ -36,10 +36,10 @@ const viaDetail = (via) => (via ? { via } : {});
 // A photo uploaded on a bottle carries no wine of its own — the bottle does.
 // Publishing it (approved + public) makes it a photo OF THE WINE: every owner
 // of that wine sees it in their gallery and can pick it as their bottle's
-// picture, and it can become the wine's registry image. Until 2026-09-27 the
-// approve and visibility routes left the wine reference empty, so a published
-// bottle photo was visible on that one bottle only, never reached the wine,
-// and approving from the queue needed a second "assign to wine" click.
+// picture, and it can become the wine's registry image. So approving or
+// publishing fills in the wine reference: without it a published bottle photo
+// would be visible on that one bottle only, never reach the wine, and
+// approving from the queue would need a second "assign to wine" click.
 // Resolves the wine through the bottle when the row has none; a photo that
 // already carries a wine (a wine-level upload) keeps it. Returns the wine id.
 async function linkWineViaBottle(image) {
@@ -60,14 +60,14 @@ async function linkWineViaBottle(image) {
  *   false   — never. A back label is published in the gallery but must not
  *             become the picture just because it was approved first.
  */
-async function approveImage({ imageId, actorId, visibility = 'public', official = 'auto', replaceMain = false, req, via }) {
+async function approveImage({ imageId, actorId, visibility = 'public', official = 'auto', replaceMain = false, req, via, notify = true }) {
   if (!isValidId(imageId)) return fail('invalid_input', 'Invalid ID');
   const image = await BottleImage.findById(imageId);
   if (!image) return fail('not_found', 'Image not found');
   if (!['processed', 'uploaded'].includes(image.status)) {
     return fail('invalid_input', 'Image cannot be approved in current state');
   }
-  // Never a label scan (audit L-6): it is a private frame kept only so a
+  // Never a label scan: it is a private frame kept only so a
   // curator can read an unreadable label. Promoting one to a wine's official
   // image makes it public AND sets assignedToWine, which moves it out of the
   // delete branch of account deletion into the anonymise branch, so the
@@ -102,7 +102,7 @@ async function approveImage({ imageId, actorId, visibility = 'public', official 
   image.reviewedAt = new Date();
   // Approving a REPORTED photo is the answer to that report: clear the
   // needs-a-look flag, but keep the reports themselves so a photo raised
-  // repeatedly still shows its history (ticket 6a865f60).
+  // repeatedly still shows its history.
   image.reportedAt = null;
   // Published: the photo belongs to the wine from here on (linkWineViaBottle).
   // A private approval stays the uploader's own bottle photo.
@@ -117,7 +117,9 @@ async function approveImage({ imageId, actorId, visibility = 'public', official 
     processImage(image._id).catch((err) => console.error('Post-approval processing error:', err.message));
   }
 
-  incrementCred(image.uploadedBy, 'image_approved').catch(() => {});
+  // Cred is for a photo someone approved; one published as uploaded
+  // (services/trustedContributions) was not.
+  if (via !== 'unreviewed') incrementCred(image.uploadedBy, 'image_approved').catch(() => {});
 
   // Resolve the wine for the notification label regardless of visibility —
   // private approvals should still name the wine (the reject path does).
@@ -149,13 +151,17 @@ async function approveImage({ imageId, actorId, visibility = 'public', official 
   const wineLabel = approvedWine
     ? `"${approvedWine.name}" by ${approvedWine.producer}`
     : 'a wine';
-  createNotification(
-    image.uploadedBy,
-    'image_approved',
-    'Image approved',
-    `Your image for ${wineLabel} has been approved.`,
-    null
-  );
+  // notify:false = applied as uploaded on a server that does not review
+  // photos (services/trustedContributions): nobody decided anything to tell.
+  if (notify) {
+    createNotification(
+      image.uploadedBy,
+      'image_approved',
+      'Image approved',
+      `Your image for ${wineLabel} has been approved.`,
+      null
+    );
+  }
 
   logAudit(req, 'admin.image.approve',
     { type: 'image', id: image._id },
@@ -260,7 +266,7 @@ async function setOfficialImage({ imageId, actorId, replaceMain = true, clearRep
   const image = await BottleImage.findById(imageId).populate('bottle', 'wineDefinition');
   if (!image) return fail('not_found', 'Image not found');
   if (image.status === 'rejected') return fail('invalid_input', 'Rejected images cannot be set as official');
-  // Never a label scan (audit L-6) — see approveImage.
+  // Never a label scan — see approveImage.
   if (image.kind === 'label-scan') return fail('invalid_input', LABEL_SCAN_MSG);
 
   const imageUrl = image.processedUrl || image.originalUrl;
@@ -364,7 +370,7 @@ async function setImageVisibility({ imageId, actorId, visibility, clearReport = 
 
 /**
  * Answer a report with "the photo is fine as it is": the needs-a-look flag is
- * cleared, the reports themselves stay as history (ticket 6a865f60).
+ * cleared, the reports themselves stay as history.
  */
 async function dismissImageReport({ imageId, actorId, req, via }) {
   if (!isValidId(imageId)) return fail('invalid_input', 'Invalid ID');

@@ -120,7 +120,9 @@
   font-size: 0.9rem;
 }
 
-.form-group input:not([type="checkbox"]),
+/* Text-like fields only: a radio given the field box renders as a full-width
+   44px circle above its label. */
+.form-group input:not([type="checkbox"]):not([type="radio"]),
 .form-group textarea,
 .form-group select {
   width: 100%;
@@ -420,7 +422,7 @@
   text-align: center;
 }
 
-/* Contribution licence note under a submission form (registry lockdown 2026-09-06, L6). */
+/* Contribution licence note under a submission form. */
 .modal-hint {
   margin: 0 0 0.75rem;
   font-size: 0.82rem;
@@ -438,7 +440,7 @@
   margin-top: 1.25rem;
 }
 
-/* Shared by dialogs that open on several pages (release audit 2026-10-13: the
+/* Shared by dialogs that open on several pages (the
    pick list opened them before CellarDetail.css / BottleDetail.css loaded). */
 /* The bulk modals' forms (purchase details, consume, reserve, add to list). */
 .bulk-form .form-group { display: flex; flex-direction: column; gap: 0.25rem; margin-bottom: 0.75rem; }
@@ -450,6 +452,7 @@
 .bulk-price-row label { display: flex; flex-direction: column; gap: 0.25rem; }
 .bulk-mode-row { display: flex; flex-direction: row; gap: 1rem; }
 .move-bottle-skipped { color: var(--color-text-secondary); }
+.move-bottle-owner-note { color: var(--color-text-secondary); font-size: 0.9rem; margin: 0.5rem 0 0; }
 
 /* Consume button */
 .btn-consume {
@@ -486,9 +489,9 @@
 }
 
 /* Touch screens: small controls answer taps further than they are drawn — an
-   invisible overlay, nothing changes on screen (small icons and "×"s were hard
-   to hit with a thumb; usability pass 2026-10). Each control sets how far with
-   --tap-reach beside its own rule, and is positioned there. */
+   invisible overlay, nothing changes on screen (small icons and "×"s are hard
+   to hit with a thumb). Each control sets how far with --tap-reach beside its
+   own rule, and is positioned there. */
 @media (pointer: coarse) {
   .active-filter-chip-remove::after,
   .view-toggle-btn::after,

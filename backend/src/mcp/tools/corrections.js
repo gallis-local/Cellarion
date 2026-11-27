@@ -1,15 +1,15 @@
-// User-facing registry correction suggestions (#985 Slice A) — the regular-
-// user counterpart of the sommelier's propose_wine_correction (somm.js).
+// User-facing registry correction suggestions — the regular-user
+// counterpart of the sommelier's propose_wine_correction (somm/corrections.js).
 // Field corrections only; merge / non-wine stay sommelier tools. All
 // semantics (validation, tier budget, ban, one-pending conflict) live in
 // services/wineProposalOps.js, shared with routes/wineProposals.js.
 const { z } = require('zod');
 const { registerTool } = require('../registry');
 const ops = require('../../services/wineProposalOps');
-const { ok, fail, objectId } = require('../toolUtil');
+const { ok, fail, objectId, FIELD_DESCRIPTIONS, proposalFieldName } = require('../toolUtil');
+const { STYLE_TERM_MAX } = require('../../services/proposalFields');
 // A suggestion cannot be withdrawn, so a retry after an ambiguous transport
-// failure must be safe: idempotency_key claims/replays through the ledger
-// (support ticket 2026-09-12).
+// failure must be safe: idempotency_key claims/replays through the ledger.
 const { logAction, replay } = require('../actionLedger');
 // The replayable body stored on the ledger row: what ok() serialises.
 const envelopeOf = (summary, data) => ({ summary, data });
@@ -43,7 +43,14 @@ registerTool({
     'noticed right after filing; while SOMEONE ELSE\'s is pending the call fails with conflict. Check get_wine → ' +
     'pending_correction first: it says whether a suggestion is pending, which fields it covers and whether it is ' +
     'the caller\'s. NOT undoable via undo_last — an admin reads and decides. Sommeliers proposing merges or ' +
-    'non-wine flags use propose_wine_correction instead. ' + RETRY_NOTE,
+    'non-wine flags use propose_wine_correction instead. ALSO `sweetness_style`: the sweetness term a wine is known ' +
+    'by when its label prints none, with who names it and the page that does. A customary term (regulated: false ' +
+    'in list_sweetness_terms — feinherb, fruchtsüß …) suggested on its own, on a typed wine that has no style yet, ' +
+    'APPLIES AT ONCE (the reply says applied, and get_wine → sweetness_style shows it). Everything else is reviewed ' +
+    'like the rest: a term with a legal definition, a different style on a wine that has one, a wine with no type, ' +
+    'a style sent with other fields, and a style added while the user\'s own suggestion on that wine is still ' +
+    'waiting (it is merged into it). A style the label\'s own term or a sweetness word in the wine\'s name stands ' +
+    'against is refused, with the reason. ' + RETRY_NOTE,
   scope: 'write',
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   inputSchema: {
@@ -52,16 +59,21 @@ registerTool({
     fields: z.object({
       producer: z.string().max(200).optional(),
       name: z.string().max(200).optional(),
-      appellation: z.string().max(200).optional(),
-      region: z.string().max(200).optional(),
+      appellation: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.appellation),
+      region: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.region),
       country: z.string().max(200).optional(),
-      classification: z.string().max(200).optional(),
+      classification: z.string().max(200).optional().describe(FIELD_DESCRIPTIONS.classification),
       type: z.enum(['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified']).optional()
         .describe('The wine\'s colour/style, when the record has it wrong'),
       colour: z.enum(['red', 'white', 'rosé']).optional()
         .describe('The colour of a sparkling, dessert or fortified wine, when the record is missing it or has it wrong. Refused on a wine that stays red/white/rosé — suggest type too if that is the error.'),
       grapes: z.array(z.string().min(1).max(60)).min(1).max(12).optional()
         .describe('The COMPLETE corrected variety list (replaces the current one); every name must already be in the taxonomy'),
+      sweetness_style: z.object({
+        term: z.string().min(1).max(STYLE_TERM_MAX),
+        source: z.enum(['producer', 'trade']),
+        source_url: z.string().max(500).optional(),
+      }).optional().describe(FIELD_DESCRIPTIONS.sweetnessStyle),
     }).describe('Only the fields that should CHANGE, with their corrected values'),
     reason: z.string().min(10).max(1000).describe('What is wrong and how it was verified'),
     evidence_url: z.string().max(500).optional().describe('http(s) link backing the claim — strongly encouraged'),
@@ -78,6 +90,13 @@ registerTool({
     // guarantee of ours — so it is dropped here too, where a test can pin it.
     const fields = { ...(args.fields || {}) };
     delete fields.newGrapes;
+    // The style in the service's own shape; its link falls back to
+    // evidence_url there (services/proposalFields readProposedFields).
+    if (fields.sweetness_style) {
+      const s = fields.sweetness_style;
+      fields.sweetnessStyle = { term: s.term, source: s.source, url: s.source_url };
+    }
+    delete fields.sweetness_style;
 
     const result = await ops.createFieldCorrection(
       ctx.user.id,
@@ -89,11 +108,36 @@ registerTool({
       return fail(FAIL_CODE[result.code] || 'invalid_input', result.message + hint);
     }
     const pf = result.proposal.proposedFields;
-    const allFields = Object.keys(pf && typeof pf.toObject === 'function' ? pf.toObject() : pf || {});
+    const allFields = Object.keys(pf && typeof pf.toObject === 'function' ? pf.toObject() : pf || {}).map(proposalFieldName);
     const label = `${result.wine.producer || '?'} — ${result.wine.name}`;
-    const envelope = result.amended
+    const envelope = result.applied && result.appliedBecause === 'sweetness_style'
+      // A sourced style on a wine that had none applies on filing.
       ? envelopeOf(
-        `Your pending suggestion for ${label} was amended with ${result.amendedFields.join(', ')} — it now covers ${allFields.join(', ')} (admin will review)`,
+        `Applied to ${label}: sweetness_style ${pf.sweetnessStyle.term} (named by the ${pf.sweetnessStyle.source})`,
+        {
+          proposal_id: result.proposal._id,
+          status: 'approved',
+          amended: !!result.amended,
+          fields: allFields,
+          note: 'Applied at once: a sweetness style with its source, on a wine that had none, needs no review. '
+            + 'get_wine → sweetness_style shows it. A curator can still read the filing and change it.',
+        }
+      )
+      : result.applied
+      // A server that does not review contributions applied it as filed.
+      ? envelopeOf(
+        `Applied to ${label}: ${allFields.join(', ')} (this server does not review contributions)`,
+        {
+          proposal_id: result.proposal._id,
+          status: 'approved',
+          amended: !!result.amended,
+          fields: allFields,
+          note: 'Applied at once: this server\'s admin turned review of contributions off. get_wine shows the corrected record.',
+        }
+      )
+      : result.amended
+      ? envelopeOf(
+        `Your pending suggestion for ${label} was amended with ${result.amendedFields.map(proposalFieldName).join(', ')} — it now covers ${allFields.join(', ')} (admin will review)`,
         {
           proposal_id: result.proposal._id,
           status: 'pending',

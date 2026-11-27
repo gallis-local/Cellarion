@@ -1,5 +1,5 @@
 /**
- * Public key vocabulary + values (#985 Slice B) — ONE implementation shared
+ * Public key vocabulary + values — ONE implementation shared
  * by the REST routes (routes/registryData.js, routes/admin/registryData.js)
  * and the MCP tools (mcp/tools/registryData.js).
  *
@@ -9,7 +9,7 @@
  * WineDefinition and nothing auto-applies — the registry stays human-gated.
  *
  * Results are transport-neutral: { ok: true, ... } | { ok: false, code,
- * message } — codes: invalid | banned | limit | not_found | conflict.
+ * message } — codes: invalid | banned | limit | not_found | conflict | in_use.
  */
 const RegistryDataKey = require('../models/RegistryDataKey');
 const RegistryDataValue = require('../models/RegistryDataValue');
@@ -17,11 +17,18 @@ const { originFrom } = require('../utils/contributionOrigin');
 const { findVisibleWine } = require('./wineVisibility');
 const { validateValue, validateKeyDefinition } = require('../utils/personalDataTypes');
 const { checkContributionGate } = require('./contributionGate');
+const { appliesDirectly } = require('./trustedContributions');
 const { stripHtml } = require('../utils/sanitize');
 const { isValidId, parseAndValidateVintage } = require('../utils/validation');
 const { localizedName, sanitizeTranslations } = require('../utils/localizedName');
 const { logAudit } = require('./audit');
 const { createNotification } = require('./notifications');
+const { awardValue, SUPERSEDED_REASON } = require('./suggestionCred');
+const { matchKeyByName } = require('../utils/registryKeyName');
+
+// The one-row-per-slot index of models/RegistryDataValue (partial on
+// suggested + published, so a query for published rows may use it).
+const VALUES_BY_WINE_INDEX = { wineDefinition: 1, key: 1, vintage: 1, status: 1 };
 
 // Names that would shadow first-class record fields — a key called
 // "producer" or "region" must never exist beside the real thing.
@@ -29,13 +36,16 @@ const RESERVED_NAMES = [
   'producer', 'name', 'appellation', 'region', 'country', 'classification',
   'type', 'grapes', 'vintage', 'body', 'tannin', 'acidity', 'sweetness',
   'flavors', 'flavours', 'description', 'rating', 'price',
+  // The label sweetness term is a first-class field of the wine record
+  // (WineDefinition.labelSweetness): no data field may shadow it.
+  'label sweetness', 'labelsweetness',
 ];
 
 const fail = (code, message) => ({ ok: false, code, message });
 
 /**
  * The slot a value applies to: null = the wine-wide default, 'YYYY' = that
- * vintage only (2026-09-04, per-vintage overrides). Blank, 'all', NV and
+ * vintage only (a per-vintage override). Blank, 'all', NV and
  * Unknown all collapse to the default — an override records drift BETWEEN
  * years, and a bottle without a year has nothing to drift from. Anything
  * else must be a plausible year (same rule as Bottle.vintage).
@@ -68,7 +78,7 @@ function resolveForVintage(rows, vintage) {
 }
 
 // The accepted vocabulary is global, tiny, and changes only on an admin
-// decision — cache it in-process (audit: dataForWine rides the hottest page).
+// decision — cache it in-process (dataForWine rides the hottest page).
 let vocabCache = null;
 let vocabCacheAt = 0;
 const VOCAB_TTL_MS = 60 * 1000;
@@ -125,7 +135,8 @@ async function proposeKey(userId, { name, type, unit, enumOptions, rationale }, 
     return fail('conflict', `"${def.name}" is already a first-class field of the wine record.`);
   }
 
-  const gate = await checkContributionGate(userId);
+  // No daily limit where nobody reviews (services/trustedContributions).
+  const gate = await checkContributionGate(userId, { budget: !appliesDirectly(via) });
   if (!gate.ok) return gate;
 
   const existing = await RegistryDataKey.findOne({
@@ -151,6 +162,11 @@ async function proposeKey(userId, { name, type, unit, enumOptions, rationale }, 
   logAudit(req || null, 'registry_data.key_propose',
     { type: 'registry_key', id: key._id },
     { name: key.name, keyType: key.type, ...(via ? { via } : {}) });
+  // A server that does not review accepts it as proposed, decided by its proposer.
+  if (appliesDirectly(via)) {
+    const decided = await decideKey(userId, key._id, 'accept', null, { req, notify: false });
+    if (decided.ok) return { ok: true, key: decided.key, applied: true };
+  }
   return { ok: true, key: serializeKey(key) };
 }
 
@@ -161,10 +177,27 @@ async function listAcceptedKeys({ locale } = {}) {
 }
 
 /**
+ * The ACCEPTED key a member's name for it means, or null. The exact name
+ * comes first (indexed); otherwise the cached vocabulary is matched on the
+ * canonical name and every translation, ignoring case, accents and
+ * punctuation (utils/registryKeyName) — "Alkoholhalt" is ABV. A proposed or
+ * rejected key never matches: values are filed against accepted keys only.
+ */
+async function findAcceptedKeyByName(name) {
+  if (typeof name !== 'string' || !name.trim()) return null;
+  const exact = await RegistryDataKey.findOne({
+    nameKey: { $eq: name.trim().toLowerCase() },
+    status: 'accepted',
+  });
+  if (exact) return exact;
+  return matchKeyByName(await acceptedKeys(), name);
+}
+
+/**
  * Suggest a value for an ACCEPTED key on a visible wine. The key may be
  * addressed by id (keyId) or by NAME (keyName — the promotion path from a
- * personal entry resolves against nameKey server-side, so clients never
- * duplicate the matching rule).
+ * personal entry resolves server-side through findAcceptedKeyByName, so
+ * clients never duplicate the matching rule).
  *
  * `vintage` picks the slot: omitted/blank = the wine-wide default, 'YYYY' =
  * an override for that bottling only. A figure read off a label or a
@@ -178,10 +211,7 @@ async function suggestValue(userId, { wineId, keyId, keyName, value, reason, evi
     if (!isValidId(String(keyId))) return fail('invalid', 'Invalid key id');
     key = await RegistryDataKey.findOne({ _id: { $eq: String(keyId) }, status: 'accepted' });
   } else if (typeof keyName === 'string' && keyName.trim()) {
-    key = await RegistryDataKey.findOne({
-      nameKey: { $eq: keyName.trim().toLowerCase() },
-      status: 'accepted',
-    });
+    key = await findAcceptedKeyByName(keyName);
   } else {
     return fail('invalid', 'Pass keyId or keyName');
   }
@@ -203,7 +233,8 @@ async function suggestValue(userId, { wineId, keyId, keyName, value, reason, evi
   }
   const cleanReason = stripHtml(typeof reason === 'string' ? reason : '').trim().slice(0, 1000);
 
-  const gate = await checkContributionGate(userId);
+  // No daily limit where nobody reviews (services/trustedContributions).
+  const gate = await checkContributionGate(userId, { budget: !appliesDirectly(via) });
   if (!gate.ok) return gate;
 
   if (!isValidId(String(wineId))) return fail('invalid', 'Invalid wine id');
@@ -256,6 +287,17 @@ async function suggestValue(userId, { wineId, keyId, keyName, value, reason, evi
   logAudit(req || null, 'registry_data.value_suggest',
     { type: 'wine', id: wine._id },
     { key: key.name, valueId: row._id, vintage: slot.value, ...(via ? { via } : {}) });
+  // A server that does not review publishes it as suggested, decided by its suggester.
+  if (appliesDirectly(via)) {
+    const decided = await decideValue(userId, row._id, 'publish', null, { req, notify: false });
+    if (decided.ok) {
+      return {
+        ok: true,
+        applied: true,
+        value: { _id: row._id, key: serializeKey(key), value: row.value, vintage: slot.value, status: 'published' },
+      };
+    }
+  }
   return {
     ok: true,
     value: { _id: row._id, key: serializeKey(key), value: row.value, vintage: slot.value, status: row.status },
@@ -265,7 +307,7 @@ async function suggestValue(userId, { wineId, keyId, keyName, value, reason, evi
 /**
  * Everything the wine-record section needs for one wine: the accepted
  * vocabulary, published values, whether ANY suggestion occupies a key's
- * one-pending slot (audit: without this a second suggester dead-ends on a
+ * one-pending slot (without this a second suggester dead-ends on a
  * 409 the UI could not predict), and the caller's own pending suggestion.
  *
  * Gated on wine VISIBILITY like every other registry surface — a hidden
@@ -289,9 +331,9 @@ async function dataForWine(wineId, userId = null, { roles, vintage, locale } = {
   // WHO contributed a published value stays on the row (`suggestedBy` — the
   // admin queues, the audit trail and the contributor's own export read it) and
   // goes no further: this function feeds every user-facing surface (the bottle
-  // page, the connector), and none of them names the contributor (Johan,
-  // 2026-09-18 — the record is the registry's, not a byline; same rule as a
-  // correction's proposer, #930). So it is not even loaded here.
+  // page, the connector), and none of them names the contributor (the record
+  // is the registry's, not a byline; same rule as a correction's proposer).
+  // So it is not even loaded here.
   const [publishedRows, pendingRows] = await Promise.all([
     RegistryDataValue.find({ wineDefinition: { $eq: wid }, status: 'published' })
       .select('key value vintage').lean(),
@@ -344,11 +386,64 @@ async function dataForWine(wineId, userId = null, { roles, vintage, locale } = {
   };
 }
 
+/**
+ * The published value of every accepted key each bottle sees, for many bottles
+ * in one query: dataForWine's rule (the value for the bottle's vintage wins
+ * over the wine-wide default), keys narrowed to `types` when given. Caller:
+ * services/bottleSearch (cellar page, history, multi-cellar view, MCP
+ * search_bottles). Returns bottle id → [{ key, type, value }] in key name
+ * order; [] when it sees none.
+ */
+async function publishedValuesForBottles(bottles, { types } = {}) {
+  const out = new Map();
+  if (!Array.isArray(bottles) || bottles.length === 0) return out;
+  for (const b of bottles) out.set(String(b._id), []);
+  const wineOf = (b) => (b.wineDefinition ? String(b.wineDefinition._id || b.wineDefinition) : null);
+  const wineIds = [...new Set(bottles.map(wineOf).filter(Boolean))];
+  const keys = (await acceptedKeys()).filter((k) => !types || types.includes(k.type));
+  if (wineIds.length === 0 || keys.length === 0) return out;
+
+  const query = () => RegistryDataValue.find({
+    wineDefinition: { $in: wineIds },
+    key: { $in: keys.map((k) => k._id) },
+    status: 'published',
+  }).select('wineDefinition key vintage value').lean();
+  // The planner can prefer the review queue's { status, createdAt } index and
+  // read every published value in the registry; the per-slot index reads only
+  // these wines'. A hint naming an index that does not exist yet (an install
+  // still building it at boot) is an error, so that one case runs unhinted.
+  let rows;
+  try {
+    rows = await query().hint(VALUES_BY_WINE_INDEX);
+  } catch (err) {
+    if (!/hint/i.test(String(err && err.message))) throw err;
+    rows = await query();
+  }
+  const rowsOf = new Map(); // `${wine}:${key}` → that key's published rows on that wine
+  for (const r of rows) {
+    const slot = `${r.wineDefinition}:${r.key}`;
+    if (!rowsOf.has(slot)) rowsOf.set(slot, []);
+    rowsOf.get(slot).push(r);
+  }
+  for (const b of bottles) {
+    const wid = wineOf(b);
+    if (!wid) continue;
+    const asked = normaliseVintage(b.vintage);
+    const vintage = asked.ok ? asked.value : null;
+    const list = out.get(String(b._id));
+    for (const k of keys) {
+      const { row } = resolveForVintage(rowsOf.get(`${wid}:${k._id}`) || [], vintage);
+      if (row) list.push({ key: k.name, type: k.type, value: row.value });
+    }
+  }
+  return out;
+}
+
 /* ── Admin operations ────────────────────────────────────────────────── */
 
 // Review pages and the MCP review tool work oldest-first in bounded pages —
-// an unbounded triple-populate find over a growing queue is how admin pages
-// die (audit finding).
+// an unbounded triple-populate find over a growing queue would take the admin
+// page down with it.
 const REVIEW_QUEUE_LIMIT = 200;
 
 async function listReviewQueues() {
@@ -405,7 +500,7 @@ function notifyDecision(userId, type, title, message, reason) {
   });
 }
 
-async function decideKey(adminId, keyId, decision, rejectReason, { req } = {}) {
+async function decideKey(adminId, keyId, decision, rejectReason, { req, notify = true } = {}) {
   if (!isValidId(String(keyId))) return fail('invalid', 'Invalid key id');
   if (!['accept', 'reject'].includes(decision)) return fail('invalid', "decision must be 'accept' or 'reject'");
   const key = await RegistryDataKey.findOneAndUpdate(
@@ -429,8 +524,9 @@ async function decideKey(adminId, keyId, decision, rejectReason, { req } = {}) {
   // curator took the trouble to write — was reachable only through a GDPR
   // data export, so a contributor got silence either way. Fire-and-forget,
   // like every other notify call: a notification failure must never undo a
-  // recorded decision.
-  notifyDecision(
+  // recorded decision. notify:false = accepted as proposed on a server that
+  // does not review (services/trustedContributions).
+  if (notify) notifyDecision(
     key.proposedBy,
     'registry_key_decided',
     decision === 'accept' ? 'Registry key accepted' : 'Registry key not accepted',
@@ -449,7 +545,7 @@ async function decideKey(adminId, keyId, decision, rejectReason, { req } = {}) {
  * the reviewer's call when the evidence is clearly a producer spec sheet and
  * the suggester just left the (safer) vintage default selected.
  */
-async function decideValue(adminId, valueId, decision, rejectReason, { req, asWineDefault = false } = {}) {
+async function decideValue(adminId, valueId, decision, rejectReason, { req, asWineDefault = false, notify = true } = {}) {
   if (!isValidId(String(valueId))) return fail('invalid', 'Invalid value id');
   if (!['publish', 'reject'].includes(decision)) return fail('invalid', "decision must be 'publish' or 'reject'");
 
@@ -480,16 +576,17 @@ async function decideValue(adminId, valueId, decision, rejectReason, { req, asWi
   // when the reviewer widened it. Publishing supersedes ONLY the value in
   // that same slot — a new default never touches the per-vintage overrides
   // and an override never touches the default. The old row is DEMOTED to
-  // rejected (not deleted — audit finding: a crash between two writes must
-  // never destroy the only durable copy of a published value; a demoted row
-  // can be re-published by hand), then this row takes the published slot
-  // the partial unique index keeps singular.
+  // rejected, not deleted: a crash between two writes must never destroy the
+  // only durable copy of a published value (a demoted row can be re-published
+  // by hand). Then this row takes the published slot the partial unique index
+  // keeps singular. The demoted row keeps its
+  // suggester's Cellar Cred (services/suggestionCred reads SUPERSEDED_REASON).
   const widened = !!asWineDefault && !!row.vintage;
   const targetVintage = asWineDefault ? null : (row.vintage || null);
   const suggestedFor = row.vintage || null;
   await RegistryDataValue.updateOne(
     { wineDefinition: row.wineDefinition, key: row.key._id, vintage: targetVintage, status: 'published' },
-    { $set: { status: 'rejected', rejectReason: 'Superseded by a newer approval', decidedBy: adminId, decidedAt: new Date() } }
+    { $set: { status: 'rejected', rejectReason: SUPERSEDED_REASON, decidedBy: adminId, decidedAt: new Date() } }
   );
   row.vintage = targetVintage;
   row.status = 'published';
@@ -499,10 +596,13 @@ async function decideValue(adminId, valueId, decision, rejectReason, { req, asWi
   logAudit(req || null, 'registry_data.value_publish',
     { type: 'wine', id: row.wineDefinition },
     { key: row.key?.name, valueId: row._id, value: row.value, vintage: targetVintage, ...(widened ? { widenedFrom: suggestedFor } : {}) });
+  // Published: the suggester's Cellar Cred, once per row — never for a
+  // curator's own value or a staff account's. Never throws.
+  await awardValue(row);
   const where = targetVintage
     ? `on the ${targetVintage} vintage`
     : (widened ? `on the wine for every vintage (a curator judged your ${suggestedFor} figure to be the producer's general spec)` : 'on the wine');
-  notifyDecision(
+  if (notify) notifyDecision(
     row.suggestedBy,
     'registry_value_decided',
     'Suggested value published',
@@ -544,17 +644,172 @@ async function setKeyTranslations(adminId, keyId, translations, { req } = {}) {
   return { ok: true, key: serializeKey(key) };
 }
 
+/* ── Changing the vocabulary itself ──────────────────────────────────── */
+
+// The rows a key definition governs: what waits and what wine records show.
+// A rejected row is history (a declined or superseded value) and keeps the
+// form it was stored in.
+const LIVE_VALUES = ['suggested', 'published'];
+// What a key taken out of the vocabulary, and each value it held, is marked
+// with — a tombstone, never a deletion.
+const KEY_REMOVED_REASON = 'Removed from the vocabulary by an admin';
+const FIELD_REMOVED_REASON = 'Removed together with its field';
+
+/**
+ * A stored value read under a (new) definition: the ordinary entry rules,
+ * plus one allowance for a number first stored as text with the field's
+ * unit written after it ("13.5 %", "13,5%" on an ABV field created as text).
+ */
+function castForKey(def, raw) {
+  const out = validateValue(def, raw);
+  if (out.ok || !def.unit || !['integer', 'decimal'].includes(def.type) || typeof raw !== 'string') return out;
+  const s = raw.trim();
+  if (!s.toLowerCase().endsWith(def.unit.toLowerCase())) return out;
+  const bare = s.slice(0, s.length - def.unit.length).trim();
+  return bare ? validateValue(def, bare) : out;
+}
+
+/**
+ * Change a key's type, unit or allowed values (admin), so a field created the
+ * wrong way (ABV as text) has a way back. Accepted and
+ * still-proposed keys alike; the name stays (it is the identifier), and so
+ * does the id, so analytics fields and saved views keep pointing at it.
+ *
+ * Every live value is read again under the new definition. When they all
+ * fit, they are stored in the new form together with the key; when any does
+ * not, nothing changes and the answer names the values to correct first.
+ * Returns the previous definition beside the new one.
+ */
+async function updateKey(adminId, keyId, { type, unit, enumOptions } = {}, { req } = {}) {
+  if (!isValidId(String(keyId))) return fail('invalid', 'Invalid key id');
+  if (type === undefined && unit === undefined && enumOptions === undefined) {
+    return fail('invalid', 'Nothing to change — pass type, unit and/or enumOptions');
+  }
+  const key = await RegistryDataKey.findOne({ _id: { $eq: String(keyId) }, status: { $in: ['proposed', 'accepted'] } });
+  if (!key) return fail('not_found', 'No live key with that id');
+
+  // What is not passed stays; validateKeyDefinition drops a unit or a list
+  // the new type does not carry.
+  const checked = validateKeyDefinition({
+    name: key.name,
+    type: type !== undefined ? type : key.type,
+    unit: unit !== undefined ? unit : key.unit,
+    enumOptions: enumOptions !== undefined ? enumOptions : key.enumOptions,
+  });
+  if (!checked.ok) return fail('invalid', checked.error);
+  const def = checked.def;
+  const definitionOf = (d) => ({ type: d.type, unit: d.unit || null, enumOptions: d.enumOptions?.length ? [...d.enumOptions] : null });
+  const before = definitionOf(key);
+  const after = definitionOf(def);
+  if (JSON.stringify(before) === JSON.stringify(after)) return fail('invalid', `"${key.name}" is already defined that way`);
+
+  const rows = await RegistryDataValue.find({ key: key._id, status: { $in: LIVE_VALUES } })
+    .select('value wineDefinition vintage').lean();
+  const misfits = [];
+  const changes = [];
+  for (const r of rows) {
+    const cast = castForKey(def, r.value);
+    if (!cast.ok) misfits.push(r);
+    else if (cast.value !== r.value) changes.push({ _id: r._id, value: cast.value });
+  }
+  if (misfits.length) {
+    const WineDefinition = require('../models/WineDefinition');
+    const shown = misfits.slice(0, 5);
+    const wines = await WineDefinition.find({ _id: { $in: shown.map((r) => r.wineDefinition) } }).select('name producer').lean();
+    const label = new Map(wines.map((w) => [String(w._id), [w.producer, w.name].filter(Boolean).join(' — ')]));
+    const named = shown.map((r) => `"${r.value}" on ${label.get(String(r.wineDefinition)) || 'a wine'}${r.vintage ? ` ${r.vintage}` : ''}`);
+    const more = misfits.length > shown.length ? ` and ${misfits.length - shown.length} more` : '';
+    const one = misfits.length === 1;
+    return fail('in_use',
+      `${misfits.length} value${one ? '' : 's'} of "${key.name}" ${one ? 'does' : 'do'} not fit a ${def.type} field: ${named.join(', ')}${more}. ` +
+      `Correct ${one ? 'it' : 'them'} on the wine first (a newer value replaces the old one), then change the field.`);
+  }
+
+  if (changes.length) {
+    const now = new Date();
+    await RegistryDataValue.bulkWrite(changes.map((c) => ({
+      updateOne: { filter: { _id: c._id }, update: { $set: { value: c.value, updatedAt: now } } },
+    })));
+  }
+  key.type = def.type;
+  key.unit = def.unit || undefined;
+  key.enumOptions = def.enumOptions || undefined;
+  await key.save();
+  invalidateVocabCache();
+  logAudit(req || null, 'registry_data.key_update',
+    { type: 'registry_key', id: key._id }, { name: key.name, before, after, converted: changes.length });
+  return { ok: true, key: serializeKey(key), prev: before, converted: changes.length };
+}
+
+/**
+ * Take an accepted key out of the vocabulary (admin). It stays as a
+ * tombstone — rejected, like a declined proposal — so the name is free for
+ * a better-defined field, the standard-field seed (services/registryKeySeed)
+ * leaves it alone, and every value that pointed at it still has its key.
+ *
+ * A key holding values is removed only with removeValues: its waiting
+ * suggestions and published values are demoted with it (never deleted) and
+ * wine records stop showing them. Suggesters keep their cred — what they
+ * contributed was accepted (services/suggestionCred) — and whoever still
+ * waited is told. A proposed key is rejected instead (decideKey).
+ */
+async function removeKey(adminId, keyId, { removeValues = false, req } = {}) {
+  if (!isValidId(String(keyId))) return fail('invalid', 'Invalid key id');
+  const key = await RegistryDataKey.findOne({ _id: { $eq: String(keyId) }, status: 'accepted' });
+  if (!key) return fail('not_found', 'No accepted key with that id (a proposed one is rejected instead)');
+
+  const [published, suggested] = await Promise.all([
+    RegistryDataValue.countDocuments({ key: key._id, status: 'published' }),
+    RegistryDataValue.countDocuments({ key: key._id, status: 'suggested' }),
+  ]);
+  if ((published || suggested) && removeValues !== true) {
+    const held = [
+      published ? `${published} published value${published === 1 ? '' : 's'}` : null,
+      suggested ? `${suggested} waiting suggestion${suggested === 1 ? '' : 's'}` : null,
+    ].filter(Boolean).join(' and ');
+    return fail('in_use', `"${key.name}" holds ${held}. Removing the field takes them off the wine records too.`);
+  }
+
+  const now = new Date();
+  const waiting = suggested
+    ? await RegistryDataValue.distinct('suggestedBy', { key: key._id, status: 'suggested' })
+    : [];
+  if (published || suggested) {
+    await RegistryDataValue.updateMany(
+      { key: key._id, status: { $in: LIVE_VALUES } },
+      { $set: { status: 'rejected', rejectReason: FIELD_REMOVED_REASON, decidedBy: adminId, decidedAt: now, updatedAt: now } }
+    );
+  }
+  key.status = 'rejected';
+  key.rejectReason = KEY_REMOVED_REASON;
+  key.decidedBy = adminId;
+  key.decidedAt = now;
+  await key.save();
+  invalidateVocabCache();
+  logAudit(req || null, 'registry_data.key_remove',
+    { type: 'registry_key', id: key._id }, { name: key.name, published, suggested });
+  for (const userId of waiting) {
+    if (String(userId) === String(adminId)) continue;
+    notifyDecision(userId, 'registry_value_decided', 'Suggested value not published',
+      `Your suggested ${key.name} was not published: the field was removed from the registry.`);
+  }
+  return { ok: true, key: serializeKey(key), removed: { published, suggested } };
+}
+
 module.exports = {
-  RESERVED_NAMES,
   REVIEW_QUEUE_LIMIT,
   proposeKey,
   listAcceptedKeys,
+  findAcceptedKeyByName,
   suggestValue,
   dataForWine,
+  publishedValuesForBottles,
   listReviewQueues,
   decideKey,
   decideValue,
   setKeyTranslations,
+  updateKey,
+  removeKey,
   // Vintage-slot helpers — shared with the analytics query engine so a
   // bottle resolves its ABV by the same override → default rule everywhere.
   normaliseVintage,

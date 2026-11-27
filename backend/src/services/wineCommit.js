@@ -3,24 +3,15 @@
  * write (bottle add, wishlist add). The shared implementation behind the
  * `newWine` branch of POST /api/bottles and POST /api/wishlist.
  *
- * Third verse of the mint-before-commitment cleanup, same shape as the two
- * prior fixes:
- *   - v1.97: POST /api/wines/identify-text minted a WineDefinition per AI
- *     guess; measured on prod 2026-08-03, 85 of 162 createdVia:'ai' rows had
- *     zero bottles (52%). It is now read-only; see routes/wines.js.
- *   - v1.100.0 (#899): bottle import minted on /validate; /validate is now
- *     registry-read-only and wines mint on /confirm. See routes/import.js.
- *   - This one: the AddBottle/AddToWishlist UI minted on step-1 confirm via
- *     POST /api/wines/find-or-create, before any bottle existed. Measured on
- *     prod 2026-08-10: 31 zero-bottle createdVia:'ui' rows; the same day a
- *     user minted "Domaine de Riquewihr — Kaefferkopf" (village-as-producer,
- *     likely fictitious) and two minutes later attached their bottle to a
- *     DIFFERENT existing wine — the orphan would have sat in the shared
- *     registry forever. The mint now happens here, inside the commit, so an
- *     abandoned form leaves nothing behind.
+ * A registry wine is minted only inside the write that commits to it, never
+ * before a bottle exists: an abandoned form must leave nothing behind, or the
+ * orphan sits in the shared registry for good. The other entry points keep the
+ * same rule: POST /api/wines/identify-text and POST /api/wines/find-or-create
+ * create nothing (routes/wines.js), and the bottle import mints on /confirm,
+ * never on /validate (routes/import.js).
  *
- * Contract (mirrors the old find-or-create route exactly, so the UI's
- * soft-zone dialog logic carries over unchanged):
+ * Contract (the `candidates` soft zone has the shape the step-1 lookup,
+ * POST /api/wines/find-or-create, answers):
  *   resolveOrMintWine(newWine, req) →
  *     { error: { status, message } }   — client fault (validation, mint gates)
  *     { candidates: [{ wine, score }]} — dedup soft zone; NOTHING was created.
@@ -30,8 +21,8 @@
  *                                        (created:true, audited + IndexNow'd)
  *
  * newWine shape: { name, producer, country, region?, appellation?, type?,
- *   grapes?: string[], confirmCreate?: boolean, source?: 'ai' } — the exact
- *   payload POST /api/wines/find-or-create took when it still created.
+ *   grapes?: string[], confirmCreate?: boolean, source?: 'ai' } — the body
+ *   POST /api/wines/find-or-create takes, plus confirmCreate and source.
  *   `source:'ai'` marks "the user accepted an AI suggestion" and stamps
  *   createdVia:'ai'; anything else stamps 'ui' (strict allowlist, so a body
  *   value can't invent a provenance the enum would reject).
@@ -44,14 +35,14 @@ const { submitUrls } = require('./indexNow');
 // truth (imported by routes/wines.js too) mirroring what findOrCreateWine
 // enforces at its own create chokepoint — kept here as REQUEST validation so a
 // multi-MB name/producer never reaches the O(m·n) fuzzy-match scorer
-// (authenticated DoS; same rationale as the old find-or-create route).
+// (an authenticated DoS; POST /api/wines/find-or-create applies the same caps).
 const MAX_WINE_FIELD = 200;
 const MAX_GRAPES = 20;
 
 /**
- * Validate a new-wine payload against the caps the old find-or-create route
- * enforced — extracted rather than duplicated, so the resolve endpoint and
- * both commit endpoints can never drift.
+ * Validate a new-wine payload against the registry-write caps — one helper,
+ * so the resolve endpoint (POST /api/wines/find-or-create) and both commit
+ * endpoints can never drift.
  *
  * @param {object} payload
  * @param {object} [opts]
@@ -68,7 +59,7 @@ function validateNewWineFields(payload, { allowPending = false } = {}) {
   }
   const { name, producer, country, region, appellation, grapes, classification } = payload;
   // typeof, not `?.` — a non-string here must be a 400, not a thrown TypeError
-  // inside findOrCreateWine's .trim() (the identify-text hang, audit HIGH).
+  // inside findOrCreateWine's .trim(), whose rejection can hang the request.
   if (typeof name !== 'string' || !name.trim()) {
     return allowPending ? 'name is required' : 'name and producer are required';
   }
@@ -77,6 +68,11 @@ function validateNewWineFields(payload, { allowPending = false } = {}) {
   }
   if (typeof country !== 'string' || !country.trim()) {
     return 'country is required';
+  }
+  // The Other category (a drink that is not wine) is the only value besides
+  // the default; anything else is a client fault, not a silent "wine".
+  if (payload.category !== undefined && payload.category !== 'wine' && payload.category !== 'other') {
+    return 'category must be "wine" or "other"';
   }
   // region is capped too: findOrCreateRegion mints whatever arrives, and this
   // path receives machine-generated payloads (accepted AI suggestions).
@@ -106,7 +102,7 @@ const MAX_SCAN_CONFLICTS = 8;
 // its MERGE_SCALARS plus 'grapes' (services/labelScan.js; mirrored rather
 // than imported so this module keeps its lazy-require test seams). A free-text
 // key here would be 4.8KB of attacker-chosen text rendered in the curator's
-// modal and model context (release-audit LOW-2).
+// modal and model context.
 const CONFLICT_FIELDS = ['name', 'producer', 'vintage', 'country', 'region', 'appellation', 'type', 'grapes', 'classification'];
 
 /**
@@ -114,10 +110,9 @@ const CONFLICT_FIELDS = ['name', 'producer', 'vintage', 'country', 'region', 'ap
  * back-label rescue scan (POST /api/wines/scan-label-back returned them).
  *
  * Client-supplied like everything else in `newWine`, so it is bounded here
- * rather than trusted: the merge that produced it compares seven scalar fields,
- * so eight entries is already more than the feature can legitimately generate,
- * and each string rides the same MAX_WINE_FIELD cap as the identity fields it
- * describes.
+ * rather than trusted: at most MAX_SCAN_CONFLICTS entries, each naming one of
+ * the fields the merge compares (CONFLICT_FIELDS), and each string rides the
+ * same MAX_WINE_FIELD cap as the identity fields it describes.
  *
  * @returns {Array<{field,front,back}>|null} the clean array, or null when the
  *   payload is unusable — the caller DROPS it rather than 400-ing: this is
@@ -143,8 +138,8 @@ function validateScanConflicts(raw) {
  * Attach the label photo(s) the user scanned to the registry wine they
  * produced, so curation can show a curator the actual label instead of asking
  * them to guess from three broken strings — whether the row landed in the
- * pending-identity queue or minted looking complete (see the L-5 discussion at
- * the call site: the quiet failures are the ones that most need the photo).
+ * pending-identity queue or minted looking complete (see the call site: the
+ * quiet failures are the ones that most need the photo).
  *
  * Ownership-checked and single-use PER IMAGE: only the SCANNER's own label-scan
  * images, and only ones not already attached to a wine (which is also what
@@ -175,10 +170,10 @@ async function attachScanImage(wine, { scanImageId, scanImageBackId } = {}, req)
       // the guard). Authorization is still the uploadedBy term.
       if (!id || !isValidId(String(id))) return null;
       // For a wine born PROMOTED, the retention clock starts in the SAME
-      // atomic claim (release-audit LOW-1): stamping afterwards left a window
-      // where a failed stamp produced an attached frame with retainUntil null
-      // — skipped by the unattached sweep (it is attached) AND by the expiry
-      // sweep (no date) — i.e. kept forever, unreadable. Claim-and-clock is
+      // atomic claim: stamping afterwards leaves a window where a failed stamp
+      // produces an attached frame with retainUntil null — skipped by the
+      // unattached sweep (it is attached) AND by the expiry sweep (no date) —
+      // i.e. kept forever, unreadable. Claim-and-clock is
       // one write; the later stampPromotedScanRetention call is then an
       // idempotent no-op (it matches retainUntil: null only).
       const bornPromotedClock = wine.pendingIdentity !== true
@@ -228,7 +223,7 @@ async function resolveOrMintWine(newWine, req, { allowPending = true } = {}) {
   const via = newWine.source === 'ai' ? 'ai' : 'ui';
 
   // Lazy require: findOrCreateWine top-requires services/search → the
-  // ESM-only meilisearch package jest cannot parse (the #702 failure mode).
+  // ESM-only meilisearch package jest cannot parse.
   const { findOrCreateWine } = require('./findOrCreateWine');
   let result;
   try {
@@ -240,8 +235,8 @@ async function resolveOrMintWine(newWine, req, { allowPending = true } = {}) {
         region: newWine.region,
         appellation: newWine.appellation,
         // Scan-extracted classification line ("Grand Cru Classé en 1855") —
-        // stored on creates only; before this rode along, the scan had no
-        // legitimate slot for it and it landed in the NAME (ticket 6a8162c5).
+        // stored on creates only; without this slot the line would land in
+        // the NAME.
         classification: newWine.classification,
         type: newWine.type,
         // The colour of a sparkling/dessert/fortified wine, when the form
@@ -253,13 +248,16 @@ async function resolveOrMintWine(newWine, req, { allowPending = true } = {}) {
       // skipSiblingMatch with confirmCreate: the user has already reviewed the
       // suggested matches (that is what confirmCreate means) — an appellation-
       // variant sibling must not silently override their explicit "create a
-      // new wine anyway". Same semantics the find-or-create route had.
+      // new wine anyway".
       {
         confirmCreate: !!newWine.confirmCreate, skipSiblingMatch: !!newWine.confirmCreate, createdVia: via, allowPending,
-        // PRIVATE DRAFT (support ticket 2026-09-12): the caller asked for the
-        // wine to stay theirs until they publish it. Strictly boolean true —
-        // a body value can't turn a string into a draft by accident.
+        // PRIVATE DRAFT: the caller asked for the wine to stay theirs until
+        // they publish it. Strictly boolean true — a body value can't turn a
+        // string into a draft by accident.
         draft: newWine.draft === true,
+        // The Other category: born outside the shared wine registry with no
+        // type — the member said it is not wine, so no curator round trip.
+        nonWine: newWine.category === 'other',
       }
     );
   } catch (err) {
@@ -272,10 +270,10 @@ async function resolveOrMintWine(newWine, req, { allowPending = true } = {}) {
 
   if (result.candidates) return { candidates: result.candidates };
 
-  // Release-audit LOW-2: findOrCreateWine's E11000 recovery re-queries by
-  // normalizedKey only — a same-slug/different-key sub-second race can return
-  // { wine: null }. Both consumers would deref it into a 500; a clean 409
-  // self-heals on retry (the winner is committed by then).
+  // findOrCreateWine's E11000 recovery re-queries by normalizedKey only — a
+  // same-slug/different-key sub-second race can return { wine: null }. Both
+  // consumers would deref it into a 500; a clean 409 self-heals on retry (the
+  // winner is committed by then).
   if (!result.wine) {
     return { error: { status: 409, message: 'Wine resolution raced with another write — please retry.' } };
   }
@@ -283,14 +281,13 @@ async function resolveOrMintWine(newWine, req, { allowPending = true } = {}) {
   const { wine, created } = result;
   const draft = wine.draft === true;
   // A draft is pending by invariant; for the audit "pendingIdentity" keeps its
-  // historical meaning — the producer was missing — so a draft only carries
-  // it when that is also true.
+  // own meaning — the producer was missing — so a draft only carries it when
+  // that is also true.
   const pendingIdentity = wine.pendingIdentity === true && (!draft || result.pendingIdentity === true);
   if (created) {
-    // Same action string + detail shape the find-or-create route emitted (and
-    // the MCP/admin/import surfaces emit), so registry writes keep reading as
-    // ONE audit stream (2026-08-03 M-1). `createdVia` alone doesn't serve: it
-    // is client-asserted and later merges rewrite it.
+    // Same action string + detail shape the MCP/admin/import surfaces emit, so
+    // registry writes read as ONE audit stream. `createdVia` alone doesn't
+    // serve: it is client-asserted and later merges rewrite it.
     logAudit(req, 'wine.create',
       { type: 'wine', id: wine._id },
       {
@@ -316,14 +313,12 @@ async function resolveOrMintWine(newWine, req, { allowPending = true } = {}) {
   // OWN pending row that has none yet, which is how a second bottle of the same
   // unidentified wine can still supply the photo the first add didn't have.
   //
-  // L-5 (data minimisation) REVISITED, honestly. The rule used to be PENDING
-  // ONLY, on the argument that a fully-identified wine needs no evidence. Prod
-  // 2026-08-13 disproved the premise: the wines whose scan errors need a label
-  // to settle are precisely the ones that came back looking complete —
-  // "Chardonnay Reserve" by "Pays d'Oc Organic Wine" minted as an ordinary
-  // published row, and a curator meeting it later had a plausible-looking
-  // record, no photo, and no way to tell. A scan that fails LOUDLY leaves
-  // evidence; a scan that fails QUIETLY left none. That is the wrong way round.
+  // Data minimisation does not argue for PENDING ONLY: "a fully-identified wine
+  // needs no evidence" fails exactly where it matters. The wines whose scan
+  // errors need a label to settle are the ones that come back looking complete:
+  // such a wine mints as an ordinary published row, and a curator meeting it
+  // later has a plausible record, no photo, and no way to tell. A scan that
+  // fails LOUDLY leaves evidence, so one that fails QUIETLY must leave it too.
   //
   // So the purpose exists for both populations, and the WINDOW is what bounds
   // it — not queue membership:
@@ -332,14 +327,12 @@ async function resolveOrMintWine(newWine, req, { allowPending = true } = {}) {
   //   non-pending mint → stamped here, immediately: the wine was born promoted,
   //                      so its correction window starts at birth. Same
   //                      PROMOTED_SCAN_GRACE_DAYS, same sweep, same deletion.
-  // GDPR posture is unchanged: same data category (a private kind:'label-scan'
-  // photo of the user's own bottle), no new consent, already covered by
+  // GDPR: the same data category as any label scan (a private kind:'label-scan'
+  // photo of the user's own bottle), no new consent needed, covered by
   // GET /api/users/me/export and the account-deletion cascade (both key on
-  // uploadedBy, not on the wine's state — services/userDataRegistry), and
-  // deleted by the same two sweeps in services/scanImageRetentionJob. The net
-  // effect is BOUNDED retention where there was previously none at all: before
-  // this, a non-pending mint's frame was left unattached and swept at 30 days;
-  // it is now attached and swept at 7.
+  // uploadedBy, not on the wine's state — services/userData/accountAndCellar),
+  // and deleted by the sweeps in services/scanImageRetentionJob: attached to a
+  // non-pending mint, the frame goes at 7 days.
   //
   // The RESOLVE branch keeps its pending-only gate deliberately: backfilling a
   // photo onto an existing published wine somebody else may have created is a
@@ -396,7 +389,8 @@ async function resolveOrMintWine(newWine, req, { allowPending = true } = {}) {
  * through findOrCreateWine directly rather than through resolveOrMintWine.
  */
 function announceMintedWine(wine) {
-  if (wine && wine.pendingIdentity !== true && wine.draft !== true) submitUrls(`/wines/${wine.slug || wine._id}`);
+  // Nor for a drink that is not wine (the Other category): no public page.
+  if (wine && wine.pendingIdentity !== true && wine.draft !== true && wine.nonWine !== true) submitUrls(`/wines/${wine.slug || wine._id}`);
 }
 
 module.exports = {

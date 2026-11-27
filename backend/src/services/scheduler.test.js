@@ -25,6 +25,7 @@ jest.mock('./recommendationRetentionJob', () => ({ runRecommendationEmailScrub: 
 jest.mock('./mcpSnapshotRetentionJob', () => ({ runMcpSnapshotScrub: jest.fn() }));
 jest.mock('./scanImageRetentionJob', () => ({ runScanImageRetentionSweep: jest.fn() }));
 jest.mock('./wineDraftExpiryJob', () => ({ runWineDraftExpirySweep: jest.fn() }));
+jest.mock('./uncheckedWineSweepJob', () => ({ runUncheckedWineSweep: jest.fn() }));
 jest.mock('./searchReconcileJob', () => ({ runSearchIndexReconcile: jest.fn() }));
 jest.mock('./securityAlertJob', () => ({ runSecurityAlertCheck: jest.fn() }));
 jest.mock('./aiCapAlertJob', () => ({ runAiCapAlertCheck: jest.fn() }));
@@ -34,6 +35,8 @@ jest.mock('./registryHealthJob', () => ({ runRegistryHealthCheck: jest.fn() }));
 jest.mock('./registryReadReportJob', () => ({ runRegistryReadReport: jest.fn() }));
 jest.mock('./embeddingJob', () => ({}));
 jest.mock('./registryBridge', () => ({ isEnabled: () => false }));
+jest.mock('./apiDeprecationNotices', () => ({ runDeprecationReminders: jest.fn() }));
+jest.mock('./inactiveAccounts', () => ({ runInactiveAccounts: jest.fn() }));
 jest.mock('../models/DiscussionReply', () => ({}));
 
 const cron = require('node-cron');

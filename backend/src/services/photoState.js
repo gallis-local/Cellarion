@@ -1,10 +1,10 @@
 /**
- * A photo's state as its OWNER sees it, for the MCP read path (support ticket
- * 2026-09-06: the connector could upload a photo but never see whether one
- * existed, was still processing, awaited review or had been rejected — so an
- * assistant answered "no pending changes" from the wrong queue, and could not
- * honour attach_bottle_image's "attach once per wine" rule because it had no
- * way to check first).
+ * A photo's state as its OWNER sees it, for the MCP read path. A connector
+ * that can upload a photo must also see whether one exists, is still
+ * processing, awaits review or was rejected: without that an assistant
+ * answers "no pending changes" from the wrong queue, and cannot honour
+ * attach_bottle_image's "attach once per wine" rule, having no way to check
+ * first.
  *
  * The lifecycle lives in ONE status enum on BottleImage (models/BottleImage.js,
  * services/imageProcessor.js, routes/admin/images.js); this module only
@@ -12,7 +12,7 @@
  * a bottle read needs: which photos apply to this bottle, and whether a list
  * row has any photo at all. Visibility matches the web gallery: a viewer sees
  * their own rows in every state (rejected included — that is the answer they
- * were missing), and other people's rows only once published.
+ * need), and other people's rows only once published.
  */
 const BottleImage = require('../models/BottleImage');
 
@@ -36,14 +36,14 @@ const NOT_SCAN = { kind: { $ne: 'label-scan' } };
 const MAX_ROWS = 20;
 const MAX_SCANS = 4; // label-scan frames of one wine by one viewer
 
-// Same rule as routes/og.js and the frontend's getWineImageUrl: a stored image
+// Same rule as routes/og/wine.js and the frontend's getWineImageUrl: a stored image
 // is a full URL, an /api/ path, or a bare upload filename.
 const apiBase = () => (process.env.BACKEND_URL || process.env.FRONTEND_URL || 'https://cellarion.app').replace(/\/+$/, '');
 function absoluteImageUrl(path) {
   if (!path || typeof path !== 'string') return null;
   // An inline data: image (a registry image copied verbatim from a wine
   // request) can be half a megabyte; it never travels in a tool result
-  // (audit 2026-09-07) — the public wine page shows it.
+  // — the public wine page shows it.
   if (path.startsWith('data:')) return null;
   if (/^https?:\/\//i.test(path)) return path;
   return path.startsWith('/') ? `${apiBase()}${path}` : `${apiBase()}/api/uploads/${path}`;
@@ -84,7 +84,7 @@ async function photosForBottle(userId, bottle) {
   const wineId = wd && (wd._id || wd);
   // Two bounded queries, own rows first: one query with a shared cap let a
   // wine with many published photos push the viewer's own row past the cap
-  // — the very "did my upload land?" answer this exists for (audit 2026-09-07).
+  // — the very "did my upload land?" answer this exists for.
   const own = await BottleImage.find({
     ...NOT_SCAN, uploadedBy: userId,
     $or: [{ bottle: bottle._id }, ...(wineId ? [{ wineDefinition: wineId }] : [])],
@@ -94,10 +94,9 @@ async function photosForBottle(userId, bottle) {
         ...NOT_SCAN, wineDefinition: wineId, status: 'approved', visibility: 'public', uploadedBy: { $ne: userId },
       }).sort({ createdAt: -1 }).limit(MAX_ROWS).lean()
     : [];
-  // The viewer's own label-scan frames of this wine (support ticket
-  // 2026-09-07): never a "photo of the bottle" — kept out of items, count and
-  // has_photo, the 2026-09-03 leak — but the sharpest image of the label
-  // there is, and get_photo can now show it.
+  // The viewer's own label-scan frames of this wine: never a "photo of the
+  // bottle" — kept out of items, count and has_photo — but the sharpest
+  // image of the label there is, and get_photo can show it.
   const scans = wineId
     ? await BottleImage.find({ kind: 'label-scan', uploadedBy: userId, wineDefinition: wineId })
         .sort({ createdAt: -1 }).limit(MAX_SCANS).select('side createdAt').lean()
@@ -150,4 +149,4 @@ async function photoPresence(userId, docs) {
   return out;
 }
 
-module.exports = { STATE, PENDING_STATES, MAX_ROWS, absoluteImageUrl, isInlineImage, photoState, photosForBottle, photoPresence };
+module.exports = { STATE, MAX_ROWS, absoluteImageUrl, isInlineImage, photoState, photosForBottle, photoPresence };

@@ -4,24 +4,24 @@ import { useAuth } from '../contexts/AuthContext';
 import { consumeBottle } from '../api/bottles';
 import { ConsumeModal } from './ConsumeModal';
 import { useDialogA11y } from '../utils/useDialogA11y';
+import { useOverlayClose } from './Modal';
 import { isReserved, reservationSummary } from '../utils/reservation';
 import './DrinkOneModal.css';
 import { slotLabel as slotWords } from '../utils/slotLabel';
 import { bottleSizeLabel, DEFAULT_SIZE } from '../config/bottleSizes';
 
 /**
- * "Drink one" from a grouped entry or the vintage page (support ticket
- * 2026-10-09): pick WHICH bottle of the group leaves — by rack slot, with
+ * "Drink one" from a grouped entry or the vintage page: pick WHICH bottle of
+ * the group leaves — by rack slot, with
  * its purchase and reservation beside it — then the ordinary consume form.
  * One bottle, one request: the group's other bottles are never touched.
  *
  * `rackMap` (cellar list) or `bottle.rackInfo` (vintage page) names the slot.
  * With a single bottle the picker is skipped — and so it is when every row
- * would read the same (same place, purchase and reservation): three rows of
- * "Not in a rack · Oct 2026" are a choice with nothing to choose (live
- * walkthrough 2026-10-15). onDone(bottle, reason) fires
- * after the server confirmed, so the caller can refresh and offer the
- * journal prompt as the bottle page does.
+ * would read the same (same place, purchase and reservation): three identical
+ * rows are a choice with nothing to choose. onDone(bottle, reason) fires after
+ * the server confirmed, so the caller can refresh and offer the journal
+ * prompt as the bottle page does.
  */
 export default function DrinkOneModal({ bottles, rackMap, wineName, onClose, onDone, placesKnown = true }) {
   const { t, i18n } = useTranslation();
@@ -42,8 +42,8 @@ export default function DrinkOneModal({ bottles, rackMap, wineName, onClose, onD
   // until then (or if that load failed) every bottle reads "Not in a rack" —
   // skipping then could free the wrong slot. An opened bottle is never the
   // same as a sealed one.
-  // The size too: the vintage page offers every size of the wine and year
-  // (release audit 2026-10-16 — a magnum went for a 75 cl).
+  // The size too: the vintage page offers every size of the wine and year,
+  // and a magnum must never go for a 75 cl.
   const sizeOf = (b) => b.bottleSize || DEFAULT_SIZE;
   const sizeLabel = (b) => (sizeOf(b) === DEFAULT_SIZE ? '' : bottleSizeLabel(sizeOf(b), t));
   const rowText = (b) => [slotLabel(b), sizeOf(b), purchaseLabel(b), isReserved(b) ? reservationSummary(b, t) : '', b.openedAt ? 'open' : ''].join('|');
@@ -57,6 +57,7 @@ export default function DrinkOneModal({ bottles, rackMap, wineName, onClose, onD
   const [pickerShown, setPickerShown] = useState(!nothingToChoose);
   const titleId = useId();
   const boxRef = useDialogA11y(onClose);
+  const overlayClose = useOverlayClose(onClose);
 
   // A refusal goes back to the picker, which is where the error shows — the
   // consume form has no room for one. With a single bottle too: the picker
@@ -93,7 +94,7 @@ export default function DrinkOneModal({ bottles, rackMap, wineName, onClose, onD
   }
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    <div className="modal-overlay" {...overlayClose}>
       <div className="modal-box drink-one" onClick={(e) => e.stopPropagation()} ref={boxRef} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
         <h2 id={titleId}>{t('drinkOne.title', 'Which bottle?')}</h2>
         {wineName && <p className="modal-wine-name">{wineName}</p>}

@@ -1,6 +1,6 @@
-import { useState, useEffect, useMemo, useCallback, useRef, Suspense } from 'react';
+import { useState, useEffect, useMemo, useRef, Suspense } from 'react';
 import { lazy } from '../utils/lazyWithReload';
-import { useParams, Link, useSearchParams, useNavigate, useLocation } from 'react-router-dom';
+import { useParams, useSearchParams, useNavigate, useLocation } from 'react-router-dom';
 import { useBackHere } from '../utils/useBackHere';
 import { useBackToClose } from '../utils/useBackToClose';
 import { useTranslation } from 'react-i18next';
@@ -8,7 +8,6 @@ import { useAuth } from '../contexts/AuthContext';
 import { getCellar } from '../api/cellars';
 import { getRacks, deleteRack, updateSlot, clearSlot, moveSlot, createRack, updateRack, disableSlot, enableSlot, previewArrange, applyArrange, moveRackBottles } from '../api/racks';
 import { consumeBottle, pourBottle, openBottle } from '../api/bottles';
-import { glassesLeft, daysLeft, freshnessStatus, remainingMl } from '../utils/openBottle';
 import PreservationPickerModal from '../components/bottle/PreservationPickerModal';
 import { getTotalSlots, getModularTotalSlots } from '../utils/rackLayouts';
 import { readPlaceQueue, planAutoPlace, withoutPlaced } from '../utils/placeQueue';
@@ -17,16 +16,11 @@ import ShelfView from '../components/racks/ShelfView';
 // Lazy: ShelfView3D pulls in three.js (~250 kB gzip) — only load it when the
 // user actually switches to the 3D view, not on every visit to the racks page.
 const ShelfView3D = lazy(() => import('../components/racks/ShelfView3D'));
-import RackTypeSelector, { TYPE_DIMENSIONS } from '../components/racks/RackTypeSelector';
-import {
-  CABINET_PRESETS, CABINET_PRESET_GROUPS, CABINET_DEFAULT, CABINET_MAX_ROWS_PER_SHELF,
-  fitShelfRows, cabinetCapacity,
-} from '../utils/cabinetPresets';
-import { cabinetShelfCols, cabinetShelfAlternate, cabinetShelfSideways } from '../utils/rackLayouts';
+import { TYPE_DIMENSIONS } from '../components/racks/RackTypeSelector';
+import { createRackTypeConfig, defaultTypeConfig } from '../utils/rackTypeConfig';
 import { ConsumeModal } from '../components/ConsumeModal';
 import BottleUndoNotice, { bottleNoticeName } from '../components/BottleUndoNotice';
 import { isReserved, reservationSummary } from '../utils/reservation';
-import WineImage from '../components/WineImage';
 import ConfirmModal from '../components/ConfirmModal';
 import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
 import ArrangeModal from '../components/racks/ArrangeModal';
@@ -38,11 +32,12 @@ import CellarPageHeader from '../components/CellarPageHeader';
 import DialogBox from '../components/DialogBox';
 import EditRackModal from '../components/racks/EditRackModal';
 import MoveRackBottlesModal from '../components/racks/MoveRackBottlesModal';
-import BetaBadge from '../components/BetaBadge';
-import { useFeature } from '../utils/featureFlags';
+import NfcLinkModal from '../components/racks/NfcLinkModal';
+import NewRackForm from '../components/racks/NewRackForm';
+import { EmptySlotContent, DisabledSlotContent, FilledSlotContent } from '../components/racks/SlotPopupContent';
 import { groupRacks, groupNames } from '../utils/rackGroups';
-import { swatchType, wineTypeLabel } from '../utils/wineColour';
 import { friendlyError, messageForResponse } from '../utils/friendlyError';
+import { canEditCellar } from '../utils/cellarRole';
 import ActionNotice from '../components/ActionNotice';
 import './CellarRacks.css';
 
@@ -77,8 +72,8 @@ function CellarRacks() {
   const [viewMode, setViewModeState] = useState(() => {
     try {
       const stored = window.localStorage.getItem('cellarion.rackViewMode');
-      // 'iso' was a short-lived option (deprecated in v1.53.1) — fall back to
-      // the closest equivalent so returning users don't see a missing view.
+      // A stored 'iso' names a view that no longer exists — fall back to the
+      // closest equivalent so returning users don't see a missing view.
       if (stored === 'iso') return 'shelf';
       return stored || 'compact';
     } catch {
@@ -166,20 +161,23 @@ function CellarRacks() {
     return () => document.removeEventListener('keydown', onKey);
   }, [movingOn]);
 
-  // --- post-add placing mode (issue #1055) — HOOKS live up here, before the
-  // page's early `if (error) return` (audit 2026-09-14 H: hooks declared after
-  // a conditional return crash the page on a load error). The handlers that
-  // use them sit further down, next to the render.
+  // --- post-add placing mode — HOOKS live up here, before the page's early
+  // `if (error) return`: hooks declared after a conditional return crash the
+  // page on a load error. The handlers that use them sit further down, next
+  // to the render.
   const location = useLocation();
   // Handed to the bottle page so its back link returns here (BottleDetail).
   const backHere = useBackHere('racks');
   const [placeQueue, setPlaceQueue] = useState(() => readPlaceQueue(location.state));
   const [placeTotal] = useState(() => readPlaceQueue(location.state).length);
+  // The bottle page hands over ONE existing bottle (not a fresh add): the
+  // bar says so instead of "your new bottles".
+  const [placeFromBottle] = useState(() => !!(location.state && location.state.placeFrom === 'bottle'));
   const [placeNotice, setPlaceNotice] = useState(null);
   const [placeBusy, setPlaceBusy] = useState(false);
-  // Back/reload after the queue drained used to re-enter the mode with the
-  // original ids and MOVE already-placed bottles: drop anything the loaded
-  // racks already hold (audit 2026-09-14 M).
+  // Back/reload after the queue drained re-enters the mode with the original
+  // ids, which would MOVE already-placed bottles: drop anything the loaded
+  // racks already hold.
   useEffect(() => {
     if (!placeQueue.length || !racks.length) return;
     const trimmed = withoutPlaced(placeQueue, racks);
@@ -199,13 +197,10 @@ function CellarRacks() {
   // Rack tools (⋮) dropdown in the lens toolbar
   const [toolsOpen, setToolsOpen] = useState(false);
 
-  // Early access: "Move bottles to another rack" (MoveRackBottlesModal). Holds
-  // the SOURCE rack's id while open — pinned, because reloading the racks
-  // after the move can change which rack the page has selected (a ?highlight
-  // follows its bottle into the target).
-  const moveRackOn = useFeature('rackMoveBottles');
-  // Early access: "Move" in a slot's pop-up, then a tap on the slot it goes to.
-  const slotMoveOn = useFeature('rackSlotMove');
+  // "Move bottles to another rack" (MoveRackBottlesModal). Holds the SOURCE
+  // rack's id while open — pinned, because reloading the racks after the move
+  // can change which rack the page has selected (a ?highlight follows its
+  // bottle into the target).
   const [moveOpen, setMoveOpen] = useState(null);
 
   // Zone editor modal
@@ -252,11 +247,15 @@ function CellarRacks() {
     }
   }, [highlightBottleId, racks]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Auto-select rack when navigating from room view with ?rack=<id>
+  // Auto-select rack when navigating from room view with ?rack=<id>. Once per
+  // id: the racks change with every slot action, and focusing again would
+  // pull the view back from the rack the member has moved on to.
+  const focusedRackId = useRef(null);
   useEffect(() => {
-    if (!focusRackId || racks.length === 0) return;
+    if (!focusRackId || focusedRackId.current === focusRackId || racks.length === 0) return;
     const found = racks.find(r => r._id === focusRackId);
     if (found) {
+      focusedRackId.current = focusRackId;
       setSelectedRackId(found._id);
       // Scroll to the rack after a short delay for rendering
       setTimeout(() => {
@@ -330,42 +329,9 @@ function CellarRacks() {
         cols: newRack.cols,
         ...(newRack.group && newRack.group.trim() ? { group: newRack.group.trim() } : {}),
       };
-      if (newRack.typeConfig && Object.keys(newRack.typeConfig).length > 0) {
-        const typeConfig = { ...newRack.typeConfig };
-        // Drop double-height rows outside the final row count — the rows
-        // input may have been lowered after they were typed, and the
-        // backend rejects out-of-range entries with a 400.
-        if (Array.isArray(typeConfig.doubleHeightRows)) {
-          typeConfig.doubleHeightRows = typeConfig.doubleHeightRows
-            .filter(r => r >= 1 && r <= newRack.rows);
-          if (typeConfig.doubleHeightRows.length === 0) delete typeConfig.doubleHeightRows;
-        }
-        // Cabinet: the per-shelf list must match the final shelf count (the
-        // rows input may have changed after the list was edited); other
-        // types must not carry cabinet keys (the backend rejects them).
-        if (newRack.type === 'cabinet') {
-          typeConfig.shelfRows = fitShelfRows(typeConfig.shelfRows, newRack.rows);
-          typeConfig.twoDeep = typeConfig.twoDeep !== false;
-          typeConfig.stagger = typeConfig.stagger !== false;
-          typeConfig.alternate = typeConfig.alternate === true;
-          // Head to tail is for a one-deep cabinet only (the backend refuses
-          // it with two deep), and stored only when on.
-          if (typeConfig.twoDeep === false && typeConfig.headToTail === true) typeConfig.headToTail = true; else delete typeConfig.headToTail;
-          // Per-shelf width / pattern: fitted to the final shelf count and
-          // width, and stored only where a shelf differs from the cabinet.
-          const widths = cabinetShelfCols(newRack.rows, newRack.cols, typeConfig);
-          if (widths.some((w) => w !== newRack.cols)) typeConfig.shelfCols = widths; else delete typeConfig.shelfCols;
-          const patterns = cabinetShelfAlternate(newRack.rows, typeConfig);
-          if (patterns.some((a) => a !== typeConfig.alternate)) typeConfig.shelfAlternate = patterns; else delete typeConfig.shelfAlternate;
-          // How each shelf's bottles lie (drawing only): fitted to the final
-          // shelf count, and stored only when some shelf lies sideways.
-          const lies = cabinetShelfSideways(newRack.rows, typeConfig);
-          if (lies.some(Boolean)) typeConfig.shelfSideways = lies; else delete typeConfig.shelfSideways;
-        } else {
-          for (const k of ['shelfRows', 'twoDeep', 'stagger', 'headToTail', 'alternate', 'shelfCols', 'shelfAlternate', 'shelfSideways']) delete typeConfig[k];
-        }
-        payload.typeConfig = typeConfig;
-      }
+      // The form's options, fitted to the rows and columns it ends with.
+      const typeConfig = createRackTypeConfig(newRack);
+      if (typeConfig) payload.typeConfig = typeConfig;
       const res = await createRack(apiFetch, payload);
       const data = await res.json();
       if (res.ok) {
@@ -392,11 +358,7 @@ function CellarRacks() {
       type,
       rows: dims.defaultRows,
       cols: dims.defaultCols,
-      typeConfig: type === 'cube'
-        ? { moduleRows: 2, moduleCols: 2 }
-        : type === 'x-rack' ? { bottlesPerSection: 10 }
-        : type === 'shelf' ? { bottlesPerCell: 1, backCols: 0 }
-        : type === 'cabinet' ? { shelfRows: [...CABINET_DEFAULT.shelfRows], twoDeep: CABINET_DEFAULT.twoDeep, stagger: CABINET_DEFAULT.stagger, alternate: CABINET_DEFAULT.alternate } : {},
+      typeConfig: defaultTypeConfig(type),
     }));
   };
 
@@ -629,11 +591,11 @@ function CellarRacks() {
     }
   };
 
-  const confirmPartial = async (method) => {
+  const confirmPartial = async (method, takeOutOfRack) => {
     const { bottleId } = partialPicker;
     setPartialBusy(true);
     try {
-      const res = await openBottle(apiFetch, bottleId, method);
+      const res = await openBottle(apiFetch, bottleId, method, { takeOutOfRack });
       if (!res.ok) {
         failed(res, await res.json().catch(() => ({})), t('racks.errors.open', 'The bottle could not be opened.'));
         return;
@@ -740,8 +702,8 @@ function CellarRacks() {
     }
   };
 
-  // Every bottle of one rack into another, in order (early access
-  // 'rackMoveBottles'). Both racks change, so reload them all.
+  // Every bottle of one rack into another, in order. Both racks change, so
+  // reload them all.
   const handleMoveBottles = async (rackId, toRackId) => {
     try {
       const res = await moveRackBottles(apiFetch, rackId, toRackId);
@@ -757,11 +719,14 @@ function CellarRacks() {
     }
   };
 
-  // Rename / regroup (support ticket 2026-09-06): PUT name + group and adopt
+  // Rename / regroup: PUT name + group and adopt
   // the returned values. An empty group clears it.
-  const handleEditRackSave = async (rackId, { name, group, typeConfig }) => {
+  const handleEditRackSave = async (rackId, { name, group, typeConfig, rows, cols }) => {
     try {
-      const res = await updateRack(apiFetch, rackId, { name, group, ...(typeConfig ? { typeConfig } : {}) });
+      // rows and cols come with a wall's new shape; the server then renumbers
+      // what lies in it, so those are adopted from its answer below.
+      const reshaped = rows !== undefined;
+      const res = await updateRack(apiFetch, rackId, { name, group, ...(typeConfig ? { typeConfig } : {}), ...(reshaped ? { rows, cols } : {}) });
       const data = await res.json();
       if (!res.ok) return { ok: false, error: data.error };
       // Adopt the changed fields only — the rack in state carries populated
@@ -771,6 +736,7 @@ function CellarRacks() {
         name: data.rack.name,
         group: data.rack.group ?? null,
         ...(typeConfig ? { typeConfig: data.rack.typeConfig || typeConfig } : {}),
+        ...(reshaped ? { rows: data.rack.rows, cols: data.rack.cols, slots: data.rack.slots, disabledPositions: data.rack.disabledPositions, zones: data.rack.zones } : {}),
       } : r));
       return { ok: true };
     } catch {
@@ -796,10 +762,34 @@ function CellarRacks() {
     }
   };
 
+  // A bottle added from an empty slot ("Add a new bottle here") goes into
+  // that slot as soon as the racks are loaded; the rest of the queue (more
+  // bottles of the add) is placed as usual. A slot taken meanwhile says so
+  // and keeps the bottle in the queue. Declared above the error return (hooks
+  // must run every render); a render with an error never reaches the
+  // placement, whose handler is declared below that return.
+  // One-shot: once decided, the history entry keeps only the queue, so Back or
+  // a reload never decides again. The slot is for the add's first bottle; a
+  // rack holding it already (this render's queue may not be trimmed yet)
+  // means it was placed, and nothing else may take its slot.
+  const placeAtDone = useRef(false);
+  useEffect(() => {
+    const placeAt = location.state?.placeAt;
+    if (error || placeAtDone.current || !placeAt || !placeQueue.length || !racks.length || !canEditCellar(cellar)) return;
+    placeAtDone.current = true;
+    navigate(location.pathname + location.search, { replace: true, state: { placeQueue: location.state.placeQueue } });
+    const [first] = readPlaceQueue(location.state);
+    if (placeQueue[0] !== first || !withoutPlaced([first], racks).length) return;
+    const target = racks.find((r) => r._id === placeAt.rackId);
+    const taken = target && (target.slots || []).some((s) => s.position === placeAt.position);
+    if (!target || taken) { setPlaceNotice({ kind: 'error', text: t('racks.placeQueue.slotTaken') }); return; }
+    handlePlaceTap(target, placeAt.position, null, { auto: true });
+  }, [racks, placeQueue, cellar, error]); // eslint-disable-line react-hooks/exhaustive-deps
+
   if (error) return <div className="alert alert-error">{error}</div>;
 
   const rack = racks.find(r => r._id === selectedRackId) || racks[0];
-  const canEdit = cellar?.userRole !== 'viewer';
+  const canEdit = canEditCellar(cellar);
   // Shelves and wine cabinets drawn in 3D hide the lens toolbar (and the rack
   // header with its pencil lives only in the Compact view).
   const shelf3d = !!rack && (rack.type === 'shelf' || rack.type === 'cabinet') && !rack.isModular && viewMode === '3d';
@@ -807,7 +797,7 @@ function CellarRacks() {
   // Rack tools (⋮), for editors, in every view and whether or not the rack
   // holds bottles. Rename sits here too: the header pencil is missing in the
   // Shelf and 3D views of shelves and wine cabinets, and a rack you cannot
-  // find a way to rename gets deleted and rebuilt (forum feedback 2026-10-12).
+  // find a way to rename gets deleted and rebuilt.
   const rackToolsMenu = rack && canEdit ? (
     <div className="rack-tools">
       <button
@@ -835,7 +825,7 @@ function CellarRacks() {
                 {t('arrange.openBtn', 'Organize…')}
               </button>
             )}
-            {moveRackOn && rack.slots.length > 0 && (
+            {rack.slots.length > 0 && (
               <button type="button" role="menuitem" onClick={() => { setToolsOpen(false); setMoveOpen(rack._id); }}>
                 {t('racks.moveBottles.menuItem', 'Move bottles to another rack…')}
               </button>
@@ -851,7 +841,7 @@ function CellarRacks() {
     </div>
   ) : null;
 
-  // --- post-add placing mode (issue #1055): handlers ---
+  // --- post-add placing mode: handlers ---
   // The add flow hands over the ids of the bottles it just created as router
   // state (hooks declared with the others above); each tap on a free slot
   // places the next one, "auto-place" fills first-free slots, leaving the mode
@@ -871,8 +861,10 @@ function CellarRacks() {
     clearPlaceState();
   };
 
-  // Returns true when the tap was consumed by the placing mode.
-  const handlePlaceTap = async (targetRack, pos, slotData) => {
+  // Returns true when the tap was consumed by the placing mode. `auto` is the
+  // placement no tap asked for (an add from a slot): the server must find the
+  // slot still empty, so a bottle placed there meanwhile is never pushed out.
+  const handlePlaceTap = async (targetRack, pos, slotData, { auto = false } = {}) => {
     if (!placeQueue.length || !canEdit) return false;
     if (placeBusy) return true; // a placement is in flight — swallow the tap, do not open the slot picker
     const isDisabled = (targetRack.disabledPositions || []).includes(pos);
@@ -880,8 +872,13 @@ function CellarRacks() {
     const bottleId = placeQueue[0];
     setPlaceBusy(true);
     try {
-      const res = await updateSlot(apiFetch, targetRack._id, pos, { bottleId });
+      const res = await updateSlot(apiFetch, targetRack._id, pos, auto ? { bottleId, expectOccupant: null } : { bottleId });
       const data = await res.json();
+      if (res.status === 409 && data.code === 'slot_changed') {
+        setPlaceNotice({ kind: 'error', text: t('racks.placeQueue.slotTaken') });
+        await reloadRacks();
+        return true;
+      }
       if (res.status === 404) {
         // The bottle is gone (deleted or moved since the add) — it must not
         // block the rest of the queue.
@@ -1023,13 +1020,17 @@ function CellarRacks() {
       {/* Room View / Cellar Book live in the shared view switcher on every page */}
       <CellarNav cellarId={id} active="racks" />
 
-      {/* Post-add placing mode (issue #1055): progress + auto-place + leave */}
+      {/* Post-add placing mode: progress + auto-place + leave */}
       {placingActive && !loading && racks.length > 0 && (
         <div className={`alert ${placeNotice?.kind === 'error' ? 'alert-warning' : 'alert-info'} place-queue-bar`} role="status">
           <span>
             {placeQueue.length > 0
-              ? t('racks.placeQueue.progress', { placed: placedCount, total: placeTotal })
-              : t('racks.placeQueue.allPlaced', { count: placeTotal })}
+              ? (placeFromBottle && placeTotal === 1
+                ? t('racks.placeQueue.progressExisting', 'Placing the bottle')
+                : t('racks.placeQueue.progress', { placed: placedCount, total: placeTotal }))
+              : (placeFromBottle && placeTotal === 1
+                ? t('racks.placeQueue.placedExisting', 'The bottle is in its slot.')
+                : t('racks.placeQueue.allPlaced', { count: placeTotal }))}
             {placeQueue.length > 0 && <> · {t('racks.placeQueue.tapHint')}</>}
             {placeNotice?.text && <> · {placeNotice.text}</>}
           </span>
@@ -1058,7 +1059,6 @@ function CellarRacks() {
               {t('common.cancel')}
             </button>
           </span>
-          <BetaBadge feature="rackSlotMove" note={t('racks.moveMode.betaNote', 'Moving a bottle by tapping is in early access.')} />
         </div>
       )}
 
@@ -1086,8 +1086,7 @@ function CellarRacks() {
       ) : (
         <>
           {/* Tabs sectioned by the racks' group label ("Basement" holds several
-              racks — support ticket 2026-09-06). A cellar without groups
-              renders one plain strip, exactly as before. */}
+              racks). A cellar without groups renders one plain strip. */}
           {groupRacks(racks).map(section => (
             <div key={section.group ?? '__ungrouped'} className={`rack-tab-group${section.group ? '' : ' rack-tab-group--none'}`}>
               {section.group && <div className="rack-tab-group-label">{section.group}</div>}
@@ -1167,9 +1166,7 @@ function CellarRacks() {
               </div>
               {canEdit && (
                 <p className="rack-drag-hint">
-                  {slotMoveOn
-                    ? t('rackLens.dragHintMove', 'Tip: drag a bottle to an empty slot to move it, onto another bottle to swap them — or tap the bottle and choose Move.')
-                    : t('rackLens.dragHint', 'Tip: drag a bottle to an empty slot to move it, onto another bottle to swap them.')}
+                  {t('rackLens.dragHintMove', 'Tip: drag a bottle to an empty slot to move it, onto another bottle to swap them — or tap the bottle and choose Move.')}
                 </p>
               )}
             </>
@@ -1209,7 +1206,7 @@ function CellarRacks() {
               const handleClick = async (pos, slotData) => {
                 // Move mode consumes every tap while it is on.
                 if (moving && await handleMoveTap(rack, pos, slotData)) return;
-                // Placing mode consumes a tap on a free slot (issue #1055).
+                // Placing mode consumes a tap on a free slot.
                 if (placeQueue.length && await handlePlaceTap(rack, pos, slotData)) return;
                 const isDisabled = (rack.disabledPositions || []).includes(pos);
                 // Viewers can inspect filled or disabled slots, not empty ones
@@ -1252,7 +1249,7 @@ function CellarRacks() {
               onSlotClick={async (pos, slotData) => {
                 // Move mode consumes every tap while it is on.
                 if (moving && await handleMoveTap(rack, pos, slotData)) return;
-                // Placing mode consumes a tap on a free slot (issue #1055).
+                // Placing mode consumes a tap on a free slot.
                 if (placeQueue.length && await handlePlaceTap(rack, pos, slotData)) return;
                 // Viewers can only inspect filled or disabled slots, not interact with empty ones
                 const isDisabled = (rack.disabledPositions || []).includes(pos);
@@ -1311,11 +1308,11 @@ function CellarRacks() {
                   canEdit={canEdit}
                   onPour={() => handlePour(activePopup.rackId, (activePopup.slot.bottle?._id || activePopup.slot.bottle).toString())}
                   onRemoveFromRack={() => handleRemoveFromRack(activePopup.rackId, activePopup.position)}
-                  onMove={slotMoveOn ? () => {
+                  onMove={() => {
                     setMoving({ rackId: activePopup.rackId, position: activePopup.position, bottle: activePopup.slot.bottle });
                     setActivePopup(null);
                     setActionError(null);
-                  } : undefined}
+                  }}
                   onConsume={() => {
                     setConsumeModal({
                       bottleId: activePopup.slot.bottle._id,
@@ -1346,6 +1343,10 @@ function CellarRacks() {
                     : undefined}
                   onAssign={(pos, bottleId) => handleAssign(activePopup.rackId, pos, bottleId)}
                   onDisable={() => handleDisableSlot(activePopup.rackId, activePopup.position)}
+                  // The demo cannot add bottles (as on the cellar page).
+                  onAddNew={canEdit && !user?.isDemo
+                    ? () => navigate(`/cellars/${id}/add-bottle`, { state: { placeAt: { rackId: activePopup.rackId, position: activePopup.position } } })
+                    : undefined}
                   onClose={() => setActivePopup(null)}
                 />
               )}
@@ -1392,7 +1393,7 @@ function CellarRacks() {
         />
       )}
 
-      {/* Early access: move every bottle to another rack */}
+      {/* Move every bottle to another rack */}
       {moveOpen && (() => {
         const source = racks.find(r => r._id === moveOpen);
         return source ? (
@@ -1463,994 +1464,6 @@ function CellarRacks() {
           />
         );
       })()}
-    </div>
-  );
-}
-
-// Parse a comma-separated "double-height rows" input ("1, 3") into a
-// deduplicated array of positive integers. Range-checking against the row
-// count happens in handleCreateRack (the rows input can change afterwards)
-// and defensively in the layout/geometry helpers.
-function parseDoubleHeightRows(text) {
-  const seen = new Set();
-  return String(text)
-    .split(',')
-    .map(s => parseInt(s.trim(), 10))
-    .filter(n => {
-      if (!Number.isInteger(n) || n < 1 || n > 20 || seen.has(n)) return false;
-      seen.add(n);
-      return true;
-    });
-}
-
-// How many stand-in bottles the 3D preview draws at most (see previewSlots).
-const PREVIEW_FILL_MAX = 180;
-
-// ---- Wine cabinet shape: preset, rows of bottles per shelf, two deep ----
-// A preset is a STARTING shape — makers ship sliding shelves and tell owners
-// to pull shelves out and stack bottles, so two owners of one model end up
-// with different layouts. The per-shelf list is always kept the length of the
-// shelves input (fitShelfRows) so a changed shelf count never desyncs it.
-// `alternate` (rows alternate cols / cols−1, the honeycomb of a Liebherr
-// GrandCru shelf — support ticket 2026-09-15) changes capacity and the slot
-// numbering, so unlike two-deep and nesting it is offered here only, never
-// in the edit dialog; and since a narrow row can only nest, it forces nesting.
-// Every shelf can then differ from the cabinet — its rows, its width and its
-// pattern — so a preset is the maker's loading diagram and the owner edits it
-// into their own cabinet (support ticket 2026-08-31: a GrandCru 5001 has
-// 4-wide staggered shelves top and bottom around 6-wide honeycomb ones).
-function CabinetShapeFields({ newRack, setNewRack }) {
-  const { t } = useTranslation();
-  const [presetKey, setPresetKey] = useState('custom');
-  const shelfRows = fitShelfRows(newRack.typeConfig?.shelfRows, newRack.rows);
-  const shelfCols = cabinetShelfCols(newRack.rows, newRack.cols, newRack.typeConfig);
-  const shelfAlt = cabinetShelfAlternate(newRack.rows, newRack.typeConfig);
-  const twoDeep = newRack.typeConfig?.twoDeep !== false;
-  const alternate = newRack.typeConfig?.alternate === true;
-  const allAlternate = shelfAlt.length > 0 && shelfAlt.every(Boolean);
-  const stagger = allAlternate || newRack.typeConfig?.stagger !== false;
-  const headToTailOn = useFeature('cabinetHeadToTail');
-  const headToTail = !twoDeep && newRack.typeConfig?.headToTail === true;
-  // How each shelf's bottles lie (early access, 'cabinetSideways'): the
-  // per-shelf choice and the presets built on it show only with the flag.
-  const sidewaysOn = useFeature('cabinetSideways');
-  const shelfSide = cabinetShelfSideways(newRack.rows, newRack.typeConfig);
-  const presetShown = (p) => !p.feature || (p.feature === 'cabinetSideways' && sidewaysOn);
-  const preset = CABINET_PRESETS.find((p) => p.key === presetKey);
-  // The shelves / bottles-across inputs live in the parent form, so editing
-  // them must drop the preset label: the shape is no longer that model.
-  useEffect(() => {
-    if (preset && (newRack.rows !== preset.shelves || newRack.cols !== preset.cols)) setPresetKey('custom');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [newRack.rows, newRack.cols]);
-
-  const applyPreset = (key) => {
-    setPresetKey(key);
-    const p = CABINET_PRESETS.find((x) => x.key === key);
-    if (!p) return;
-    setNewRack({
-      ...newRack,
-      rows: p.shelves,
-      cols: p.cols,
-      typeConfig: {
-        ...newRack.typeConfig,
-        shelfRows: [...p.shelfRows], twoDeep: p.twoDeep, stagger: p.stagger !== false, alternate: p.alternate === true,
-        shelfCols: p.shelfCols ? [...p.shelfCols] : undefined,
-        shelfAlternate: p.shelfAlternate ? [...p.shelfAlternate] : undefined,
-        shelfSideways: p.shelfSideways ? [...p.shelfSideways] : undefined,
-      },
-    });
-  };
-  const setShelf = (patch) => {
-    setPresetKey('custom');
-    setNewRack({ ...newRack, typeConfig: { ...newRack.typeConfig, ...patch } });
-  };
-  const setRow = (i, value) => {
-    const next = [...shelfRows];
-    next[i] = Math.max(1, Math.min(CABINET_MAX_ROWS_PER_SHELF, parseInt(value, 10) || 1));
-    setShelf({ shelfRows: next });
-  };
-  const setWidth = (i, value) => {
-    const next = [...shelfCols];
-    next[i] = Math.max(1, Math.min(newRack.cols || 1, parseInt(value, 10) || 1));
-    setShelf({ shelfCols: next });
-  };
-  const setPattern = (i, value) => {
-    const next = [...shelfAlt];
-    next[i] = !!value;
-    setShelf({ shelfAlternate: next });
-  };
-  const setSide = (i, value) => {
-    const next = [...shelfSide];
-    next[i] = value;
-    setShelf({ shelfSideways: next });
-  };
-
-  return (
-    <>
-      <div className="form-group">
-        <label>{t('racks.cabinetPresetLabel', 'Start from')}</label>
-        <select value={presetKey} onChange={(e) => applyPreset(e.target.value)}>
-          <option value="custom">{t('racks.cabinetPresetCustom', 'Custom shape')}</option>
-          {CABINET_PRESET_GROUPS.filter((group) => CABINET_PRESETS.some((p) => p.group === group && presetShown(p))).map((group) => (
-            <optgroup key={group} label={t(`racks.cabinetPresetGroup_${group}`, group)}>
-              {CABINET_PRESETS.filter((p) => p.group === group && presetShown(p)).map((p) => (
-                <option key={p.key} value={p.key}>{t(`racks.cabinetPreset_${p.key}`, p.key)}</option>
-              ))}
-            </optgroup>
-          ))}
-        </select>
-        <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
-          {t('racks.cabinetPresetHint', 'Starting shapes only. Owners pull shelves out and stack bottles, so edit the rows below to match your cabinet.')}
-          {preset?.capacity
-            ? ` ${t('racks.cabinetPresetCapacity', 'The maker quotes {{model}} bottles; this shape holds {{shape}}.', { model: preset.capacity, shape: cabinetCapacity(newRack.cols, shelfRows, newRack.typeConfig) })}`
-            : ''}
-        </small>
-      </div>
-
-      <div className="form-group">
-        <label>{t('racks.cabinetShelfRowsLabel', 'Each shelf, top shelf first: rows of bottles, bottles across, rows alternating')}</label>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-          {shelfRows.map((v, i) => (
-            <div key={i} style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.35rem 0.6rem', fontSize: '0.85rem' }}>
-              <span style={{ minWidth: '4.5rem' }}>{t('racks.cabinetShelfN', { n: i + 1 })}</span>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
-                <input
-                  type="number"
-                  inputMode="numeric"
-                  min={1} max={CABINET_MAX_ROWS_PER_SHELF}
-                  value={v}
-                  onChange={(e) => setRow(i, e.target.value)}
-                  style={{ width: '4.2rem' }}
-                  aria-label={`${t('racks.cabinetShelfN', { n: i + 1 })} ${t('racks.cabinetShelfRowsShort', 'rows')}`}
-                />
-                <span>{t('racks.cabinetShelfRowsShort', 'rows')}</span>
-              </label>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
-                <input
-                  type="number"
-                  inputMode="numeric"
-                  min={1} max={newRack.cols || 1}
-                  value={shelfCols[i]}
-                  onChange={(e) => setWidth(i, e.target.value)}
-                  style={{ width: '4.2rem' }}
-                  aria-label={`${t('racks.cabinetShelfN', { n: i + 1 })} ${t('racks.cabinetShelfAcrossShort', 'across')}`}
-                />
-                <span>{t('racks.cabinetShelfAcrossShort', 'across')}</span>
-              </label>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
-                <input
-                  type="checkbox"
-                  checked={shelfAlt[i]}
-                  onChange={(e) => setPattern(i, e.target.checked)}
-                  aria-label={`${t('racks.cabinetShelfN', { n: i + 1 })} ${t('racks.cabinetShelfAlternateShort', '6 / 5 alternating')}`}
-                />
-                <span>{t('racks.cabinetShelfAlternateShort', '6 / 5 alternating')}</span>
-              </label>
-              {sidewaysOn && (
-                <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
-                  <span>{t('racks.cabinetShelfSidewaysShort', 'bottles lie')}</span>
-                  <select
-                    value={shelfSide[i]}
-                    onChange={(e) => setSide(i, e.target.value)}
-                    aria-label={`${t('racks.cabinetShelfN', { n: i + 1 })} ${t('racks.cabinetShelfSidewaysShort', 'bottles lie')}`}
-                  >
-                    <option value="">{t('racks.cabinetSidewaysNone', 'front to back')}</option>
-                    <option value="front">{t('racks.cabinetSidewaysFront', 'one across the front')}</option>
-                    <option value="all">{t('racks.cabinetSidewaysAll', 'all across')}</option>
-                  </select>
-                </label>
-              )}
-            </div>
-          ))}
-        </div>
-        <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
-          {t('racks.cabinetShelfRowsHelp', 'Rows: 1 = a sliding shelf with a single row, more = a stacking bay. Across: a shelf narrower than the cabinet is drawn centred. Alternating: the rows of that shelf go full width, one fewer, full width … (6 in front of 5, then 5 in front of 6). The maker\'s presets fill this in; change any shelf to match how you load yours.')}
-          {sidewaysOn ? ` ${t('racks.cabinetSidewaysHelp', 'Bottles lie: front to back, one bottle lying across the front of the others (as in a slim fridge), or all lying across (as in a bottom bin). On a shelf stacked in levels of a one-deep cabinet, the level above a bottle lying across rests on the bottles behind it, so it holds one fewer. Otherwise the number of bottles and the slot numbers stay the same.')}` : ''}
-        </small>
-      </div>
-
-      <div className="form-group">
-        <label>
-          <input
-            type="checkbox"
-            checked={twoDeep}
-            onChange={(e) => setNewRack({ ...newRack, typeConfig: { ...newRack.typeConfig, twoDeep: e.target.checked } })}
-          />
-          {' '}{t('racks.cabinetTwoDeepLabel', 'Two deep (neck to neck)')}
-        </label>
-        <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
-          {t('racks.cabinetTwoDeepHelp', 'Bottles lie neck to neck, two rows per level. This changes how the cabinet is drawn, not how many bottles it holds.')}
-        </small>
-      </div>
-
-      <div className="form-group">
-        <label>
-          <input
-            type="checkbox"
-            checked={alternate}
-            onChange={(e) => {
-              // The cabinet-wide setting: every shelf follows it until one is changed.
-              setShelf({ alternate: e.target.checked, shelfAlternate: undefined });
-            }}
-          />
-          {' '}{t('racks.cabinetAlternateLabel', 'Rows alternate in width on every shelf (6 / 5 / 6 …)')}
-        </label>
-        <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
-          {t('racks.cabinetAlternateHelp', 'The first level holds a full row in front of one bottle fewer behind it; the level above nests in its grooves, one fewer in front of a full row, and so on — the honeycomb of a Liebherr GrandCru shelf. Sets every shelf at once; untick single shelves above. This changes how many bottles the cabinet holds, so it is set when the cabinet is created.')}
-        </small>
-      </div>
-
-      <div className="form-group">
-        <label>
-          <input
-            type="checkbox"
-            checked={stagger}
-            disabled={allAlternate}
-            onChange={(e) => setNewRack({ ...newRack, typeConfig: { ...newRack.typeConfig, stagger: e.target.checked } })}
-          />
-          {' '}{t('racks.cabinetStaggerLabel', 'Stacked rows nest (staggered)')}
-        </label>
-        <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
-          {allAlternate
-            ? t('racks.cabinetAlternateNests', 'Rows that alternate in width always nest: each narrow row lies in the grooves of the wide row below it.')
-            : t('racks.cabinetStaggerHelp', 'Each stacked row sits in the grooves of the row below, offset half a bottle, the way bottles actually stack on a shelf. Turn it off for rows stacked squarely on top of each other. Drawing only — the number of bottles is the same.')}
-        </small>
-      </div>
-
-      {headToTailOn && (
-        <div className="form-group">
-          <label>
-            <input
-              type="checkbox"
-              checked={headToTail}
-              disabled={twoDeep}
-              onChange={(e) => setNewRack({ ...newRack, typeConfig: { ...newRack.typeConfig, headToTail: e.target.checked } })}
-            />
-            {' '}{t('racks.cabinetHeadToTailLabel', 'Bottles lie head to tail')}
-          </label>
-          <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
-            {twoDeep
-              ? t('racks.cabinetHeadToTailNeedsSingle', 'Head to tail is for bottles that lie one deep: untick Two deep first.')
-              : t('racks.cabinetHeadToTailHelp', 'For bottles that lie one deep, base forward and neck forward in turn, so a row fits more. Every other bottle is drawn neck forward. Drawing only — the number of bottles and the slot numbers stay the same.')}
-          </small>
-        </div>
-      )}
-    </>
-  );
-}
-
-// ---- New rack creation form with type selector ----
-function NewRackForm({ newRack, setNewRack, onTypeChange, onSubmit, saving, groups = [] }) {
-  const { t } = useTranslation();
-  const headToTailOn = useFeature('cabinetHeadToTail');
-  const sidewaysOn = useFeature('cabinetSideways');
-  const dims = TYPE_DIMENSIONS[newRack.type] || TYPE_DIMENSIONS.grid;
-  const [showPreview, setShowPreview] = useState(false);
-  // Which preview to draw. A cabinet or an open shelf is about its SHAPE, so
-  // it opens in 3D; flat types open as the numbered map, which is the only
-  // view that shows slot numbering. Follows the type unless the user picks.
-  const prefers3d = newRack.type === 'cabinet' || newRack.type === 'shelf';
-  const [previewMode, setPreviewMode] = useState(prefers3d ? '3d' : 'map');
-  useEffect(() => { setPreviewMode(prefers3d ? '3d' : 'map'); }, [prefers3d]);
-  // Raw text of the double-height rows input (grid only). Kept as text so
-  // partial input like "1," doesn't fight the parser; cleared when the rack
-  // type changes (the parent resets typeConfig at the same time).
-  const [doubleRowsText, setDoubleRowsText] = useState('');
-  useEffect(() => { setDoubleRowsText(''); }, [newRack.type]);
-
-  // Synthetic rack for the preview renderer. The 3D view is filled with
-  // stand-in bottles so it reads as a loaded cabinet rather than an empty
-  // box; the map stays empty because its job is to show slot NUMBERING, which
-  // a bottle in every cell would cover up. Nothing here is ever saved.
-  const previewCapacity = getTotalSlots(newRack.type, newRack.rows, newRack.cols, newRack.typeConfig);
-  const previewSlots = useMemo(() => {
-    if (previewMode !== '3d') return [];
-    // A plausible cellar mix, weighted to red and white.
-    const mix = ['red', 'white', 'red', 'sparkling', 'white', 'red', 'rosé', 'white', 'red', 'dessert'];
-    // Each bottle is a four-mesh group with its own transmissive material, so
-    // a 312-bottle cabinet (the largest preset) would cost ~1250 draw calls
-    // and a hand-built shape far more. Fill the first PREVIEW_FILL_MAX cells
-    // and leave the rest showing their rings — the shape still reads, and the
-    // phone survives it.
-    const filled = Math.min(previewCapacity, PREVIEW_FILL_MAX);
-    return Array.from({ length: filled }, (_, i) => ({
-      position: i + 1,
-      bottle: { _id: `preview-${i + 1}`, wineDefinition: { _id: `preview-w-${i + 1}`, type: mix[i % mix.length] } },
-    }));
-  }, [previewMode, previewCapacity]);
-
-  const previewRack = {
-    _id: 'preview',
-    name: newRack.name || t('racks.namePlaceholder', 'Preview'),
-    type: newRack.type,
-    rows: newRack.rows,
-    cols: newRack.cols,
-    typeConfig: newRack.typeConfig,
-    slots: previewSlots,
-    isModular: false,
-  };
-
-  return (
-    <>
-    <form className="card new-rack-form" onSubmit={onSubmit}>
-      <h3>{t('racks.newRackTitle')}</h3>
-
-      <RackTypeSelector value={newRack.type} onChange={onTypeChange} />
-
-      <div className="new-rack-fields">
-        <div className="form-group">
-          <label>{t('racks.nameLabel')}</label>
-          <input
-            type="text"
-            value={newRack.name}
-            onChange={e => setNewRack({ ...newRack, name: e.target.value })}
-            placeholder={t('racks.namePlaceholder')}
-            required
-          />
-        </div>
-
-        <div className="form-group">
-          <label>{t('racks.groupLabel', 'Group')}</label>
-          <input
-            type="text"
-            list="new-rack-group-options"
-            value={newRack.group || ''}
-            onChange={e => setNewRack({ ...newRack, group: e.target.value })}
-            placeholder={t('racks.groupPlaceholder', 'e.g. Basement, Kitchen fridge')}
-            maxLength={40}
-          />
-          <datalist id="new-rack-group-options">
-            {groups.map(g => <option key={g} value={g} />)}
-          </datalist>
-          <small className="help-text">{t('racks.groupHint', 'Optional. Racks with the same group are shown together — a room, a fridge, a cooler. Leave it empty for no group.')}</small>
-        </div>
-
-        {dims.showRows && (
-          <div className="form-group">
-            <label>{t(dims.rowLabel || 'racks.rowsLabel')}</label>
-            <input
-              type="number"
-              inputMode="numeric"
-              min={1} max={20}
-              value={newRack.rows}
-              onChange={e => setNewRack({ ...newRack, rows: parseInt(e.target.value) || dims.defaultRows })}
-            />
-          </div>
-        )}
-
-        {dims.showCols && (
-          <div className="form-group">
-            <label>{t(dims.colLabel || 'racks.colsLabel')}</label>
-            <input
-              type="number"
-              inputMode="numeric"
-              min={1} max={20}
-              value={newRack.cols}
-              onChange={e => setNewRack({ ...newRack, cols: parseInt(e.target.value) || dims.defaultCols })}
-            />
-          </div>
-        )}
-
-        {dims.showDoubleHeightRows && (
-          <div className="form-group">
-            <label>{t('racks.doubleHeightRowsLabel', 'Double-height rows')}</label>
-            <input
-              type="text"
-              value={doubleRowsText}
-              placeholder={t('racks.doubleHeightRowsPlaceholder', 'e.g. 1,3')}
-              onChange={e => {
-                const text = e.target.value;
-                setDoubleRowsText(text);
-                const parsed = parseDoubleHeightRows(text);
-                setNewRack({
-                  ...newRack,
-                  typeConfig: {
-                    ...newRack.typeConfig,
-                    doubleHeightRows: parsed.length > 0 ? parsed : undefined,
-                  },
-                });
-              }}
-            />
-            <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
-              {t('racks.doubleHeightRowsHelp', 'Rows with headroom for bottles resting on top')}
-            </small>
-          </div>
-        )}
-
-        {dims.showHexFlip && (
-          <div className="form-group">
-            <label>
-              <input
-                type="checkbox"
-                checked={!!newRack.typeConfig?.hexFlip}
-                onChange={e => setNewRack({
-                  ...newRack,
-                  typeConfig: { ...newRack.typeConfig, hexFlip: e.target.checked || undefined }
-                })}
-              />
-              {' '}{t('racks.hexFlipLabel', 'Flip rows (short row on top)')}
-            </label>
-            <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
-              {t('racks.hexFlipHelp', 'By default the top row is full width. Enable this to mirror the rows top-to-bottom.')}
-            </small>
-          </div>
-        )}
-
-        {dims.showHexFlip && (
-          <div className="form-group">
-            <label>
-              <input
-                type="checkbox"
-                checked={!!newRack.typeConfig?.hexEqualRows}
-                onChange={e => setNewRack({
-                  ...newRack,
-                  typeConfig: { ...newRack.typeConfig, hexEqualRows: e.target.checked || undefined }
-                })}
-              />
-              {' '}{t('racks.hexEqualRowsLabel', 'Equal rows (staggered)')}
-            </label>
-            <small style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>
-              {t('racks.hexEqualRowsHelp', 'Every row holds the full number of columns, offset by half a bottle — like the top and bottom shelves of many wine fridges.')}
-            </small>
-          </div>
-        )}
-
-        {dims.showModule && (
-          <>
-            <div className="form-group">
-              <label>{t('racks.moduleRowsLabel')}</label>
-              <input
-                type="number"
-                inputMode="numeric"
-                min={1} max={10}
-                value={newRack.typeConfig?.moduleRows || 2}
-                onChange={e => setNewRack({
-                  ...newRack,
-                  typeConfig: { ...newRack.typeConfig, moduleRows: parseInt(e.target.value) || 2 }
-                })}
-              />
-            </div>
-            <div className="form-group">
-              <label>{t('racks.moduleColsLabel')}</label>
-              <input
-                type="number"
-                inputMode="numeric"
-                min={1} max={10}
-                value={newRack.typeConfig?.moduleCols || 2}
-                onChange={e => setNewRack({
-                  ...newRack,
-                  typeConfig: { ...newRack.typeConfig, moduleCols: parseInt(e.target.value) || 2 }
-                })}
-              />
-            </div>
-          </>
-        )}
-
-        {dims.showCabinet && (
-          <CabinetShapeFields newRack={newRack} setNewRack={setNewRack} />
-        )}
-
-        {dims.showBottlesPerCell && (
-          <div className="form-group">
-            <label>{t('racks.bottlesPerCellLabel', 'Bottles per cell')}</label>
-            <input
-              type="number"
-              inputMode="numeric"
-              min={1} max={20}
-              value={newRack.typeConfig?.bottlesPerCell || 1}
-              onChange={e => setNewRack({
-                ...newRack,
-                typeConfig: { ...newRack.typeConfig, bottlesPerCell: parseInt(e.target.value) || 1 }
-              })}
-            />
-          </div>
-        )}
-
-        {dims.showBackCols && (
-          <div className="form-group">
-            <label>{t('racks.backColsLabel', 'Back row bottles (per shelf)')}</label>
-            <input
-              type="number"
-              inputMode="numeric"
-              min={0} max={20}
-              value={newRack.typeConfig?.backCols ?? 0}
-              onChange={e => setNewRack({
-                ...newRack,
-                typeConfig: { ...newRack.typeConfig, backCols: Math.max(0, parseInt(e.target.value) || 0) }
-              })}
-            />
-          </div>
-        )}
-
-        {dims.showBottlesPerSection && (
-          <div className="form-group">
-            <label>{t('racks.bottlesPerSectionLabel', 'Bottles per section')}</label>
-            <input
-              type="number"
-              inputMode="numeric"
-              min={1} max={30}
-              value={newRack.typeConfig?.bottlesPerSection || 10}
-              onChange={e => setNewRack({
-                ...newRack,
-                typeConfig: { ...newRack.typeConfig, bottlesPerSection: parseInt(e.target.value) || 10 }
-              })}
-            />
-          </div>
-        )}
-
-        <button
-          type="button"
-          className={`btn btn-secondary new-rack-preview-toggle ${showPreview ? 'active' : ''}`}
-          onClick={() => setShowPreview(p => !p)}
-        >
-          {showPreview ? t('racks.hidePreview', 'Hide preview') : t('racks.preview', 'Preview')}
-        </button>
-        <button type="submit" className="btn btn-primary" disabled={saving}>
-          {saving ? t('racks.creating') : t('racks.createRack')}
-        </button>
-      </div>
-
-      <div className="new-rack-preview-hint">
-        {t('racks.totalSlots')}: {previewCapacity}
-      </div>
-
-      {showPreview && (
-        <div className="new-rack-preview-panel">
-          <div className="new-rack-preview-head">
-            <div className="new-rack-preview-label">
-              {t('racks.previewLabel', 'Preview — this is how the rack will look once created')}
-            </div>
-            <div className="rack-view-mode-toggle" role="tablist">
-              <button
-                type="button"
-                role="tab"
-                aria-selected={previewMode === '3d'}
-                className={`view-mode-btn ${previewMode === '3d' ? 'active' : ''}`}
-                onClick={() => setPreviewMode('3d')}
-              >
-                {t('racks.view3d')}
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={previewMode === 'map'}
-                className={`view-mode-btn ${previewMode === 'map' ? 'active' : ''}`}
-                onClick={() => setPreviewMode('map')}
-              >
-                {t('racks.viewCompact')}
-              </button>
-            </div>
-          </div>
-          <div className={`new-rack-preview-canvas ${previewMode === '3d' ? 'new-rack-preview-canvas--3d' : ''}`}>
-            {previewMode === '3d' ? (
-              <Suspense fallback={<div className="loading">{t('common.loading')}</div>}>
-                {/* pullOut={false}: a look-only preview, so every free cell
-                    shows its ring instead of hiding inside a closed cabinet. */}
-                <ShelfView3D rack={previewRack} pullOut={false} />
-              </Suspense>
-            ) : (
-              <RackRenderer
-                rack={previewRack}
-                canEdit={false}
-                onSlotClick={() => {}}
-              />
-            )}
-          </div>
-        </div>
-      )}
-    </form>
-    {/* Outside the form: the feedback dialog has a form of its own, and a
-        submit inside this one created the rack (release audit 2026-10-12). */}
-    {newRack.type === 'cabinet' && headToTailOn && (
-      <BetaBadge feature="cabinetHeadToTail" note={t('racks.cabinetHeadToTailBeta', 'Bottles head to tail is in early access.')} />
-    )}
-    {newRack.type === 'cabinet' && sidewaysOn && (
-      <BetaBadge feature="cabinetSideways" note={t('racks.cabinetSidewaysBeta', 'Bottles lying sideways is in early access.')} />
-    )}
-    </>
-  );
-}
-
-// ---- Content for empty slot: pick a bottle to place ----
-/** Group unplaced bottles by wine + vintage so a case shows as one row ×N. */
-function groupBottles(bottles) {
-  const map = new Map();
-  for (const b of bottles) {
-    const key = `${b.wineDefinition?._id || b._id}:${b.vintage || ''}`;
-    if (!map.has(key)) map.set(key, { key, sample: b, bottles: [] });
-    map.get(key).bottles.push(b);
-  }
-  return [...map.values()];
-}
-
-function EmptySlotContent({ position, zone, apiFetch, cellarId, canEdit, onAssign, onAssignMany, freeRun, onDisable, onClose }) {
-  const { t } = useTranslation();
-  const [search, setSearch] = useState('');
-  const [results, setResults] = useState([]);
-  const [loading, setLoading] = useState(true);
-  // A failed load shows a retry, not "no unplaced bottles".
-  const [loadFailed, setLoadFailed] = useState(false);
-  // Case placement: the group being quantity-picked, chosen quantity, busy flag
-  const [caseGroup, setCaseGroup] = useState(null);
-  const [caseQty, setCaseQty] = useState(2);
-  const [placing, setPlacing] = useState(false);
-  const timerRef = useRef(null);
-  // Only the latest request may fill the list: an older search can answer last.
-  const seqRef = useRef(0);
-  // Retry gives way to the loading line; focus goes here, not to the page.
-  const searchRef = useRef(null);
-
-  // Fetch bottles from backend, excluding already-placed bottles server-side
-  const fetchBottles = useCallback(async (term) => {
-    const seq = ++seqRef.current;
-    setLoading(true);
-    setLoadFailed(false);
-    try {
-      const params = new URLSearchParams({ limit: '30' });
-      if (term) params.set('search', term);
-      // The backend excludes rack-placed bottles itself — sending every placed
-      // bottle ID in the query string overflows the URL limit on big cellars.
-      params.set('excludePlaced', '1');
-      const res = await getCellar(apiFetch, cellarId, params.toString());
-      const data = await res.json();
-      if (seq !== seqRef.current) return;
-      if (res.ok) setResults(data.bottles?.items || []);
-      else setLoadFailed(true);
-    } catch {
-      if (seq !== seqRef.current) return;
-      setLoadFailed(true);
-    }
-    setLoading(false);
-  }, [apiFetch, cellarId]);
-
-  // Load initial results on mount
-  useEffect(() => { fetchBottles(''); }, [fetchBottles]);
-
-  // Debounced search (300ms)
-  const handleSearch = (value) => {
-    setSearch(value);
-    clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => fetchBottles(value), 300);
-  };
-
-  // Cleanup timer on unmount
-  useEffect(() => () => clearTimeout(timerRef.current), []);
-
-  return (
-    <>
-      <div className="slot-popup-header">
-        <span className="slot-popup-title" id="slot-popup-heading">
-          {t('racks.slotPlaceBottle', { position })}
-          {zone && (
-            <span className="slot-zone-chip">
-              <span className="rack-zone-dot" style={{ background: zone.color || '#888' }} />
-              {zone.name}
-            </span>
-          )}
-        </span>
-        <button className="slot-popup-close" onClick={onClose} aria-label="Close">&times;</button>
-      </div>
-      <input
-        ref={searchRef}
-        type="text"
-        className="slot-search"
-        placeholder={t('racks.searchWines')}
-        value={search}
-        onChange={e => handleSearch(e.target.value)}
-        aria-label={t('racks.searchWines')}
-        autoFocus
-      />
-      {caseGroup ? (
-        /* Quantity picker: place several bottles of the same wine into the
-           free slots starting at this position. */
-        <div className="slot-case-panel">
-          <p className="slot-case-title">
-            <strong>{caseGroup.sample.wineDefinition?.name || t('common.unknown')}</strong>
-            {caseGroup.sample.vintage ? ` (${caseGroup.sample.vintage})` : ''}
-          </p>
-          <p className="slot-case-hint">
-            {t('racks.caseHint', 'Fills the free slots from here onward, in position order.')}
-          </p>
-          <div className="slot-case-qty">
-            <button
-              type="button"
-              className="btn btn-secondary btn-small"
-              onClick={() => setCaseQty(q => Math.max(2, q - 1))}
-              disabled={placing || caseQty <= 2}
-              aria-label="−"
-            >
-              −
-            </button>
-            <span className="slot-case-count">{caseQty}</span>
-            <button
-              type="button"
-              className="btn btn-secondary btn-small"
-              onClick={() => setCaseQty(q => Math.min(caseGroup.max, q + 1))}
-              disabled={placing || caseQty >= caseGroup.max}
-              aria-label="+"
-            >
-              +
-            </button>
-            <span className="slot-case-max">{t('racks.caseMax', 'max {{max}}', { max: caseGroup.max })}</span>
-          </div>
-          <div className="slot-popup-actions">
-            <button className="btn btn-secondary btn-small" onClick={() => setCaseGroup(null)} disabled={placing}>
-              {t('common.cancel')}
-            </button>
-            <button
-              className="btn btn-primary btn-small"
-              disabled={placing}
-              onClick={async () => {
-                setPlacing(true);
-                // The parent closes the popup once every bottle is placed.
-                await onAssignMany(caseGroup.bottles.slice(0, caseQty).map(b => b._id));
-              }}
-            >
-              {placing
-                ? t('racks.casePlacing', 'Placing…')
-                : t('racks.casePlaceBtn', 'Place {{count}} bottles', { count: caseQty })}
-            </button>
-          </div>
-        </div>
-      ) : (
-      <div className="slot-bottle-list">
-        {loading ? (
-          <p className="slot-empty-msg">…</p>
-        ) : loadFailed ? (
-          <p className="slot-empty-msg">
-            <span role="alert">{t('racks.unplacedLoadFailed', "Couldn't load your bottles.")}</span>{' '}
-            <button type="button" className="btn btn-secondary btn-small" onClick={() => { searchRef.current?.focus(); fetchBottles(search); }}>
-              {t('common.retry', 'Retry')}
-            </button>
-          </p>
-        ) : results.length === 0 ? (
-          <p className="slot-empty-msg">{t('racks.noUnplacedBottles')}</p>
-        ) : (
-          groupBottles(results).map(g => (
-            <div
-              key={g.key}
-              className="slot-bottle-item"
-              onClick={() => onAssign(position, g.bottles[0]._id)}
-              onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && onAssign(position, g.bottles[0]._id)}
-              role="button"
-              tabIndex={0}
-            >
-              <span className={`slot-bottle-type-dot type-${swatchType(g.sample.wineDefinition, 'red')}`} aria-hidden="true" />
-              <div className="slot-bottle-info">
-                <strong>
-                  {g.sample.wineDefinition?.name || t('common.unknown')}
-                  {g.bottles.length > 1 && <span className="slot-case-badge">×{g.bottles.length}</span>}
-                </strong>
-                <span className="slot-bottle-meta">
-                  {g.sample.wineDefinition?.producer} &middot; {g.sample.vintage}
-                  {g.sample.wineDefinition?.country?.name ? ` \u00B7 ${g.sample.wineDefinition.country.name}` : ''}
-                </span>
-              </div>
-              {onAssignMany && g.bottles.length > 1 && Math.min(g.bottles.length, freeRun || 0) > 1 && (
-                <button
-                  type="button"
-                  className="btn btn-secondary btn-small slot-case-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    const max = Math.min(g.bottles.length, freeRun);
-                    setCaseGroup({ ...g, max });
-                    setCaseQty(Math.min(g.bottles.length, max));
-                  }}
-                >
-                  {t('racks.caseOpenBtn', 'Place several\u2026')}
-                </button>
-              )}
-            </div>
-          ))
-        )}
-      </div>
-      )}
-      {canEdit && onDisable && (
-        <div className="slot-popup-actions">
-          <button className="btn btn-secondary btn-small" onClick={onDisable}>
-            {t('racks.disableSlot')}
-          </button>
-        </div>
-      )}
-    </>
-  );
-}
-
-// ---- Content for a disabled (unusable) slot ----
-function DisabledSlotContent({ position, canEdit, onEnable, onClose }) {
-  const { t } = useTranslation();
-  return (
-    <>
-      <div className="slot-popup-header">
-        <span className="slot-popup-title" id="slot-popup-heading">{t('racks.disabledSlotTitle', { position })}</span>
-        <button className="slot-popup-close" onClick={onClose} aria-label="Close">&times;</button>
-      </div>
-      <p className="slot-disabled-note">{t('racks.disabledSlotNote')}</p>
-      {canEdit && (
-        <div className="slot-popup-actions">
-          <button className="btn btn-secondary btn-small" onClick={onEnable}>
-            {t('racks.enableSlot')}
-          </button>
-        </div>
-      )}
-    </>
-  );
-}
-
-// ---- Content for filled slot: show bottle info + actions ----
-function FilledSlotContent({ position, slot, zone, canEdit, onRemoveFromRack, onMove, onConsume, onPour, onClose }) {
-  const { t } = useTranslation();
-  const bottle = slot.bottle;
-  const wine = bottle?.wineDefinition;
-
-  return (
-    <>
-      <div className="slot-popup-header">
-        <span className="slot-popup-title" id="slot-popup-heading">
-          {t('racks.slotTitle', { position })}
-          {zone && (
-            <span className="slot-zone-chip">
-              <span className="rack-zone-dot" style={{ background: zone.color || '#888' }} />
-              {zone.name}
-            </span>
-          )}
-        </span>
-        <button className="slot-popup-close" onClick={onClose} aria-label="Close">&times;</button>
-      </div>
-
-      <div className="slot-bottle-detail">
-        <WineImage image={wine?.image} alt={wine?.name} className="slot-detail-img" />
-        <div className="slot-detail-info">
-          <h4>{wine?.name || t('common.unknown')}</h4>
-          {wine?.producer && <p className="slot-detail-producer">{wine.producer}</p>}
-          <p className="slot-detail-meta">
-            <span className={`slot-bottle-type-dot type-${swatchType(wine, 'red')}`} />
-            {wineTypeLabel(wine, t)} &middot; {bottle?.vintage}
-          </p>
-          {wine?.country?.name && (
-            <p className="slot-detail-meta">
-              {wine.country.name}{wine?.region?.name ? `, ${wine.region.name}` : ''}
-            </p>
-          )}
-          {bottle?.notes && <p className="slot-detail-notes">{bottle.notes}</p>}
-          {bottle?.openedAt && (
-            <p className={`slot-open-info slot-open-info--${freshnessStatus(bottle) || 'ok'}`}>
-              🍷 {t('racks.openInfo', 'Open — ≈ {{glasses}} glasses left · drink within {{days}}d', {
-                glasses: glassesLeft(bottle),
-                days: Math.max(0, daysLeft(bottle) ?? 0),
-              })}
-            </p>
-          )}
-        </div>
-      </div>
-
-      {canEdit && (
-        <div className="slot-popup-actions">
-          {bottle?.openedAt && onPour && (
-            <button className="btn btn-primary btn-small" onClick={onPour} disabled={remainingMl(bottle) <= 0}>
-              {t('racks.pourGlass', 'Pour a glass')}
-            </button>
-          )}
-          {/* Then a tap on the slot it should go to — dragging is mouse/pen only */}
-          {onMove && (
-            <button className="btn btn-secondary btn-small" onClick={onMove}>
-              {t('racks.moveMode.button', 'Move')}
-            </button>
-          )}
-          <button className="btn btn-secondary btn-small" onClick={onRemoveFromRack}>
-            {t('racks.removeFromRack')}
-          </button>
-          <button className="btn btn-consume btn-small" onClick={onConsume}>
-            {t('racks.remove')}
-          </button>
-        </div>
-      )}
-    </>
-  );
-}
-
-// ---- NFC link modal ----
-function NfcLinkModal({ rack, onSave, onCancel }) {
-  const { t } = useTranslation();
-  const [status, setStatus] = useState('idle'); // idle | writing | success | error
-  const [errorMsg, setErrorMsg] = useState('');
-  const supportsNfc = typeof window !== 'undefined' && 'NDEFReader' in window;
-
-  const nfcUrl = `${window.location.origin}/nfc/rack/${rack?._id}`;
-
-  const handleWrite = async () => {
-    if (!supportsNfc) return;
-    setStatus('writing');
-    setErrorMsg('');
-    try {
-      const reader = new window.NDEFReader();
-      await reader.write({
-        records: [{ recordType: 'url', data: nfcUrl }]
-      });
-      setStatus('success');
-      // Save rfidTag marker on the rack
-      onSave(rack._id);
-    } catch (err) {
-      setStatus('error');
-      setErrorMsg(err.message || t('nfc.writeFailed'));
-    }
-  };
-
-  const handleUnlink = () => {
-    onSave('');
-  };
-
-  return (
-    <div className="slot-modal-overlay" onClick={onCancel}>
-      <DialogBox
-        className="slot-modal"
-        onClick={e => e.stopPropagation()}
-        style={{ maxWidth: 400 }}
-        onClose={onCancel}
-        label={t('nfc.linkTitle')}
-      >
-        <div className="slot-popup-header">
-          <span className="slot-popup-title">{t('nfc.linkTitle')}</span>
-          <button className="slot-popup-close" onClick={onCancel} aria-label="Close">&times;</button>
-        </div>
-        <div style={{ padding: '1rem' }}>
-          <p style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)', margin: '0 0 1rem' }}>
-            {t('nfc.linkDescription')}
-          </p>
-
-          {rack?.rfidTag && (
-            <div style={{ padding: '0.5rem 0.75rem', background: 'rgba(var(--color-primary-rgb), 0.08)', borderRadius: 'var(--radius-sm)', marginBottom: '1rem', fontSize: '0.85rem' }}>
-              {t('nfc.currentlyLinked')}
-            </div>
-          )}
-
-          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)', wordBreak: 'break-all', marginBottom: '1rem', padding: '0.5rem', background: 'var(--color-surface-raised)', borderRadius: 'var(--radius-sm)' }}>
-            <strong>URL:</strong> {nfcUrl}
-          </div>
-
-          {supportsNfc ? (
-            <>
-              <button
-                className="btn btn-primary"
-                onClick={handleWrite}
-                disabled={status === 'writing'}
-                style={{ width: '100%', marginBottom: '0.5rem' }}
-              >
-                {status === 'writing' ? t('nfc.writing') : t('nfc.writeToTag')}
-              </button>
-              {status === 'success' && (
-                <p style={{ color: 'var(--color-success)', fontSize: '0.85rem', margin: '0.5rem 0 0' }}>
-                  {t('nfc.writeSuccess')}
-                </p>
-              )}
-              {status === 'error' && (
-                <p style={{ color: 'var(--color-danger)', fontSize: '0.85rem', margin: '0.5rem 0 0' }}>
-                  {errorMsg}
-                </p>
-              )}
-            </>
-          ) : (
-            <div style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)' }}>
-              <p style={{ margin: '0 0 0.5rem', fontWeight: 600 }}>{t('nfc.notSupported')}</p>
-              <p style={{ margin: 0 }}>{t('nfc.manualInstructions')}</p>
-            </div>
-          )}
-
-          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem', justifyContent: 'flex-end' }}>
-            {rack?.rfidTag && (
-              <button className="btn btn-danger btn-small" onClick={handleUnlink}>
-                {t('nfc.unlink')}
-              </button>
-            )}
-            {!supportsNfc && !rack?.rfidTag && (
-              <button className="btn btn-primary btn-small" onClick={() => onSave(rack._id)}>
-                {t('nfc.markAsLinked')}
-              </button>
-            )}
-          </div>
-        </div>
-      </DialogBox>
     </div>
   );
 }

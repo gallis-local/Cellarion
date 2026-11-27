@@ -1,5 +1,5 @@
 /**
- * Offline-queue preconditions on the bottle routes (#1355). A write queued
+ * Offline-queue preconditions on the bottle routes. A write queued
  * offline says what the user saw; if the bottle changed meanwhile the route
  * answers 409 instead of overwriting someone else's change. Absent → the
  * routes behave exactly as before. Harness cloned from bottles.consumeDate.test.js.
@@ -11,8 +11,8 @@ const jwt = require('jsonwebtoken');
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 
 jest.mock('../services/search', () => ({
-  indexBottle: jest.fn(), removeBottle: jest.fn(), indexWine: jest.fn(),
-  bulkIndexBottles: jest.fn(), getIsAvailable: jest.fn(() => false),
+  indexWine: jest.fn(),
+  getIsAvailable: jest.fn(() => false),
 }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../services/embeddingJob', () => ({ embedSinglePair: jest.fn().mockResolvedValue(undefined), reembedActiveVintages: jest.fn() }));

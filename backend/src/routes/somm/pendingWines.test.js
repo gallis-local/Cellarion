@@ -15,15 +15,19 @@ process.env.JWT_SECRET = 'test-secret';
 jest.mock('../../models/WineDefinition', () => ({
   find: jest.fn(),
   findById: jest.fn(),
+  findOne: jest.fn(),
   countDocuments: jest.fn(),
 }));
+// The merge of a queue row into a published wine re-points every model that
+// references a wine; its own behaviour is pinned in
+// services/uncheckedWines.mongo.test.js against a real database.
+jest.mock('../../services/wineMergeOps', () => ({ performWineMerge: jest.fn() }));
 jest.mock('../../models/BottleImage', () => ({ find: jest.fn() }));
 jest.mock('../../models/Bottle', () => ({ find: jest.fn(), distinct: jest.fn() }));
 jest.mock('../../models/Country', () => ({ findOne: jest.fn() }));
 jest.mock('../../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../../services/search', () => ({
   indexWine: jest.fn().mockResolvedValue(undefined),
-  bulkIndexBottles: jest.fn().mockResolvedValue(undefined),
 }));
 jest.mock('../../services/embeddingJob', () => ({
   reembedActiveVintages: jest.fn().mockResolvedValue(undefined),
@@ -67,6 +71,7 @@ const searchService = require('../../services/search');
 const { reembedActiveVintages } = require('../../services/embeddingJob');
 const { ensurePendingVintageProfile } = require('../../utils/vintageProfile');
 const { resolveGrapeIdsStrict } = require('../../services/wineProfileOps');
+const { performWineMerge } = require('../../services/wineMergeOps');
 const router = require('./pendingWines');
 
 const oid = (c) => c.repeat(24);
@@ -216,19 +221,19 @@ describe('GET — projection and anonymisation', () => {
     WineDefinition.countDocuments.mockResolvedValue(0);
     await get(tokenFor(['somm']), '?createdVia=' + encodeURIComponent('{"$ne":null}'));
     expect(WineDefinition.find).toHaveBeenCalledWith(
-      { pendingIdentity: true, identityUnavailable: { $ne: true }, draft: { $ne: true } });
+      { pendingIdentity: true, identityUnavailable: { $ne: true }, draft: { $ne: true }, nonWine: { $ne: true } });
   });
 
   test('rows dispositioned "no producer on the label" are excluded, and ?includeUnavailable=1 shows them', async () => {
     await get(tokenFor(['somm']));
     expect(WineDefinition.find).toHaveBeenCalledWith(
-      { pendingIdentity: true, identityUnavailable: { $ne: true }, draft: { $ne: true } });
+      { pendingIdentity: true, identityUnavailable: { $ne: true }, draft: { $ne: true }, nonWine: { $ne: true } });
 
     jest.clearAllMocks();
     WineDefinition.find.mockReturnValue(leanChain([]));
     WineDefinition.countDocuments.mockResolvedValue(0);
     await get(tokenFor(['somm']), '?includeUnavailable=1');
-    expect(WineDefinition.find).toHaveBeenCalledWith({ pendingIdentity: true, draft: { $ne: true } });
+    expect(WineDefinition.find).toHaveBeenCalledWith({ pendingIdentity: true, draft: { $ne: true }, nonWine: { $ne: true } });
   });
 });
 
@@ -367,5 +372,122 @@ describe('PATCH — fix, promote, audit', () => {
 
     expect(res.status).toBe(409);
     expect((await res.json()).error).toMatch(/merge them instead/);
+  });
+});
+
+/**
+ * The wines from a member's cellar file that wait for a curator's check ride
+ * the same queue: a filter lists only them, a duplicate refusal names the wine
+ * it collided with, and a row that IS a published wine is merged into it.
+ */
+describe('wines waiting for a check', () => {
+  const TWIN = oid('b');
+  const merge = (token, id, body) => fetch(`${baseUrl}/api/somm/pending-wines/${id}/merge`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const leanDoc = (doc) => ({ select: () => ({ lean: async () => doc }) });
+
+  test('?kind=needs_check lists only them, oldest first, and the envelope counts them', async () => {
+    const chain = leanChain([{ ...WINE_ROW, producer: 'Cave de Kaysersberg', uncheckedIdentity: true, createdVia: 'import' }]);
+    WineDefinition.find.mockReturnValue(chain);
+
+    const body = await (await get(tokenFor(['somm']), '?kind=needs_check')).json();
+
+    expect(WineDefinition.find.mock.calls[0][0]).toMatchObject({ pendingIdentity: true, uncheckedIdentity: true });
+    expect(chain.sort).toHaveBeenCalledWith({ createdAt: 1, _id: 1 });
+    expect(body.wines[0]).toMatchObject({ unchecked: true, producer: 'Cave de Kaysersberg' });
+    expect(body.uncheckedTotal).toBe(1);
+  });
+
+  test('an unknown kind is ignored: both halves, newest first', async () => {
+    const chain = leanChain([WINE_ROW]);
+    WineDefinition.find.mockReturnValue(chain);
+    await get(tokenFor(['somm']), '?kind=everything');
+    expect(WineDefinition.find.mock.calls[0][0].uncheckedIdentity).toBeUndefined();
+    expect(chain.sort).toHaveBeenCalledWith({ createdAt: -1, _id: -1 });
+  });
+
+  test('a check that duplicates a published wine is a 409 that names it', async () => {
+    const doc = wineDoc({ producer: 'Cave de Kaysersberg', uncheckedIdentity: true });
+    doc.save = jest.fn(async () => { const e = new Error('dup'); e.code = 11000; throw e; });
+    WineDefinition.findById.mockResolvedValue(doc);
+    WineDefinition.findOne.mockReturnValue(leanDoc({ _id: TWIN, name: 'Kaefferkopf', producer: 'Cave de Kaysersberg', pendingIdentity: false }));
+
+    const res = await patch(tokenFor(['somm']), W1, { identityChecked: true });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).duplicate).toEqual({
+      wineId: TWIN, name: 'Kaefferkopf', producer: 'Cave de Kaysersberg', appellation: null, published: true, nonWine: false,
+    });
+  });
+
+  test('POST /:id/merge moves the row onto the published wine', async () => {
+    const row = wineDoc({ producer: 'Cave de Kaysersberg', uncheckedIdentity: true });
+    WineDefinition.findById.mockResolvedValueOnce(row); // the queue row
+    WineDefinition.findOne.mockReturnValue(leanDoc({ _id: TWIN, name: 'Kaefferkopf', producer: 'Cave de Kaysersberg', pendingIdentity: false })); // the target
+    performWineMerge.mockResolvedValue({ bottlesMoved: 3, target: { _id: TWIN, name: 'Kaefferkopf', producer: 'Cave de Kaysersberg' } });
+
+    const res = await merge(tokenFor(['somm']), W1, { intoWineId: TWIN });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ mergedWineId: W1, intoWineId: TWIN, bottlesMoved: 3 });
+    expect(performWineMerge).toHaveBeenCalledWith(W1, TWIN, expect.anything());
+    // The target is looked up by the validated id string, compared for equality.
+    expect(WineDefinition.findOne).toHaveBeenCalledWith({ _id: { $eq: TWIN } });
+    // The vintages still in a cellar get their maturity row on the target.
+    expect(ensurePendingVintageProfile).toHaveBeenCalledWith(TWIN, '2019');
+  });
+
+  test('the target must be a published wine: a pending one is a 409 and nothing moves', async () => {
+    WineDefinition.findById.mockResolvedValueOnce(wineDoc({ producer: 'Cave de Kaysersberg', uncheckedIdentity: true }));
+    WineDefinition.findOne.mockReturnValue(leanDoc({ _id: TWIN, name: 'Kaefferkopf', pendingIdentity: true }));
+
+    const res = await merge(tokenFor(['somm']), W1, { intoWineId: TWIN });
+
+    expect(res.status).toBe(409);
+    expect(performWineMerge).not.toHaveBeenCalled();
+  });
+
+  test('only a row of the queue is merged away; a plain user is refused', async () => {
+    WineDefinition.findById.mockResolvedValueOnce(wineDoc({ producer: 'Cave de Kaysersberg', pendingIdentity: false }));
+    expect((await merge(tokenFor(['admin']), W1, { intoWineId: TWIN })).status).toBe(409);
+
+    WineDefinition.findById.mockResolvedValueOnce(wineDoc({ uncheckedIdentity: true }));
+    expect((await merge(tokenFor(['somm']), W1, {})).status).toBe(400);
+
+    // An id that is not a plain string never reaches the query.
+    WineDefinition.findById.mockResolvedValueOnce(wineDoc({ uncheckedIdentity: true }));
+    expect((await merge(tokenFor(['somm']), W1, { intoWineId: { $ne: null } })).status).toBe(400);
+    expect(WineDefinition.findOne).not.toHaveBeenCalled();
+
+    expect((await merge(tokenFor(['user']), W1, { intoWineId: TWIN })).status).toBe(403);
+    expect(performWineMerge).not.toHaveBeenCalled();
+  });
+});
+
+describe('a wine waiting for a check, through the REST fix', () => {
+  test('a fix without the check says the wine is still waiting, not that it lacks a producer', async () => {
+    WineDefinition.findById.mockResolvedValue(wineDoc({ producer: 'Cave de Kaysersberg', uncheckedIdentity: true }));
+    // The model hook keeps such a row pending; mirror it.
+    const doc = await WineDefinition.findById();
+    doc.save = jest.fn(async () => doc);
+
+    const res = await patch(tokenFor(['somm']), W1, { appellation: 'Alsace Grand Cru' });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.promoted).toBe(false);
+    expect(body.message).toMatch(/still waiting for a check/);
+  });
+
+  test('"no producer on the label" is refused for a wine that has a producer', async () => {
+    WineDefinition.findById.mockResolvedValue(wineDoc({ producer: 'Cave de Kaysersberg', uncheckedIdentity: true }));
+
+    const res = await patch(tokenFor(['somm']), W1, { identityUnavailable: true });
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/has a producer/);
   });
 });

@@ -1,7 +1,7 @@
 /**
  * The colour of a sparkling/dessert/fortified wine through the pending-wine
- * fix (and, via the shared validator, the private-draft edit) — support ticket
- * 2026-09-17 ("Colour Sparkling/Rosè"). The validator owns the vocabulary;
+ * fix (and, via the shared validator, the private-draft edit).
+ * The validator owns the vocabulary;
  * whether the type can carry a colour is the model hook's call.
  */
 jest.mock('../models/WineDefinition', () => ({ find: jest.fn(), findById: jest.fn(), countDocuments: jest.fn() }));
@@ -11,7 +11,6 @@ jest.mock('../models/Country', () => ({ findOne: jest.fn() }));
 jest.mock('./crossFieldScan', () => ({ detectCrossFieldForValues: jest.fn().mockResolvedValue(null) }));
 jest.mock('./search', () => ({
   indexWine: jest.fn().mockResolvedValue(undefined),
-  bulkIndexBottles: jest.fn().mockResolvedValue(undefined),
 }));
 jest.mock('./embeddingJob', () => ({ reembedActiveVintages: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('./enrichmentJob', () => ({ enrichWineById: jest.fn().mockResolvedValue(undefined) }));
@@ -44,7 +43,7 @@ describe('validatePendingFix — colour', () => {
   });
 });
 
-// Audit 2026-09-19: refused, not accepted-and-dropped by the model hook.
+// Refused, not accepted-and-dropped by the model hook.
 test('applyPendingFix refuses a colour on a wine that stays red/white/rosé, before any write', async () => {
   const wine = {
     _id: 'wine-2', name: 'Rich Ruby Red', producer: '', appellation: null, type: 'red',

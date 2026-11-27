@@ -14,6 +14,15 @@
  */
 
 jest.mock('../models/WineDefinition', () => ({ findOne: jest.fn(), find: jest.fn(), findById: jest.fn() }));
+// The sweetness category has its own load of the wine, checked on real rows in
+// routes/sweetnessCategory.surfaces.mongo.test.js. With the wine model mocked
+// it is stood in for: nothing read, and a read's wines left as they are.
+jest.mock('../services/sweetnessCategory', () => ({
+  ...jest.requireActual('../services/sweetnessCategory'),
+  readSweetnessCategories: jest.fn(async () => new Map()),
+  attachSweetnessCategories: jest.fn(async (wines) => wines),
+  attachSweetnessCategoriesIfReadable: jest.fn(async (wines) => wines),
+}));
 jest.mock('../services/wineProposalOps', () => ({ pendingForWine: jest.fn() }));
 jest.mock('../services/search', () => ({ getIsAvailable: () => false, search: jest.fn() }));
 jest.mock('../utils/siteUrl', () => ({ siteBaseUrl: () => 'https://cellarion.app' }));
@@ -51,7 +60,7 @@ describe('get_wine — pendingIdentity is excluded in the QUERY', () => {
     await tool('get_wine').handler({ wine_id: WINE }, CTX);
 
     // A signed-in caller's clause carries both exclusions PLUS the one
-    // exception (2026-09-12): their OWN private draft, keyed on the creator in
+    // exception: their OWN private draft, keyed on the creator in
     // the query itself, so nobody else's draft can match.
     expect(WineDefinition.findOne).toHaveBeenCalledWith({
       _id: WINE,
@@ -141,7 +150,7 @@ describe('search_registry — the sibling that was already right', () => {
   });
 });
 
-// Support ticket 2026-09-12: the one-pending-per-wine rule was only
+// The one-pending-per-wine rule must be visible before filing, not only
 // discoverable by composing a correction and having it refused.
 describe('get_wine — pending_correction', () => {
   const visible = { _id: WINE, name: 'Grand Vin de Bordeaux', producer: 'Chateau Martinat', grapes: [], slug: 'martinat' };

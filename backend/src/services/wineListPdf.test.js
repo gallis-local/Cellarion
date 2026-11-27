@@ -146,7 +146,7 @@ describe('buildSections (custom mode)', () => {
   });
 });
 
-// --- Nested auto grouping (support ticket 2026-09-12) -----------------------
+// --- Nested auto grouping ----------------------------------------------------
 
 describe('buildSections (nested auto grouping)', () => {
   const rioja = {
@@ -258,7 +258,7 @@ describe('nested grouping fallbacks (review 2026-09-12)', () => {
   });
 });
 
-// --- Page layout (support ticket 2026-09-12: blank footer pages, splits) ---
+// --- Page layout (no blank footer pages, no bad splits) ----------------------
 
 const pdfBytes = (doc) => new Promise((resolve, reject) => {
   const chunks = [];
@@ -332,7 +332,7 @@ describe('PDF page layout', () => {
   });
 });
 
-// --- Geography in the list's language (support ticket 2026-09-12) ----------
+// --- Geography in the list's language ----------------------------------------
 
 describe('country and region print in the list language', () => {
   const tuscan = {
@@ -413,5 +413,72 @@ describe('page breaks between sibling groups (post-ship audit 2026-09-12)', () =
     expect(priceWithSymbol('Kč', '160')).toBe('Kč 160');
     expect(priceWithSymbol('Fr.', '16')).toBe('Fr. 16');
     expect(priceWithSymbol('£', '16')).toBe('£16');
+  });
+});
+
+// The PDF groups like the on-screen menu
+// (frontend/src/utils/wineListSections.js) — a drink that is not wine heads
+// "Other", a wine of unknown colour "Unknown", both after the wine types.
+describe('buildSections — the Other category and untyped wines', () => {
+  const cider = { _id: 'w4', name: 'Dry Cider', producer: 'Orchard', type: 'sparkling', nonWine: true, country: { name: 'England' }, region: null, grapes: [] };
+  const untyped = { _id: 'w5', name: 'Mystery', producer: 'Someone', type: null, country: { name: 'Italy' }, region: null, grapes: [] };
+  const wineMap = new Map([mapEntry(WINES.barolo), mapEntry(cider), mapEntry(untyped)]);
+  const list = (language = 'en') => ({
+    structureMode: 'auto', language, autoGrouping: { groupBy: 'type', withinGroup: 'name' },
+    autoGroupEntries: [entry('w1'), entry('w4'), entry('w5')], layout: {},
+  });
+
+  test('a cider saved under a wine type heads Other, an untyped wine Unknown, both after the wine types', () => {
+    expect(buildSections(list(), wineMap).map((s) => s.title)).toEqual(['Red Wines', 'Other', 'Unknown']);
+    expect(buildSections(list('sv'), wineMap).map((s) => s.title)).toEqual(['Röda Viner', 'Övrigt', 'Okänd']);
+  });
+});
+
+// --- The bottle count (layout.showStock) ---------------------------------------
+
+describe('the bottle count', () => {
+  const { bottleCountText } = require('./wineListPdf');
+
+  test('resolveEntry carries the live count only when the list shows counts', () => {
+    const three = new Map([mapEntry(WINES.barolo, { stock: 3 })]);
+    expect(resolveEntry(entry('w1'), three, { showStock: true }).bottleCount).toBe(3);
+    expect(resolveEntry(entry('w1'), three, {}).bottleCount).toBeNull();
+    const none = new Map([mapEntry(WINES.barolo, { stock: 0 })]);
+    expect(resolveEntry(entry('w1'), none, { showStock: true }).bottleCount).toBe(0);
+  });
+
+  test('the count reads in the list language, French singular for 0 and 1', () => {
+    expect(bottleCountText(1)).toBe('1 bottle');
+    expect(bottleCountText(3)).toBe('3 bottles');
+    expect(bottleCountText(1, 'sv')).toBe('1 flaska');
+    expect(bottleCountText(2, 'de')).toBe('2 Flaschen');
+    expect(bottleCountText(0, 'fr')).toBe('0 bouteille');
+    expect(bottleCountText(2, 'fr')).toBe('2 bouteilles');
+    expect(bottleCountText(2, 'xx')).toBe('2 bottles');
+  });
+
+  test('the PDF prints the count on the second line only when the list shows counts', async () => {
+    // Content streams are compressed, so the written strings are captured at the source.
+    const PDFDocument = require('pdfkit');
+    const render = async (layout) => {
+      const written = [];
+      const orig = PDFDocument.prototype.text;
+      const spy = jest.spyOn(PDFDocument.prototype, 'text').mockImplementation(function (str, ...rest) {
+        written.push(String(str));
+        return orig.call(this, str, ...rest);
+      });
+      try {
+        const doc = await generateWineListPdf({
+          name: 'Hemma', structureMode: 'auto', language: 'sv',
+          autoGrouping: { levels: ['type'] }, autoGroupEntries: [entry('w1')], layout, branding: {},
+        }, new Map([mapEntry(WINES.barolo, { stock: 3 })]));
+        await new Promise((resolve, reject) => { doc.on('data', () => {}); doc.on('end', resolve); doc.on('error', reject); });
+      } finally {
+        spy.mockRestore();
+      }
+      return written;
+    };
+    expect(await render({ showStock: true })).toContain('Conterno — Piedmont · Nebbiolo · 3 flaskor');
+    expect((await render({})).some((t) => /flaskor/.test(t))).toBe(false);
   });
 });

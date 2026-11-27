@@ -8,16 +8,16 @@ import TypedValueInput, { TYPES } from '../TypedValueInput';
 // feature. This file adds only the add-form's own layout.
 import './PersonalDataCard.css';
 import './AddBottleCustomFields.css';
+import { formatVintage } from '../../utils/vintage';
 
 /**
- * Custom fields on the add-bottle form (user ticket 6ab05cca — "Have the
- * option to add abv when adding bottles").
+ * Custom fields on the add-bottle form (e.g. an ABV entered while adding the
+ * bottle).
  *
  * The data itself is nothing new: these are the same typed personal entries
- * the bottle page already writes (#986). What was missing was an entry point
- * at the moment people actually have the number in front of them — the label
- * is in their hand while they are adding the bottle, not a page-visit later.
- * The reporter had 117 bottles and had never found the card at all.
+ * the bottle page already writes. This is an entry point at the moment
+ * people actually have the number in front of them — the label is in their
+ * hand while they are adding the bottle, not a page-visit later.
  *
  * Two suggestion sources feed the chips, in this order:
  *  1. The PUBLIC registry vocabulary (accepted RegistryDataKeys — today: ABV).
@@ -34,7 +34,7 @@ import './AddBottleCustomFields.css';
 
 // The server's rule for an enum key's options (utils/personalDataTypes:
 // 2–20 options, each at most 40 characters), mirrored so the row says what is
-// wrong while it is typed rather than after the add (release audit 2026-09-27, L).
+// wrong while it is typed rather than after the add.
 export const ENUM_OPTIONS_MIN = 2;
 export const ENUM_OPTIONS_MAX = 20;
 export const ENUM_OPTION_MAX_CHARS = 40;
@@ -364,7 +364,7 @@ function AddBottleCustomFields({ apiFetch, wineId, vintage, rows, onChange, onKe
                 <option value="bottle">{t('personalData.levelBottle', 'This bottle only')}</option>
                 {vintage && (
                   <option value="wine-vintage">
-                    {t('personalData.levelWineVintage', 'Every bottle of this vintage ({{vintage}})', { vintage })}
+                    {t('personalData.levelWineVintage', 'Every bottle of this vintage ({{vintage}})', { vintage: formatVintage(vintage, t) })}
                   </option>
                 )}
                 <option value="wine">{t('personalData.levelWine', 'Every bottle of this wine (all vintages)')}</option>

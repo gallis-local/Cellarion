@@ -12,19 +12,19 @@ import { isRatingField, ratingMeasureField, viewerRatingScale, formatRatingCell 
 import '../components/AnalyticsTable.css';
 import './AnalyticsDashboard.css';
 
-// The analytics table lives here since it moved off the cellar page (support
-// ticket 2026-09-05: the cellar page's search bar and filters sat above a
-// table they did not filter). Lazy — it ships its own catalogue fetch, query
-// client and CSV assembly, none of which the boards pay for.
+// The analytics table lives here, not on the cellar page, where the search
+// bar and filters would sit above a table they do not filter. Lazy — it ships
+// its own catalogue fetch, query client and CSV assembly, none of which the
+// boards pay for.
 const AnalyticsTable = lazy(() => import('../components/AnalyticsTable'));
 
 /**
- * The analytics dashboards (#987) — cube.dev-style "pages you just look at",
- * SEVERAL of them since the saved-views slice: a dropdown switches between
- * named boards, each a grid of widgets running in parallel through the same
- * bounded engine as the table. A user with no saved board sees the DEFAULT
- * set below (client-side, no DB row until they customize). One column on
- * mobile — the phone-first surface the wide table can never be.
+ * The analytics dashboards — cube.dev-style "pages you just look at",
+ * SEVERAL of them: a dropdown switches between named boards, each a grid of
+ * widgets running in parallel through the same bounded engine as the table.
+ * A user with no saved board sees the DEFAULT set below (client-side, no DB
+ * row until they customize). One column on mobile — the phone-first surface
+ * the wide table can never be.
  */
 
 const DEFAULT_WIDGETS = [
@@ -233,7 +233,7 @@ export default function AnalyticsDashboard() {
   useEffect(() => { reload(); }, [reload]);
 
   // With saved boards present, one of them is ALWAYS the active board — the
-  // client-side default only exists for zero-board users (audit F2).
+  // client-side default only exists for zero-board users.
   const active = boards?.length ? (boards.find((d) => d.id === activeId) || boards[0]) : null;
   const widgets = active ? active.widgets : DEFAULT_WIDGETS;
 
@@ -255,10 +255,10 @@ export default function AnalyticsDashboard() {
       return;
     }
     // Removing from the client-side default materializes it as a saved board.
-    // The default pseudo-board only renders when NO boards exist (audit F2:
-    // with a saved 'My cellar' present, this create 409'd forever), but a
-    // board created in another tab can still collide — fall back to UPDATING
-    // the same-named board instead of failing.
+    // The default pseudo-board only renders when NO boards exist (with a saved
+    // 'My cellar' present, this create would 409 forever), but a board created
+    // in another tab can still collide — fall back to UPDATING the same-named
+    // board instead of failing.
     mutate(async () => {
       const res = await createDashboard(apiFetch, t('analytics.defaultBoardName', 'My cellar'), next);
       if (res.status === 409) {

@@ -16,16 +16,24 @@ const { scanLabelFull, scanLabelBack, mergeBackScan, identifyWineFromQuery } = r
 const { sanitizeImageBuffer, detectImageFormat } = require('../services/imageSanitizer');
 const { persistLabelScan } = require('../services/imageOps');
 const { findOrCreateWine } = require('../services/findOrCreateWine');
+const { markNotWineByMember } = require('../services/nonWineOps');
 const { generateWineKey } = require('../utils/normalize');
 const { findBestMatch } = require('../services/wineMatching');
 const { conflictingStyleTerms } = require('../utils/styleTerms');
+// Every wine read here populates the same taxonomy rows — the label sweetness
+// term among them, as the API shape ({ name, band, scale, regulated }): the
+// style guard reads it off a candidate, and a member read sends it, not an id.
+// The sweetness style's term beside it, for the reads that ask for the style.
+const WINE_READ_POPULATE = ['country', 'region', 'grapes', { path: 'labelSweetness', select: 'name band scale regulated -_id' }, { path: 'sweetnessStyle.term', select: 'name band scale regulated' }];
 const { parsePagination } = require('../utils/pagination');
-const { isValidId } = require('../utils/validation');
+const { isValidId, coerceStringQuery } = require('../utils/validation');
 const { MEMBER_WINE_HIDDEN_FIELDS, MEMBER_WINE_EXCLUDE_KEEP_CREATOR } = require('../config/constants');
 // Read-surface decoration: each populated grape gains `displayName` — the
 // regionally correct label for THIS wine (Tinta Roriz on a Douro Port) —
 // while `name` stays canonical. Storage/filters/stats are untouched.
 const { decorateGrapes } = require('../utils/grapeDisplay');
+const { attachSweetnessCategoriesIfReadable } = require('../services/sweetnessCategory');
+const { displayProfile } = require('../utils/profileLanguage');
 const { wineVisibilityFilter, isCurator: isCuratorRole } = require('../services/wineVisibility');
 const { normalizeBarcode } = require('../utils/barcode');
 const { lookupBarcode } = require('../services/barcodeLookup');
@@ -44,25 +52,23 @@ const router = express.Router();
 // chat message cap (chat.js).
 const MAX_AI_QUERY_LEN = 300;
 
-// Field caps shared with the registry-write path (which now lives at bottle/
-// wishlist commit — services/wineCommit). Imported, not re-declared, so the
-// resolve endpoint below and the commit endpoints can never drift.
+// Field caps shared with the registry-write path (the bottle/wishlist commit
+// — services/wineCommit). Imported, not re-declared, so the resolve endpoint
+// below and the commit endpoints can never drift.
 const { validateNewWineFields, MAX_WINE_FIELD, MAX_GRAPES } = require('../services/wineCommit');
 const WINE_TYPES = ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'];
 
 /**
  * Mark a scan whose PRODUCER is detectably not a producer.
  *
- * Prod 2026-08-13: a label scan returned producer "Pays d'Oc Organic Wine",
- * name "Chardonnay Reserve". Both boxes were filled, so the extraction looked
- * complete, the read-only confirmation card was shown, the user pressed
- * confirm, and the registry gained a published wine whose producer is a
- * region-plus-marketing-copy string. Nothing asked whether the string was a
- * producer.
+ * Both boxes filled does not make an extraction complete: a label scan can
+ * return a region-plus-marketing-copy string as the producer, and the
+ * read-only confirmation card would let one tap publish it as a registry wine.
+ * Nothing else asks whether the string is a producer.
  *
  * The same six rules the mint chokepoint and the curation queue use
  * (services/crossFieldScan.detectBlockingProducerIssue), applied to the
- * EXTRACTION. A hit reuses the v1.109.0 half-read machinery verbatim —
+ * EXTRACTION. A hit reuses the half-read machinery verbatim —
  * `partial: true` routes the client to the editable prefilled form plus the
  * back-label offer — so the user gets a chance to fix the producer BEFORE
  * committing, with no new step and nothing rejected. `producer_suspect` names
@@ -77,10 +83,10 @@ async function flagSuspectProducer(extracted, { match = null } = {}) {
   if (typeof extracted.producer !== 'string' || !extracted.producer.trim()) return extracted;
   try {
     const { detectScanSuspectProducer } = require('../services/crossFieldScan');
-    // Field caps BEFORE the check (release-audit HIGH-2): scanLabelFull hands
-    // back the model's raw JSON, so a crafted label can return a producer far
-    // past any schema cap — and the containment heuristic's cost grows with
-    // token count. 200 chars is the registry field cap; nothing real is longer.
+    // Field caps BEFORE the check: scanLabelFull hands back the model's raw
+    // JSON, so a crafted label can return a producer far past any schema cap
+    // — and the containment heuristic's cost grows with token count. 200
+    // chars is the registry field cap; nothing real is longer.
     const hit = await detectScanSuspectProducer({
       name: typeof extracted.name === 'string' ? extracted.name.slice(0, 200) : '',
       producer: extracted.producer.slice(0, 200),
@@ -88,12 +94,12 @@ async function flagSuspectProducer(extracted, { match = null } = {}) {
     });
     if (!hit) return extracted;
     // Flag ONLY when the registry matched nothing — for hard and soft hits
-    // alike (release-audit M-3). With a match present, confirming attaches to
-    // the EXISTING wine and mints nothing, so the flag would cost the one-tap
-    // card (and the manual form's country requirement) for zero registry
-    // benefit; a real place-named estate — Château Margaux — keeps its card
-    // (the #942 lesson). A junk producer that matches an existing junk row
-    // dedups to it, which beats minting a twin; that row is curation's to fix.
+    // alike. With a match present, confirming attaches to the EXISTING wine
+    // and mints nothing, so the flag would cost the one-tap card (and the
+    // manual form's country requirement) for zero registry benefit; a real
+    // place-named estate — Château Margaux — keeps its card. A junk producer
+    // that matches an existing junk row dedups to it, which beats minting a
+    // twin; that row is curation's to fix.
     // Without a match, the flag routes to the editable form, and if the user
     // confirms a HARD-hit producer unchanged the mint gate files it pending.
     if (!match) {
@@ -188,14 +194,13 @@ function sendAiBudgetExhausted(res, debit) {
  * contract, and two copies of it drifting apart would mean the same bottle
  * matched on the front scan and minted a duplicate on the back scan.
  *
- * ADVISORY, NOT THE COMMIT (issue #1134). What comes back is a SUGGESTION the
+ * ADVISORY, NOT THE COMMIT. What comes back is a SUGGESTION the
  * client shows by name and may offer as a "did you mean?" candidate — it is
  * not what gets saved. The bottle/wishlist commit resolves the SCANNED
  * identity through findOrCreateWine, whose own ladder links at ≥0.95 and asks
  * between 0.85 and 0.95. 0.75 is deliberately below both: it is the floor for
- * "worth showing the user", not for "file their bottle here". It used to be
- * the latter, and a Mosel estate's Kabinett, Auslese and two Spätlesen all
- * committed to one row because of it.
+ * "worth showing the user", not for "file their bottle here": as the latter
+ * it would commit a Mosel estate's Kabinett, Auslese and Spätlese to one row.
  *
  * Tolerates a PARTIAL identity by design: a half-read label reaching here with
  * a name and no producer still gets a lookup — findBestMatch scores the fields
@@ -220,7 +225,7 @@ async function matchScannedIdentity({ name, producer, appellation }, viewer) {
   // 1. Exact normalizedKey match
   const normalizedKey = generateWineKey(name, producer, appellation);
   const wine = await WineDefinition.findOne({ normalizedKey, ...visible })
-    .populate(['country', 'region', 'grapes']);
+    .populate(WINE_READ_POPULATE);
   if (wine) return { wine, confidence: 1.0 };
 
   // 2. Fuzzy search
@@ -234,7 +239,7 @@ async function matchScannedIdentity({ name, producer, appellation }, viewer) {
         // The index excludes hidden rows when it is built, but a row hidden
         // while the index was down keeps its stale entry: filter here too.
         candidates = await WineDefinition.find({ _id: { $in: ids }, ...visible })
-          .populate(['country', 'region', 'grapes']);
+          .populate(WINE_READ_POPULATE);
       }
     } catch (err) {
       console.warn('Meilisearch unavailable during scan-label match:', err.message);
@@ -244,7 +249,7 @@ async function matchScannedIdentity({ name, producer, appellation }, viewer) {
   if (candidates.length === 0) {
     try {
       candidates = await WineDefinition.find({ $text: { $search: searchQuery }, ...visible })
-        .populate(['country', 'region', 'grapes'])
+        .populate(WINE_READ_POPULATE)
         .limit(20);
     } catch {
       // No text match — no candidates
@@ -252,18 +257,19 @@ async function matchScannedIdentity({ name, producer, appellation }, viewer) {
   }
 
   // Drop candidates whose name states a DIFFERENT Prädikat or sweetness than
-  // the scanned one (issue #1134). A producer's range from one vineyard shares
-  // the producer and appellation axes — 0.55 of the composite — so every
-  // sibling scores 0.83–0.90 against every other and the top one here is
+  // the scanned one. A producer's range from one vineyard shares the producer
+  // and appellation axes — 0.55 of the composite — so every sibling scores
+  // 0.83–0.90 against every other and the top one here is
   // decided by string distance between "Feinherb" and "Trocken". Filtered
   // BEFORE scoring, not after: dropping only the winner would hand the match
   // to the next wine in the same range. See utils/styleTerms.
-  candidates = candidates.filter((c) => !conflictingStyleTerms(name, c.name));
+  // The candidate goes in whole: the guard reads its labelSweetness record
+  // where it has one, its name where it does not (utils/styleTerms.styleOf).
+  candidates = candidates.filter((c) => !conflictingStyleTerms({ name }, c));
 
   // Use the shared scorer so scan-label, find-or-create and import all
-  // dedup with one implementation. redistribute:false preserves this
-  // path's historical "neither side has an appellation → full weight"
-  // behaviour (matching find-or-create).
+  // dedup with one implementation. redistribute:false keeps the "neither side
+  // has an appellation → full weight" rule findOrCreateWine uses too.
   const { bestMatch, bestScore } = findBestMatch(
     { name, producer, appellation },
     candidates,
@@ -315,7 +321,7 @@ async function mongoSearch(filter, sort, limit, offset, search) {
   }
 
   const wines = await query
-    .populate(['country', 'region', 'grapes'])
+    .populate(WINE_READ_POPULATE)
     .limit(limit)
     .skip(offset)
     .sort(sortOptions);
@@ -348,10 +354,12 @@ router.get('/', requireAuth, async (req, res) => {
   try {
     const isPrivileged = req.user.roles.includes('admin') || req.user.roles.includes('somm');
 
-    const { country, region, grapes, type, search, sort = 'name' } = req.query;
+    const { country, region, grapes, type, search } = req.query;
+    const sort = coerceStringQuery(req.query.sort) || 'name';
 
-    // Coerce search to string (query params can be arrays if repeated)
-    const searchTerm = Array.isArray(search) ? search[0] : search;
+    // One search term: the first of a repeated parameter, and nothing for an
+    // operator-shaped one (`?search[$gt]=`).
+    const searchTerm = coerceStringQuery(Array.isArray(search) ? search[0] : search);
 
     if (!isPrivileged && !searchTerm) {
       return res.status(400).json({ error: 'A search term is required' });
@@ -361,8 +369,8 @@ router.get('/', requireAuth, async (req, res) => {
     }
 
     // Curators browse the whole registry, but not 10,000 rows at a time: a
-    // phished admin account was the cheapest full dump (registry lockdown
-    // 2026-09-06, L5). 500 a page keeps every admin screen working.
+    // phished admin account must not be the cheapest full dump. 500 a page
+    // keeps every admin screen working.
     const paginationOpts = isPrivileged
       ? { limit: 50, maxLimit: 500 }
       : { limit: USER_SEARCH_LIMIT, maxLimit: USER_SEARCH_LIMIT };
@@ -370,9 +378,8 @@ router.get('/', requireAuth, async (req, res) => {
     const grapeIds = grapes ? String(grapes).split(',').filter(id => mongoose.isValidObjectId(id)) : [];
 
     // Build MongoDB filter (used for non-search queries and as fallback).
-    // Invalid country/region ids are a 400 — the old `? id : undefined`
-    // assignment made Mongoose drop the condition and silently return the
-    // UNFILTERED list for e.g. ?country=France.
+    // Invalid country/region ids are a 400 — dropping the condition instead
+    // would silently return the UNFILTERED list for e.g. ?country=France.
     const filter = {};
     if (country) {
       if (!mongoose.isValidObjectId(String(country))) return res.status(400).json({ error: 'Invalid country ID' });
@@ -406,7 +413,7 @@ router.get('/', requireAuth, async (req, res) => {
         const ids = await findOwnHiddenWineIds(req.user.id, searchTerm);
         if (ids.length) {
           ownHidden = await WineDefinition.find({ _id: { $in: ids }, nonWine: true })
-            .populate(['country', 'region', 'grapes']);
+            .populate(WINE_READ_POPULATE);
         }
       } catch (err) {
         console.warn('Own hidden-wine lookup failed (search continues without it):', err.message);
@@ -428,7 +435,7 @@ router.get('/', requireAuth, async (req, res) => {
 
         // Fetch full documents from MongoDB, preserving Meilisearch ranking
         const wines = await WineDefinition.find({ _id: { $in: ids } })
-          .populate(['country', 'region', 'grapes']);
+          .populate(WINE_READ_POPULATE);
 
         // Re-order to match Meilisearch relevance ranking
         const idOrder = new Map(ids.map((id, i) => [id, i]));
@@ -487,12 +494,12 @@ router.get('/', requireAuth, async (req, res) => {
 // flagSuspectProducer; `producer_suspect` then names the cross-field rule that
 // caught it). It is a 200, not an error: the fields that WERE read prefill the
 // form, the frame is kept, and the client may offer the optional back-label
-// rescue (POST /scan-label-back). A 422 (nothing readable at all) now also carries
+// rescue (POST /scan-label-back). A 422 (nothing readable at all) also carries
 // `scanImageId`, for the same reason — the user is about to type the wine by
 // hand, and that manual entry mints the pending row the photo is evidence for.
 //
-// scanImageId: the ORIGINAL frame is now persisted (private, kind:'label-scan')
-// instead of being discarded with the request. The client threads it back
+// scanImageId: the ORIGINAL frame is persisted (private, kind:'label-scan'),
+// not discarded with the request. The client threads it back
 // inside `newWine` on the bottle/wishlist commit, where it is stamped onto the
 // minted wine — that photo is what lets a curator FIX a wine the extraction
 // could not identify, which is the whole point of the pending-identity queue.
@@ -502,7 +509,7 @@ router.get('/', requireAuth, async (req, res) => {
 // and erased with all the others.
 // asyncHandler (mirrors chat.js): if tryDebitAi rejects on a Mongo error — it
 // runs BEFORE the try below — Express 4 would otherwise leave the request
-// hanging on an unhandled rejection instead of responding 500 (audit HIGH).
+// hanging on an unhandled rejection instead of responding 500.
 router.post('/scan-label', requireAuth, aiBurstLimiter, asyncHandler(async (req, res) => {
   const { image } = req.body;
 
@@ -536,7 +543,7 @@ router.post('/scan-label', requireAuth, aiBurstLimiter, asyncHandler(async (req,
   // debit ONLY on a failure that produced no billable completion (no API key,
   // unsupported image, transport error). A completed-but-unhelpful call
   // (422 "Could not read label") STAYS debited — mirrors identify-text/ai-info
-  // and closes the budget + kill-switch bypass via unreadable labels (audit HIGH).
+  // and closes the budget + kill-switch bypass via unreadable labels.
   let extracted;
   let labelImage;
   try {
@@ -568,11 +575,11 @@ router.post('/scan-label', requireAuth, aiBurstLimiter, asyncHandler(async (req,
     // 2. Extract wine info via Claude.
     //
     // allowPartial: a label that yielded a producer and no name (or the
-    // reverse) used to 422 here, and the photo went to the garbage collector
-    // with the request. The user then typed the wine by hand, the commit minted
-    // a pendingIdentity row, and the curator got a broken string and NO
-    // evidence — the exact case the queue exists to serve. A half-read now
-    // comes back with `partial: true` and the frame is kept either way (below).
+    // reverse) must not 422 and lose the photo with the request — the user
+    // would type the wine by hand, the commit would mint a pendingIdentity row,
+    // and the curator would get a broken string and NO evidence, the exact
+    // case the queue exists to serve. A half-read comes back with
+    // `partial: true` and the frame is kept either way (below).
     extracted = await scanLabelFull(scanImage, scanMediaType, { allowPartial: true });
   } catch (err) {
     // Only a pre-completion / transport failure refunds; a completed 422 stays debited.
@@ -666,7 +673,7 @@ router.post('/scan-label-back', requireAuth, aiBurstLimiter, asyncHandler(async 
   // oversized payload is a cost attack, not a user error to be tolerated.
   // Same caps as the registry-write path, imported not re-declared.
   //
-  // ALLOWLIST, not a loop over whatever arrived (release-audit HIGH-1): the
+  // ALLOWLIST, not a loop over whatever arrived: the
   // client sends back the `extracted` object /scan-label handed it, VERBATIM —
   // including `partial: true`, the very flag that makes the rescue worth
   // offering. A validator that 400'd on any non-string key therefore rejected
@@ -749,12 +756,12 @@ router.post('/scan-label-back', requireAuth, aiBurstLimiter, asyncHandler(async 
   try {
     // The ALLOWLISTED front object, so junk keys a hostile client stuffed into
     // frontExtracted can never ride mergeBackScan's spread back out to the
-    // client (audit INFO-1).
+    // client.
     // The client echoes the front response's producer_suspect flag; it never
     // enters the allowlisted `front` object (schema fields only), but it tells
     // the merge that a usable back producer should WIN that field rather than
-    // lose to the flagged string (release-audit M-1 — front-wins made the
-    // rescue inert for the very case that triggers it).
+    // lose to the flagged string (front-wins would make the rescue inert for
+    // the very case that triggers it).
     const suspectProducer = typeof frontExtracted?.producer_suspect === 'string'
       && frontExtracted.producer_suspect.length <= 64;
     const { merged, conflicts, filled } = mergeBackScan(front, back, { suspectProducer });
@@ -793,21 +800,31 @@ router.post('/scan-label-back', requireAuth, aiBurstLimiter, asyncHandler(async 
   }
 }));
 
+// POST /api/wines/:id/not-wine — a member moves a drink that is not wine
+// (cider, beer, spirits, a soft drink) to the Other category: out of the
+// shared wine registry, still in their cellar. Applies at once while few
+// members hold the row, otherwise files the curator proposal the sommelier
+// would (services/nonWineOps). Answer: { status: applied | already | filed |
+// pending, category, holders }.
+router.post('/:id/not-wine', requireAuth, requireNonDemo, asyncHandler(async (req, res) => {
+  const r = await markNotWineByMember({ wineId: req.params.id, userId: req.user.id, req, via: 'member' });
+  if (!r.ok) {
+    const status = r.code === 'not_found' ? 404 : (r.code === 'forbidden' || r.code === 'banned') ? 403 : r.code === 'limit' ? 429 : 400;
+    return res.status(status).json({ error: r.message });
+  }
+  res.json({ status: r.status, category: r.category, ...(r.holders !== undefined ? { holders: r.holders } : {}) });
+}));
+
 // POST /api/wines/find-or-create — resolve a confirmed wine against the
 // registry. RESOLVE-ONLY: this route creates nothing (path kept for client
 // compatibility; it is the add flows' step-1 lookup/soft-zone endpoint).
 //
-// It used to mint the WineDefinition (plus Country/Region/Grape taxonomy) the
-// moment the user confirmed the wine in STEP 1 of AddBottle/AddToWishlist —
-// before any bottle existed. A user who abandoned the flow left an orphan
-// registry row forever. Measured on prod 2026-08-10: 31 zero-bottle
-// createdVia:'ui' rows; the same day a user minted "Domaine de Riquewihr —
-// Kaefferkopf" (village-as-producer, likely fictitious) and two minutes later
-// attached their bottle to a DIFFERENT existing wine. Creation now happens at
-// the commit itself — POST /api/bottles / POST /api/wishlist with `newWine`
-// (services/wineCommit) — exactly the shape of the two prior fixes:
-// identify-text went read-only in v1.97 (52% orphan rate for 'ai' rows) and
-// import /validate went registry-read-only in v1.100.0 (#899).
+// The WineDefinition (plus Country/Region/Grape taxonomy) is minted at the
+// commit itself — POST /api/bottles / POST /api/wishlist with `newWine`
+// (services/wineCommit) — never when the user confirms the wine in STEP 1 of
+// AddBottle/AddToWishlist, before any bottle exists: a user who abandons the
+// flow must not leave an orphan registry row behind. identify-text and import
+// /validate stay registry-read-only for the same reason.
 //
 // Body:  { name, producer, country, region?, appellation?, type?, grapes? }
 //        (confirmCreate / source / labelImage are accepted and IGNORED — a
@@ -821,15 +838,15 @@ router.post('/scan-label-back', requireAuth, aiBurstLimiter, asyncHandler(async 
 //                                          — not in the registry. The client
 //                                            carries the fields to the bottle/
 //                                            wishlist commit, which mints.
-// Never 201: `created` is always false here. Consumers that assumed a saved
-// document on the noMatch shape fail loudly (wine is null), not silently.
+// Never 201: `created` is always false here. A consumer that assumes a saved
+// document fails loudly on the noMatch shape (wine is null), not silently.
 //
 // requireNonDemo kept deliberately: this endpoint only serves the add flows,
 // which the demo does not have (POST /api/bottles is requireNonDemo, AddBottle
 // shows a sign-up nudge) — loosening it would be an unrelated semantic change.
 // asyncHandler: `?.trim()` only short-circuits on null/undefined — a numeric
-// `name` threw a rejection Express 4 never catches, so the request hung open
-// forever. The shared validator 400s non-strings before the service runs.
+// `name` would throw a rejection Express 4 never catches, hanging the request
+// open forever. The shared validator 400s non-strings before the service runs.
 router.post('/find-or-create', requireAuth, requireNonDemo, asyncHandler(async (req, res) => {
   const { name, producer, country, region, appellation, type, grapes } = req.body;
 
@@ -838,7 +855,7 @@ router.post('/find-or-create', requireAuth, requireNonDemo, asyncHandler(async (
   // multi-MB name/producer would be an authenticated DoS.
   //
   // allowPending relaxes ONLY the producer requirement, because the add flows
-  // now let a user leave the producer blank when the label is unreadable. This
+  // let a user leave the producer blank when the label is unreadable. This
   // route still creates nothing (matchOnly); a producerless probe simply can't
   // score high enough to auto-match or soft-zone — producer carries 45% of the
   // composite — so it returns noMatch and the fields ride to the commit, which
@@ -872,16 +889,12 @@ router.post('/find-or-create', requireAuth, requireNonDemo, asyncHandler(async (
 // AI and report what the registry already holds. READ-ONLY: this route creates
 // nothing.
 //
-// It used to call findOrCreateWine unconditionally, minting a WineDefinition
-// (plus Country/Region/Grape taxonomy) for every AI guess — before the user
-// confirmed and before any bottle existed. Measured on prod 2026-08-03: 85 of
-// 162 createdVia:'ai' rows had zero bottles (52%) against 3% for 'ui', and the
-// same producer arrived spelled three ways from one user retyping a query.
-// Creation now happens only when the user COMMITS — POST /api/bottles /
-// /api/wishlist with `newWine` (services/wineCommit); an accepted suggestion
-// rides along as fields until then. (/find-or-create was the interim mint
-// point; it went resolve-only when the 'ui' source grew the same orphan
-// pattern — 31 zero-bottle rows by 2026-08-10.)
+// It never mints: a WineDefinition (plus Country/Region/Grape taxonomy) for
+// every AI guess, before the user confirms and before any bottle exists, would
+// leave orphan rows and the same producer spelled several ways by one user
+// retyping a query. Creation happens only when the user COMMITS — POST
+// /api/bottles / /api/wishlist with `newWine` (services/wineCommit); an
+// accepted suggestion rides along as fields until then.
 //
 // Response — 200, one shape with four states:
 //   { identified: {name, producer, country, region, appellation, type,
@@ -896,9 +909,8 @@ router.post('/find-or-create', requireAuth, requireNonDemo, asyncHandler(async (
 //   3. candidates.length>0  ⟹ match is null.
 //   4. identified && !match && !candidates.length ⟹ identified but NOT in the
 //      registry — the state this route exists to report.
-// There is deliberately no top-level `wine`/`created`: the rename makes any
-// consumer that assumed a saved document fail loudly rather than silently
-// dereference undefined.
+// There is deliberately no top-level `wine`/`created`: a consumer that assumes
+// a saved document fails loudly rather than silently dereferencing undefined.
 //
 // `match` carries no confidence: findOrCreateWine resolves via exact key,
 // canonicalKey, sibling prefix or score ≥ 0.95 without reporting which, so any
@@ -907,7 +919,7 @@ router.post('/find-or-create', requireAuth, requireNonDemo, asyncHandler(async (
 // Stays a POST though it is semantically a read — app.js's writeLimiter skips
 // GET/HEAD/OPTIONS, and this path must keep its rate limit.
 //
-// asyncHandler: tryDebitAi runs before the try; a Mongo error there must 500, not hang (audit HIGH).
+// asyncHandler: tryDebitAi runs before the try; a Mongo error there must 500, not hang.
 router.post('/identify-text', requireAuth, aiBurstLimiter, asyncHandler(async (req, res) => {
   const query = typeof req.body.query === 'string' ? req.body.query.trim() : '';
   if (!query) return res.status(400).json({ error: 'query is required' });
@@ -941,13 +953,12 @@ router.post('/identify-text', requireAuth, aiBurstLimiter, asyncHandler(async (r
 
   // Phase 2: registry probe. The billable call has completed and been paid for —
   // a failure here (e.g. a DB error) returns 500 WITHOUT a refund, since the AI
-  // work really happened. The old blanket catch-and-refund reversed both the
-  // per-user debit and the site-wide kill-switch on any throw, and the soft-zone
-  // shape below reached it on every near-match.
+  // work really happened. A blanket catch-and-refund would reverse both the
+  // per-user debit and the site-wide kill-switch on any throw.
   try {
     // matchOnly and NOTHING else. confirmCreate would gate off the soft-zone
     // return that sits above the matchOnly gate, collapsing every 0.85–0.95
-    // near-match into noMatch — which is exactly the duplication this fixes.
+    // near-match into noMatch — exactly the duplication this probe must stop.
     const probe = await findOrCreateWine(identified, req.user.id, { matchOnly: true });
 
     // decorateGrapes on every wine that leaves this route: the AI-identify
@@ -974,7 +985,7 @@ router.post('/identify-text', requireAuth, aiBurstLimiter, asyncHandler(async (r
 // POST /api/wines/ai-info — query AI for wine info without creating anything in DB.
 // Returns raw AI-identified data (country/region/grapes as name strings, not IDs).
 // Used by the AdminRequests page to pre-fill the Create New Wine form.
-// asyncHandler: tryDebitAi runs before the try; a Mongo error there must 500, not hang (audit HIGH).
+// asyncHandler: tryDebitAi runs before the try; a Mongo error there must 500, not hang.
 router.post('/ai-info', requireAuth, aiBurstLimiter, asyncHandler(async (req, res) => {
   const query = typeof req.body.query === 'string' ? req.body.query.trim() : '';
   if (!query) return res.status(400).json({ error: 'query is required' });
@@ -1000,7 +1011,9 @@ router.post('/ai-info', requireAuth, aiBurstLimiter, asyncHandler(async (req, re
 
 // GET /api/wines/:idOrSlug/public — Public wine detail (no auth required)
 // Accepts both ObjectId and slug. Used for shared links and social previews.
-const PUBLIC_PROJECTION = 'name producer slug country region appellation grapes type colour image communityRating classification aiProfile canary';
+// The sweetness style is public like the label term beside it, on the
+// anonymous tier too: a term, its source and a public page.
+const PUBLIC_PROJECTION = 'name producer slug country region appellation grapes type colour image communityRating classification classifications labelSweetness sweetnessStyle aiProfile canary';
 // The populated places and grapes on the public page carry their public
 // fields only: a bare populate also sent createdBy / reviewedBy, the ids of
 // the members who added or reviewed a region or grape. Descriptions feed the
@@ -1009,23 +1022,23 @@ const PUBLIC_TAXONOMY_POPULATE = [
   { path: 'country', select: 'name slug code translations' },
   { path: 'region', select: 'name slug description country translations' },
   { path: 'grapes', select: 'name slug color description regionalNames translations' },
+  { path: 'classifications', select: 'name kind' },
+  { path: 'labelSweetness', select: 'name band scale regulated -_id' },
+  { path: 'sweetnessStyle.term', select: 'name band scale regulated' },
 ];
 
 // Anti-enumeration limit for the ONE wine endpoint that needs no account.
 //
 // Public wine pages are deliberate — they are how a wine is shared and
 // indexed, and the slugs are not going anywhere. But "readable" and
-// "downloadable in bulk" are different things, and until now they were the
-// same thing: this route sat under the general /api/ limiter at 2500 per 15
-// minutes, so a single address could walk the entire registry in about the
+// "downloadable in bulk" are different things: under the general /api/
+// limiter alone, a single address could walk the entire registry in about the
 // time it takes to make lunch.
 //
-// The cap is sized from measured traffic, not caution: across 24 hours this
-// endpoint served FIVE requests, from one address, all real browsers, and no
-// search crawler touched it at all. 120 per 15 minutes is therefore about
-// twenty times the entire site's daily use of it, per address — invisible to
-// anyone reading wine pages, including a logged-in user (the frontend calls
-// this route for everyone, so the cap must clear real browsing and does).
+// The cap (120 per 15 minutes by default, config/rateLimits publicWineRead)
+// sits far above what one address reading wine pages ever needs — invisible
+// to anyone browsing, including a logged-in user (the frontend calls this
+// route for everyone, so the cap must clear real browsing).
 //
 // A 429 here is worth SEEING rather than silently absorbing: ordinary use
 // cannot reach it, so a breach is either a scraper or a real usage pattern
@@ -1049,16 +1062,16 @@ const publicWineLimiter = rateLimit({
     res.status(429).json({ error: 'Too many requests, please try again later' });
   },
 });
-// optionalAuth (registry lockdown 2026-09-06, L3/L4): the SAME endpoint serves
-// a signed-in member the full profile and an anonymous visitor the prose-only
-// tier (services/registryTiering.js), and every read is counted per reader
-// per day — an anonymous address past the daily distinct cap is refused
+// optionalAuth (registry lockdown): the SAME endpoint serves a signed-in
+// member the full profile and an anonymous visitor the prose-only tier
+// (services/registryTiering.js), and every read is counted per reader per day
+// — an anonymous address past the daily distinct cap is refused
 // (services/registryReadTracker.js). Members are counted, never refused.
 router.get('/:idOrSlug/public', publicWineLimiter, optionalAuth, async (req, res) => {
   try {
     const { idOrSlug } = req.params;
     // Unauthenticated share/preview surface — quarantined non-wines are hidden
-    // here for the same reason as on the OG page (code audit 2026-07-27, M5).
+    // here for the same reason as on the OG page.
     // The authenticated /:id route below deliberately still resolves them, so
     // an owner's own bottle page keeps working: hiding, not breaking.
     // pendingIdentity joins the exclusion: this route is unauthenticated, so
@@ -1091,8 +1104,26 @@ router.get('/:idOrSlug/public', publicWineLimiter, optionalAuth, async (req, res
     // A public-demo session is signed in but is not a member: the full tier
     // and the drink windows are for real accounts.
     const member = !!req.user && !req.user.isDemo;
-    const payload = tierWinePayload(decorateGrapes(wine), { full: member });
+    const decorated = decorateGrapes(wine);
+    const payload = tierWinePayload(decorated, { full: member });
     delete payload.canary;
+    // The translated prose while it is fresh (utils/profileLanguage): the
+    // description for everyone, the lists only on the member tier that has
+    // them. The page's meta description stays the English one, as on the
+    // crawler page (og/wine.js).
+    payload.aiProfile = displayProfile(payload.aiProfile, { stored: decorated.aiProfile, proseOnly: !member, token: !!req.apiToken });
+    // Wine-level serving advice for everyone: the temperature (the
+    // sommelier's or the style's) and the air trait. Not tiered — it is not
+    // the drink-window data members pay attention for — and composed from the
+    // untiered record, so a visitor gets the sommelier's temperature too. The
+    // decanting advice for a bottle's age stays on the bottle page.
+    {
+      const { servingAdvice } = require('../utils/servingUtils');
+      const advice = servingAdvice(wine, null);
+      payload.serving = advice
+        ? { temperature: advice.temperature, unit: 'C', needsAir: (wine.aiProfile && wine.aiProfile.needsAir) || null }
+        : null;
+    }
     // The page around the wine (links, region and grape notes, related
     // wines, drink windows for members only), behind the same counted read.
     // Optional: when it fails the wine itself still answers.
@@ -1147,10 +1178,11 @@ router.get('/:idOrSlug/community-prices', publicWineLimiter, async (req, res) =>
   }
 });
 
-// GET /api/wines/barcode/:code — the registry wine a retail barcode belongs to,
-// learned from members' bottles that were added after scanning it
-// (services/barcodeLookup). Answers { wine, vintage, owners } or { wine: null }
-// — an unknown or invalid code is not an error, it is simply not known yet.
+// GET /api/wines/barcode/:code — the registry wine a retail barcode belongs to:
+// the wine that holds the code, else the one members' bottles carry it on
+// (services/barcodeLookup). Answers { wine, vintage, owners, bottleSize?, code }
+// or { wine: null } — an unknown or invalid code is not an error, it is simply
+// not known yet.
 // No AI and no write: a cheap read the add-bottle camera makes when it sees a
 // barcode.
 router.get('/barcode/:code', requireAuth, async (req, res) => {
@@ -1167,7 +1199,7 @@ router.get('/barcode/:code', requireAuth, async (req, res) => {
 
 // Authenticated wine detail. A pendingIdentity row is visible ONLY to its
 // creator (whose bottle page has to render — hiding, not breaking, same
-// principle as the nonWine quarantine one route up) and to curation
+// principle as the nonWine quarantine on /:idOrSlug/public) and to curation
 // (somm/admin, who work the pending queue). Everyone else gets the same 404 a
 // non-existent id gets, so the row's existence never leaks.
 router.get('/:id', requireAuth, async (req, res) => {
@@ -1177,23 +1209,25 @@ router.get('/:id', requireAuth, async (req, res) => {
     // The label-scan evidence fields belong to the pending queue (which has
     // its own gated surfaces), not to a general wine read: conflicts survive
     // promotion for the 7-day correction window, and any logged-in user could
-    // read that label text here (release-audit LOW-3 — same rationale as the
-    // wishlist $unset). Image BYTES were always gated per-image; this hides
-    // the pointers and the text.
-    // Registry lockdown (2026-09-06, L5): the dedup keys, verification record
-    // and provenance are curation internals. Nothing a member's screens render
-    // needs them, and together they are the part of a copy that is hardest to
-    // rebuild. Who contributed the row (contribution, createdVia) is never a
-    // member's business either. Curators keep the full document.
+    // otherwise read that label text here (same rationale as the wishlist
+    // $unset). Image BYTES are gated per-image; this hides the pointers and
+    // the text.
+    // Registry lockdown: the dedup keys, verification record and provenance
+    // are curation internals. Nothing a member's screens render needs them,
+    // and together they are the part of a copy that is hardest to rebuild.
+    // Who contributed the row (contribution, createdVia) is never a member's
+    // business either. Curators keep the full document.
     // pendingIdentity/createdBy stay selected for the gate below and are then
     // dropped from the response.
     const isCurator = req.user.roles.includes('admin') || req.user.roles.includes('somm');
+    // The sweetness style is asked for (select: false on the model) and sent
+    // in its outgoing shape by decorateGrapes below.
     const select = isCurator
       ? '-scanImage -scanImageBack -scanFieldConflicts'
       : MEMBER_WINE_EXCLUDE_KEEP_CREATOR;
     const wine = await WineDefinition.findById(req.params.id)
-      .select(select)
-      .populate(['country', 'region', 'grapes']);
+      .select(`${select} +sweetnessStyle`)
+      .populate(WINE_READ_POPULATE);
 
     if (!wine) {
       return res.status(404).json({ error: 'Wine not found' });
@@ -1207,11 +1241,15 @@ router.get('/:id', requireAuth, async (req, res) => {
     // missing id gets.
     const { canSeeWine, isDraftVisibleViaSharedCellar } = require('../services/wineVisibility');
     if (!canSeeWine(wine, { userId: req.user.id, roles: req.user.roles })) {
-      const viaCellar = wine.draft === true && await isDraftVisibleViaSharedCellar(String(wine._id), req.user.id);
+      // The same for a wine waiting for a curator's check: an editor's
+      // import into someone's cellar must leave the owner able to open it.
+      const viaCellar = (wine.draft === true || wine.uncheckedIdentity === true)
+        && await isDraftVisibleViaSharedCellar(String(wine._id), req.user.id);
       if (!viaCellar) return res.status(404).json({ error: 'Wine not found' });
     }
 
     const payload = decorateGrapes(wine);
+    await attachSweetnessCategoriesIfReadable(payload, 'wine');
     // A draft says whose it is only as a boolean — never by id.
     if (wine.draft === true) payload.draftMine = String(wine.createdBy) === String(req.user.id);
     if (!isCurator) delete payload.createdBy;

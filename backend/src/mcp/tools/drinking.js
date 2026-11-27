@@ -1,9 +1,9 @@
-// "What should I drink" tools (plan Phase 3): what_should_i_open_tonight and
+// "What should I drink" tools: what_should_i_open_tonight and
 // pair_with_dish. Both are candidate-shortlist generators — they select
 // ready-to-drink bottles with the structured facts a sommelier would weigh
 // (maturity + urgency, taste profile, rating, price, rack position, open-
 // bottle state) and let the CALLING model make the actual choice. No LLM runs
-// here (§5.2): the server curates data, the caller reasons.
+// here: the server curates data, the caller reasons.
 //
 // Selection/enrichment/scoring live in services/drinkingService.js — ONE
 // implementation shared with any future UI feature (one-impl rule). This file
@@ -93,7 +93,7 @@ registerTool({
     const urgentCount = data.filter((c) => c.readiness === 'declining' || c.readiness === 'late').length;
     return ok(
       // Same screened-total lead as pair_with_dish — and it must be the
-      // UNFILTERED total (release-audit M-2): with wine_type/max_price set,
+      // UNFILTERED total: with wine_type/max_price set,
       // `considered` is the post-filter pool, and leading with it re-created
       // the very "the AI can only see part of my cellar" misreading this line
       // exists to kill.
@@ -161,7 +161,7 @@ registerTool({
     // so the model can pair by style knowledge even with zero keyword hits.
     // Every type's first pick comes before any type's second, and the cap
     // never drops below the number of types — a 3-slot cap filled by two reds
-    // and a sparkling once hid every white in the cellar (ticket 6aad5481).
+    // and a sparkling would hide every white in the cellar.
     const perType = new Map();
     for (const r of rest) {
       const t = r.b.wineDefinition?.type || 'unknown';
@@ -180,10 +180,10 @@ registerTool({
     const spreadOut = await serializeCandidates(spread, sel.profileMap, scope.cellarIds, spreadLimit);
 
     return ok(
-      // Lead with the screened total (support ticket 2026-08-12 "IA bottles
-      // known false"): this tool reads the WHOLE cellar and returns a shortlist,
-      // but a summary that only counts the shortlist reads as "the AI can see
-      // 11 of my 72 bottles" to the person the answer is relayed to.
+      // Lead with the screened total: this tool reads the WHOLE cellar and
+      // returns a shortlist, but a summary that only counts the shortlist
+      // reads as "the AI can only see some of my bottles" to the person the
+      // answer is relayed to.
       `Screened all ${sel.totalActive} active bottle(s) in the cellar; returning a shortlist — ` +
         `${matchedOut.length} keyword match(es) for "${args.dish}", ${spreadOut.length} style-spread candidate(s). ` +
         'Tell the user the whole cellar was considered.',

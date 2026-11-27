@@ -1,7 +1,7 @@
 /**
- * The shared typed-value system (#986) — every type's accept/reject/cast
+ * The shared typed-value system — every type's accept/reject/cast
  * behaviour, plus key-definition validation. This module is reused by the
- * public-vocabulary work (#985) and the analytics catalogue (#987), so these
+ * public-vocabulary work and the analytics catalogue, so these
  * pins are contract tests, not implementation details.
  */
 const { TYPES, TEXT_MAX, validateValue, validateKeyDefinition } = require('./personalDataTypes');
@@ -21,8 +21,14 @@ describe('validateValue', () => {
     test('trims and accepts', () => {
       expect(validateValue({ type: 'text' }, '  decanted 2h  ')).toEqual({ ok: true, value: 'decanted 2h' });
     });
-    test('rejects non-strings and over-long text', () => {
-      expect(validateValue({ type: 'text' }, 42).ok).toBe(false);
+    test('keeps a number-only value as text', () => {
+      expect(validateValue({ type: 'text' }, 95278)).toEqual({ ok: true, value: '95278' });
+      expect(validateValue({ type: 'text' }, '00123')).toEqual({ ok: true, value: '00123' });
+    });
+    test('rejects other non-strings and over-long text', () => {
+      expect(validateValue({ type: 'text' }, true).ok).toBe(false);
+      expect(validateValue({ type: 'text' }, Number.NaN).ok).toBe(false);
+      expect(validateValue({ type: 'text' }, { a: 1 }).ok).toBe(false);
       expect(validateValue({ type: 'text' }, 'x'.repeat(TEXT_MAX + 1)).ok).toBe(false);
       expect(validateValue({ type: 'text' }, 'x'.repeat(TEXT_MAX)).ok).toBe(true);
     });

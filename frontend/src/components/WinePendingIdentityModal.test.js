@@ -1,0 +1,276 @@
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+
+vi.mock('../api/somm', () => ({
+  sommGetPendingWines: vi.fn(),
+  sommFixPendingWine: vi.fn(),
+  sommMergePendingWine: vi.fn(),
+}));
+// The admin's import switches above the queue: their own unit (ImportPolicySwitch.test.js).
+vi.mock('./ImportPolicySwitch', () => ({ default: () => null }));
+
+// `t` must keep a stable identity across renders, as react-i18next's real one
+// does: the dialog lists it in useCallback deps, so a fresh function per render
+// would reload the queue forever.
+vi.mock('react-i18next', () => {
+  const t = (key, vars) => (vars ? `${key}:${JSON.stringify(vars)}` : key);
+  return { useTranslation: () => ({ t }) };
+});
+
+const { sommGetPendingWines, sommFixPendingWine, sommMergePendingWine } = await import('../api/somm');
+const WinePendingIdentityModal = (await import('./WinePendingIdentityModal')).default;
+
+const wine = (n) => ({ _id: `w${n}`, name: `Wine ${n}`, producer: '', bottleCount: 1, createdVia: 'scan' });
+const ok = (body) => ({ ok: true, json: async () => body });
+const refused = (status, body) => ({ ok: false, status, json: async () => body });
+
+// The queue the server holds; a load is answered with the page it asks for.
+let queue;
+const PAGE_SIZE = 25;
+const answerFromQueue = (apiFetch, params) => {
+  const page = Number(params.get('page'));
+  const pages = Math.max(1, Math.ceil(queue.length / PAGE_SIZE));
+  return Promise.resolve(ok({
+    wines: queue.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
+    total: queue.length, pages, createdViaOptions: ['scan', 'import'], unavailableTotal: 0,
+  }));
+};
+const pagesAsked = () => sommGetPendingWines.mock.calls.map(([, params]) => Number(params.get('page')));
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  queue = [wine(1), wine(2)];
+  sommGetPendingWines.mockImplementation(answerFromQueue);
+});
+
+const renderModal = () => render(<WinePendingIdentityModal apiFetch={vi.fn()} onClose={() => {}} />);
+
+// The server takes the wine out of the queue and says what it did.
+const fixSucceeds = (message) => sommFixPendingWine.mockImplementation(async (apiFetch, wineId) => {
+  queue = queue.filter((w) => w._id !== wineId);
+  return ok({ message });
+});
+
+const fixFirstRow = async (producer) => {
+  fireEvent.click((await screen.findAllByText('admin.wines.pendingIdentity.fixBtn'))[0]);
+  fireEvent.change(screen.getByPlaceholderText('admin.wines.pendingIdentity.producerPlaceholder'), { target: { value: producer } });
+  fireEvent.click(screen.getByText('common.save'));
+};
+
+test('the confirmation of a fix stays on screen after the list has reloaded', async () => {
+  fixSucceeds('Wine 1 is now in the registry.');
+  renderModal();
+  await fixFirstRow('Example Estate');
+
+  // the list is the reloaded one: the fixed wine is gone, the other is there
+  await waitFor(() => expect(screen.queryByText('Wine 1')).not.toBeInTheDocument());
+  expect(screen.getByText('Wine 2')).toBeInTheDocument();
+  expect(screen.getByText('Wine 1 is now in the registry.')).toBeInTheDocument();
+  expect(sommFixPendingWine).toHaveBeenCalledWith(expect.anything(), 'w1', expect.objectContaining({ producer: 'Example Estate' }));
+});
+
+test('the confirmation of "no producer on the label" stays after the reload too', async () => {
+  vi.spyOn(window, 'confirm').mockReturnValue(true);
+  fixSucceeds('Wine 1 left the queue.');
+  renderModal();
+  fireEvent.click((await screen.findAllByText('admin.wines.pendingIdentity.unavailableBtn'))[0]);
+
+  await waitFor(() => expect(screen.queryByText('Wine 1')).not.toBeInTheDocument());
+  expect(screen.getByText('Wine 1 left the queue.')).toBeInTheDocument();
+  expect(sommFixPendingWine).toHaveBeenCalledWith(expect.anything(), 'w1', { identityUnavailable: true });
+});
+
+test('fixing the only row of a later page steps back one page and asks for it once', async () => {
+  queue = Array.from({ length: PAGE_SIZE + 1 }, (_, i) => wine(i + 1));
+  fixSucceeds('Wine 26 is now in the registry.');
+  renderModal();
+  await screen.findByText('Wine 1');
+  fireEvent.click(screen.getByText('common.next'));
+  await screen.findByText('Wine 26');
+  expect(pagesAsked()).toEqual([1, 2]);
+
+  await fixFirstRow('Example Estate');
+
+  await screen.findByText('Wine 1');
+  expect(pagesAsked()).toEqual([1, 2, 1]);
+  expect(screen.getByText('Wine 26 is now in the registry.')).toBeInTheDocument();
+});
+
+test('the confirmation goes when the curator changes the source filter', async () => {
+  fixSucceeds('Wine 1 is now in the registry.');
+  renderModal();
+  await fixFirstRow('Example Estate');
+  await screen.findByText('Wine 1 is now in the registry.');
+
+  fireEvent.change(screen.getByRole('combobox'), { target: { value: 'import' } });
+
+  await waitFor(() => expect(screen.queryByText('Wine 1 is now in the registry.')).not.toBeInTheDocument());
+  expect(sommGetPendingWines.mock.calls.at(-1)[1].get('createdVia')).toBe('import');
+});
+
+test('the confirmation goes when the curator pages', async () => {
+  queue = Array.from({ length: PAGE_SIZE + 2 }, (_, i) => wine(i + 1));
+  fixSucceeds('Wine 1 is now in the registry.');
+  renderModal();
+  await fixFirstRow('Example Estate');
+  await screen.findByText('Wine 1 is now in the registry.');
+
+  fireEvent.click(screen.getByText('common.next'));
+
+  await screen.findByText('Wine 27');
+  expect(screen.queryByText('Wine 1 is now in the registry.')).not.toBeInTheDocument();
+});
+
+test('a write that is refused does not sit under the confirmation of the one before', async () => {
+  fixSucceeds('Wine 1 is now in the registry.');
+  renderModal();
+  await fixFirstRow('Example Estate');
+  await screen.findByText('Wine 1 is now in the registry.');
+
+  sommFixPendingWine.mockResolvedValue(refused(400, { error: 'A producer is required' }));
+  await fixFirstRow('   ');
+
+  expect(await screen.findByText('A producer is required')).toBeInTheDocument();
+  expect(screen.queryByText('Wine 1 is now in the registry.')).not.toBeInTheDocument();
+  // the row is still there to be tried again
+  expect(screen.getByPlaceholderText('admin.wines.pendingIdentity.producerPlaceholder')).toBeInTheDocument();
+});
+
+describe('a wine from an import that waits for a check', () => {
+  const waiting = (n, extra = {}) => ({ ...wine(n), producer: 'Example Estate', unchecked: true, createdVia: 'import', ...extra });
+
+  test('is marked, and one that is right as it stands is published with one click', async () => {
+    queue = [waiting(1), wine(2)];
+    fixSucceeds('Wine 1 is now in the registry.');
+    renderModal();
+
+    expect(await screen.findByText('admin.wines.pendingIdentity.uncheckedBadge')).toBeInTheDocument();
+    expect(screen.getByText(/admin\.wines\.pendingIdentity\.uncheckedIntro/)).toBeInTheDocument();
+    // Only the waiting row offers it: the other row has no producer to publish.
+    const publish = screen.getAllByText('admin.wines.pendingIdentity.publishBtn');
+    expect(publish).toHaveLength(1);
+    fireEvent.click(publish[0]);
+
+    await waitFor(() => expect(sommFixPendingWine).toHaveBeenCalledWith(expect.anything(), 'w1', { identityChecked: true }));
+    expect(await screen.findByText('Wine 1 is now in the registry.')).toBeInTheDocument();
+  });
+
+  test('saving corrections to it is the check: the save publishes it', async () => {
+    queue = [waiting(1)];
+    fixSucceeds('Wine 1 is now in the registry.');
+    renderModal();
+
+    fireEvent.click(await screen.findByText('admin.wines.pendingIdentity.fixBtn'));
+    fireEvent.change(screen.getByPlaceholderText('admin.wines.pendingIdentity.producerPlaceholder'), { target: { value: 'Example Estate & Sons' } });
+    fireEvent.click(screen.getByText('admin.wines.pendingIdentity.saveAndPublish'));
+
+    await waitFor(() => expect(sommFixPendingWine).toHaveBeenCalled());
+    expect(sommFixPendingWine.mock.calls[0][2]).toMatchObject({ producer: 'Example Estate & Sons', identityChecked: true });
+  });
+
+  test('a waiting wine with no producer cannot be published as it is, only fixed', async () => {
+    queue = [waiting(1, { producer: '' })];
+    renderModal();
+    expect(await screen.findByText('admin.wines.pendingIdentity.uncheckedBadge')).toBeInTheDocument();
+    expect(screen.queryByText('admin.wines.pendingIdentity.publishBtn')).not.toBeInTheDocument();
+  });
+
+  test('an ordinary pending row is saved as before, with no check sent', async () => {
+    fixSucceeds('Wine 1 is now in the registry.');
+    renderModal();
+    await fixFirstRow('Example Estate');
+    await waitFor(() => expect(sommFixPendingWine).toHaveBeenCalled());
+    expect(sommFixPendingWine.mock.calls[0][2].identityChecked).toBeUndefined();
+  });
+});
+
+describe('what a curator could not do in the queue before', () => {
+  const waiting = (n, extra = {}) => ({ ...wine(n), producer: 'Example Estate', unchecked: true, createdVia: 'import', ...extra });
+  const TWIN = { wineId: 'pub1', name: 'Wine 1', producer: 'Example Estate', published: true };
+
+  test('a waiting wine with no producer can have its other details saved: the check is not sent with it', async () => {
+    queue = [waiting(1, { producer: '' })];
+    sommFixPendingWine.mockResolvedValue(ok({ message: 'Saved' }));
+    renderModal();
+
+    fireEvent.click(await screen.findByText('admin.wines.pendingIdentity.fixBtn'));
+    fireEvent.change(screen.getByPlaceholderText('admin.wines.pendingIdentity.countryPlaceholder'), { target: { value: 'France' } });
+    fireEvent.click(screen.getByText('admin.wines.pendingIdentity.saveAndPublish'));
+
+    await waitFor(() => expect(sommFixPendingWine).toHaveBeenCalled());
+    const patch = sommFixPendingWine.mock.calls[0][2];
+    expect(patch.countryName).toBe('France');
+    expect(patch.identityChecked).toBeUndefined();
+  });
+
+  test('…and once a producer is typed, the save is the check', async () => {
+    queue = [waiting(1, { producer: '' })];
+    sommFixPendingWine.mockResolvedValue(ok({ message: 'Saved' }));
+    renderModal();
+
+    fireEvent.click(await screen.findByText('admin.wines.pendingIdentity.fixBtn'));
+    fireEvent.change(screen.getByPlaceholderText('admin.wines.pendingIdentity.producerPlaceholder'), { target: { value: 'Example Estate' } });
+    fireEvent.click(screen.getByText('admin.wines.pendingIdentity.saveAndPublish'));
+    await waitFor(() => expect(sommFixPendingWine).toHaveBeenCalled());
+    expect(sommFixPendingWine.mock.calls[0][2]).toMatchObject({ producer: 'Example Estate', identityChecked: true });
+  });
+
+  test('the type is shown and can be set: a wine from a file often has none', async () => {
+    queue = [waiting(1, { type: null })];
+    sommFixPendingWine.mockResolvedValue(ok({ message: 'Saved' }));
+    renderModal();
+
+    expect(await screen.findByText('admin.wines.pendingIdentity.noType')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('admin.wines.pendingIdentity.fixBtn'));
+    fireEvent.change(screen.getByLabelText('admin.wines.pendingIdentity.typeLabel'), { target: { value: 'white' } });
+    fireEvent.click(screen.getByText('admin.wines.pendingIdentity.saveAndPublish'));
+
+    await waitFor(() => expect(sommFixPendingWine).toHaveBeenCalled());
+    expect(sommFixPendingWine.mock.calls[0][2].type).toBe('white');
+  });
+
+  test('a type left alone is not sent', async () => {
+    fixSucceeds('done');
+    renderModal();
+    await fixFirstRow('Example Estate');
+    await waitFor(() => expect(sommFixPendingWine).toHaveBeenCalled());
+    expect(sommFixPendingWine.mock.calls[0][2].type).toBeUndefined();
+  });
+
+  test('a publish refused as a duplicate offers the merge into the wine it names, and the merge empties the row', async () => {
+    queue = [waiting(1)];
+    sommFixPendingWine.mockResolvedValue(refused(409, { error: 'identical to an existing registry wine', duplicate: TWIN }));
+    sommMergePendingWine.mockImplementation(async () => { queue = []; return ok({ message: 'Merged into Example Estate — Wine 1.' }); });
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    renderModal();
+
+    fireEvent.click(await screen.findByText('admin.wines.pendingIdentity.publishBtn'));
+    const merge = await screen.findByText(/admin\.wines\.pendingIdentity\.mergeBtn/);
+    expect(merge.textContent).toContain('Example Estate — Wine 1');
+    fireEvent.click(merge);
+
+    await waitFor(() => expect(sommMergePendingWine).toHaveBeenCalledWith(expect.anything(), 'w1', 'pub1'));
+    expect(confirm).toHaveBeenCalled();
+    expect(await screen.findByText('Merged into Example Estate — Wine 1.')).toBeInTheDocument();
+    confirm.mockRestore();
+  });
+
+  test('no merge is offered when the duplicate is not a published wine, or the curator declines', async () => {
+    queue = [waiting(1)];
+    sommFixPendingWine.mockResolvedValue(refused(409, { error: 'identical', duplicate: { ...TWIN, published: false } }));
+    renderModal();
+    fireEvent.click(await screen.findByText('admin.wines.pendingIdentity.publishBtn'));
+    expect(await screen.findByText('identical')).toBeInTheDocument();
+    expect(screen.queryByText(/mergeBtn/)).not.toBeInTheDocument();
+  });
+
+  test('a declined confirmation merges nothing', async () => {
+    queue = [waiting(1)];
+    sommFixPendingWine.mockResolvedValue(refused(409, { error: 'identical', duplicate: TWIN }));
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    renderModal();
+    fireEvent.click(await screen.findByText('admin.wines.pendingIdentity.publishBtn'));
+    fireEvent.click(await screen.findByText(/mergeBtn/));
+    expect(sommMergePendingWine).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+});

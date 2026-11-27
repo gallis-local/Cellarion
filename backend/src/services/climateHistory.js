@@ -1,8 +1,7 @@
 const ClimateReading = require('../models/ClimateReading');
 const { boundsFor } = require('./climateAlerts');
 
-// Climate history aggregates for the MCP climate_status tool (support ticket
-// 6a71c6b2): per reading type (temperature/humidity), min/max/mean plus
+// Climate history aggregates for the MCP climate_status tool: per reading type (temperature/humidity), min/max/mean plus
 // excursion episodes over three windows — 24h / 30d / 12m — so a chat answer
 // can read "13–17 °C across the year, no excursions" without the model ever
 // seeing raw readings.
@@ -173,7 +172,7 @@ function mergeBucketRows(rows, gapMs) {
   let cur = null;
   let curPart = null;
   for (const row of rows) {
-    const part = `${row._id.device} ${row._id.channel} ${row._id.type}`;
+    const part = `${row._id.device}\u0000${row._id.channel}\u0000${row._id.type}`;
     const firstTs = new Date(row.firstTs).getTime();
     const lastTs = new Date(row.lastTs).getTime();
     if (cur && part === curPart && firstTs - cur.lastTs <= gapMs) {

@@ -41,9 +41,11 @@ jobs:
     runs-on: ubuntu-latest
     services:
       # A real MongoDB for the public API contract test
-      # (backend/src/openapi/contract.test.js) and the cleanup-unused-wines
-      # run (backend/src/scripts/cleanup-unused-wines.db.test.js), the same
-      # major as production. Each test uses its own database.
+      # (backend/src/openapi/contract.test.js), the cleanup-unused-wines
+      # run (backend/src/scripts/cleanup-unused-wines.db.test.js) and the
+      # API deprecation notices (backend/src/services/
+      # apiDeprecationNotices.mongo.test.js), the same major as production.
+      # Each test uses its own database.
       mongo:
         image: mongo:7
         ports:
@@ -71,6 +73,7 @@ jobs:
         env:
           CONTRACT_MONGO_URI: mongodb://localhost:27017/cellarion_contract_ci
           CLEANUP_MONGO_URI: mongodb://localhost:27017/cellarion_cleanup_ci
+          NOTICES_MONGO_URI: mongodb://localhost:27017/cellarion_notices_ci
         run: npm test
 
   frontend:
@@ -95,6 +98,12 @@ jobs:
         working-directory: frontend
         run: npm test
 
+      # The guard scripts' own tests (file sizes, comment-only proof). They
+      # run in this job because the comment-only proof minifies with esbuild,
+      # which the install above provides.
+      - name: Guard scripts
+        run: node --test scripts/guards.test.mjs
+
   mcp-bridge:
     # cellarion-mcp is published to npm on its own tag
     # (cellarion-mcp-publish.yml); its tests gate every PR like the app's.
@@ -116,6 +125,45 @@ jobs:
       - name: Test
         working-directory: cellarion-mcp
         run: npm test
+
+  mcp-registry:
+    # The MCP server announces backend/package.json's version in its
+    # handshake; the registry entries must announce the same one, or every
+    # directory reading the registry shows a stale listing. Publishing them
+    # stays a manual step after the deploy (mcp-registry/README.md) — this
+    # only keeps the release bump from forgetting the two files.
+    name: MCP registry entries match the app version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compare versions
+        run: |
+          node -e '
+            const app = require("./backend/package.json").version;
+            let bad = 0;
+            for (const f of ["mcp-registry/cellarion/server.json", "mcp-registry/wine-registry/server.json"]) {
+              const v = require("./" + f).version;
+              if (v !== app) { console.log(`::error file=${f}::version ${v}, backend/package.json is ${app}`); bad = 1; }
+            }
+            process.exit(bad);
+          '
+
+  sizes:
+    # Files over 1,500 lines do not grow: scripts/check-file-sizes.mjs compares
+    # every tracked source file with scripts/file-size-baseline.json, which a
+    # move PR lowers with --update. Node built-ins only, so no npm ci.
+    name: File sizes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Check
+        run: node scripts/check-file-sizes.mjs
 
   images:
     name: Docker build (${{ matrix.context }})

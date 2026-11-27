@@ -1,5 +1,5 @@
 # Digest-pinned (security audit L-11); Dependabot's docker ecosystem bumps it.
-FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
+FROM python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
 
 WORKDIR /app
 
@@ -32,7 +32,16 @@ COPY app.py .
 # cache (pymatting) and gunicorn's control socket, which lives under HOME.
 # appuser stays the default user, so `docker run` and the compose file run it
 # exactly as before.
+#
+# The JIT itself is off. Importing rembg imports pymatting, which compiles its
+# numba functions on import: a minute or two at every container start, and
+# until it ends the single worker answers nothing, /health included. Only
+# alpha matting and decontamination call that code, and app.py asks for
+# neither, so the photos come out the same and the worker is up in seconds.
+# Turn it back on (NUMBA_DISABLE_JIT=0) only together with a caller that needs
+# it; the cache directory above is what it then writes to.
 ENV NUMBA_CACHE_DIR=/tmp/numba-cache \
+    NUMBA_DISABLE_JIT=1 \
     HOME=/tmp
 
 # Hand /app to the runtime user, then drop privileges.

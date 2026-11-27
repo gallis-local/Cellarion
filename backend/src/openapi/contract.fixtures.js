@@ -13,6 +13,7 @@ const User = require('../models/User');
 const Country = require('../models/Country');
 const Region = require('../models/Region');
 const Grape = require('../models/Grape');
+const SweetnessTerm = require('../models/SweetnessTerm');
 const WineDefinition = require('../models/WineDefinition');
 const WineVintageProfile = require('../models/WineVintageProfile');
 const WineRequest = require('../models/WineRequest');
@@ -57,8 +58,13 @@ async function seedContractData() {
   const merlot = await Grape.create({ name: 'Merlot', normalizedName: 'merlot', createdBy: alice._id });
   const sauvignon = await Grape.create({ name: 'Sauvignon Blanc', normalizedName: 'sauvignon blanc', createdBy: alice._id });
 
+  // The red carries a sweetness style (the term it is known by, named by its
+  // producer, with the page), so that documented shape is exercised too; the
+  // white carries a label term and no style.
+  const dry = await SweetnessTerm.create({ name: 'dry', scale: 'still', band: 'dry', system: 'EU 2019/33 Annex III A (en)', reviewedAt: new Date() });
   const red = await WineDefinition.create({
     name: 'Château Exemple', producer: 'Château Exemple', type: 'red',
+    sweetnessStyle: { term: dry._id, source: 'producer', url: 'https://www.example.com/chateau-exemple/wines' },
     country: france._id, region: pauillac._id, appellation: 'Pauillac', grapes: [cab._id, merlot._id],
     normalizedKey: 'chateau exemple|chateau exemple|pauillac', createdBy: alice._id, image: PHOTO(1),
     aiProfile: {
@@ -67,10 +73,13 @@ async function seedContractData() {
       description: 'Never sent to integrations.',
     },
   });
+  // One wine carries a label sweetness term, so the documented shape is
+  // exercised on every wine read (the red stays without one: the null case).
+  const trocken = await SweetnessTerm.create({ name: 'trocken', scale: 'still', band: 'dry', system: 'EU 2019/33 Annex III A (de)', reviewedAt: new Date() });
   const white = await WineDefinition.create({
     name: 'Exemple Blanc', producer: 'Domaine Exemple', type: 'white',
-    country: france._id, grapes: [sauvignon._id],
-    normalizedKey: 'exemple blanc|domaine exemple|', createdBy: alice._id,
+    country: france._id, grapes: [sauvignon._id], labelSweetness: trocken._id,
+    normalizedKey: 'exemple blanc|domaine exemple|#sw=trocken', createdBy: alice._id,
   });
 
   // A reviewed drink window for the red 2015 (the bottle has none of its own).

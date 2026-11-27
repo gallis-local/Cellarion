@@ -66,6 +66,29 @@ test('"Mark reviewed" calls the API, drops the row, and offers Undo', async () =
   expect(screen.getByText('common.undo')).toBeInTheDocument();
 });
 
+test('a verdict on a flagged producer offers no Undo: the flag is cleared for good', async () => {
+  adminMarkProfileReviewed.mockResolvedValue(ok({ profileReviewedAt: 'now', suspectCleared: true }));
+  renderModal();
+
+  fireEvent.click(await screen.findByText('admin.wines.lowConfidence.reviewBtn'));
+
+  expect(await screen.findByText('admin.wines.lowConfidence.empty')).toBeInTheDocument();
+  expect(screen.queryByText('common.undo')).not.toBeInTheDocument();
+});
+
+test('a row is reviewed when the server says so, not by its timestamps', async () => {
+  // Stamped by a profile write, but nobody ruled on the flagged producer.
+  adminGetLowConfidenceWines.mockResolvedValue(ok({
+    ...PAYLOAD,
+    wines: [{ ...ARCANE, profileReviewedAt: '2026-07-27T00:00:00Z', reviewed: false }],
+  }));
+  renderModal();
+
+  expect(await screen.findByText('admin.wines.lowConfidence.reviewBtn')).toBeInTheDocument();
+  expect(screen.queryByText('admin.wines.lowConfidence.unreviewBtn')).not.toBeInTheDocument();
+  expect(screen.queryByText('admin.wines.lowConfidence.reviewedBadge')).not.toBeInTheDocument();
+});
+
 test('Undo reverses the review and refetches', async () => {
   adminMarkProfileReviewed.mockResolvedValue(ok({}));
   adminUnmarkProfileReviewed.mockResolvedValue(ok({}));
@@ -134,4 +157,32 @@ test('the audit checkbox requests includeReviewed=1 and reviewed rows swap to Un
   });
   expect(await screen.findByText('admin.wines.lowConfidence.unreviewBtn')).toBeInTheDocument();
   expect(screen.getByText('admin.wines.lowConfidence.reviewedBadge')).toBeInTheDocument();
+});
+
+// After "Mark reviewed" the row has left the list. A message on that row is
+// shown nowhere, so an undo that fails reports at the top of the dialog and
+// leaves the Undo banner for another try.
+test('an undo the server refuses shows its reason at the top of the dialog and keeps Undo', async () => {
+  adminMarkProfileReviewed.mockResolvedValue(ok({}));
+  adminUnmarkProfileReviewed.mockResolvedValue({ ok: false, status: 409, json: async () => ({ error: 'This profile changed since it was reviewed' }) });
+  renderModal();
+
+  fireEvent.click(await screen.findByText('admin.wines.lowConfidence.reviewBtn'));
+  fireEvent.click(await screen.findByText('common.undo'));
+
+  expect(await screen.findByText('This profile changed since it was reviewed')).toBeInTheDocument();
+  expect(screen.getByText('common.undo')).toBeInTheDocument();
+  expect(adminGetLowConfidenceWines).toHaveBeenCalledTimes(1);
+});
+
+test('an undo that never reaches the server says so and keeps Undo', async () => {
+  adminMarkProfileReviewed.mockResolvedValue(ok({}));
+  adminUnmarkProfileReviewed.mockRejectedValue(new TypeError('Failed to fetch'));
+  renderModal();
+
+  fireEvent.click(await screen.findByText('admin.wines.lowConfidence.reviewBtn'));
+  fireEvent.click(await screen.findByText('common.undo'));
+
+  expect(await screen.findByText('common.networkError')).toBeInTheDocument();
+  expect(screen.getByText('common.undo')).toBeInTheDocument();
 });

@@ -28,7 +28,7 @@ jest.mock('../models/WineDefinition', () => ({ find: jest.fn(), findById: jest.f
 jest.mock('../models/WineEmbedding', () => ({ findOne: jest.fn() }));
 jest.mock('../models/WineVintageProfile', () => ({ find: jest.fn() }));
 jest.mock('../models/McpActionLog', () => ({ create: jest.fn(), findOne: jest.fn(), findOneAndUpdate: jest.fn() }));
-jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn() }));
+jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn() }));
 jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), buildEmptyStats: jest.fn() }));
 jest.mock('../services/vectorStore', () => ({ getVector: jest.fn(), search: jest.fn() }));
 jest.mock('../config/aiConfig', () => ({ get: jest.fn(() => ({ vectorIndex: 'v1', embeddingModel: 'voyage-4-large' })) }));
@@ -154,7 +154,7 @@ describe('what_should_i_open_tonight', () => {
     expect(body.data).toHaveLength(1);
     expect(String(body.data[0].bottle_id)).toBe(String(cheapRed._id));
     expect(body.warnings.join(' ')).toMatch(/without a comparable price were excluded/);
-    // Release-audit M-2: the screened total is the UNFILTERED cellar; the
+    // The screened total is the UNFILTERED cellar; the
     // filtered pool is reported separately, never as the total.
     expect(body.summary).toMatch(/^Screened 4 active bottle\(s\) \(1 matched the filters\)/);
   });
@@ -237,8 +237,9 @@ describe('what_should_i_open_tonight', () => {
   });
 
   test('a bottle within 2 years of its window is included last as "approaching"; further out stays excluded', async () => {
-    // Ticket 6aad5481: a 2025 Riesling curated "from 2027" was hidden from a
-    // pairing, and it was the right wine. Youthful is not wrong.
+    // A young wine whose window opens in a year or two (a Riesling curated
+    // "from" two years out) can still be the right wine for a pairing.
+    // Youthful is not wrong.
     const peak = mkBottle({ drinkFrom: THIS_YEAR - 2, drinkTo: THIS_YEAR + 2 });
     const nextYear = mkBottle({ drinkFrom: THIS_YEAR + 1 });
     const twoYears = mkBottle({ drinkFrom: THIS_YEAR + 2 });
@@ -364,8 +365,8 @@ describe('pair_with_dish', () => {
   });
 
   test('style spread gives every wine type a slot before any type gets a second, and groups identical bottles', async () => {
-    // Ticket 6aad5481: a 3-slot spread filled by two reds and a sparkling hid
-    // nine Rieslings; the same Chenin took three slots.
+    // A 3-slot spread must not fill up with two reds and a sparkling while a
+    // whole type (all the whites) goes unseen, nor give one wine three slots.
     const wine = (type, name) => ({ ...mkBottle().wineDefinition, type, name });
     const redA = wine('red', 'Rioja'); const redB = wine('red', 'Syrah');
     const chenin = wine('white', 'Chenin');

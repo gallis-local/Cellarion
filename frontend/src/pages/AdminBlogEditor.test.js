@@ -1,5 +1,5 @@
 /**
- * The admin blog editor could not open ANY existing post (found 2026-09-15).
+ * The admin blog editor could not open ANY existing post.
  *
  * loadPost was a useCallback listing `editor` as a dependency, and TipTap's
  * useEditor hands back a fresh reference on re-render — so every state update
@@ -11,7 +11,7 @@
  * These tests pin the contract: the post is fetched ONCE, its fields land in
  * the form, and nothing alerts.
  */
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { vi, describe, test, expect, beforeEach, afterEach } from 'vitest';
 import AdminBlogEditor from './AdminBlogEditor';
 
@@ -67,6 +67,46 @@ describe('AdminBlogEditor', () => {
     expect(apiFetch).toHaveBeenCalledWith(`/api/blog/admin/posts/${POST._id}`);
     expect(window.alert).not.toHaveBeenCalled();
     expect(navigate).not.toHaveBeenCalled();
+  });
+
+  // StarterKit brings Link and Underline itself; adding them again registered
+  // each twice, and TipTap warns that the result is not defined.
+  test('every editor extension is registered once, and a link keeps the set-up of this editor', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    apiFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ post: { ...POST, content: '<p>See <a href="https://example.com/x">the source</a> and <u>this</u>.</p>' } }) });
+    const { container } = render(<AdminBlogEditor />);
+
+    await waitFor(() => expect(container.querySelector('.ProseMirror a')).not.toBeNull());
+    expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => /Duplicate extension names/.test(m))).toEqual([]);
+    const link = container.querySelector('.ProseMirror a');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    expect(container.querySelector('.ProseMirror u')).not.toBeNull();
+  });
+
+  test('a translation opens with its language and original and saves them back; the originals list waits until asked for', async () => {
+    const ORIGINAL = { _id: '6aa9257367c260237d471800', title: 'Drink windows explained', slug: 'drink-windows', language: 'en' };
+    apiFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ post: { ...POST, language: 'sv', translationOf: ORIGINAL } }) });
+    render(<AdminBlogEditor />);
+
+    await waitFor(() => expect(screen.getByLabelText('blog.editor.language')).toHaveValue('sv'));
+    expect(screen.getByLabelText('blog.editor.translationOf')).toHaveValue(ORIGINAL._id);
+    // Opening a post is still one request: the list of originals loads when the Language section opens.
+    expect(apiFetch.mock.calls.map((c) => c[0])).not.toContain('/api/blog/admin/originals');
+
+    fireEvent.click(screen.getByText('blog.editor.saveDraft'));
+    await waitFor(() => expect(apiFetch.mock.calls.some((c) => c[1]?.method === 'PUT')).toBe(true));
+    const body = JSON.parse(apiFetch.mock.calls.find((c) => c[1]?.method === 'PUT')[1].body);
+    expect(body).toMatchObject({ language: 'sv', translationOf: ORIGINAL._id });
+  });
+
+  test('an original saves as one: no translationOf', async () => {
+    render(<AdminBlogEditor />);
+    await waitFor(() => expect(screen.getByLabelText('blog.editor.language')).toHaveValue('en'));
+    fireEvent.click(screen.getByText('blog.editor.saveDraft'));
+    await waitFor(() => expect(apiFetch.mock.calls.some((c) => c[1]?.method === 'PUT')).toBe(true));
+    const body = JSON.parse(apiFetch.mock.calls.find((c) => c[1]?.method === 'PUT')[1].body);
+    expect(body).toMatchObject({ language: 'en', translationOf: null });
   });
 
   test('an error response alerts once and returns to the list, instead of looping', async () => {

@@ -13,7 +13,7 @@
 
 process.env.JWT_SECRET = 'test-secret';
 
-jest.mock('../../models/WineRequest', () => ({ findById: jest.fn() }));
+jest.mock('../../models/WineRequest', () => ({ findById: jest.fn(), findOneAndUpdate: jest.fn(), exists: jest.fn(), updateOne: jest.fn() }));
 jest.mock('../../models/WineDefinition', () => {
   const ctor = jest.fn();
   ctor.findById = jest.fn();
@@ -24,7 +24,7 @@ jest.mock('../../models/Bottle', () => ({ distinct: jest.fn(), updateMany: jest.
 jest.mock('../../models/Country', () => ({ findById: jest.fn() }));
 jest.mock('../../services/findOrCreateWine', () => ({ findOrCreateWine: jest.fn() }));
 jest.mock('../../services/search', () => ({ indexWine: jest.fn() }));
-jest.mock('../../services/audit', () => ({ logAudit: jest.fn() }));
+jest.mock('../../services/audit', () => ({ logAudit: jest.fn(), logger: { warn: jest.fn() } }));
 jest.mock('../../services/dataVersion', () => ({ bumpDataVersion: jest.fn(), bumpWineOwners: jest.fn() }));
 jest.mock('../../services/notifications', () => ({ createNotification: jest.fn() }));
 jest.mock('../../utils/cellarCred', () => ({ incrementCred: jest.fn().mockResolvedValue(undefined) }));
@@ -64,14 +64,18 @@ beforeEach(() => {
     wineName: 'Barolo del Comune',
     user: '64b000000000000000000003',
     save: jest.fn().mockResolvedValue({}),
+    markModified: jest.fn(),
     populate: jest.fn().mockResolvedValue({}),
   };
   WineRequest.findById.mockResolvedValue(requestDoc);
+  // The decision takes the request before it does anything (services/wineRequestOps.claimRequest).
+  WineRequest.findOneAndUpdate.mockResolvedValue(requestDoc);
+  WineRequest.updateOne.mockResolvedValue({});
   Bottle.updateMany.mockResolvedValue({ modifiedCount: 0 });
   Bottle.distinct.mockResolvedValue([]);
 });
 
-// Audit 2026-09-27 M6: the detached bottles' owners see different statistics
+// The detached bottles' owners see different statistics
 // and bottle lists — their data version must move, as it does on resolve, or
 // the read caches keep the old answer for up to 30 minutes.
 test('reject moves the data version of every owner of a detached bottle', async () => {
@@ -164,4 +168,34 @@ test('a detach failure leaves the request PENDING so a retry re-runs the detach'
   expect(res.status).toBe(500);
   expect(requestDoc.save).not.toHaveBeenCalled();
   expect(requestDoc.status).toBe('pending'); // retryable — the $unset is idempotent
+});
+
+test.each([
+  ['a number', 5],
+  ['an object', { $gt: '' }],
+  ['a list', ['spam']],
+])('admin notes that are %s are refused like missing ones, not answered with a 500', async (name, adminNotes) => {
+  const res = await reject({ adminNotes });
+  expect(res.status).toBe(400);
+  expect((await res.json()).error).toBe('Admin notes are required when rejecting a request');
+});
+
+// A reject detaches the waiting bottles before it writes the status, so it
+// must not run beside a resolve that is at work on the same request.
+test('a reject while another decision holds the request: 409, and no bottle is detached', async () => {
+  WineRequest.findOneAndUpdate.mockResolvedValue(null);
+  WineRequest.exists.mockResolvedValue({ _id: REQUEST_ID });
+  const res = await reject();
+
+  expect(res.status).toBe(409);
+  expect((await res.json()).error).toMatch(/Someone else is deciding this wine request/);
+  expect(Bottle.updateMany).not.toHaveBeenCalled();
+  expect(requestDoc.save).not.toHaveBeenCalled();
+});
+
+test('a reject that goes through clears the claim with the decision', async () => {
+  const res = await reject();
+  expect(res.status).toBe(200);
+  expect(requestDoc.status).toBe('rejected');
+  expect(requestDoc.claimedAt).toBeNull();
 });

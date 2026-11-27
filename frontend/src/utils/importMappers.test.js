@@ -682,12 +682,11 @@ describe('parseAndMap', () => {
   });
 
   it('skips PRODUCER-ONLY rows too — a producer is not a wine name', () => {
-    // The 2026-08-28 cal import: a generic CSV whose name column never
-    // mapped produced 148 producer-only rows, and the old AND-gate
-    // (`!wineName && !producer`) let every one through — each then filed a
-    // WineRequest with the PRODUCER as the wine's name ("Hewitson —
-    // Hewitson", ×131). wineName is required, exactly as the master-format
-    // doc at the top of this module has always said.
+    // A generic CSV whose name column never mapped yields producer-only rows.
+    // An AND-gate (`!wineName && !producer`) would let every one through, and
+    // each would file a WineRequest with the PRODUCER as the wine's name
+    // ("Hewitson — Hewitson"). wineName is required, exactly as the
+    // master-format doc at the top of this module says.
     const csv = 'Wine,Producer,Vintage\n,Hewitson,2005\n,Tahbilk,2019\nMargaux,CM,2016';
     const result = parseAndMap(csv);
     expect(result.items).toHaveLength(1);
@@ -1033,7 +1032,7 @@ describe('parseOenoExport', () => {
     expect(result.oenoRackSpecs).toBeDefined();
   });
 
-  // ── The last Oeno exports (2026-09-15 support mail) ─────────────────────
+  // ── The later Oeno export format ──────────────────────────────────────────
   // Every cell quoted, a title block above the cabinet header, "null" for
   // absent values, "N.V." vintages, and Vintec VWM storage shelves whose
   // "layers" are STACKED rows (up to 10 per shelf), not front/back.
@@ -1151,10 +1150,10 @@ describe('wine colour is stated, never guessed', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Classification-in-name guard (somm ticket 0063bb76). Producer-stripping a
-// Bordeaux CT name like "Château Talbot Grand Cru Classé" used to leave the
-// bare TIER as the wine's name — prod grew 19 such rows, three distinct wines
-// all named "Grand Cru Classé", six duplicating a properly-named record.
+// Classification-in-name guard. Producer-stripping a Bordeaux CT name like
+// "Château Talbot Grand Cru Classé" must not leave the bare TIER as the
+// wine's name: distinct wines would all be named "Grand Cru Classé", and
+// some would duplicate a properly-named record.
 // ---------------------------------------------------------------------------
 describe('splitClassificationFromName', () => {
 
@@ -1227,7 +1226,7 @@ describe('classification reaches the mapped item', () => {
   });
 });
 
-describe('stripAppellationPrefixFromName (registry backlog 2026-09-06)', () => {
+describe('stripAppellationPrefixFromName', () => {
   it('drops an appellation that opens the name, keeping the file spelling', () => {
     expect(stripAppellationPrefixFromName('Rioja Prado Enea Gran Reserva', { appellation: 'Rioja' })).toBe('Prado Enea Gran Reserva');
     expect(stripAppellationPrefixFromName('Barolo Bricco Boschis', { appellation: 'Barolo' })).toBe('Bricco Boschis');
@@ -1252,7 +1251,7 @@ describe('stripAppellationPrefixFromName (registry backlog 2026-09-06)', () => {
   });
 });
 
-describe('a row without a vintage is filed as NV but flagged (audit ticket 2026-09-05)', () => {
+describe('a row without a vintage is filed as NV but flagged', () => {
   it('sets vintageMissing on the item and reports one warning with the count', () => {
     const csv = 'Wine name,Producer,Vintage,Country\nPrado Enea Gran Reserva,Muga,,Spain\nBrut Réserve,Pol Roger,NV,France\nBarolo,Vajra,2019,Italy\n';
     const out = parseAndMap(csv);
@@ -1263,5 +1262,64 @@ describe('a row without a vintage is filed as NV but flagged (audit ticket 2026-
     expect(out.items[1].vintageMissing).toBeUndefined();
     expect(out.items[2].vintage).toBe('2019');
     expect(out.warnings).toEqual(expect.arrayContaining([{ code: 'vintage-missing', count: 1 }]));
+  });
+});
+
+describe('CellarTracker vintage sentinels in a file no CT fingerprint claims', () => {
+  // A CT "My Cellar" view export can carry just Wine / Vintage / Size, so the
+  // GENERIC mapper reads it. CT writes a non-vintage wine as 1001 and an
+  // unknown year as 9999; the backend refuses both as years, which dropped
+  // every non-vintage bottle of such a file at confirm.
+  const csv = 'Wine,Vintage,Size\n'
+    + 'Champagne Brut Fictif,1001,750ml\n'
+    + 'Some Red,9999,750ml\n'
+    + 'Barolo,2019,750ml\n';
+
+  it('reads 1001 as a stated non-vintage and 9999 as a missing year', () => {
+    const out = parseAndMap(csv);
+    expect(out.format).toBe('generic');
+    expect(out.items.map((i) => i.vintage)).toEqual(['NV', 'NV', '2019']);
+    expect(out.items[0].vintageMissing).toBeUndefined();
+    expect(out.items[1].vintageMissing).toBe(true);
+    expect(out.warnings).toEqual(expect.arrayContaining([{ code: 'vintage-missing', count: 1 }]));
+  });
+
+  it('leaves a real year near them alone', () => {
+    const out = parseAndMap('Wine,Vintage\nOld Madeira,1900\nTypo,1010\n');
+    expect(out.items.map((i) => i.vintage)).toEqual(['1900', '1010']);
+  });
+});
+
+describe('a vintage cell that says "no vintage" in words', () => {
+  // The backend takes a year, "NV" or "Unknown". Anything else in the cell is
+  // refused at confirm and that bottle is not imported.
+  const vintagesOf = (cells) => {
+    const out = parseAndMap(`Wine,Producer,Vintage\n${cells.map((c, i) => `Wine ${i},Producer,${c}`).join('\n')}\n`);
+    return out.items.map((i) => [i.vintage, i.vintageMissing === true]);
+  };
+
+  it('reads a stated non-vintage as NV, whatever the language, and does not flag it', () => {
+    const stated = [
+      'Ohne', 'ohne Jahrgang', 'Ohne Jahrgang.', 'o.J.', 'o. J.',
+      'Non-Vintage', 'non vintage', 'non - vintage', 'M.V.', 'Multi-Vintage', 'N/V',
+      'N.M.', 'Sans millésime', 'non millésimé',
+      'senza annata', 's.a.', 'sin añada', 's/a',
+      'Utan årgång', 'Uten årgang', 'zonder jaargang',
+    ];
+    expect(vintagesOf(stated)).toEqual(stated.map(() => ['NV', false]));
+  });
+
+  it('reads a placeholder for an empty cell as a missing year: NV, flagged for the review', () => {
+    const placeholders = ['-', '--', '–', '—', '?', 'n/a', 'N/A', 'n.a.', 'none', 'k.A.', '0'];
+    expect(vintagesOf(placeholders)).toEqual(placeholders.map(() => ['NV', true]));
+  });
+
+  it('reads bare "NM" and "MV" as NV but flags them: two letters can also be a column mapped wrong', () => {
+    expect(vintagesOf(['NM', 'MV', 'nm'])).toEqual([['NV', true], ['NV', true], ['NV', true]]);
+  });
+
+  it('leaves a year, "Unknown" and text it does not know alone', () => {
+    expect(vintagesOf(['2019', 'Unknown', '2015er', 'SA', 'OJ', 'Red']))
+      .toEqual([['2019', false], ['Unknown', false], ['2015er', false], ['SA', false], ['OJ', false], ['Red', false]]);
   });
 });

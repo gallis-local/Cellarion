@@ -3,7 +3,6 @@ const mongoose = require('mongoose');
 const { requireAuth, requireNonDemo } = require('../middleware/auth');
 const Review = require('../models/Review');
 const ReviewVote = require('../models/ReviewVote');
-const WineDefinition = require('../models/WineDefinition');
 const { findVisibleWine } = require('../services/wineVisibility');
 const User = require('../models/User');
 const Follow = require('../models/Follow');
@@ -14,6 +13,7 @@ const { logAudit } = require('../services/audit');
 const { updateWineCommunityRating } = require('../services/reviewAggregation');
 const { parsePagination } = require('../utils/pagination');
 const { isValidId } = require('../utils/validation');
+const asyncHandler = require('../utils/asyncHandler');
 const { REVIEWS_PER_PAGE, REVIEWS_MAX_PER_PAGE, REVIEW_MAX_LENGTHS } = require('../config/constants');
 
 const router = express.Router();
@@ -55,7 +55,7 @@ router.post('/', requireNonDemo, async (req, res) => {
     // Validate wine exists AND is visible to this user — a pendingIdentity row
     // is a wine nobody but its creator and curation may see, so for everyone
     // else "exists" must answer the same 404 a missing id does
-    // (services/wineVisibility, security audit M-4).
+    // (services/wineVisibility).
     // noDrafts: a review is public content; a private draft is published first.
     const wine = await findVisibleWine(wineDefinition, { userId: req.user.id, roles: req.user.roles, noDrafts: true });
     if (!wine) {
@@ -169,9 +169,24 @@ router.get('/wine/:wineId', async (req, res) => {
   }
 });
 
-// GET /api/reviews/user/:userId - Reviews by a user
-router.get('/user/:userId', async (req, res) => {
-  try {
+// A review can be written on a wine that is not registry content yet (its
+// identity is pending, or it waits for a curator's check): its author sees
+// the wine, nobody else may. The feeds carry the wine's name and producer, so
+// such a review is left out of what OTHER members are served. `pendingIdentity`
+// is selected for this test only and never sent.
+const WINE_CARD = { path: 'wineDefinition', select: 'name producer type colour pendingIdentity', populate: { path: 'country', select: 'name' } };
+const servableTo = (viewerId) => (review) =>
+  review.wineDefinition?.pendingIdentity !== true || String(review.author?._id || review.author) === String(viewerId);
+const reviewCard = (review, liked) => {
+  const out = { ...review.toObject(), liked };
+  if (out.wineDefinition) delete out.wineDefinition.pendingIdentity;
+  return out;
+};
+
+// GET /api/reviews/user/:userId - Reviews by a user. The author is populated as
+// on the other review lists: the card links the name and offers Edit and Delete
+// only when author._id is the viewer.
+router.get('/user/:userId', asyncHandler(async (req, res) => {
     if (!isValidId(req.params.userId)) return res.status(400).json({ error: 'Invalid user ID' });
     const { page, limit, offset: skip } = parsePagination(req.query, { limit: REVIEWS_PER_PAGE, maxLimit: REVIEWS_MAX_PER_PAGE });
 
@@ -194,7 +209,8 @@ router.get('/user/:userId', async (req, res) => {
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .populate({ path: 'wineDefinition', select: 'name producer type colour', populate: { path: 'country', select: 'name' } }),
+        .populate('author', 'username displayName plan contribution.tier contribution.specialty')
+        .populate(WINE_CARD),
       Review.countDocuments(filter)
     ]);
 
@@ -203,17 +219,12 @@ router.get('/user/:userId', async (req, res) => {
     const userVotes = await ReviewVote.find({ user: req.user.id, review: { $in: reviewIds } }).select('review');
     const likedSet = new Set(userVotes.map(v => v.review.toString()));
 
-    const enriched = reviews.map(r => ({
-      ...r.toObject(),
-      liked: likedSet.has(r._id.toString())
-    }));
+    const enriched = reviews
+      .filter(servableTo(req.user.id))
+      .map(r => reviewCard(r, likedSet.has(r._id.toString())));
 
     res.json({ reviews: enriched, total, page, pages: Math.ceil(total / limit) });
-  } catch (err) {
-    console.error('Get user reviews error:', err);
-    res.status(500).json({ error: 'Failed to get reviews' });
-  }
-});
+}));
 
 // GET /api/reviews/feed - Reviews from followed users
 router.get('/feed', async (req, res) => {
@@ -242,7 +253,7 @@ router.get('/feed', async (req, res) => {
         .skip(skip)
         .limit(limit)
         .populate('author', 'username displayName plan contribution.tier contribution.specialty')
-        .populate({ path: 'wineDefinition', select: 'name producer type colour', populate: { path: 'country', select: 'name' } }),
+        .populate(WINE_CARD),
       Review.countDocuments(feedFilter)
     ]);
 
@@ -251,10 +262,9 @@ router.get('/feed', async (req, res) => {
     const userVotes = await ReviewVote.find({ user: req.user.id, review: { $in: reviewIds } }).select('review');
     const likedSet = new Set(userVotes.map(v => v.review.toString()));
 
-    const enriched = reviews.map(r => ({
-      ...r.toObject(),
-      liked: likedSet.has(r._id.toString())
-    }));
+    const enriched = reviews
+      .filter(servableTo(req.user.id))
+      .map(r => reviewCard(r, likedSet.has(r._id.toString())));
 
     res.json({ reviews: enriched, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
@@ -294,7 +304,7 @@ router.get('/discover', async (req, res) => {
         .skip(skip)
         .limit(limit)
         .populate('author', 'username displayName plan contribution.tier contribution.specialty')
-        .populate({ path: 'wineDefinition', select: 'name producer type colour', populate: { path: 'country', select: 'name' } }),
+        .populate(WINE_CARD),
       Review.countDocuments(discoverFilter)
     ]);
 
@@ -303,10 +313,9 @@ router.get('/discover', async (req, res) => {
     const userVotes = await ReviewVote.find({ user: req.user.id, review: { $in: reviewIds } }).select('review');
     const likedSet = new Set(userVotes.map(v => v.review.toString()));
 
-    const enriched = reviews.map(r => ({
-      ...r.toObject(),
-      liked: likedSet.has(r._id.toString())
-    }));
+    const enriched = reviews
+      .filter(servableTo(req.user.id))
+      .map(r => reviewCard(r, likedSet.has(r._id.toString())));
 
     res.json({ reviews: enriched, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
@@ -351,7 +360,7 @@ router.put('/:id', async (req, res) => {
 
     await review.save();
 
-    // Keep Cellar-Cred symmetric across visibility flips (L-19): the +3
+    // Keep Cellar-Cred symmetric across visibility flips: the +3
     // "public review" award tracks whether the review IS public, so flipping
     // public→private reverses it and private→public re-awards it. A flip loop
     // therefore nets zero, and deleting after going private can't dodge the
@@ -393,7 +402,7 @@ router.delete('/:id', async (req, res) => {
     const wineId = review.wineDefinition;
     const authorId = review.author;
 
-    // Reverse the Cellar-Cred this review awarded (L-19) — count the votes
+    // Reverse the Cellar-Cred this review awarded — count the votes
     // BEFORE they are deleted. The +3 public-review award is only reversed if
     // the review is currently public (a private review either never earned it
     // or already had it reversed on the public→private flip); like-cred was
@@ -449,7 +458,7 @@ router.post('/:id/like', requireNonDemo, async (req, res) => {
       const del = await ReviewVote.deleteOne({ _id: existing._id });
       if (del.deletedCount > 0) {
         await Review.updateOne({ _id: review._id, likesCount: { $gt: 0 } }, { $inc: { likesCount: -1 } });
-        // Symmetric cred (L-19): the like awarded +1 to the author, so the
+        // Symmetric cred: the like awarded +1 to the author, so the
         // unlike takes it back — a like/unlike toggle loop nets zero. Guarded
         // by deletedCount so a concurrent double-unlike can't double-reverse.
         decrementCred(review.author.toString(), 'review_like_received').catch(() => {});

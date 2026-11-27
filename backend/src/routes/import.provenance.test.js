@@ -1,15 +1,13 @@
 /**
  * Identity provenance for AI-identified import rows.
  *
- * WHY THIS EXISTS (somm ticket 6a958dbc, 2026-08-31):
- * A 205-row import carried appellation on every row and grapes on none. The
- * identifier duly supplied grapes — by reasoning FROM the appellation — and
- * all eight Montlouis-sur-Loire wines came out Chenin Blanc, including a
- * pétillant naturel that is mostly Menu Pineau, and a Coteaux d'Ancenis red
- * Pinot Noir came out white Malvoisie. The values were wrong, mutually
- * consistent, and indistinguishable from researched ones, so the curator
- * stopped work: a profile written onto a misidentified record marks it
- * verified forever.
+ * WHY THIS EXISTS:
+ * An import row that carries an appellation but no grapes leaves the
+ * identifier to supply grapes by reasoning FROM the appellation — so a
+ * Montlouis-sur-Loire pétillant naturel that is mostly Menu Pineau comes out
+ * Chenin Blanc. Such values are wrong, mutually consistent, and
+ * indistinguishable from researched ones, and a profile written onto a
+ * misidentified record marks it verified forever.
  *
  * The fix is not better guessing — it is saying which values were guesses.
  * These tests pin the rule that a field the FILE stated is never labelled
@@ -21,7 +19,7 @@
 // the other import suites do. Nothing below touches any of it — this is a pure
 // function test.
 jest.mock('../services/search', () => ({
-  indexWine: jest.fn(), bulkIndexBottles: jest.fn(), getIsAvailable: jest.fn(() => false),
+  indexWine: jest.fn(), getIsAvailable: jest.fn(() => false),
 }));
 jest.mock('../services/labelScan', () => ({ identifyWineFromText: jest.fn() }));
 jest.mock('../services/findOrCreateWine', () => ({ findOrCreateWine: jest.fn(), findOrCreateRegion: jest.fn() }));
@@ -30,7 +28,7 @@ jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 
 const { computeIdentityProvenance } = require('./import');
 
-// The real shape of the failing rows: identity columns, no type, no grapes.
+// The row shape this guards: identity columns, no type, no grapes.
 const loireRow = (over = {}) => ({
   wineName: 'Sans Pagne', producer: 'Ludovic Chanson', vintage: '2021',
   country: 'France', region: 'Vallée de la Loire', appellation: 'Montlouis sur Loire',
@@ -43,19 +41,31 @@ const identified = (over = {}) => ({
   type: 'white', grapes: ['Chenin Blanc'], ...over,
 });
 
-describe('computeIdentityProvenance — the ticket 6a958dbc row', () => {
+describe('computeIdentityProvenance — a row with an appellation and no grapes', () => {
   test('appellation and region are the FILE; type and grapes are the MODEL', () => {
     const p = computeIdentityProvenance(loireRow(), identified());
     expect(p.appellation).toBe('file');
     expect(p.region).toBe('file');
-    // The two fields nobody stated — and the two the curator found wrong.
+    // The two fields nobody stated — and the two the model infers.
     expect(p.type).toBe('model');
     expect(p.grapes).toBe('model');
   });
 
-  test('name and producer are always the model on this path (it canonicalises them)', () => {
-    const p = computeIdentityProvenance(loireRow(), identified());
+  test('a name or producer the model reworded comes from the model', () => {
+    const p = computeIdentityProvenance(loireRow(), identified({ name: 'Sans Pagne Pétillant', producer: 'Domaine Ludovic Chanson' }));
     expect(p.name).toBe('model');
+    expect(p.producer).toBe('model');
+  });
+
+  test('a name and producer minted as the file states them come from the file: a row identified with no model claims none', () => {
+    const p = computeIdentityProvenance(loireRow(), identified());
+    expect(p.name).toBe('file');
+    expect(p.producer).toBe('file');
+    expect(p.country).toBe('file');
+  });
+
+  test('a producer the file does not state never comes from the file', () => {
+    const p = computeIdentityProvenance(loireRow({ producer: '' }), identified());
     expect(p.producer).toBe('model');
   });
 });
@@ -148,8 +158,8 @@ describe('robustness', () => {
 /**
  * Provenance follows the VALUE, not the column it was typed in.
  *
- * When a Prädikat is routed out of the appellation column (somm ticket
- * 6a966386), the appellation the wine ends up with came from the model even
+ * When a Prädikat is routed out of the appellation column, the appellation
+ * the wine ends up with came from the model even
  * though the file's column was filled — and the classification came from the
  * file even though its column was empty. Reporting the columns would tell the
  * curator the exact opposite of the truth on both fields, which matters

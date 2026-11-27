@@ -43,10 +43,10 @@ jest.mock('../services/mcpOAuth', () => ({ revokeOAuthConnectionsForUser: jest.f
 // meilisearch; stub it as the other auth suites do.
 jest.mock('../services/search', () => ({
   initialize: jest.fn(), getIsAvailable: () => false, search: async () => ({ ids: [] }),
-  searchBottles: async () => ({ ids: [] }), searchDiscussions: async () => ({ ids: [] }),
-  indexWine: jest.fn(), removeWine: jest.fn(), indexBottle: jest.fn(), removeBottle: jest.fn(),
-  removeBottles: jest.fn(), bulkIndexBottles: jest.fn(), indexDiscussion: jest.fn(),
-  removeDiscussion: jest.fn(), fullSync: jest.fn(), fullSyncBottles: jest.fn(), fullSyncDiscussions: jest.fn(),
+  searchDiscussions: async () => ({ ids: [] }),
+  indexWine: jest.fn(), removeWine: jest.fn(),
+  indexDiscussion: jest.fn(),
+  removeDiscussion: jest.fn(), fullSync: jest.fn(), fullSyncDiscussions: jest.fn(),
 }));
 jest.mock('../utils/clientIp', () => {
   let n = 0;
@@ -78,6 +78,15 @@ const register = (body) => fetch(`${baseUrl}/api/auth/register`, {
     username: 'anna', email: 'anna@example.com', password: 'Correct-horse-9',
     consentPrivacyPolicy: true, consentDataProcessing: true, ...body,
   }),
+});
+
+test('with email verification off there is no signup binding cookie (the account is signed in at once)', async () => {
+  User.findOne.mockResolvedValue(null);
+
+  const res = await register();
+
+  expect(res.status).toBe(201);
+  expect(res.headers.get('set-cookie') || '').not.toMatch(/signupBinding/);
 });
 
 test('a new account is marked for first-sign-in language + currency defaults', async () => {

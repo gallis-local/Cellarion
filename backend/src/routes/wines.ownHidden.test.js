@@ -1,6 +1,6 @@
 /**
  * GET /api/wines?ownHidden=1 — a member's own quarantined drinks come first in
- * the pickers that put a bottle on the pick (2026-10-13), and only there.
+ * the pickers that put a bottle on the pick, and only there.
  */
 process.env.JWT_SECRET = 'test-secret';
 
@@ -125,7 +125,7 @@ test('the Meilisearch path does the same', async () => {
   expect(body.total).toBe(8);
 });
 
-// Audit 2026-10-14: search results answered with whole documents, so every
+// Search results answered with whole documents, so every
 // row named the member who contributed it and carried the curation keys.
 test('a member\'s results carry no curation internals and no createdBy, on both paths', async () => {
   const internals = { createdBy: USER_ID, normalizedKey: 'k', canonicalKey: 'c', productNumber: '123', canary: false, identityProvenance: { x: 1 } };
@@ -179,4 +179,17 @@ test('a failed lookup never costs the search', async () => {
   expect(status).toBe(200);
   expect(body.wines.map((w) => w._id)).toEqual([WINE]);
   warn.mockRestore();
+});
+
+// A search or sort that is not one plain value (Express: an array for a
+// repeated parameter, an object for `?search[$gt]=1`).
+test('a search shaped like an operator is no search term: 400, not 500', async () => {
+  const { status, body } = await get('/api/wines?search[$gt]=1');
+  expect(status).toBe(400);
+  expect(body.error).toBe('A search term is required');
+});
+
+test('a repeated sort is ignored and the search still answers', async () => {
+  const { status } = await get('/api/wines?search=blanc&sort=name&sort=producer');
+  expect(status).toBe(200);
 });

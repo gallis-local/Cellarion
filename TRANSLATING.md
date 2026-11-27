@@ -31,6 +31,12 @@ Cellarion's interface is community-translated. Thank you for helping!
 
 5. **Don't translate:** product names (Cellarion, CellarTracker, Vivino), technical identifiers, or the demo email addresses.
 
+### Language guides and a worked example
+
+A language can keep its own style guide in [`docs/translation/`](docs/translation/), named after its code, for the next translator to find: the style rules, the rules learned along the way, and the choices that were settled with the alternatives that were turned down. The terms themselves stay in the Weblate glossary, so there is one list to keep up to date. [`nb.md`](docs/translation/nb.md) is the Norwegian Bokmål guide.
+
+Starting a language from scratch? [How Cellarion was translated into Norwegian Bokmål](docs/translation/how-bokmal-was-translated.md) has a checklist for a new language and the workflow behind the Bokmål translation, including how to use an AI assistant for drafts while reading every string yourself.
+
 ## How a new language gets shipped
 
 1. Request the language in Weblate (or open a GitHub discussion) and start translating.
@@ -39,9 +45,9 @@ Cellarion's interface is community-translated. Thank you for helping!
 3. Anyone can select a beta language deliberately, but nobody is switched into one automatically: browser-language detection only ever selects a finished language, and only finished languages are declared to search engines.
 4. At **90 % of user-facing strings** the label and the restrictions drop off by themselves — no code change, no waiting for someone to add your language to a list.
 
-### Machine-drafted languages are a special case
+### French and German: complete, translated by AI, not yet reviewed
 
-French and German did not start from zero: their first pass was **drafted in bulk by the maintainers** so that reviewing beats typing. Those languages are listed in `MACHINE_DRAFTED` in [`frontend/src/locales/coverage.js`](frontend/src/locales/coverage.js) and **stay labelled beta at any percentage** — the percentage only knows that a string is *filled*, and a drafted locale is 100 % filled and 0 % read.
+French and German did not start from zero: their text was **written by AI** and checked against the current English with a fixed word list (wine terms, "vous" in French, "du" in German), so reviewing beats typing. They ship like any finished language (offered from the browser's language) and say **unreviewed** in Settings → Language until a speaker has read them. They are not declared to search engines yet: the pages crawlers read are English, so that waits for public pages in those languages.
 
 What that means if you translate French or German: everything is already there, so your work is **reviewing, not filling in blanks**. In Weblate the queue you want is *unreviewed* strings, not *untranslated* ones — read what is there, fix what is wrong, and approve what is right. The search query is:
 
@@ -49,7 +55,7 @@ What that means if you translate French or German: everything is already there, 
 state:translated NOT state:approved
 ```
 
-When enough of a language has been read by an actual speaker, a maintainer removes it from `MACHINE_DRAFTED` and it graduates the normal way.
+A future language bootstrapped in bulk without that check goes in `MACHINE_DRAFTED` in [`frontend/src/locales/coverage.js`](frontend/src/locales/coverage.js), which keeps it labelled beta at any percentage (the percentage only knows that a string is *filled*) until a maintainer removes it.
 
 ### "Unreviewed" is tracked separately from "beta"
 
@@ -58,8 +64,8 @@ A language can be complete and still unread, so those are two flags, not one:
 | | label in Settings → Language | offered in the menu | auto-selected from the browser | declared via hreflang |
 |---|---|---|---|---|
 | `en` | English | yes | yes | yes |
-| `sv` (98 %, 1 % approved) | `Svenska (unreviewed)` | yes | **yes** | **yes** |
-| `fr` / `de` (drafted) | `Français (beta · unreviewed)` | yes | no | no |
+| `sv` (human, completed by AI) | `Svenska (unreviewed)` | yes | **yes** | **yes** |
+| `fr` / `de` (AI, complete) | `Français (unreviewed)` | yes | **yes** | no (crawlers read English pages) |
 
 `UNREVIEWED` in [`coverage.js`](frontend/src/locales/coverage.js) is **label-only**: it never changes whether a language ships. Swedish is honest about its review state without losing the auto-detection and search visibility it has had since v1.88.0 — telling Swedish users nothing is wrong, but handing them an English UI to make a point about process would be. Fitness to ship stays governed by `beta`.
 
@@ -80,6 +86,7 @@ Coverage is counted in *units*, the same way Weblate counts them: a plural famil
 - Don't build sentences by concatenating strings or placing numbers next to `t()` calls — put the whole sentence in one key and interpolate (`{{count}}`, `{{name}}`). Word order differs across languages.
 - Renaming a key discards its existing translations in every language. Reword the English value only when the *meaning* changes (Weblate then flags translations for review); avoid renaming keys casually.
 - **Never end a key in `_one`, `_other`, `_zero`, `_two`, `_few` or `_many` unless it is a real plural.** Those suffixes mark CLDR plural families for i18next *and* Weblate — an enum key like `status_other` ("other" status) gets mistaken for an incomplete plural and Weblate scaffolds empty sibling forms. Nest enums instead (`bottles.statusLabels.other`), and give every real plural family both `_one` and `_other` in English (no bare base key as the singular).
+- **Turning a bare key into a plural family? Convert it in every language in the same PR**, as a PR that drops a key removes it everywhere: the language's existing text goes into each form that language has (`_one`, `_many` and `_other` in French; `_one` and `_other` in German, Bokmål and Swedish). That moves a translation, it doesn't write one. Left bare, Weblate puts the text in the first form and leaves the others empty, and its next PR fails. The locale tests flag both a bare key and a missing form.
 - **Nothing needs adding to a list when a language arrives.** `frontend/src/i18n.js` discovers locales from the directories themselves (`import.meta.glob`), and completeness comes from the `virtual:locale-coverage` module built by `frontend/vite-plugins/localeCoverage.js`. Dropping in `fr/translation.json` is the whole change.
 - **The directory name is the language code**, and it is what the app addresses the locale by — `pt-BR` and `pt_BR` both work (exact match first, base subtag second), but prefer Weblate's BCP-47 hyphen style so `<html lang>` and `Intl.DisplayNames` get a valid tag without normalising.
 - **When a language crosses 90 % it graduates automatically** — except for two hand-maintained gates: `MACHINE_DRAFTED` in `frontend/src/locales/coverage.js` (a bulk-drafted language stays beta until a human review pass clears it), and `CRAWLER_LANGUAGES` in `backend/src/config/languages.js`, which the crawler-rendered pages in `routes/og.js` use for `hreflang`. The backend image doesn't ship the locale files, so add the language there in the release that announces it.

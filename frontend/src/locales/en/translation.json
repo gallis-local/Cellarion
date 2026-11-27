@@ -38,6 +38,8 @@
     "all": "All",
     "by": "by",
     "unknown": "Unknown",
+    "nonVintage": "NV",
+    "unknownVintage": "Unknown",
     "deletedUser": "[Deleted user]",
     "skipToContent": "Skip to main content",
     "unknownWine": "Unknown Wine",
@@ -56,8 +58,25 @@
     "loadFailed": "Failed to load ({{status}})",
     "actionFailed": "Failed ({{status}})"
   },
+  "serving": {
+    "label": "Serving",
+    "temperature": "Serve at {{range}}",
+    "air": {
+      "decant_long": "decant one to two hours before serving",
+      "decant_short": "open thirty minutes ahead, or decant briefly",
+      "open_ahead": "open half an hour ahead",
+      "pour": "open and pour",
+      "pour_careful": "open and pour; sediment is likely, so pour carefully"
+    },
+    "needsAir": {
+      "long": "needs one to two hours of air when young",
+      "short": "a little air helps when young",
+      "none": "no decanting"
+    }
+  },
   "nav": {
     "myCellars": "My Cellars",
+    "search": "Search",
     "wineRegistry": "Wine Registry",
     "myRequests": "My Requests",
     "myDrafts": "My Drafts",
@@ -120,7 +139,29 @@
     "rateLimited": "Too many requests in a short time. Wait a few minutes and try again.",
     "rateLimitedFor": "Too many requests in a short time. Try again in {{minutes}} min.",
     "rateLimitedSoon": "Too many requests in a short time. Try again in a few seconds.",
-    "generic": "Something went wrong. Please try again."
+    "generic": "Something went wrong. Please try again.",
+    "codes": {
+      "credentials_required": "Enter your username or email, and your password.",
+      "invalid_credentials": "That username or email and password don’t match. Check them and try again.",
+      "EMAIL_NOT_VERIFIED": "Confirm your email address before you log in. The link is in the email we sent you.",
+      "registration_fields_required": "Fill in a username, an email address and a password.",
+      "username_invalid": "Usernames are 3–30 characters and may use letters, numbers, dots, underscores and hyphens — no spaces.",
+      "consent_required": "To create an account, accept the Privacy Policy and agree to the processing of your personal data.",
+      "verification_token_invalid": "This confirmation link is invalid or has expired. Ask for a new confirmation email.",
+      "reset_token_invalid": "This reset link is invalid or has expired. Ask for a new one from the login page.",
+      "wishlist_shop_url_invalid": "The shop link must be a web address, such as https://shop.example/wine.",
+      "bridge_not_connected": "This install is not connected to the shared registry.",
+      "contribution_wine_ids_invalid": "Choose between 1 and {{max}} wines to offer.",
+      "contribution_already_sent": "This wine is already with the shared registry; it is answered there.",
+      "contribution_not_offered": "This wine has not been offered to the shared registry.",
+      "blog_language_invalid": "Choose the language the post is written in.",
+      "blog_translation_of_invalid": "Choose the original post this one translates.",
+      "blog_translation_of_translation": "A translation must point at the original post, not at another translation.",
+      "blog_translation_same_language": "A translation must be in another language than its original.",
+      "blog_translation_exists": "The original already has a translation in this language.",
+      "blog_original_has_translations": "This post has translations of its own, so it cannot be a translation.",
+      "blog_language_taken_by_translation": "A translation of this post is already in that language."
+    }
   },
   "auth": {
     "continueWithGoogle": "Continue with Google",
@@ -170,10 +211,12 @@
     "verificationFailed": "Verification failed. The link may have expired.",
     "verifying": "Verifying your email address...",
     "verified": "Email verified! Taking you to the login page...",
+    "verifiedSignedIn": "Email verified! You're signed in — taking you to your cellar...",
     "verifiedNowLogin": "Your email is verified. Log in to start your cellar.",
     "usernameHint": "3–30 characters: letters, numbers, dots, underscores or hyphens.",
     "usernameRuleError": "Usernames are 3–30 characters and may use letters, numbers, dots, underscores and hyphens — no spaces.",
     "passwordRuleError": "Your password needs at least 12 characters, with an uppercase letter, a lowercase letter, a number and a symbol.",
+    "emailRuleError": "Enter a whole email address, such as anna@example.com.",
     "registrationRejected": "That username or email can’t be used. Try another username — or, if you already have an account, log in or reset your password.",
     "enterEmailForNewLink": "Enter your email to get a new verification link:",
     "emailExamplePlaceholder": "your@email.com",
@@ -359,6 +402,10 @@
     "displayPreferences": "Display Preferences",
     "defaultCurrency": "Default Currency",
     "currencyHint": "Used as the default in bottle forms and price fields.",
+    "temperatureUnit": "Temperature",
+    "temperatureUnitHint": "How temperatures are shown: the serving advice on a bottle and your cellar's climate readings.",
+    "temperatureUnitC": "Celsius (°C)",
+    "temperatureUnitF": "Fahrenheit (°F)",
     "language": "Language",
     "languageHint": "Select your preferred display language.",
     "languageBetaOption": "{{language}} (beta · {{percent, number}}%)",
@@ -463,9 +510,12 @@
       "errorWrongPassword": "Your password is incorrect.",
       "errorRateLimited": "Too many attempts. Please wait a few minutes and try again.",
       "scope_write": "write",
-      "scopeDesc_write": "Write (AI agent) — let a connected AI add, edit and organise bottles via MCP. Broadest scope; grant only to an assistant you trust.",
+      "scopeDesc_write": "Write — move bottles between your cellars and rack slots through the API. The broadest scope: the same token also lets a connected AI add, edit and delete bottles, racks and cellars, change your profile and export your account data via MCP. Grant it only to something you trust.",
       "developersLink": "Building an integration? Read the API guide for developers",
-      "scopesHelpLink": "What each scope allows, and the terms of use (API guide, opens in a new tab)"
+      "scopesHelpLink": "What each scope allows, and the terms of use (API guide, opens in a new tab)",
+      "deprecatedUse_one": "Still calls a route that API tokens can no longer use from {{date}}:",
+      "deprecatedUse_other": "Still calls routes that API tokens can no longer use from {{date}}:",
+      "deprecatedUseLink": "What to use instead"
     },
     "bridge": {
       "title": "Connect a self-hosted Cellarion",
@@ -520,8 +570,10 @@
       "hint": "The shared registry on cellarion.app holds curated wines with tasting profiles and drink windows. A connected install shows registry matches in the add-bottle search and copies the wines you pick, one at a time.",
       "connected": "Connected",
       "keyPrefix": "key",
-      "heldCopies": "{{count}} wines copied from the registry",
-      "removedCopies": "{{count}} no longer in the registry",
+      "heldCopies_one": "{{count}} wine copied from the registry",
+      "heldCopies_other": "{{count}} wines copied from the registry",
+      "removedCopies_one": "{{count}} no longer in the registry",
+      "removedCopies_other": "{{count}} no longer in the registry",
       "lastRefresh": "Last refresh {{when}}: {{updated}} updated, {{removed}} removed",
       "neverRefreshed": "Nothing is downloaded in bulk: registry wines show up in the add-bottle search right away and are copied when you pick one. Copies refresh weekly, on Monday mornings.",
       "quotaLine": "Today: {{searches}}/{{searchCap}} searches · {{fetches}}/{{fetchCap}} wines copied",
@@ -537,7 +589,8 @@
       "step3": "Put the two lines into this server's .env and restart the backend.",
       "hostedSettingsLink": "Open cellarion.app settings",
       "docsLink": "How the bridge works",
-      "errorLoad": "Failed to read the registry connection."
+      "errorLoad": "Failed to read the registry connection.",
+      "contributionsLine": "{{used}}/{{cap}} contributions"
     },
     "aiConnect": {
       "title": "Connect your AI",
@@ -559,8 +612,8 @@
       "docsLink": "Set-up guides for every client",
       "testError": "Could not verify right now (server busy or unreachable) — this says nothing about your token. Try again in a moment.",
       "beta": "Beta",
-      "betaNotice": "This is a beta feature and you use it at your own risk. It works, but it is new and still being tested — expect rough edges, and changes while we refine it. If you are unsure, connect with a read-only token: anything an AI changes can be undone under \"What your AI has changed\", and revoking the token cuts it off instantly.",
-      "safetyNotice": "If you are unsure, start with a read-only token. Anything an AI changes can be undone under \"What your AI has changed\", and revoking the token cuts it off instantly."
+      "betaNotice": "This is a beta feature and you use it at your own risk. It works, but it is new and still being tested — expect rough edges, and changes while we refine it. If you are unsure, connect with a read-only token: anything an AI changes can be undone under \"{{section}}\", and revoking the token cuts it off instantly.",
+      "safetyNotice": "If you are unsure, start with a read-only token. Anything an AI changes can be undone under \"{{section}}\", and revoking the token cuts it off instantly."
     },
     "climateDevices": {
       "title": "Climate devices",
@@ -644,6 +697,7 @@
       "scheduledFor": "Account deletion is scheduled for <strong>{{date}}</strong>. All your data will be permanently removed after this date.",
       "cancelling": "Cancelling...",
       "cancelDeletion": "Cancel deletion",
+      "cancelFailed": "The deletion could not be cancelled. Please try again.",
       "intro": "Permanently delete your account and all associated data — cellars, bottles, reviews, and settings. After requesting deletion, you have 7 days to change your mind before the deletion is permanent.",
       "deleteBtn": "Delete my account",
       "typeToConfirm": "Type <strong>DELETE</strong> to confirm:",
@@ -691,6 +745,33 @@
         "title": "Early access",
         "summary": "Try new features before everyone else, and tell us what you think"
       }
+    },
+    "registryContributions": {
+      "title": "Wines made on this install",
+      "offerable_one": "{{count}} wine made on this install is not in the shared registry. You can offer it, with its picture and the drink windows reviewed here; it is reviewed on cellarion.app before it joins the registry, and when it is approved your wine here is linked to it.",
+      "offerable_other": "{{count}} wines made on this install are not in the shared registry. You can offer them, with their pictures and the drink windows reviewed here; each is reviewed on cellarion.app before it joins the registry, and when it is approved your wine here is linked to it.",
+      "offerAll_one": "Contribute {{count}} wine",
+      "offerAll_other": "Contribute all {{count}}",
+      "confirm": "They go up under the cellarion.app account that owns this install's key, as far as each day's allowance reaches. A wine still waiting can be taken back from its page.",
+      "confirmSend": "Offer them",
+      "queuedNotice_one": "{{count}} wine offered. It is sent as far as today's allowance reaches, or with the next hourly run.",
+      "queuedNotice_other": "{{count}} wines offered. They are sent as far as today's allowance reaches, and the rest follow hourly.",
+      "countQueued_one": "{{count}} waiting to be sent",
+      "countQueued_other": "{{count}} waiting to be sent",
+      "countSent_one": "{{count}} waiting for review on cellarion.app",
+      "countSent_other": "{{count}} waiting for review on cellarion.app",
+      "countDeclined_one": "{{count}} declined",
+      "countDeclined_other": "{{count}} declined",
+      "countDuplicate_one": "{{count}} already copied here",
+      "countDuplicate_other": "{{count}} already copied here",
+      "countFailed_one": "{{count}} not accepted as sent",
+      "countFailed_other": "{{count}} not accepted as sent",
+      "reasonDuplicate": "approved, and this install already has its copy; an admin can merge the two",
+      "reasonFailed": "not accepted as sent: {{reason}}",
+      "reasonDeclined": "declined: {{reason}}",
+      "errorLoad": "Failed to read the wines offered to the shared registry.",
+      "errorOffer": "The wines could not be offered right now. Please try again.",
+      "nothingQueued": "Nothing was offered: every wine made here has been offered already."
     }
   },
   "climate": {
@@ -795,7 +876,13 @@
     "pray": "Thanks"
   },
   "plans": {
-    "expired": "Expired"
+    "expired": "Expired",
+    "description": {
+      "free": "Full access to every feature — completely free.",
+      "supporter": "Chip in to help fund development — no extra features, just our thanks.",
+      "patron": "Support Cellarion at a higher level — no extra features, just bigger thanks.",
+      "benefactor": "Cover a meaningful slice of the running costs — still no extra features."
+    }
   },
   "supporter": {
     "title": "Cellarion is free, and open-source. Here's what keeps it running.",
@@ -924,6 +1011,9 @@
     "reservedOnly": "Reserved only",
     "grapeLabel": "Grapes",
     "vintageLabel": "Vintage",
+    "sweetnessLabel": "Sweetness",
+    "sweetnessNotStated": "Not stated",
+    "sweetnessNotStatedChip": "Sweetness not stated",
     "showMore": "+{{count}} more",
     "showLess": "Show less",
     "allRatings": "All Ratings",
@@ -954,6 +1044,7 @@
     "ratingChipRange": "{{min}} to {{max}}",
     "noBottles": "No bottles in this cellar yet.",
     "noSearchResults": "No bottles match your search.",
+    "searchAllCellars": "Search all cellars for \"{{query}}\"",
     "toggleFilters": "Filters",
     "compactView": "Compact view",
     "showNotes": "Show notes",
@@ -1114,6 +1205,8 @@
     "scanRegion": "Region",
     "scanAppellation": "Appellation",
     "scanType": "Type",
+    "typeOther": "Other (not wine)",
+    "typeOtherHint": "Cider, beer, spirits or anything else that is not wine. It stays in your cellar and never enters the shared wine registry.",
     "scanGrapes": "Grapes (comma-separated)",
     "scanGrapesPlaceholder": "e.g. Cabernet Sauvignon, Merlot",
     "scanConfirmWine": "Confirm Wine",
@@ -1213,6 +1306,13 @@
     "buyerOther": "buyers",
     "indicativePrice": "indicative",
     "sommMaturity": "Aging & Maturity",
+    "notWineAction": "Not a wine? Move it to Other",
+    "notWineApplied": "Moved to Other. It stays in your cellar and is no longer in the shared wine registry.",
+    "notWineFiled": "Several members hold this one, so a curator will look at it.",
+    "notWinePending": "A curator is already looking at this one.",
+    "notWineError": "That did not work. Please try again later.",
+    "notWineConfirm": "Move it to Other? It leaves the shared wine registry for everyone who holds it, and an admin would have to bring it back.",
+    "notWineConfirmAction": "Yes, it is not wine",
     "loadingMaturity": "Loading…",
     "awaitingSommelier": "Awaiting staff review",
     "sommelierWillSet": "Our staff will set the aging window for this vintage soon.",
@@ -1249,7 +1349,30 @@
     "personalPast": "Declining — past your window",
     "windowFromYear": "from {{year}}",
     "windowUntilYear": "until {{year}}",
+    "personalPhaseDrink": "Ready to drink",
+    "windowAdjust": "Adjust",
+    "windowAdjustLabel": "Adjust your drink window",
+    "windowSetOwn": "Set your own window",
+    "windowSetOwnDrink": "Set your own drink window",
+    "windowChange": "Change",
+    "windowChangeLabel": "Change your drink window",
+    "windowAdjustBeta": "Sliding your own drink window is in early access.",
+    "windowAdjustHint": "Drag a handle, or use the arrow keys, one year at a time.",
+    "windowHandleDrinkFrom": "Drink from",
+    "windowHandlePeakFrom": "Peak from",
+    "windowHandlePeakUntil": "Peak until",
+    "windowHandleDrinkTo": "Drink until",
+    "windowHandleDrinkFromValue": "Drink from {{year}}",
+    "windowHandlePeakFromValue": "Peak from {{year}}",
+    "windowHandlePeakUntilValue": "Peak until {{year}}",
+    "windowHandleDrinkToValue": "Drink until {{year}}",
+    "windowMarkPeak": "Mark a peak",
+    "windowRemovePeak": "Remove peak",
+    "windowRemoveMine": "Remove my window",
+    "windowSaveFailed": "Could not save your window. Please try again.",
     "rackLocation": "Rack Location",
+    "notInRack": "Not in a rack yet",
+    "placeInRack": "Place in a rack",
     "purchase": "Purchase",
     "priceEvolution": "Price Evolution",
     "premiumFeature": "Premium feature",
@@ -1297,11 +1420,15 @@
     "maturityPhaseEarly": "Early",
     "maturityPhasePeak": "Peak ⭐",
     "maturityPhaseLate": "Late",
+    "maturityTimelineBeta": "The drink window as a timeline is in early access.",
+    "maturityShowDetails": "Show details",
+    "maturityHideDetails": "Hide details",
     "rackSlot": "slot",
     "grapes": "Grape Varieties",
     "noGrapes": "No grape varieties listed",
     "contributePhotoTitle": "Help the community",
     "contributePhotoMsg": "This wine has no photo yet. Adding one helps other collectors recognise it — it will be reviewed before going public.",
+    "contributePhotoMsgUnreviewed": "This wine has no photo yet. Adding one helps everyone on this server recognise it.",
     "contributePhotoAction": "Add a photo",
     "contributeGrapesTitle": "Help the community",
     "contributeGrapesMsg": "Grape varieties aren't listed for this wine yet. Suggest them and our team will review.",
@@ -1317,6 +1444,7 @@
     "backToHistory": "Back to history",
     "defaultImageHint": "Click the star to choose which image is shown first.",
     "imageNotice": "Images are reviewed by an admin before being added to the shared wine registry, where they will be visible to all Cellarion users.",
+    "imageNoticeUnreviewed": "Photos are added to the wine registry as soon as you upload them, where everyone on this server can see them.",
     "pendingReview": "Pending review",
     "ownerInquiry": {
       "title": "A curator has a question about this wine",
@@ -1330,6 +1458,7 @@
       "replyTitle": "A curator replied about this wine",
       "replyIntro": "You answered a question about this wine — here is what came of it. Thank you: the shared registry is more accurate because you checked.",
       "yourAnswer": "Your answer",
+      "answerAbout": "Your answer about {{wine}}",
       "curatorReply": "The curator’s reply"
     },
     "tastingProfile": "Tasting profile",
@@ -1354,7 +1483,11 @@
       "submit_one": "Add {{count}} bottle",
       "submit_other": "Add {{count}} bottles",
       "success_one": "{{count}} more bottle added to this cellar. It's unplaced — place it from the cellar page whenever you like.",
-      "success_other": "{{count}} more bottles added to this cellar. They're unplaced — place them from the cellar page whenever you like."
+      "success_other": "{{count}} more bottles added to this cellar. They're unplaced — place them from the cellar page whenever you like.",
+      "vintageLabel": "Vintage",
+      "vintageHint": "Change the year to add another vintage of this wine.",
+      "successOtherVintage_one": "{{count}} bottle of the {{vintage}} vintage added to this cellar. It's unplaced — place it from the cellar page whenever you like.",
+      "successOtherVintage_other": "{{count}} bottles of the {{vintage}} vintage added to this cellar. They're unplaced — place them from the cellar page whenever you like."
     },
     "backToVintage": "Back to the vintage",
     "barcode": "Barcode",
@@ -1386,6 +1519,13 @@
     "loading": "Loading…",
     "summary": "{{count}} of {{total}} bottles",
     "backToStats": "← Back to Statistics",
+    "searchPlaceholder": "Search name, producer, region, grape…",
+    "searchLabel": "Search all your bottles",
+    "searchButton": "Search",
+    "scopeLabel": "Which bottles to search",
+    "scopeActive": "In cellar",
+    "scopeAll": "Everything",
+    "scopeConsumed": "Drunk or gone",
     "removeFilter": "Remove this filter",
     "clearAll": "Clear all",
     "noneForFilters": "No bottles match those filters.",
@@ -1473,6 +1613,48 @@
     "type_cube": "Modular Cube",
     "type_shelf": "Open Shelf",
     "type_cabinet": "Wine cabinet",
+    "type_wall": "Wall",
+    "wall": {
+      "betaNote": "Building a wall from boxes is in early access.",
+      "cellsWide": "Wall width (cells)",
+      "cellsHigh": "Wall height (cells)",
+      "hint": "Tap a box to change what is inside it. Tap a dashed cell to add a box there.",
+      "canvasLabel": "The wall, {{cols}} cells wide and {{rows}} high",
+      "cellAria": "Empty wall at {{label}}, add a box",
+      "boxAria": "Box {{label}}, {{kind}}, {{n}} bottles",
+      "boxTitle": "Box {{label}}",
+      "boxHolds": "Holds {{n}} bottles",
+      "boxHoldsNone": "Holds no bottles",
+      "inUse": "{{n}} bottles lie in this box. Move them out before you remove it or change what is inside. It can still grow.",
+      "inside": "Inside",
+      "kind_x": "X",
+      "kind_slash": "Diagonal /",
+      "kind_backslash": "Diagonal \\",
+      "kind_bin": "Open bin",
+      "kind_rack": "Rack",
+      "kind_shelves": "Shelves",
+      "kind_closed": "Closed",
+      "perTriangle": "Bottles per triangle",
+      "perHalf": "Bottles per half",
+      "binBottles": "Bottles",
+      "rackRows": "Rows",
+      "rackCols": "Bottles per row",
+      "shelfCount": "Shelves",
+      "perShelf": "Bottles per shelf",
+      "boxWide": "Box width (cells)",
+      "boxHigh": "Box height (cells)",
+      "spanHint": "A box can grow into the empty wall beside it or below it.",
+      "remove": "Remove this box",
+      "emptyTitle": "Empty wall at {{label}}",
+      "emptyHint": "Choose what to put here.",
+      "nothingSelected": "No box is chosen. Tap one in the wall above.",
+      "needsBox": "Add a box that holds bottles before you create the wall.",
+      "needsBoxEdit": "A wall needs at least one box that holds bottles.",
+      "editRack": "Rename, group or change this wall",
+      "editTitle": "Wall: name, group and boxes",
+      "editLegend": "The wall",
+      "editHint": "Add, change or resize the boxes. Every bottle stays in its box."
+    },
     "shelvesLabel": "Shelves",
     "bottlesAcrossLabel": "Bottles across",
     "cabinetPresetLabel": "Start from",
@@ -1535,14 +1717,12 @@
     "cabinetHeadToTailLabel": "Bottles lie head to tail",
     "cabinetHeadToTailHelp": "For bottles that lie one deep, base forward and neck forward in turn, so a row fits more. Every other bottle is drawn neck forward. Drawing only — the number of bottles and the slot numbers stay the same.",
     "cabinetHeadToTailNeedsSingle": "Head to tail is for bottles that lie one deep: untick Two deep first.",
-    "cabinetHeadToTailBeta": "Bottles head to tail is in early access.",
     "cabinetShelfSidewaysShort": "bottles lie",
     "cabinetSidewaysNone": "front to back",
     "cabinetSidewaysFront": "one across the front",
     "cabinetSidewaysAll": "all across",
     "cabinetSidewaysHelp": "Bottles lie: front to back, one bottle lying across the front of the others (as in a slim fridge), or all lying across (as in a bottom bin). On a shelf stacked in levels of a one-deep cabinet, the level above a bottle lying across rests on the bottles behind it, so it holds one fewer. Otherwise the number of bottles and the slot numbers stay the same.",
     "cabinetSidewaysEditLabel": "How each shelf's bottles lie, top shelf first",
-    "cabinetSidewaysBeta": "Bottles lying sideways is in early access.",
     "cabinetAlternateLabel": "Rows alternate in width on every shelf (6 / 5 / 6 …)",
     "cabinetAlternateHelp": "The first level holds a full row in front of one bottle fewer behind it; the level above nests in its grooves, one fewer in front of a full row, and so on — the honeycomb of a Liebherr GrandCru shelf. Sets every shelf at once; untick single shelves above. This changes how many bottles the cabinet holds, so it is set when the cabinet is created.",
     "cabinetAlternateNests": "Rows that alternate in width always nest: each narrow row lies in the grooves of the wide row below it.",
@@ -1565,7 +1745,6 @@
     "moveBottles": {
       "menuItem": "Move bottles to another rack…",
       "title": "Move bottles to another rack",
-      "betaNote": "Moving a whole rack at once is in early access.",
       "intro_one": "The {{count}} bottle in {{from}} moves to the rack you choose, into its first free slot.",
       "intro_other": "The {{count}} bottles in {{from}} move to the rack you choose. They keep their order and fill its free slots from the first one.",
       "toLabel": "Move them to",
@@ -1607,6 +1786,7 @@
     "nfcLink": "NFC Tag",
     "nfcLinked": "NFC Linked",
     "disableSlot": "Disable slot",
+    "addNewHere": "Add a new bottle here",
     "enableSlot": "Enable slot",
     "disabledSlotTitle": "Slot {{position}} — Disabled",
     "disabledSlotNote": "This slot is marked as unusable — bottles can't be placed here.",
@@ -1618,6 +1798,8 @@
     "view3d": "3D",
     "placeQueue": {
       "progress": "Placing your new bottles: {{placed}} of {{total}} placed",
+      "progressExisting": "Placing the bottle",
+      "placedExisting": "The bottle is in its slot.",
       "tapHint": "tap a free slot for the next one",
       "autoPlace_one": "Auto-place the remaining bottle",
       "autoPlace_other": "Auto-place the remaining {{count}}",
@@ -1632,8 +1814,7 @@
       "button": "Move",
       "hint": "Tap the slot to move {{name}} to",
       "otherRackHint": "for another rack, open its tab first",
-      "otherRackFilled": "In another rack, choose an empty slot — bottles only swap places within one rack.",
-      "betaNote": "Moving a bottle by tapping is in early access."
+      "otherRackFilled": "In another rack, choose an empty slot — bottles only swap places within one rack."
     }
   },
   "nfc": {
@@ -1736,6 +1917,7 @@
     "loadingRequests": "Loading requests...",
     "noRequests": "You haven't submitted any wine requests yet.",
     "linkedTo": "Linked to:",
+    "linkedWine": "{{wine}} by {{producer}}",
     "adminNotes": "Admin Notes:",
     "submitted": "Submitted {{date}}",
     "grapeSuggestion": "Grape suggestion",
@@ -1746,6 +1928,7 @@
     "submitFailed": "The request could not be sent. Please try again.",
     "submitFailedReason": "The request could not be sent: {{reason}}",
     "photoTooLarge": "This photo could not be made small enough to send. Try another photo, or send the request without one.",
+    "photoUnreadable": "This photo could not be read. Try another photo, or send the request without one.",
     "backPhotoTooLarge": "The back label photo could not be made small enough to send. Try another photo, or send the request without it.",
     "moreLinksLabel": "More links",
     "linksHint": "A winery page and a review each give the reviewer something different.",
@@ -1774,7 +1957,8 @@
       "moved": "Moved to {{cellar}}",
       "arrived": "Arrived",
       "onOrder": "On order",
-      "onOrderExpected": "On order, expected {{month}}"
+      "onOrderExpected": "On order, expected {{month}}",
+      "otherAccount": "a cellar of another account"
     },
     "vintageLabel": "Vintage:",
     "paidLabel": "Paid:",
@@ -1834,9 +2018,14 @@
     "sharedAs": "{{user}} as {{role}}",
     "roleChanged": "Role changed: {{from}} → {{to}}",
     "bulkMoveDetail": "{{moved}} of {{requested}} bottles moved",
+    "otherAccountCellar": "a cellar of another account",
     "bulkDoneDetail": "{{done}} of {{requested}} bottles · {{what}}",
     "bulkArriveDetail": "{{done}} of {{requested}} bottles arrived",
     "bulkRestoreDetail": "{{done}} of {{requested}} bottles moved back"
+  },
+  "roles": {
+    "viewer": "Viewer",
+    "editor": "Editor"
   },
   "bulk": {
     "moveAction": "Move",
@@ -1939,7 +2128,7 @@
     "loadError": "Couldn't load the deleted bottles.",
     "batchHeading_one": "Deleted {{date}} · {{count}} bottle",
     "batchHeading_other": "Deleted {{date}} · {{count}} bottles",
-    "daysLeft_zero": "Deleted for good within a day",
+    "lastDay": "Deleted for good within a day",
     "daysLeft_one": "{{count}} day left",
     "daysLeft_other": "{{count}} days left",
     "restore": "Restore",
@@ -1986,7 +2175,12 @@
     "movedManyInfo_one": "{{count}} bottle was moved to {{cellar}}.",
     "movedManyInfo_other": "{{count}} bottles were moved to {{cellar}}.",
     "skippedInfo_one": "{{count}} bottle could not be moved — it is already consumed, or not yours to move.",
-    "skippedInfo_other": "{{count}} bottles could not be moved — they are already consumed, or not yours to move."
+    "skippedInfo_other": "{{count}} bottles could not be moved — they are already consumed, or not yours to move.",
+    "sharedOption": "{{name}} (shared with you)",
+    "becomesOwners_one": "This cellar belongs to someone else. The bottle becomes theirs and stays in their cellar, even if you later leave it.",
+    "becomesOwners_other": "This cellar belongs to someone else. The bottles become theirs and stay in their cellar, even if you later leave it.",
+    "becomesYours_one": "The bottle becomes yours and leaves the shared cellar.",
+    "becomesYours_other": "The bottles become yours and leave the shared cellar."
   },
   "admin": {
     "requests": {
@@ -2042,7 +2236,14 @@
       "applyGrapesLabel": "Grapes to add",
       "linkSearchLabel": "Search Wine Registry",
       "linkSearchPlaceholder": "Search by name or producer…",
-      "selectedId": "Selected ID:"
+      "selectedId": "Selected ID:",
+      "fromInstall": "From the self-hosted install",
+      "grapes": "Grapes",
+      "proposedWindows": "Drink windows from the install",
+      "proposedWindowsNote": "Approving the wine puts these in the maturity queue as suggestions. Nothing is published until a curator reviews them.",
+      "phaseEarly": "early",
+      "phasePeak": "peak",
+      "phaseLate": "late"
     },
     "bottleSizes": {
       "normalizeAll": "Normalize all",
@@ -2064,6 +2265,50 @@
       "appellations": "Appellations",
       "grapes": "Grapes",
       "bottleSizes": "Bottle Sizes",
+      "classifications": "Classifications",
+      "addClassification": "+ Add classification",
+      "classificationNameLabel": "Classification *",
+      "kindLabel": "Kind",
+      "kind": {
+        "vineyard_rank": "Vineyard rank",
+        "ripeness": "Ripeness tier",
+        "ageing": "Ageing tier",
+        "other": "Other (producer's own)"
+      },
+      "systemLabel": "System",
+      "systemPlaceholder": "e.g. Médoc classification of 1855, VDP, Prädikatswein",
+      "classificationCountryLabel": "Country (where the word is law)",
+      "anyCountry": "Any country",
+      "classificationSynonymsPlaceholder": "VDP.Grosse Lage, Große Lage",
+      "classificationDescriptionLabel": "Description",
+      "pendingClassificationTitle": "Added by a member — not reviewed yet",
+      "sweetnessTerms": "Sweetness terms",
+      "addSweetnessTerm": "+ Add sweetness term",
+      "sweetnessTermNameLabel": "Term, as printed on the label *",
+      "scaleLabel": "Scale",
+      "scale": {
+        "still": "Still wine",
+        "sparkling": "Sparkling wine"
+      },
+      "bandLabel": "Band",
+      "band": {
+        "dry": "Dry",
+        "off-dry": "Off-dry",
+        "medium-sweet": "Medium sweet",
+        "sweet": "Sweet",
+        "brut-nature": "Brut nature",
+        "extra-brut": "Extra brut",
+        "brut": "Brut",
+        "extra-dry": "Extra dry",
+        "sec": "Sec",
+        "demi-sec": "Demi-sec",
+        "doux": "Doux"
+      },
+      "sweetnessSystemPlaceholder": "e.g. EU 2019/33 Annex III A (de), Customary (en)",
+      "sweetnessCountryLabel": "Country (only where the word is law in one country)",
+      "sweetnessSynonymsPlaceholder": "Pas Dosé, Dosage Zéro",
+      "regulatedLabel": "Legally defined (leave unchecked for a customary word such as feinherb)",
+      "customary": "customary",
       "addCountry": "+ Add country",
       "addRegion": "+ Add region",
       "addAppellation": "+ Add appellation",
@@ -2168,6 +2413,12 @@
       "typeLabel": "Type",
       "appellationLabel": "Appellation",
       "selectAppellation": "Select appellation",
+      "classificationLabel": "Classification",
+      "classificationPlaceholder": "Riserva, Grand Cru Classé, Cru Bourgeois, Spätlese…",
+      "classificationSearch": "Search the classification tiers…",
+      "classificationNoMatch": "No tier matches. A tier the list lacks is added under Taxonomy → Classifications.",
+      "classificationAllSelected": "Every tier for this country is selected.",
+      "classificationHint": "A quality tier on top of the appellation. Not DOCG, DOC or AOC: that follows from the appellation.",
       "grapesLabel": "Grapes",
       "imageUrlLabel": "Image URL",
       "searchPlaceholder": "Search wines or producers...",
@@ -2364,6 +2615,15 @@
         "unavailableUndone": "Back in the queue.",
         "emptyFiltered": "Nothing waiting in this view. {{n}} wine(s) are recorded as having no producer on the label — tick the box above to see them, or clear the source filter.",
         "unavailableBadge": "recorded: no producer on the label",
+        "uncheckedBadge": "waiting for a check",
+        "uncheckedIntro": "A wine marked \"waiting for a check\" came from a member's import, as the file wrote it. Correct what is wrong and save to publish it; a wine that is right as it stands can be published at once.",
+        "publishBtn": "Publish as it is",
+        "publishTitle": "The name, producer and place are right: make this wine visible to everyone.",
+        "saveAndPublish": "Save and publish",
+        "mergeBtn": "Merge into {{wine}}",
+        "mergeConfirm": "The registry already holds this wine as \"{{wine}}\". Move the bottles of this row onto it and remove the row? This cannot be undone.",
+        "typeLabel": "Wine type",
+        "noType": "no type",
         "frontBackDisagree": "Front/back labels disagree —",
         "showUnavailable": "Show \"no producer on label\" ({{n}})",
         "showUnavailableTitle": "Include the rows already recorded as having no producer on the label. They have no work left, but the record is reversible from here.",
@@ -2395,8 +2655,10 @@
           "classification": "Classification",
           "type": "Type",
           "colour": "Colour",
-          "grapes": "Grapes"
+          "grapes": "Grapes",
+          "sweetnessStyle": "Sweetness style"
         },
+        "styleSource": "the page that names it",
         "drift": "was \"{{value}}\" when proposed",
         "unknownGrapes": "Not in the grape taxonomy yet: {{names}} — add it under Taxonomy first, then approve.",
         "otherSpellings": "The registry already spells this producer {{spellings}}. Pick one spelling below — or keep both if they are different producers.",
@@ -2606,6 +2868,31 @@
     },
     "audit": {
       "page": "Page {{current}} of {{total}}"
+    },
+    "contributionReview": {
+      "title": "Review of contributions",
+      "on": "On. Photos, wine-record fixes, values and new data fields from members wait here until an admin decides them.",
+      "off": "Off. Photos, wine-record fixes, values and new data fields go live as soon as a member adds them. A fix that needs a choice (a merge, a producer spelled two ways) still waits.",
+      "hint": "Turn it off only on a private server where everyone trusts each other.",
+      "stillWaiting_one": "{{count}} item from before is still waiting to be decided.",
+      "stillWaiting_other": "{{count}} items from before are still waiting to be decided.",
+      "turnOff": "Turn review off",
+      "turnOn": "Turn review on",
+      "superOnly": "Only the super admin can change this on this server."
+    },
+    "importPolicy": {
+      "title": "Imports",
+      "aiOn": "AI look-up: on. A wine in a file that the registry does not know is sent to the AI provider to be identified.",
+      "aiOff": "AI look-up: off. Nothing from a file is sent to an AI provider. A wine the registry does not know is created from what the file says.",
+      "aiNone": "AI look-up: this server has no AI provider, so nothing from a file is sent to one. A wine the registry does not know is created from what the file says.",
+      "checkOn": "Check new wines: on. A wine an import creates is visible only to its owner until a curator has checked it here.",
+      "checkOff": "Check new wines: off. A wine an import creates is public as soon as it is created.",
+      "checkNoReview": "Check new wines: on, but this server does not review contributions, so imported wines are public at once.",
+      "waiting": "{{n}} wine(s) are waiting for a check.",
+      "turnAiOff": "Turn AI look-up off",
+      "turnAiOn": "Turn AI look-up on",
+      "turnCheckOff": "Stop checking new wines",
+      "turnCheckOn": "Check new wines before they are public"
     }
   },
   "somm": {
@@ -2644,7 +2931,9 @@
       "removeTitle": "Remove from queue",
       "removeConfirm": "The wine was never released in {{vintage}}? Removing takes the pair out of the queue without setting a drink window. If anyone adds a bottle of this wine and vintage again — for instance once it is actually released — it returns to the queue automatically.",
       "removing": "Removing…",
-      "removeError": "Failed to remove from the queue"
+      "removeError": "Failed to remove from the queue",
+      "suggestionFromInstall": "Suggested by the self-hosted install that contributed this wine:",
+      "useSuggestion": "Use as a starting point"
     },
     "prices": {
       "title": "Price Queue",
@@ -2704,6 +2993,19 @@
       "description": "Tasting note",
       "descriptionPlaceholder": "Two or three plain sentences the owner will read on the bottle page.",
       "commaSeparated": "Comma-separated",
+      "serving": "Serving",
+      "servingTemp": "Serving temperature (°C)",
+      "servingTempHint": "Leave blank for the style's default. Both ends or neither.",
+      "servingTempMinAria": "Serving temperature, lower end (°C)",
+      "servingTempMaxAria": "Serving temperature, upper end (°C)",
+      "needsAir": "Needs air when young",
+      "needsAirHint": "The bottle page turns this into \"decant\", \"open ahead\" or \"pour carefully\" from the vintage's phase on the day it is read. Never write serving instructions in the tasting note.",
+      "needsAirValue": {
+        "long": "Long — decant one to two hours while young",
+        "short": "Short — a little air helps",
+        "none": "None — never decant"
+      },
+      "needsAirDefault": "— the type's default —",
       "unset": "— not set —",
       "value": {
         "light": "Light",
@@ -2720,6 +3022,7 @@
   "wineRecord": {
     "title": "Wine record",
     "intro": "Spot something wrong or missing? Tap Fix or Add next to it — a curator reviews every suggestion before it goes live.",
+    "introUnreviewed": "Spot something wrong or missing? Tap Fix or Add next to it — your change goes live at once.",
     "blockedByOther": "Another member’s suggestion for this wine is waiting for a curator. You can suggest a fix as soon as it has been decided.",
     "notRecorded": "not recorded",
     "suggest": "Suggest a fix",
@@ -2732,7 +3035,9 @@
     "pendingTitle": "Your suggestion is awaiting curator review",
     "pendingOtherTitle": "A suggestion for this field is awaiting curator review",
     "introShort": "The shared registry’s record of this wine, curator-reviewed.",
+    "introShortUnreviewed": "The shared registry’s record of this wine.",
     "thanks": "Thank you — your suggestion is in the review queue. We’ll notify you when a curator has decided.",
+    "thanksApplied": "Thank you — your change is live.",
     "modalTitle": "Suggest a fix: {{field}}",
     "current": "Currently recorded",
     "proposed": "Should be",
@@ -2746,6 +3051,19 @@
     "grapesHelp": "This becomes the wine’s complete grape list: remove what’s wrong, add what’s missing, and leave the rest.",
     "grapesHelpEmpty": "Add every variety in the wine — type a few letters to search.",
     "grapesNewNote": "Not in our grape list yet: {{names}}. A curator will check that before approving your suggestion.",
+    "classificationSearch": "Search the classification tiers…",
+    "classificationNoMatch": "No tier matches. Only the tiers in this list can be recorded.",
+    "classificationAllSelected": "Every tier in the list is selected.",
+    "classificationTooLong": "Too many tiers for one suggestion: together they may be 200 characters at most.",
+    "classificationHelp": "This becomes the wine’s complete classification: remove what’s wrong, add what’s missing. DOCG, DOC or AOC is not a tier — it follows from the appellation.",
+    "classificationLoadFailed": "Couldn’t load the list of tiers. Type the tier as the label states it.",
+    "classificationNoTiers": "The registry lists no classification tiers for this wine’s country. Type the tier as the label states it.",
+    "classificationKind": {
+      "vineyard_rank": "Vineyard rank",
+      "ripeness": "Ripeness tier",
+      "ageing": "Ageing tier",
+      "other": "Other (producer’s own)"
+    },
     "field_producer": "Producer",
     "field_name": "Wine name",
     "field_type": "Type",
@@ -2754,6 +3072,30 @@
     "field_region": "Region",
     "field_country": "Country",
     "field_classification": "Classification",
+    "field_sweetness": "Sweetness",
+    "styleKnownAs": "known as",
+    "styleByProducer": "named by the producer",
+    "styleByTrade": "named by the trade",
+    "styleModalTitle": "Sweetness: the term this wine is known by",
+    "styleIntro": "For a wine whose label prints no sweetness word, but which the producer or the trade calls by one: feinherb, fruchtsüß and the like. A word the label prints is part of the wine’s name, not this.",
+    "styleTermLabel": "The term",
+    "styleTermChoose": "Choose a term…",
+    "styleLoadFailed": "Couldn’t load the list of sweetness terms.",
+    "styleSourceLabel": "Who calls it that?",
+    "styleSourceProducer": "The producer",
+    "styleSourceTrade": "A merchant, critic or wine database",
+    "styleRegulatedNote": "“{{term}}” has a legal definition, so only the producer’s own wording counts for it.",
+    "styleUrlLabel": "The page that names it",
+    "styleUrlHelp": "A page that uses this term for this wine. Another vintage of the same wine is fine. Your own impression of the taste is not a source.",
+    "styleNoteLabel": "Anything a curator should know (optional)",
+    "styleReasonDefault": "{{term}}: the term this wine is known by, {{source}} on the linked page.",
+    "styleWithSource": "{{term}} ({{source}})",
+    "styleBandOnScale": "{{band}} · {{scale}}",
+    "styleGoesLive": "This wine has no such term yet, so yours goes live at once.",
+    "styleReviewed": "A curator reviews this before it goes live.",
+    "categoryFromName": "from the name",
+    "categoryFromTier": "by its tier",
+    "categoryFromType": "dessert wine",
     "publicData": "More data",
     "suggestValue": "Add value",
     "suggestValueFor": "Suggest a value for {{field}}",
@@ -2781,7 +3123,7 @@
   "personalData": {
     "title": "Your wine data",
     "add": "+ Add",
-    "intro": "Anything the record doesn’t cover — ABV, provenance, cork condition. Visible to everyone who shares this cellar, never published to the shared registry.",
+    "intro": "Notes about your own bottles — provenance, where you bought it, cork condition. Visible to everyone who shares this cellar, never published. Facts about the wine itself, like ABV, belong in the wine record, where every owner sees them.",
     "empty": "Nothing recorded yet.",
     "bottleSection": "This bottle",
     "wineSection": "This wine (all bottles of it)",
@@ -2814,14 +3156,29 @@
     "enumPlaceholder": "e.g. cork, screwcap, crown",
     "value": "Value",
     "choose": "Choose…",
+    "addOption": "+ Add a new value to the list",
+    "newOptionPlaceholder": "A value not on the list yet",
+    "backToList": "Back to the list",
     "promote": "Suggest to registry",
     "promoteTitle": "Offer this to the shared registry — a curator reviews it first",
+    "promoteTitleUnreviewed": "Add this to the shared wine record",
     "promoteModalTitle": "Suggest to the shared registry",
     "promoteIntro": "Offer “{{key}}: {{value}}” to the shared registry. A curator reviews it; if the field doesn’t exist in the public vocabulary yet, the field itself is proposed first.",
+    "promoteIntroUnreviewed": "Add “{{key}}: {{value}}” to the shared wine record, where everyone on this server sees it. If the field doesn’t exist yet, it is added too.",
     "promoteScopeVintage": "It will apply to the {{year}} vintage only.",
     "promoteScopeWine": "It will apply to every vintage of this wine.",
     "promotedValue": "Thank you — your value is in the registry review queue.",
-    "promotedKey": "Thank you — the field itself was proposed first; once a curator accepts it, values can follow."
+    "promotedLive": "Added to the wine record — everyone on this server sees it now.",
+    "promotedKey": "Thank you — the field itself was proposed first; once a curator accepts it, values can follow.",
+    "publicKeyOffer": "{{key}} is part of the shared wine record — add it there and every owner of this wine sees it. A curator checks it first.",
+    "publicKeyRecorded": "The wine record already has {{key}}: {{value}}.",
+    "publicKeyPending": "{{key}} is part of the shared wine record, and a suggested value for it is already waiting for a curator.",
+    "offerLater": "Is this a fact every bottle of this wine shares? You can offer it to the shared registry after saving.",
+    "addToRecord": "Add to the wine record",
+    "keepPrivate": "Keep it private",
+    "share": "Share with the wine record",
+    "shareIntro": "Offer “{{value}}” to the wine record as {{key}}, where every owner of this wine sees it. A curator checks it first.",
+    "matchesRecord": "matches the wine record"
   },
   "priceTracking": {
     "trigger": "Track market price",
@@ -2878,6 +3235,7 @@
       "sparkling": "Sparkling",
       "dessert": "Dessert",
       "fortified": "Fortified",
+      "other": "Other",
       "unknown": "Pending review"
     },
     "ratingBands": {
@@ -2896,10 +3254,13 @@
       "noProfile": "No maturity data"
     },
     "days": {
-      "overdue": "{{count}}d overdue",
+      "overdue_one": "{{count}}d overdue",
+      "overdue_other": "{{count}}d overdue",
       "today": "Today",
-      "left": "{{count}}d left",
-      "ago": "{{count}}d ago"
+      "left_one": "{{count}}d left",
+      "left_other": "{{count}}d left",
+      "ago_one": "{{count}}d ago",
+      "ago_other": "{{count}}d ago"
     },
     "donut": {
       "ariaLabel": "Donut chart: {{count}} total bottles",
@@ -2913,7 +3274,14 @@
     "maturity": {
       "withProfiles": "{{count}} with sommelier profiles",
       "withoutData": "{{count}} without data",
-      "profilesNeeded": "Sommelier maturity profiles needed to see your score"
+      "profilesNeeded": "Sommelier maturity profiles needed to see your score",
+      "goToSection": "Go to {{section}}"
+    },
+    "healthNoScore": "N/A",
+    "maturityByCellar": {
+      "cellar": "Cellar",
+      "countLink_one": "{{phase}} in {{cellar}}: {{count}} bottle",
+      "countLink_other": "{{phase}} in {{cellar}}: {{count}} bottles"
     },
     "regret": {
       "pastPrime_one": "{{count}} bottle past their prime, still unopened.",
@@ -2987,27 +3355,11 @@
       "unmapped_one": "{{count}} country without ISO code hidden",
       "unmapped_other": "{{count}} countries without ISO code hidden"
     },
-    "premiumGate": {
-      "desc": "Deep insights into your entire wine collection — types, origins, vintages, value, maturity profiles, consumption history, and more. The most comprehensive wine analytics dashboard available.",
-      "feat1": "Wine type & origin breakdown",
-      "feat2": "Vintage distribution by year",
-      "feat3": "Collection value analysis",
-      "feat4": "Maturity forecast",
-      "feat5": "Cellar health score",
-      "feat6": "Regret Index — bottles past their prime",
-      "feat7": "Urgency ladder — drink these now",
-      "feat8": "Joy Per Dollar — best bang for your buck",
-      "upgradeBtn": "Upgrade to Premium",
-      "notSure": "Not sure yet?",
-      "startTrial": "Start a free 30-day trial"
-    },
-    "upgrade": {
-      "unlockWith": "Unlock with {{plan}}",
-      "upgradeTo": "Upgrade to {{plan}}"
-    },
     "sections": {
       "wineTypes": "Wine Types",
       "maturityStatus": "Maturity Status",
+      "maturityByCellar": "Maturity Status by Cellar",
+      "mostInNeedFirst": "Most in need first",
       "topOrigins": "Top Origins",
       "top5": "Top 5",
       "vintageDistribution": "Vintage Distribution",
@@ -3094,6 +3446,9 @@
     "searchResults": "{{count}} posts matching \"{{query}}\"",
     "postNotFound": "Post not found.",
     "backToList": "Back to Blog",
+    "alsoIn": "Also in:",
+    "translatedFrom": "Translated from {{language}} with AI.",
+    "readOriginal": "Read the original",
     "discussTitle": "Discuss this post",
     "discussIntro": "Questions or thoughts about this post? Start or join a thread in the community.",
     "discussStart": "Start a discussion",
@@ -3148,7 +3503,12 @@
       "sourceCode": "Source Code",
       "enterUrl": "Enter URL:",
       "enterImageUrl": "Enter image URL:",
-      "enterVideoUrl": "Enter YouTube URL:"
+      "enterVideoUrl": "Enter YouTube URL:",
+      "language": "Language",
+      "languageSummary": "Language: {{language}}",
+      "translationOf": "Translation of",
+      "translationOfNone": "None: this is the original",
+      "translationHint": "A translation is not listed in the blog: its original links to it, and search engines show it to people who search in its language. It is never shown as a new post in the app."
     }
   },
   "reviews": {
@@ -3160,6 +3520,8 @@
     "vintageAll": "All vintages",
     "noReviews": "No reviews yet. Be the first to review this wine!",
     "writeReview": "Write a Review",
+    "shareAsReview": "Share as review",
+    "editSharedReview": "Edit your review",
     "visibility": "Visibility",
     "visibilityPublic": "Public",
     "visibilityPrivate": "Private",
@@ -3167,6 +3529,12 @@
     "visibilityPrivateHint": "Only you can see this review",
     "overallImpression": "Overall Impression",
     "privateBadge": "Private",
+    "showMore": "Show more",
+    "showLess": "Show less",
+    "cardAroma": "Aroma:",
+    "cardPalate": "Palate:",
+    "cardFinish": "Finish:",
+    "editReview": "Edit review",
     "deleteReview": "Delete review",
     "deleteTitle": "Delete review?",
     "deleteBody": "This will permanently delete your review. This cannot be undone.",
@@ -3298,7 +3666,13 @@
     "anonymous": "Anonymous",
     "ban": "Ban",
     "banUserTitle": "Ban User",
-    "confirmBan": "Ban {{name}} from discussions for {{duration}}?",
+    "confirmBanFor": {
+      "10m": "Ban {{name}} from discussions for 10 minutes?",
+      "1h": "Ban {{name}} from discussions for 1 hour?",
+      "1d": "Ban {{name}} from discussions for 1 day?",
+      "1w": "Ban {{name}} from discussions for 1 week?",
+      "permanent": "Ban {{name}} from discussions permanently?"
+    },
     "banDuration": {
       "10m": "10 minutes",
       "1h": "1 hour",
@@ -3451,7 +3825,24 @@
     "moreFromRegion_dessert": "More dessert wines from {{region}}",
     "moreFromRegion_fortified": "More fortified wines from {{region}}",
     "windowReviewedTitle": "A sommelier has reviewed these drink windows",
-    "windowShowAll": "Show all {{count}} vintages"
+    "windowShowAll": "Show all {{count}} vintages",
+    "contribution": {
+      "title": "Shared wine registry",
+      "offerable": "This wine was made on this install and is not in the shared registry on cellarion.app. You can offer it, with its picture and the drink windows reviewed here. It is reviewed there before it joins the registry, and when it is approved this wine is linked to it; its bottles stay where they are.",
+      "queued": "Offered to the shared registry. It goes with the next hourly run, as far as today's allowance reaches.",
+      "sent": "With the shared registry on cellarion.app, waiting for review. When it is approved, this wine is linked to it.",
+      "declined": "The shared registry declined this wine: {{reason}}",
+      "failed": "The shared registry did not accept this wine as it was sent: {{reason}}",
+      "duplicate": "The shared registry approved this wine, and this install already has its copy of it. An admin can merge the two.",
+      "openCopy": "Open the registry's copy",
+      "offer": "Contribute to the shared registry",
+      "offerAgain": "Offer it again",
+      "withdraw": "Take it back",
+      "dismiss": "Dismiss",
+      "errorOffer": "The wine could not be offered right now. Please try again.",
+      "errorWithdraw": "That did not work. Please try again.",
+      "sending": "Being sent to the shared registry now."
+    }
   },
   "taxonomy": {
     "loading": "Loading…",
@@ -3597,7 +3988,7 @@
         "summary": "Create cellars to organize your wine collection.",
         "d1": "Create a cellar: on My Cellars, tap \"+ New Cellar\" and type a name.",
         "d2": "Each cellar is a separate bottle collection.",
-        "d3": "Open a cellar to see its bottles. Search by name, producer, grape or region, narrow the list with Filters, and sort it by date added, name, vintage, price, number of bottles or maturity.",
+        "d3": "Open a cellar to see its bottles. Search by name, producer, grape or region, narrow the list with Filters, and sort it by date added, name, vintage, price, number of bottles or maturity. The search also finds a bottle by the text and list values under More data in its Wine record, and in Your wine data.",
         "d4": "The strip at the top of a cellar switches between its views: Bottles, Overview, Racks, Room View, History and Cellar Book. Overview shows the number of bottles and wines, the total value and the average price.",
         "d5": "The ⋮ menu at the top right holds the cellar's actions: Edit Cellar, Set Color, Share, Wine Lists, Import Bottles, Export, Audit Log, Recently deleted and Delete Cellar. Some are for the cellar's owner only."
       },
@@ -3614,6 +4005,14 @@
         "d8": "Bought wine that has not arrived yet? Add it on order: see \"Bottles on order\" below.",
         "d9": "Saved a bottle under the wrong wine? Open the bottle, tap the ⋮ menu and choose \"Change wine…\": search for the right wine and the bottle moves there, keeping its dates, price, notes, rating, rack slot and history.",
         "d10": "The bottle page's ⋮ menu also has \"Add more bottles\", \"Move to another cellar\" and \"Added by mistake?\". A bottle added by mistake goes to Recently deleted, where you can bring it back for 30 days."
+      },
+      "notesAndReviews": {
+        "title": "Ratings, notes, journal and reviews",
+        "summary": "Four places to write about a wine, and who sees each.",
+        "d1": "Rating and notes on a bottle: your own notes about that bottle. They stay with it, and anyone you share the cellar with sees them too.",
+        "d2": "When you drink a bottle, the rating and note you give it then go with it to the cellar's History, so you can look back on how it was.",
+        "d3": "A journal entry is the moment: the occasion, the food, the people, and how the wine showed. Only you can see your journal entries; marking one public only tells the members you tagged in it that they were mentioned.",
+        "d4": "A review is about the wine, for other members: it shows on the wine's page for everyone, unless you mark it private. After drinking a bottle, \"Share as review\" starts one from the rating and note you already wrote."
       },
       "vintagePage": {
         "title": "Wine and vintage page",
@@ -3701,7 +4100,7 @@
         "d1": "Open a cellar and tap Racks in the strip at the top.",
         "d2": "Choose a rack type: grid, X-rack, honeycomb, A-frame, stack, modular cube, open shelf or wine cabinet.",
         "d3": "Customize each rack with a name, size, and layout that matches your real storage.",
-        "d4": "Place bottles into rack slots by clicking an empty slot and selecting a bottle.",
+        "d4": "Place bottles into rack slots by clicking an empty slot and selecting a bottle. An unplaced bottle's own page also offers \"Place in a rack\", which opens the rack page ready to place it.",
         "d5": "Visual grid shows which slots are filled and which are empty."
       },
       "roomView": {
@@ -3857,7 +4256,7 @@
         "title": "Other Features",
         "summary": "Blog, supporting Cellarion, support tickets and NFC tags.",
         "d1": "Blog (/blog): wine articles and guides.",
-        "d2": "Support Us (/supporter): every feature is free for everyone, on the free Enthusiast tier too. Supporter ($2/mo), Patron ($5/mo) and Benefactor ($10/mo), also available yearly, are voluntary gifts that fund development and unlock nothing extra. A custom or one-time amount can be given through GitHub Sponsors.",
+        "d2": "Support Us (/supporter): every feature is free for everyone. Supporter ($2/mo), Patron ($5/mo) and Benefactor ($10/mo), also available yearly, are voluntary gifts that fund development and unlock nothing extra. A custom or one-time amount can be given through GitHub Sponsors.",
         "d3": "Support (/support): look in Help first; if you are still stuck, send a support ticket.",
         "d4": "NFC tags: attach NFC tags to racks — scan with your phone to open the rack directly."
       }
@@ -3893,8 +4292,8 @@
     "featureImportDesc": "Bring your existing collection in via CSV. A structured wine registry shared across users ensures clean, consistent data.",
     "whyTitle": "Why wine lovers choose Cellarion",
     "whySub": "Built around the things that actually matter when you care about your collection.",
-    "whyFreeTitle": "Free to use",
-    "whyFreeDesc": "All core features are free at cellarion.app — no credit card, no trial, no upsell pop-ups. We don't sell ads either.",
+    "whyFreeTitle": "Free, every feature",
+    "whyFreeDesc": "Every feature is free at cellarion.app: no bottle limit, no paid tier, no credit card, no trial, no upsell pop-ups. We don't sell ads either.",
     "whyExportTitle": "No lock-in",
     "whyExportDesc": "Your collection is yours. Export everything as JSON — or a ZIP with your images — with one click, any time. If you ever leave, you walk out with all your data.",
     "whyPrivacyTitle": "Private by design",
@@ -3911,8 +4310,8 @@
     "footerHelp": "Help",
     "footerTranslate": "Translate Cellarion",
     "footerCopy": "Cellarion",
-    "metaTitle": "Cellarion — Wine Cellar App | Track Your Wine Collection Online",
-    "metaDescription": "Track your wine collection with Cellarion. Log every bottle, visualise racks, get drink-window alerts, and share cellars with friends. Free wine cellar app at cellarion.app.",
+    "metaTitle": "Free Wine Cellar App, No Bottle Limit | Cellarion",
+    "metaDescription": "A free wine cellar app with every feature included: no bottle limit, no subscription. Track bottles, 3D racks, drink-window alerts and cellar value.",
     "faqTitle": "Frequently asked questions",
     "faqSub": "Quick answers about Cellarion, wine cellar management, and how to get started.",
     "faq": {
@@ -3923,11 +4322,30 @@
       "q3": "What is a drink window in wine?",
       "a3": "A drink window is the period during which a wine is at its best — typically a range of years bracketing the wine's peak maturity. Cellarion classifies every vintage as Not Ready, Early, Peak, Late, or Declining based on producer notes and vintage data, so you know which bottles to drink soon and which to keep cellaring.",
       "q4": "Is Cellarion really free?",
-      "a4": "Yes. All core features at cellarion.app are free — track unlimited bottles, organise cellars, get drink-window alerts, share with friends, and export your data anytime. There are no credit-card prompts, no premium tiers gating basic functionality, and we don't sell ads or your data.",
+      "a4": "Yes. Every feature at cellarion.app is free, with no bottle limit: track as many bottles as you like, organise cellars and racks in 3D, get drink-window alerts, see your cellar's value and statistics, connect your AI assistant, share with friends and export your data any time. There is no paid tier that unlocks anything and no credit-card prompt, and we don't sell ads or your data. Members who want to can support Cellarion; supporting unlocks nothing.",
       "q5": "How do I import wines from Vivino or CellarTracker?",
       "a5": "Cellarion supports CSV import. Export your collection from Vivino, CellarTracker, or any spreadsheet, then upload the CSV in Cellarion's import tool. Note that Vivino's \"full wine list\" download is your scan history, not your cellar — Cellarion detects this and offers to import it as drinking history (with your ratings, reviews and notes) instead of as bottles in stock. The shared wine registry deduplicates entries automatically so your data stays clean and consistent across the whole catalogue.",
       "q6": "Can I export my data and leave any time?",
       "a6": "Yes — your data is yours. Cellarion includes a one-click data export that gives you everything as JSON (or a ZIP with your images), plus CSV import for bottles. You can delete your account from Settings with a 7-day cooling-off window. Hosted data lives on European infrastructure under GDPR."
+    }
+  },
+  "sweetness": {
+    "band": {
+      "dry": "Dry",
+      "off-dry": "Off-dry",
+      "medium-sweet": "Medium sweet",
+      "sweet": "Sweet",
+      "brut-nature": "Brut nature",
+      "extra-brut": "Extra brut",
+      "brut": "Brut",
+      "extra-dry": "Extra dry",
+      "sec": "Sec",
+      "demi-sec": "Demi-sec",
+      "doux": "Doux"
+    },
+    "scale": {
+      "still": "Still wine",
+      "sparkling": "Sparkling wine"
     }
   },
   "maturity": {
@@ -3968,11 +4386,18 @@
     "colWindow": "Drink window",
     "footer": "Generated by Cellarion"
   },
+  "openNow": {
+    "title": "Open now",
+    "meta": "≈ {{glasses}} glasses · drink by {{date}}",
+    "unnamed": "Open bottle"
+  },
   "openBottle": {
     "openBtn": "Open bottle…",
     "pickerTitle": "Open this bottle",
     "pickerText": "How will you preserve it? This sets the drink-by window — the bottle stays in your cellar until you finish it.",
     "confirmBtn": "Open bottle",
+    "takeOut": "Take it out of the rack",
+    "takeOutHint": "Frees its slot while it stands open. Undo puts it back.",
     "openBtnShort": "Open",
     "freshness": "about {{days}} days",
     "method": {
@@ -4064,7 +4489,6 @@
     "undoError": "A move failed while undoing — the rack may have changed. Close and check the rack."
   },
   "rackLens": {
-    "dragHint": "Tip: drag a bottle to an empty slot to move it, onto another bottle to swap them.",
     "searchPlaceholder": "Find in racks…",
     "colorBy": "Color by",
     "lensType": "Wine type",
@@ -4096,6 +4520,7 @@
     "community": "Community",
     "allrounder": "All-Rounder",
     "score": "Cellar Cred",
+    "plan_free": "Enthusiast",
     "plan_supporter": "Supporter",
     "plan_patron": "Patron",
     "plan_benefactor": "Benefactor",
@@ -4143,6 +4568,17 @@
     "decidedBy": "by {{username}} on {{date}}",
     "prev": "Prev",
     "next": "Next"
+  },
+  "adminAiLanguage": {
+    "title": "Language for AI-written wine texts",
+    "intro": "The AI can also write each wine's tasting note, flavours and food pairings in one of the app's languages. The English text stays as it is: search, matching and similar wines read it, and the Registry Bridge shares it. The wine, bottle and vintage pages show the translation.",
+    "help": "Only new AI texts are written in this language. Existing wines keep their English text until their profile is written again. Wines from the Registry Bridge and profiles written by a curator always stay in English: this install never rewrites them.",
+    "label": "Language",
+    "off": "Off (English)",
+    "save": "Save",
+    "saving": "Saving…",
+    "saved": "Saved. New wine profiles are also written in this language.",
+    "savedOff": "Saved. New wine profiles are written in English only."
   },
   "adminBridge": {
     "title": "Registry Bridge",
@@ -4344,8 +4780,8 @@
     "newSupporters90": "New supporters (90d)",
     "newSupportersTooltip": "Users whose supporter tier started in the last 90 days, by the date the tier was granted rather than the date they signed up.",
     "formerSupporters": "Former supporters",
-    "formerSupportersSub": "supported, not currently",
-    "formerSupportersTooltip": "Users on the free plan whose supporter tier once started — the start is stamped only when support is actually granted, so an abandoned Stripe checkout does not count. Someone who resubscribed counts as current, not former.",
+    "formerSupportersSub": "paid, no subscription now",
+    "formerSupportersTooltip": "People who paid for a supporter tier through Stripe at least once and have no subscription now. A tier given without payment (set by an admin, or a free trial) does not count, and neither does a checkout that was never completed. Someone who subscribed again counts as current, not former.",
     "planUnconfigured": "(not a configured tier)",
     "cohortsHead": "Do new users come back?",
     "cohortReturned": "New users present",
@@ -4489,6 +4925,7 @@
     "glassSectionFirst": "Lead with a “Wines by the Glass” section",
     "hidePrices": "Hide prices on the shared page and the PDF (the figures stay on the entries)",
     "markLastBottle": "Mark wines with only one bottle left as “Last bottle”",
+    "showStock": "Show how many bottles there are of each wine",
     "newPageEachSection": "PDF: start each section (wine type) on a new page",
     "dashboard": "Dashboard",
     "winesOnList": "Wines on list",
@@ -4605,6 +5042,9 @@
     "priorityHighOption": "High — must buy!",
     "notes": "Notes",
     "notesPlaceholder": "Where you tried it, price you saw...",
+    "shopUrl": "Shop link",
+    "shopUrlPlaceholder": "https://shop.example/wine",
+    "shopLinkAt": "Shop: {{host}} ↗",
     "saving": "Saving...",
     "save": "Save",
     "cancel": "Cancel",
@@ -4678,6 +5118,8 @@
     "priorityHigh": "High — must buy!",
     "notes": "Notes",
     "notesPlaceholder": "Where you tried it, what you liked, price you saw...",
+    "shopUrl": "Shop link",
+    "shopUrlPlaceholder": "Where you saw it, e.g. https://shop.example/wine",
     "cancel": "Cancel",
     "failedSaveWine": "Failed to save wine",
     "requiredFields": "Name, producer, and country are required",
@@ -4732,6 +5174,7 @@
     "resultWines_other": "{{count}} new wines added to the registry",
     "resultPendingIdentity_one": "{{count}} wine couldn't be fully identified — the bottle is in your cellar, and our curators will complete the details",
     "resultPendingIdentity_other": "{{count}} wines couldn't be fully identified — the bottles are in your cellar, and our curators will complete the details",
+    "resultUnchecked": "{{n}} new wine(s) wait for a curator's check before other members can see them",
     "resultWineRequests_one": "{{count}} wine submitted for review (couldn't auto-create)",
     "resultWineRequests_other": "{{count}} wines submitted for review (couldn't auto-create)",
     "resultUnplaced_one": "{{count}} bottle couldn't be placed in a rack slot",
@@ -5045,6 +5488,7 @@
       "patternSegments": "Segmented bin codes (12-3-4)",
       "patternSequential": "Numbered bins (147)",
       "patternGeneric": "Bin codes",
+      "patternWithDetail": "{{pattern}} — {{detail}}",
       "detectedDims_one": "{{rows}} rows × {{cols}} columns detected from {{count}} bin code",
       "detectedDims_other": "{{rows}} rows × {{cols}} columns detected from {{count}} bin codes",
       "detectedSeq_one": "sequential slot numbers detected from {{count}} bin code",
@@ -5095,10 +5539,11 @@
     "review": {
       "matched": "Matched",
       "fuzzy": "Fuzzy",
-      "autoAdded": "Auto Added",
+      "autoAdded": "AI Matched",
       "newWines": "New Wines",
       "noMatch": "No Match",
       "ready": "Ready",
+      "notImportedYet": "Nothing is in your cellar yet. Check the list, then press Import at the bottom to add the bottles.",
       "imported": "Imported",
       "priceWarnings": "Price warnings",
       "priceWarningBanner_one": "⚠️ {{count}} bottle has unusual prices.",
@@ -5135,6 +5580,7 @@
       "lookupFailedDesc": "The lookup encountered a temporary issue. Request the wine to be added manually.",
       "createFailedDesc": "We identified this wine but encountered an error saving it. Try requesting it manually.",
       "couldNotIdentifyDesc": "Could not identify this wine. Request it to be added to the registry.",
+      "explanation": "Details: {{text}}",
       "ratingTag": "Rating: {{rating}}",
       "hide": "Hide",
       "change": "Change",
@@ -5184,6 +5630,7 @@
       "overflowSuffix": " ({{count}} into adjacent slots)",
       "couldntPlace": "Couldn't place",
       "pendingIdentityNote": "{{n}} wine(s) couldn't be fully identified from your file — the bottles are in your cellar, and our curators will complete the details.",
+      "uncheckedNote": "{{n}} new wine(s) from your file are in your cellar. A curator checks their details before other members can see them.",
       "autoCreatedRacks": "Auto-created racks ({{count}})",
       "unplacedSummary": "Bottles that couldn't be placed in a rack ({{count}})",
       "unplacedRow": "Row {{row}} → rack <1>{{rack}}</1>",
@@ -5324,7 +5771,12 @@
     "closeCamera": "Close camera",
     "takePhoto": "Take photo",
     "switchCamera": "Switch camera",
-    "takePhotoButton": "Take Photo"
+    "takePhotoButton": "Take Photo",
+    "choosePhoto": "Choose a photo",
+    "photoUnreadable": "That photo could not be opened. Try another one.",
+    "labelUnreadable": "Could not read the label. Try again.",
+    "backLabelUnreadable": "Could not read the back label. Try again.",
+    "scanFailed": "Scan failed. Please try again."
   },
   "photoCapture": {
     "removingBackground": "Removing background…",
@@ -5920,30 +6372,20 @@
     "feedbackSent": "Your feedback is with the Cellarion team. The answer comes like a support reply: in the app under Support, and by email unless you turned those off.",
     "openSupport": "Open Support",
     "features": {
-      "rackMoveBottles": {
-        "name": "Move a rack's bottles to another rack",
-        "description": "Move every bottle in a rack to another rack in the same cellar in one go. They keep their order and fill the other rack from its first free slot. Handy when you replace a rack, for example with a wine cabinet.",
-        "where": "On the Racks page: open a rack, then ⋮ → Move bottles to another rack."
-      },
-      "cabinetHeadToTail": {
-        "name": "Wine cabinet bottles head to tail",
-        "description": "For a wine cabinet whose bottles lie one deep, base forward and neck forward in turn. The cabinet drawings then show every other bottle neck forward. The slot numbers stay the same, so you can switch it on for a cabinet that already holds bottles.",
-        "where": "On the Racks page: create or edit a wine cabinet, untick Two deep, then tick Bottles lie head to tail."
-      },
-      "cabinetSideways": {
-        "name": "Wine cabinet bottles lying sideways",
-        "description": "For each shelf of a wine cabinet, choose how its bottles lie: front to back, with one bottle lying across the front of the others (as in a slim fridge), or all lying across (as in a bottom bin). The cabinet drawings follow, including the 3D view. The slot numbers stay the same, so you can change it on a cabinet that already holds bottles. Includes a starting shape for the Kingsbottle Atelier Duo.",
-        "where": "On the Racks page: create or edit a wine cabinet and pick how each shelf's bottles lie, or start from Kingsbottle → Atelier Duo."
-      },
       "pickLists": {
         "name": "Pick lists",
         "description": "Make a list of the bottles you are about to fetch — for a dinner, a tasting, or what to drink next — and see the cellar, rack and slot of each, in the order you walk past them. Tick bottles off as you pick them, print the list, and mark the picked ones as drunk in one go.",
         "where": "In your cellar, tap Select, pick bottles and choose Pick list, or use ⋮ → Add to pick list on a bottle's page. Your lists are under Pick lists in the menu."
       },
-      "rackSlotMove": {
-        "name": "Move a bottle by tapping",
-        "description": "Move a bottle to another slot without dragging — made for phones, where dragging does not work. Tap the bottle, choose Move, then tap the slot it should go to. On a bottle in the same rack the two swap places.",
-        "where": "On the Racks page: tap a bottle, then Move."
+      "maturityTimeline": {
+        "name": "Drink window as a timeline",
+        "description": "See a wine's drink window as one bar — early, peak and late — with a marker on this year, so you can tell at a glance how far the wine has come. The exact years stay listed below it.",
+        "where": "On a bottle's page and a vintage's page, under Aging & Maturity."
+      },
+      "wallRack": {
+        "name": "A wall built from boxes",
+        "description": "Draw a whole wall of shelving as one rack. The wall is a grid of cells, and each box in it holds what yours does: an X of four triangles, a diagonal, a rack of single slots, shelves, an open bin, or a closed cupboard. A box can be several cells wide or high.",
+        "where": "On a cellar's Racks page, choose New rack and pick the type Wall."
       }
     }
   },
@@ -5960,6 +6402,7 @@
     "openRegistry": "Open in the shared registry",
     "noBottlesForWindow": "Kept on the bottles; none left in this cellar.",
     "windowDiffers": "Differs between the bottles. Edit vintage sets one for all of them.",
+    "windowSetForAll": "Set one window for all",
     "notSet": "Not set yet.",
     "notesDiffer": "Each bottle has its own note: see the bottles below.",
     "noNotes": "No notes yet.",
@@ -6034,6 +6477,18 @@
     "gone": "The curators have closed this question, or it was not addressed to you. Nothing is needed from you.",
     "toCellars": "Go to your cellars",
     "loadError": "Could not load the question."
+  },
+  "curatorQuestions": {
+    "title": "Questions from the curators",
+    "intro": "When a wine’s record needs something only the label can tell, the curators ask its owners. Each question can be answered once.",
+    "waitingTitle": "Waiting for your answer",
+    "noCellar": "Not in any of your cellars",
+    "introNoCellar": "If you remember the label, or have a photo of it, you can answer here. Answering is optional; only registry curators see your answer.",
+    "answeredTitle": "Answered",
+    "openBottle": "Open the bottle",
+    "empty": "No questions from the curators right now.",
+    "loadError": "Could not load your questions.",
+    "allLink": "All questions from the curators"
   },
   "pickLists": {
     "whichBottles": "Which bottles?",

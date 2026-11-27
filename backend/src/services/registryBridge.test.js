@@ -112,7 +112,7 @@ describe('adoptWine — registry keys this install only knows as a proposal', ()
     warn.mockRestore();
   });
 
-  // Release audit 2026-10-23: proposals allow a 1000-character rationale, and
+  // Proposals allow a 1000-character rationale, and
   // appending the registry note past that failed validation on save — after the
   // wine was already saved, so the adoption answered 500 and its values never
   // landed.
@@ -160,7 +160,7 @@ describe('adoptWine — registry keys this install only knows as a proposal', ()
 });
 
 describe('adoptWine', () => {
-  // Support ticket 2026-09-17: a sparkling rosé arrives as one.
+  // A sparkling rosé arrives as one.
   test('carries the colour the registry sends; an older registry that sends no colour key clears nothing', async () => {
     client.fetchWine.mockResolvedValue(registryWine({ type: 'sparkling', colour: 'rosé' }));
     await bridge.adoptWine(RID, USER);
@@ -170,6 +170,20 @@ describe('adoptWine', () => {
     client.fetchWine.mockResolvedValue(registryWine());
     await bridge.adoptWine(RID, USER);
     expect(WineDefinition.mock.calls[0][0]).not.toHaveProperty('colour');
+  });
+
+  // A translated copy of the prose (utils/profileLanguage) is never sent by
+  // the registry; if one ever arrived it must not land here either — the
+  // copied profile is the registry's English fields only.
+  test('a translated copy in a registry answer is not copied', async () => {
+    const english = registryWine().profile;
+    client.fetchWine.mockResolvedValue(registryWine({
+      profile: { ...english, localized: { lang: 'de', description: 'Ein dichter Priorat.', flavors: ['Pflaume'], foodPairings: ['Lamm'], generatedAt: english.generatedAt } },
+    }));
+    await bridge.adoptWine(RID, USER);
+    const { aiProfile } = WineDefinition.mock.calls[0][0];
+    expect(aiProfile).not.toHaveProperty('localized');
+    expect(aiProfile.description).toBe('A dense Priorat.');
   });
 
   test('copies a registry wine as a local wine: computed dedup key, bridge provenance, profile, windows, values, local index', async () => {
@@ -279,7 +293,7 @@ describe('refreshHeld', () => {
     const r = await bridge.refreshHeld({ now: new Date('2026-09-08') });
     // `since` is the install's own watermark from site config, not the oldest
     // per-wine sync date: derived per wine it never advanced, so the same
-    // wines came back every week until the quota ran out (audit 2026-09-08).
+    // wines came back every week until the quota ran out.
     expect(client.changes).toHaveBeenCalledWith([RID, 'b'.repeat(24)], new Date(0));
     expect(local.name).toBe('Salmos Priorat'); // untouched locally → identity follows the registry
     expect(local.aiProfile).toMatchObject({ description: 'A dense Priorat.' });
@@ -521,7 +535,7 @@ describe('audit 2026-09-08 — refresh keeps its promises', () => {
       image: null, aiProfile: { source: 'ai' },
       // Faithful to models/WineDefinition.js: the pre-save hook stamps
       // updatedAt with the REAL instant of the save, while the run passes a
-      // logical `now`. That gap is what froze copies (audit 2026-09-08), so
+      // logical `now`. That gap is what froze copies, so
       // the mock has to reproduce it rather than echo the run's clock.
       save: jest.fn(async function save() { this.updatedAt = new Date(); }),
       ...over,

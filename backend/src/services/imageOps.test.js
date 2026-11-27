@@ -23,7 +23,7 @@ jest.mock('../services/photoFormat', () => ({
 }));
 // attachOfficialWineImage lazy-requires search (ESM meilisearch — unparseable
 // by jest) — mock at top level like every other suite.
-jest.mock('../services/search', () => ({ indexWine: jest.fn(), indexBottle: jest.fn() }));
+jest.mock('../services/search', () => ({ indexWine: jest.fn() }));
 // The attach audit row has its own suite (imageOps.audit.test.js).
 jest.mock('./audit', () => ({ logAudit: jest.fn() }));
 
@@ -74,9 +74,9 @@ test('happy path: sanitises, writes a sniffed-extension file, saves the row, kic
   expect(encodeKeptPhoto).not.toHaveBeenCalled();
 });
 
-// Support ticket 6a97f870 (2026-09-02): a user's label-only photos came back
-// "systematically cropped" — rembg keeps the figure it finds on the label and
-// cuts the label away. The uploader can now opt out of background removal.
+// Label-only photos come back cropped — rembg keeps the figure it finds on
+// the label and cuts the label away. The uploader can opt out of background
+// removal.
 test('keepBackground: no bg-removal hand-off, the original is the kept image and the row is processed at once', async () => {
   const res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'u1', bottle: { _id: 'b1' }, keepBackground: true }, REQ);
   expect(res.error).toBeUndefined();
@@ -85,6 +85,19 @@ test('keepBackground: no bg-removal hand-off, the original is the kept image and
   expect(res.image.status).toBe('processed');
   expect(res.image.processedUrl).toBe(res.image.originalUrl);
   expect(res.image.save).toHaveBeenCalledTimes(1);
+});
+
+// Discussion #1778: on a server that does not review photos a kept photo is
+// published at upload, and the caller (web or MCP) must be told so — not
+// answered with the row as it was before it was published.
+test('keepBackground on a server that does not review: the answer is the photo as published, the member named', async () => {
+  const trusted = require('./trustedContributions');
+  const spy = jest.spyOn(trusted, 'approvePhotoIfTrusted').mockResolvedValueOnce(true);
+  BottleImage.findById = jest.fn().mockResolvedValue({ _id: 'img-new', status: 'approved', visibility: 'public' });
+  const res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'u1', bottle: { _id: 'b1' }, keepBackground: true }, REQ);
+  expect(spy).toHaveBeenCalledWith('img-new', REQ);
+  expect(res.image).toMatchObject({ status: 'approved', visibility: 'public' });
+  spy.mockRestore();
 });
 
 test('keepBackground: the kept photo is stored like every kept photo — the WebP of the clean bytes', async () => {
@@ -222,7 +235,7 @@ describe('attachOfficialWineImage', () => {
 // request) is born approved + public, BEFORE the background-removal worker is
 // handed the row — the worker keeps an approved row approved, while a row
 // approved after the hand-off raced it and usually settled 'processed', out
-// of every gallery (release audit 2026-10-09, H1).
+// of every gallery.
 describe('publish at ingest', () => {
   test('the row is saved approved, public, reviewed by the uploader and marked with its side before bg removal starts', async () => {
     const res = await ingestBottleImage({ buffer: Buffer.from('RAW'), userId: 'admin-1', userRoles: ['admin'], wineDefinitionId: 'w1', publish: { side: 'back' } }, REQ);
@@ -250,7 +263,7 @@ describe('publish at ingest', () => {
   });
 });
 
-// Photos per vintage (support ticket 2026-10-09): a photo is of ONE bottle,
+// Photos per vintage: a photo is of ONE bottle,
 // so the row is filed under that bottle's vintage; a wine-level upload has
 // no bottle and stays wine-wide.
 test('the row carries its bottle\'s vintage; a wine-level upload carries none', async () => {

@@ -1,11 +1,10 @@
 /**
  * GET /api/cellars/:id/vintages/:wineId/:vintage — one wine and vintage in a
- * cellar, the page behind a grouped "n identical bottles" entry (support
- * ticket 2026-10-09).
+ * cellar, the page behind a grouped "n identical bottles" entry.
  *
  * WHY THIS TEST EXISTS:
- * The grouped cellar list had no page for a group; a click only expanded it.
- * This route is a VIEW over data that already exists: the bottles of that
+ * A group in the grouped cellar list has a page of its own, not just an
+ * expand. This route is a VIEW over data that already exists: the bottles of that
  * wine and vintage in THIS cellar (never another cellar's, never a drunk or
  * on-order one in the list), each with its rack slot, what every bottle
  * shares (a note or window identical on all of them, shown once), how many
@@ -33,6 +32,15 @@ jest.mock('../models/CellarLayout', () => ({ findOne: jest.fn() }));
 jest.mock('../models/BottleImage', () => ({ find: jest.fn() }));
 jest.mock('../models/WineVintageProfile', () => ({ find: jest.fn() }));
 jest.mock('../models/WineDefinition', () => ({ findById: jest.fn() }));
+// The sweetness category has its own load of the wine, checked on real rows in
+// routes/sweetnessCategory.surfaces.mongo.test.js. With the wine model mocked
+// it is stood in for: nothing read, and a read's wines left as they are.
+jest.mock('../services/sweetnessCategory', () => ({
+  ...jest.requireActual('../services/sweetnessCategory'),
+  readSweetnessCategories: jest.fn(async () => new Map()),
+  attachSweetnessCategories: jest.fn(async (wines) => wines),
+  attachSweetnessCategoriesIfReadable: jest.fn(async (wines) => wines),
+}));
 jest.mock('../models/User', () => ({}));
 jest.mock('../models/AuditLog', () => ({}));
 jest.mock('../models/PendingShare', () => ({}));
@@ -251,7 +259,49 @@ describe('GET /api/cellars/:id/vintages/:wineId/:vintage', () => {
     expect(status).toBe(200);
     expect(body.bottles.every((b) => b.rackInfo === null)).toBe(true);
     // Said, so the page never takes them for identical bottles ("Which
-    // bottle?" skipped) — release audit 2026-10-16.
+    // bottle?" skipped).
     expect(body.placesKnown).toBe(false);
+  });
+});
+
+// The translated copy of the prose (utils/profileLanguage, SuperAdmin → AI):
+// read only while a language is set — off, the lookup is the one it always
+// was — and shown while it is fresh.
+describe('the vintage page and the translated copy of the prose', () => {
+  const aiConfig = require('../config/aiConfig');
+  const AT = new Date('2026-11-13T10:00:00Z');
+  const ENGLISH = { description: 'Cassis and cedar.', body: 'full', flavors: ['cassis'], source: 'curator', generatedAt: AT };
+  const COPY = { lang: 'fr', description: 'Cassis et cèdre.', flavors: ['cassis'], foodPairings: [], generatedAt: AT };
+  const serve = (aiProfile) => {
+    profileSelect = jest.fn(() => ({ lean: async () => ({ _id: WINE, aiProfile }) }));
+    WineDefinition.findById.mockReturnValue({ select: profileSelect });
+  };
+  afterEach(() => aiConfig.set({}));
+
+  test('off: the select is the display fields only, as before, and no copy is sent', async () => {
+    serve({ ...ENGLISH, localized: COPY });
+    const { body } = await request(url());
+    expect(profileSelect.mock.calls[0][0]).toBe('aiProfile.description aiProfile.body aiProfile.tannin aiProfile.acidity aiProfile.sweetness aiProfile.flavors aiProfile.foodPairings aiProfile.source');
+    expect(body.wine.aiProfile).not.toHaveProperty('localized');
+  });
+
+  test('on: the copy and its generatedAt are read, and a fresh copy is sent beside the English', async () => {
+    aiConfig.set({ aiTextLanguage: 'fr' });
+    serve({ ...ENGLISH, localized: COPY });
+    const { body } = await request(url());
+    expect(profileSelect.mock.calls[0][0].split(' ')).toEqual(expect.arrayContaining(['aiProfile.generatedAt', 'aiProfile.localized']));
+    expect(body.wine.aiProfile.description).toBe('Cassis and cedar.');
+    expect(body.wine.aiProfile.localized).toEqual({ ...COPY, generatedAt: AT.toISOString() });
+  });
+
+  test('on: a stale copy (another language, or older than the English) is not sent', async () => {
+    aiConfig.set({ aiTextLanguage: 'de' });
+    serve({ ...ENGLISH, localized: COPY });
+    let { body } = await request(url());
+    expect(body.wine.aiProfile).not.toHaveProperty('localized');
+    aiConfig.set({ aiTextLanguage: 'fr' });
+    serve({ ...ENGLISH, generatedAt: new Date('2026-11-14T08:00:00Z'), localized: COPY });
+    ({ body } = await request(url()));
+    expect(body.wine.aiProfile).not.toHaveProperty('localized');
   });
 });

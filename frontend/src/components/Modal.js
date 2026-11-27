@@ -19,21 +19,39 @@ import './Modal.css';
  * modal): on open it moves focus into the dialog and keeps Tab inside it.
  */
 // Open dialogs. Escape closes only the newest: a dialog opened from inside
-// another (the beta feedback form inside the rack "Move bottles" dialog) must
-// not take its parent — and the parent's typed input — with it. "Newest" is
-// the order of FIRST RENDER, which runs parent before child; effects run
-// child before parent, so they cannot tell a nested pair apart.
+// another (a form opened from a button inside a dialog) must not take its
+// parent — and the parent's typed input — with it. "Newest" is the order of
+// FIRST RENDER, which runs parent before child; effects run child before
+// parent, so they cannot tell a nested pair apart.
 const openModals = new Set();
 let modalSeq = 0;
+
+/**
+ * The overlay's handlers for "a click beside the box closes the dialog".
+ * Spread them on the overlay element; `onClose` may be undefined (no close).
+ *
+ * A click whose press began INSIDE the box — selecting text in a field and
+ * releasing past the edge — is reported by the browser on the overlay. Closing
+ * on it loses whatever was typed (a tasting note, a journal entry, a support
+ * message), so only a press that also began on the overlay closes.
+ */
+export function useOverlayClose(onClose) {
+  const pressTarget = useRef(null);
+  return {
+    onPointerDown: (e) => { pressTarget.current = e.target; },
+    onClick: (e) => {
+      const startedInside = pressTarget.current && pressTarget.current !== e.currentTarget;
+      pressTarget.current = null;
+      if (startedInside || e.target !== e.currentTarget) return;
+      if (onClose) onClose(e);
+    },
+  };
+}
 
 function Modal({ title, onClose, children, wide, showClose, boxStyle, trapFocus = false }) {
   const titleId = useId();
   const boxRef = useRef(null);
-  // Where the current press began. A click whose press began INSIDE the box —
-  // selecting text in a field and releasing past the edge — is reported by the
-  // browser on the overlay, and used to close the dialog with whatever had
-  // been typed in it (journal entry, review, support message).
-  const pressTarget = useRef(null);
+  const overlayClose = useOverlayClose(onClose);
   // The phone's Back closes the dialog instead of leaving the page.
   useBackToClose(onClose);
   const token = useRef(null);
@@ -68,7 +86,7 @@ function Modal({ title, onClose, children, wide, showClose, boxStyle, trapFocus 
     // of a roving-tabindex group (the Wine record's type/colour chips). Counting
     // them put the opening focus on an unchecked chip, where Space proposed the
     // wrong type, and let Shift+Tab from the group's real tab stop walk out of
-    // the dialog (audit 2026-09-19).
+    // the dialog.
     const focusable = () =>
       Array.from(
         box.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')
@@ -91,16 +109,7 @@ function Modal({ title, onClose, children, wide, showClose, boxStyle, trapFocus 
   }, [trapFocus]);
 
   return (
-    <div
-      className="modal-overlay"
-      onPointerDown={(e) => { pressTarget.current = e.target; }}
-      onClick={(e) => {
-        const startedInside = pressTarget.current && pressTarget.current !== e.currentTarget;
-        pressTarget.current = null;
-        if (startedInside || e.target !== e.currentTarget) return;
-        if (onClose) onClose(e);
-      }}
-    >
+    <div className="modal-overlay" {...overlayClose}>
       <div
         className={`modal-box${wide ? ' modal-box--wide' : ''}`}
         style={boxStyle}

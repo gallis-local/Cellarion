@@ -1,15 +1,13 @@
 /**
- * A wine's COLOUR, kept apart from its TYPE (support ticket 2026-09-17,
- * "Colour Sparkling/Rosè").
+ * A wine's COLOUR, kept apart from its TYPE.
  *
  * WineDefinition.type is ONE value, and three of its six values — sparkling,
  * dessert, fortified — are STYLES that say nothing about colour (the
  * colour-contradiction rules in utils/crossFieldChecks.js already refuse to
- * judge them for exactly that reason). A Trento DOC rosé therefore had to be
- * filed either as 'sparkling' — right style, drawn in the sparkling colour on
- * every card and rack — or as 'rosé', which took it out of the Sparkling
- * group, its filters and its drink-window shape. The registry held 79 sparkling
- * rosés the first way and 11 the second.
+ * judge them for exactly that reason). Without a colour, a Trento DOC rosé
+ * must be filed either as 'sparkling' — right style, drawn in the sparkling
+ * colour on every card and rack — or as 'rosé', which takes it out of the
+ * Sparkling group, its filters and its drink-window shape.
  *
  * `WineDefinition.colour` records the colour for those three types only. For
  * red / white / rosé the type IS the colour and the field stays null — the
@@ -80,8 +78,8 @@ function effectiveColour(wine) {
  * Write a colour a CALLER stated — "none" (null) included. The model hook
  * infers rosé from the name of a created, retyped or published style wine only
  * when nobody stated a colour in the same save; without this mark an explicit
- * "not stated" sent together with a retype was silently turned back into rosé,
- * and an undo could not restore a cleared colour (audit 2026-09-19).
+ * "not stated" sent together with a retype would silently turn back into rosé,
+ * and an undo could not restore a cleared colour.
  * `$locals` is per-document, never stored; plain test doubles have none.
  */
 function stateColour(wine, value) {
@@ -92,8 +90,7 @@ function stateColour(wine, value) {
 /**
  * Why `colour` cannot be written on a wine that ends up typed `typeAfter`, or
  * null when it can. The model hook would drop the value anyway — this is what
- * lets a write path REFUSE instead of reporting a success that stored nothing
- * (audit 2026-09-19).
+ * lets a write path REFUSE instead of reporting a success that stored nothing.
  */
 function colourTypeConflict(typeAfter, colour) {
   if (!colour || isStyleType(typeAfter)) return null;

@@ -9,8 +9,21 @@ import './AddBottle.css';
 import WineImage from '../components/WineImage';
 import { swatchType, wineTypeLabel } from '../utils/wineColour';
 import './Wishlist.css';
+import { formatVintage, parseVintageInput } from '../utils/vintage';
+import { messageForResponse } from '../utils/friendlyError';
 
 const PRIORITY_KEYS = { high: 'wishlist.priorityHigh', medium: 'wishlist.priorityMedium', low: 'wishlist.priorityLow' };
+
+// An entry's shop link as the list shows it: only an http(s) address (the
+// server stores nothing else), labelled by its site.
+function shopLink(url) {
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return null;
+  try {
+    return { href: url, host: new URL(url).hostname.replace(/^www\./, '') };
+  } catch {
+    return null;
+  }
+}
 
 function Wishlist() {
   const { t } = useTranslation();
@@ -19,6 +32,9 @@ function Wishlist() {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // A refused edit is shown INSIDE the edit dialog: the page's own alert sits
+  // behind the dialog's overlay, where nobody can read it.
+  const [editError, setEditError] = useState(null);
 
   // Filters
   const [statusFilter, setStatusFilter] = useState('wanted');
@@ -35,6 +51,7 @@ function Wishlist() {
   const [editNotes, setEditNotes] = useState('');
   const [editPriority, setEditPriority] = useState('medium');
   const [editVintage, setEditVintage] = useState('');
+  const [editShopUrl, setEditShopUrl] = useState('');
   const [saving, setSaving] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(null);
 
@@ -143,23 +160,27 @@ function Wishlist() {
     setEditNotes(item.notes || '');
     setEditPriority(item.priority || 'medium');
     setEditVintage(item.vintage || '');
+    setEditShopUrl(item.shopUrl || '');
+    setEditError(null);
   };
 
   const handleSaveEdit = async () => {
     if (!editItem) return;
     setSaving(true);
+    setEditError(null);
     try {
       const res = await updateWishlistItem(apiFetch, editItem._id, {
         notes: editNotes,
         priority: editPriority,
-        vintage: editVintage
+        vintage: parseVintageInput(editVintage, t),
+        shopUrl: editShopUrl.trim()
       });
       const data = await res.json();
-      if (!res.ok) { setError(data.error || t('wishlist.failedUpdate')); return; }
+      if (!res.ok) { setEditError(messageForResponse(res, data, t('wishlist.failedUpdate'), t)); return; }
       setItems(prev => prev.map(i => i._id === editItem._id ? data.item : i));
       setEditItem(null);
     } catch {
-      setError(t('wishlist.networkError'));
+      setEditError(t('wishlist.networkError'));
     } finally {
       setSaving(false);
     }
@@ -171,15 +192,17 @@ function Wishlist() {
 
   return (
     <div className="wishlist-page">
-      <div className="wishlist-header">
+      <div className="page-header">
         <div>
           <h1>{t('wishlist.title')}</h1>
-          <p className="wishlist-subtitle">{t('wishlist.subtitle')}</p>
+          <p className="page-subtitle">{t('wishlist.subtitle')}</p>
         </div>
-        <Link to="/wishlist/add" className="btn btn-primary">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          {t('wishlist.addWine')}
-        </Link>
+        <div className="header-actions">
+          <Link to="/wishlist/add" className="btn btn-primary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            {t('wishlist.addWine')}
+          </Link>
+        </div>
       </div>
 
       {/* Filters bar */}
@@ -259,22 +282,29 @@ function Wishlist() {
                     <div className="wine-meta">
                       {wd?.country?.name && <span>{wd.country.name}</span>}
                       {wd?.region?.name && <span>• {wd.region.name}</span>}
-                      {wd?.type && <span className={`wine-type-pill ${swatchType(wd)}`}>{wineTypeLabel(wd, t)}</span>}
+                      {(wd?.type || wd?.nonWine) && <span className={`wine-type-pill ${swatchType(wd)}`}>{wineTypeLabel(wd, t)}</span>}
                     </div>
-                    {item.vintage && <span className="wishlist-item-vintage">{t('wishlist.vintageLine', { vintage: item.vintage })}</span>}
+                    {item.vintage && <span className="wishlist-item-vintage">{t('wishlist.vintageLine', { vintage: formatVintage(item.vintage, t) })}</span>}
                     {item.notes && <p className="wishlist-item-notes">{item.notes}</p>}
+                    {shopLink(item.shopUrl) && (
+                      <a className="wishlist-item-shop-link" href={shopLink(item.shopUrl).href} target="_blank" rel="noopener noreferrer">
+                        {t('wishlist.shopLinkAt', { host: shopLink(item.shopUrl).host })}
+                      </a>
+                    )}
                     {item.status === 'bought' && item.boughtAt && (
                       <span className="wishlist-item-bought-date">{t('wishlist.boughtOn', { date: new Date(item.boughtAt).toLocaleDateString() })}</span>
                     )}
-                    {/* "Bought" only ticks the wishlist; this puts the bottle
-                        in the cellar — Add Bottle with the wine (and the
-                        vintage, when set) already chosen. */}
-                    {wd?._id && (
-                      <div className="wishlist-item-cellar">
-                        <AddToCellarButton wineId={wd._id} vintage={item.vintage} />
-                      </div>
-                    )}
                   </div>
+                  {/* "Bought" only ticks the wishlist; this puts the bottle
+                      in the cellar — Add Bottle with the wine (and the
+                      vintage, when set) already chosen. A sibling of the
+                      text, not a child: on a phone it shares one row with
+                      the buttons below (Wishlist.css). */}
+                  {wd?._id && (
+                    <div className="wishlist-item-cellar">
+                      <AddToCellarButton wineId={wd._id} vintage={item.vintage} />
+                    </div>
+                  )}
                   <div className="wishlist-item-actions">
                     <button
                       className={`btn btn-small ${item.status === 'wanted' ? 'btn-success' : 'btn-secondary'}`}
@@ -330,6 +360,11 @@ function Wishlist() {
             <label>{t('wishlist.notes')}</label>
             <textarea value={editNotes} onChange={(e) => setEditNotes(e.target.value)} rows="3" maxLength={2000} placeholder={t('wishlist.notesPlaceholder')} />
           </div>
+          <div className="form-group">
+            <label htmlFor="wishlist-edit-shop-url">{t('wishlist.shopUrl')}</label>
+            <input id="wishlist-edit-shop-url" type="text" inputMode="url" autoComplete="off" value={editShopUrl} onChange={(e) => setEditShopUrl(e.target.value)} maxLength={2000} placeholder={t('wishlist.shopUrlPlaceholder')} />
+          </div>
+          {editError && <div className="alert alert-error" role="alert">{editError}</div>}
           <div className="form-actions">
             <button className="btn btn-success" onClick={handleSaveEdit} disabled={saving}>
               {saving ? t('wishlist.saving') : t('wishlist.save')}

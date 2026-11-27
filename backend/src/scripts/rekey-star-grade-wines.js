@@ -1,12 +1,11 @@
 /**
  * Re-key the registry wines whose NAME carries a star grade.
  *
- * Wine names used to be keyed with every '*' stripped, so "Auslese**" and
- * "Auslese***" (two of Markus Molitor's wines) built one dedup key. A name's
- * star grade is now a word ("***" → "3star", utils/normalize
- * normalizeWineName); keys stored before that change still carry the stripped
- * form, and a lookup by the new key would miss them. This brings normalizedKey
- * and canonicalKey up to date for exactly those wines.
+ * A name's star grade is a word in its keys ("***" → "3star", utils/normalize
+ * normalizeWineName), so "Auslese**" and "Auslese***" (two of Markus Molitor's
+ * wines) build two dedup keys. A stored key built with every '*' stripped
+ * carries neither grade, and a lookup by the graded key misses it. This brings
+ * normalizedKey and canonicalKey up to date for exactly those wines.
  *
  * Runs at every boot (server.js) and is idempotent: once the keys are current
  * it finds nothing to do. Also runnable by hand:
@@ -23,40 +22,50 @@
 
 const mongoose = require('mongoose');
 const WineDefinition = require('../models/WineDefinition');
-const { normalizeString, normalizeWineName, PENDING_KEY_PREFIX, DRAFT_KEY_PREFIX } = require('../utils/normalize');
+const { normalizeString, normalizeWineName, PENDING_KEY_PREFIX, DRAFT_KEY_PREFIX, sweetnessKeySegment } = require('../utils/normalize');
 const { computeCanonicalKey } = require('../utils/wineIdentity');
+const { loadTerms } = require('../services/sweetnessOps');
 
 // The key a wine's fields build, in its own namespace, with `nameNorm` for the
 // name segment (producer and appellation are never graded). Pending
 // (producerless, per creator) and draft (private, per creator) keys keep their
-// head segment.
-function keyFor(w, nameNorm) {
+// head segment. `sweetness` is the label sweetness term's word when the wine
+// has one: it rides on every key as a suffix (utils/normalize
+// SWEETNESS_KEY_MARK), so the keys built here match the ones the save hook
+// builds and a termed wine is never written back bare.
+function keyFor(w, nameNorm, sweetness = null) {
   const head = String(w.normalizedKey || '').split(':')[0];
   const name = nameNorm(w.name || '');
   const appellation = normalizeString(w.appellation || '');
-  if (head.startsWith(PENDING_KEY_PREFIX)) return `${head}:${name}:${appellation}`;
-  if (head.startsWith(DRAFT_KEY_PREFIX)) return `${head}:${normalizeString(w.producer || '')}:${name}:${appellation}`;
-  return `${normalizeString(w.producer || '')}:${name}:${appellation}`;
+  const tail = sweetnessKeySegment(sweetness);
+  if (head.startsWith(PENDING_KEY_PREFIX)) return `${head}:${name}:${appellation}${tail}`;
+  if (head.startsWith(DRAFT_KEY_PREFIX)) return `${head}:${normalizeString(w.producer || '')}:${name}:${appellation}${tail}`;
+  return `${normalizeString(w.producer || '')}:${name}:${appellation}${tail}`;
 }
 
 async function run({ apply }) {
-  // A STRING pattern, so JavaScript turns ★ into the ★ itself: a RegExp
-  // literal reaches MongoDB as its source text, and the server's PCRE2
-  // rejects the \u escape ("Regular expression is invalid") — the whole run
-  // failed on every boot (release audit 2026-10-13, caught on prod data).
+  // The ★ is written as itself, in a string: a RegExp literal reaches MongoDB
+  // as its source text, and the server's PCRE2 rejects a \u escape in it
+  // ("Regular expression is invalid"), which fails the whole run on every
+  // boot.
   const wines = await WineDefinition.find({ name: { $regex: '[*★]' } })
-    .select('name producer appellation normalizedKey canonicalKey')
+    .select('name producer appellation normalizedKey canonicalKey labelSweetness')
     .lean();
+  // The label sweetness term's word per wine, from the table's in-memory copy
+  // (one load): every key below carries it, as the save hook would.
+  const terms = await loadTerms();
+  const sweetnessOf = (w) => (w.labelSweetness ? (terms.byId.get(String(w.labelSweetness))?.name || null) : null);
 
   const report = { found: wines.length, rekeyed: [], canonical: [], skipped: [], failed: [] };
   const claimed = new Set();
   for (const w of wines) {
     const label = `${w.producer} — ${w.name} [${w._id}]`;
+    const sweetness = sweetnessOf(w);
     try {
       const set = {};
-      const newKey = keyFor(w, normalizeWineName);
+      const newKey = keyFor(w, normalizeWineName, sweetness);
       if (w.normalizedKey !== newKey) {
-        if (w.normalizedKey !== keyFor(w, normalizeString)) {
+        if (w.normalizedKey !== keyFor(w, normalizeString, sweetness)) {
           report.skipped.push(`${label}: stored key "${w.normalizedKey}" is not the star-stripped form of its fields — left for a curator`);
         } else if (claimed.has(newKey) || await WineDefinition.exists({ normalizedKey: newKey, _id: { $ne: w._id } })) {
           report.skipped.push(`${label}: new key "${newKey}" is already taken`);
@@ -66,7 +75,7 @@ async function run({ apply }) {
           report.rekeyed.push(`${label}: "${w.normalizedKey}" → "${newKey}"`);
         }
       }
-      const canonicalKey = computeCanonicalKey(w.name, w.producer, w.appellation);
+      const canonicalKey = computeCanonicalKey(w.name, w.producer, w.appellation, { sweetness });
       if (w.canonicalKey !== canonicalKey) {
         set.canonicalKey = canonicalKey;
         report.canonical.push(label);

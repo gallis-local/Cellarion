@@ -40,7 +40,7 @@ function SupportPage() {
       if (ticketRes.ok) setTickets(ticketData.tickets || []);
       if (reportRes.ok) setWineReports(reportData.reports || []);
       // A non-ok response set no data AND no error, so a 500 looked like the
-      // normal "you have no tickets" empty state (grand-audit M20).
+      // normal "you have no tickets" empty state.
       if (!ticketRes.ok && !reportRes.ok) setError(t('support.failedLoad'));
     } catch {
       setError(t('support.failedLoad'));
@@ -98,11 +98,13 @@ function SupportPage() {
 
   return (
     <div className="support-page">
-      <div className="support-header">
+      <div className="page-header">
         <h1>{t('support.title')}</h1>
-        <button className="btn btn-primary" onClick={() => setShowModal(true)}>
-          {t('support.newTicket')}
-        </button>
+        <div className="header-actions">
+          <button className="btn btn-primary" onClick={() => setShowModal(true)}>
+            {t('support.newTicket')}
+          </button>
+        </div>
       </div>
       {/* Most questions already have an answer in Help: point there first,
           in one quiet line that does not stand in the way of a ticket. */}

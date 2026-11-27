@@ -1,5 +1,5 @@
 /**
- * Import flow registry-write boundary (security audit 2026-08-03 H-1).
+ * Import flow registry-write boundary.
  *
  * WHY THIS TEST EXISTS:
  * POST /validate is a PREVIEW — the user may cancel, re-run, or remap columns
@@ -34,7 +34,6 @@ jest.mock('../services/search', () => ({
   getIsAvailable: () => false,
   search: async () => ({ ids: [] }),
   indexWine: () => {},
-  bulkIndexBottles: jest.fn(),
 }));
 jest.mock('../services/labelScan', () => ({ identifyWineFromText: jest.fn() }));
 jest.mock('../services/findOrCreateWine', () => ({ findOrCreateWine: jest.fn() }));

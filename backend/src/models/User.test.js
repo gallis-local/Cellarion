@@ -40,6 +40,37 @@ describe('toJSON', () => {
     });
     expect(withSub.toJSON().hasStripeSubscription).toBe(true);
   });
+
+  it('keeps firstPaidAt (admin-stats bookkeeping) out of what the client receives', () => {
+    const user = new User({ username: 'e', email: 'e@cellarion.app', password: 'x', firstPaidAt: new Date('2025-02-01T09:00:00Z') });
+    expect(user.firstPaidAt).toEqual(new Date('2025-02-01T09:00:00Z'));
+    expect(user.toJSON().firstPaidAt).toBeUndefined();
+  });
+
+  it('firstPaidAt defaults to null (the account never paid)', () => {
+    expect(new User({ username: 'f', email: 'f@cellarion.app', password: 'x' }).firstPaidAt).toBeNull();
+  });
+
+  it('keeps lastActiveAt (retention bookkeeping) out of what the client receives', () => {
+    const user = new User({ username: 'c', email: 'c@cellarion.app', password: 'x', lastActiveAt: new Date('2026-10-31T00:00:00Z') });
+    expect(user.lastActiveAt).toEqual(new Date('2026-10-31T00:00:00Z'));
+    expect(user.toJSON().lastActiveAt).toBeUndefined();
+  });
+
+  it('lastActiveAt defaults to null (not seen since the field existed)', () => {
+    expect(new User({ username: 'd', email: 'd@cellarion.app', password: 'x' }).lastActiveAt).toBeNull();
+  });
+
+  it('keeps the inactive-account timeline out of what the client receives, and stores unusedSince', () => {
+    const unusedSince = new Date('2026-11-01T00:00:00Z');
+    const user = new User({
+      username: 'e', email: 'e@cellarion.app', password: 'x',
+      inactivityNotice: { firstSentAt: new Date('2028-10-01T09:13:00Z'), deleteAfter: new Date('2028-11-01T00:00:00Z'), unusedSince },
+    });
+    expect(user.inactivityNotice.unusedSince).toEqual(unusedSince);
+    expect(user.toJSON().inactivityNotice).toBeUndefined();
+    expect(new User({ username: 'f', email: 'f@cellarion.app', password: 'x' }).inactivityNotice).toBeUndefined();
+  });
 });
 
 describe('BCRYPT_COST (L-1)', () => {

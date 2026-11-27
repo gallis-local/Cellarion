@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const crypto = require('crypto');
 const fs = require('fs');
 const multer = require('multer');
-// Audit 2026-09 S2-3: the write routes are demo-blocked like their MCP twins —
+// The write routes are demo-blocked like their MCP twins —
 // an anonymous demo session must not publish a public, branded wine list or
 // consume disk with logos and duplicates. Reads stay open for the demo tour.
 const { requireAuth, requireNonDemo } = require('../middleware/auth');
@@ -25,8 +25,7 @@ const router = express.Router();
 // other, with no gate at write time. What may RENDER is decided in one place,
 // services/wineListData.ownerWineFilter — the owner's own pending rows do,
 // a stranger's hidden row never does, so an id that is not the owner's to
-// show simply never resolves, exactly like a deleted wine (support ticket
-// 2026-10-09: an owner could not save a list of their own cellar).
+// show simply never resolves, exactly like a deleted wine.
 
 // --- Logo upload setup ---
 ensureLogoDir();
@@ -217,7 +216,7 @@ router.put('/:id', requireAuth, requireNonDemo, async (req, res) => {
 });
 
 // POST /api/wine-lists/:id/add-bottles — put the wines of MANY bottles on a
-// list in one step (the cellar view's select mode, support ticket 6a9949e3).
+// list in one step (the cellar view's select mode).
 // Entries are wine + vintage + size, so a case of twelve becomes ONE line, and
 // a wine already on the list is reported as skipped, never duplicated. Same
 // rules as the MCP add_to_list tool: writes go to the ACTIVE container only, a

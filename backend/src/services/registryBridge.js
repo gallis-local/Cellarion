@@ -18,11 +18,14 @@
  * to statuses, so a hosted-side outage degrades to local-only.
  */
 const WineDefinition = require('../models/WineDefinition');
+const { assignClassification } = require('./classificationOps');
 const WineVintageProfile = require('../models/WineVintageProfile');
 const RegistryDataKey = require('../models/RegistryDataKey');
 const RegistryDataValue = require('../models/RegistryDataValue');
 const client = require('./registryBridgeClient');
-const { generateWineKey } = require('../utils/normalize');
+const { generateWineKey, appendSweetnessTerm } = require('../utils/normalize');
+const { resolveTerm, scaleForType, SCALES } = require('./sweetnessOps');
+const { assignSweetnessStyle } = require('./sweetnessWrite');
 const { TYPES: VALUE_TYPES } = require('../utils/personalDataTypes');
 // Loaded on first use, not at require time: the intake routes that forward
 // contributions require this module, and findOrCreateWine / search pull in
@@ -34,7 +37,7 @@ const searchService = () => require('./search');
 const POPULATE = ['country', 'region', 'grapes'];
 const WINE_TYPES = ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'];
 const { WINE_COLOURS, stateColour } = require('../utils/wineColour');
-const PROFILE_FIELDS = ['body', 'tannin', 'acidity', 'sweetness', 'flavors', 'foodPairings', 'description', 'source', 'generatedAt', 'verifiedAt'];
+const PROFILE_FIELDS = ['body', 'tannin', 'acidity', 'sweetness', 'flavors', 'foodPairings', 'description', 'servingTempMin', 'servingTempMax', 'needsAir', 'source', 'generatedAt', 'verifiedAt'];
 const REGISTRY_NOTE = 'From the shared registry (cellarion.app)';
 const isId = (v) => /^[a-f0-9]{24}$/i.test(String(v || ''));
 
@@ -51,9 +54,9 @@ function refreshEnvMode() {
   if (!raw) return null;
   if (['off', 'false', '0', 'no', 'never', 'none'].includes(raw)) return 'off';
   if (raw === 'weekly' || raw === 'on' || raw === 'true' || raw === '1') return 'weekly';
-  // Anything else is a typo, and treating it as "weekly" ALSO locked the admin
-  // toggle with env_override — refresh on, no way to turn it off (audit
-  // 2026-09-08). Warn and fall through to the Settings switch instead.
+  // Anything else is a typo. Treating it as "weekly" would also lock the admin
+  // toggle with env_override (refresh on, no way to turn it off), so warn and
+  // fall through to the Settings switch instead.
   console.warn(`[bridge] REGISTRY_BRIDGE_REFRESH="${raw}" is not "weekly" or "off" — ignoring it; the Settings switch decides.`);
   return null;
 }
@@ -61,7 +64,7 @@ function refreshEnvMode() {
 /**
  * The install's own bridge state: the change-check watermark and the last run.
  * Persisted so a restart — which is the last step of connecting — does not
- * erase the only record of what the refresh did (audit 2026-09-08).
+ * erase the only record of what the refresh did.
  */
 async function bridgeState() {
   try {
@@ -123,11 +126,11 @@ async function setRefreshMode(mode, userId) {
 // an adoption or a refresh. A seeded placeholder (no dates, no note) is not an
 // edit, so the registry still fills it.
 //
-// The comparison is symmetric on purpose (audit 2026-09-08). The first version
-// asked "was this row touched AFTER the last sync", and the wine's sync stamp
-// advanced on every refresh including runs that skipped the row — so an edit
-// survived exactly one refresh and the next one silently reverted it. Matching
-// stamps cannot drift: only the bridge writes them together.
+// The comparison is symmetric on purpose. "Was this row touched AFTER the last
+// sync" is not enough for these rows: the wine's sync stamp advances on every
+// refresh, including runs that skip the row, so an edit would survive one
+// refresh and the next would silently revert it. Matching stamps cannot drift:
+// only the bridge writes them together.
 const EDIT_SLACK_MS = 5000;
 const WINDOW_FIELDS = ['earlyFrom', 'earlyUntil', 'peakFrom', 'peakUntil', 'lateFrom', 'lateUntil'];
 
@@ -185,13 +188,94 @@ async function resolveTaxonomy(w, userId) {
   if (country && w.appellation) region = await regionForAppellation(w.appellation, country._id);
   if (!region && country && w.region) region = await findOrCreateRegion(w.region, country._id, userId);
   const grapes = Array.isArray(w.grapes) && w.grapes.length ? await findOrCreateGrapes(w.grapes, userId) : [];
-  return { country, region, grapes };
+  return { country, region, grapes, sweetness: await resolveRegistrySweetness(w) };
 }
+
+/**
+ * The registry's label sweetness (protocol v2), resolved against THIS
+ * install's term table by WORD and scale — never by id, ids differ per server.
+ * Only when the registry SAYS something (the key is present): an older
+ * registry sends none, and that must not clear a term held here. `row` is the
+ * local term; `word` without a row is a term this table lacks.
+ */
+async function resolveRegistrySweetness(w) {
+  if (!w || !Object.prototype.hasOwnProperty.call(w, 'labelSweetness')) return null;
+  const sent = w.labelSweetness;
+  const word = sent && typeof sent === 'object' ? (typeof sent.name === 'string' ? sent.name.trim() : null)
+    : (typeof sent === 'string' ? sent.trim() : null);
+  if (!word) return { stated: true, word: null, row: null };
+  const scale = sent && typeof sent === 'object' && SCALES.includes(sent.scale) ? sent.scale : scaleForType(w.type);
+  const row = await resolveTerm(word, { scale });
+  return { stated: true, word, row };
+}
+
+/**
+ * The term fields for a copy, from resolveRegistrySweetness. A word this
+ * server's table lacks is never minted from the wire (terms are curated): it
+ * stays where every reader still finds it — in the name, as the label reads —
+ * and the row is marked for a curator (sweetnessReview unknown_term).
+ */
+function sweetnessFields(w, s) {
+  if (!s || !s.stated) return {};
+  if (!s.word) return { labelSweetness: null };
+  if (s.row) return { labelSweetness: s.row._id };
+  return {
+    labelSweetness: null,
+    name: appendSweetnessTerm(w.name, s.word),
+    sweetnessReview: { reason: 'unknown_term', detail: `The registry states "${s.word}", a sweetness term this server's table does not have`, since: new Date() },
+  };
+}
+
+/**
+ * The registry's sweetness style (protocol v2) onto a copy, through the write
+ * rule (services/sweetnessWrite assignSweetnessStyle, lenient). Only when the
+ * registry SAYS something — the key present, the colour rule — so an older
+ * registry never clears a style held here. The term is matched by WORD on this
+ * table (a 24-hex "word" is an id from another server and is ignored) and
+ * never minted from the wire; a style the copy holds yields only to a stronger
+ * source. A null clears it only where `mayClear` (a new copy; on a refresh,
+ * a copy whose last change was the previous sync). Kept out of identityFields:
+ * the style is not identity. Never fails the adoption or the refresh: the rule
+ * and the model check the source and the link alike, and anything the rule
+ * throws leaves the style as it was. Returns the rule's verdict, or null.
+ */
+async function applyRegistryStyle(wine, w, { mayClear }) {
+  if (!w || !Object.prototype.hasOwnProperty.call(w, 'sweetnessStyle')) return null;
+  const s = w.sweetnessStyle;
+  try {
+    if (s === null) return mayClear ? await assignSweetnessStyle(wine, { term: null }) : null;
+    if (!s || typeof s !== 'object' || typeof s.name !== 'string' || !s.name.trim() || /^[0-9a-f]{24}$/i.test(s.name.trim())) return null;
+    return await assignSweetnessStyle(wine, { term: s.name, source: s.source, url: s.sourceUrl });
+  } catch (err) {
+    console.warn('[bridge] sweetness style not applied:', err.message);
+    return null;
+  }
+}
+
+// The sweetness style is select: false on the model; a copy the style is
+// applied to is loaded with it. On a query only (a test may hand a value).
+const withStyle = (q) => (q && typeof q.select === 'function' ? q.select('+sweetnessStyle') : q);
+
+/** The word the dedup key carries for a copy: the resolved term's, else none (the name keeps an unknown word). */
+const sweetnessKeyWord = (tax) => (tax && tax.sweetness && tax.sweetness.row ? tax.sweetness.row.name : null);
 
 // A picture from the registry is a URL into the hosted site, never bytes: an
 // inline data: image, or anything else that is not an http(s) link, is left
 // out (a wine record never stores its picture inline).
 const remoteImage = (v) => (typeof v === 'string' && /^https?:\/\//i.test(v) ? v : null);
+
+/** The registry's classification for the write rule: its rows by name when it sends them, else its string. */
+function classificationInput(w) {
+  const names = Array.isArray(w.classifications)
+    ? w.classifications.map((c) => (c && typeof c === 'object' ? c.name : c)).filter((n) => typeof n === 'string' && n)
+    : [];
+  return names.length ? { classifications: names } : { classification: w.classification };
+}
+
+/** Whether classificationInput(w) names any classification at all. */
+function hasClassification(input) {
+  return !!((input.classifications && input.classifications.length) || input.classification);
+}
 
 function identityFields(w, tax) {
   return {
@@ -212,6 +296,8 @@ function identityFields(w, tax) {
     image: remoteImage(w.image),
     imageCredit: remoteImage(w.image) ? (w.imageCredit || null) : null,
     lwin: w.lwin || null,
+    // Last, so an unknown word's name-with-the-word wins over the bare name above.
+    ...sweetnessFields(w, tax.sweetness),
   };
 }
 
@@ -310,7 +396,9 @@ function indexLocally(wineId) {
 
 /**
  * Copy a registry wine into this install. Returns { ok, wine, created } or
- * { ok: false, code } with code ∈ disabled | invalid | not_found | unavailable.
+ * { ok: false, code } with code ∈ disabled | invalid | not_found | unavailable
+ * | conflict (a local row with this identity is already linked to a
+ * DIFFERENT registry wine — never re-pointed; a person merges or corrects).
  * A local wine typed before the bridge existed, with the same dedup key, is
  * LINKED rather than duplicated: blanks are filled, a locally curated
  * profile is kept.
@@ -327,11 +415,25 @@ async function adoptWine(registryId, userId) {
 
   const now = new Date();
   const tax = await resolveTaxonomy(w, userId);
-  const normalizedKey = generateWineKey(w.name, w.producer || '', w.appellation || '');
-  let wine = await WineDefinition.findOne({ normalizedKey });
+  // The identity as it will be STORED — a word this table lacks rides in the
+  // name — so the key is built from the stored name, never the bare wire name
+  // (a later plain add exact-matches at stage one, where no guard runs).
+  const fields = identityFields(w, tax);
+  const normalizedKey = generateWineKey(fields.name, w.producer || '', w.appellation || '', { sweetness: sweetnessKeyWord(tax) });
+  // The exact key first. Then — a copy made before the Bridge carried terms,
+  // or typed by hand, may hold the word IN ITS NAME with no term — the
+  // display-name key, so that row is linked, not twinned.
+  let wine = await withStyle(WineDefinition.findOne({ normalizedKey }));
+  if (!wine && tax.sweetness && tax.sweetness.word) {
+    const shown = generateWineKey(appendSweetnessTerm(w.name, tax.sweetness.word), w.producer || '', w.appellation || '');
+    if (shown !== normalizedKey) wine = await withStyle(WineDefinition.findOne({ normalizedKey: shown }));
+  }
+  // A row already linked to a DIFFERENT registry wine is never re-pointed:
+  // two registry identities on one local row is a merge question for a person.
+  if (wine && wine.registryId && String(wine.registryId) !== String(w.id)) return { ok: false, code: 'conflict' };
   // Captured before the assignment below: rows a previous adoption wrote carry
   // the OLD stamp, and comparing them against the new one would read them as
-  // local edits and freeze them (audit 2026-09-08).
+  // local edits and freeze them.
   const prevSync = wine?.registrySyncedAt || null;
   const profile = profileFrom(w.profile);
   if (wine) {
@@ -340,10 +442,14 @@ async function adoptWine(registryId, userId) {
     if (!wine.image && remoteImage(w.image)) { wine.image = remoteImage(w.image); wine.imageCredit = w.imageCredit || null; }
     const locallyCurated = wine.aiProfile && wine.aiProfile.source === 'curator' && wine.aiProfile.description;
     if (profile && !locallyCurated) wine.aiProfile = profile;
+    // Kept for good, not for one cycle: the refresh reads the mark.
+    if (locallyCurated) wine.aiProfile.heldLocally = true;
+    // A row typed here keeps its own style unless the registry's is stronger.
+    await applyRegistryStyle(wine, w, { mayClear: false });
     await wine.save();
   } else {
     wine = new WineDefinition({
-      ...identityFields(w, tax),
+      ...fields,
       normalizedKey,
       createdBy: userId,
       createdVia: 'bridge',
@@ -351,19 +457,32 @@ async function adoptWine(registryId, userId) {
       registrySyncedAt: now,
       ...(profile ? { aiProfile: profile } : {}),
     });
+    // The write rule (services/classificationOps), lenient: the registry's
+    // rows by name, else its string — a tier this install's taxonomy lacks
+    // stays as the string.
+    await assignClassification(wine, classificationInput(w));
     // The registry's colour is authoritative when it sends one — null included.
     // Without the mark, the model hook inferred rosé for a new "… Rosé" copy the
-    // registry holds as uncoloured, and the next refresh cleared it again
-    // (audit 2026-09-19). An older registry sends no key: the hook infers.
+    // registry holds as uncoloured, and the next refresh cleared it again.
+    // An older registry sends no key: the hook infers.
     if (Object.prototype.hasOwnProperty.call(w, 'colour')) stateColour(wine, wine.colour);
+    await applyRegistryStyle(wine, w, { mayClear: true });
     try {
       await wine.save();
     } catch (err) {
       if (err && err.code === 11000) {
-        // Minted concurrently under the same key: take that row instead.
-        wine = await WineDefinition.findOne({ normalizedKey });
+        // Minted concurrently under the same key: take that row instead —
+        // unless it is linked to ANOTHER registry wine, the same rule as above.
+        wine = await withStyle(WineDefinition.findOne({ normalizedKey }));
         if (!wine) throw err;
-        if (!wine.registryId) { wine.registryId = String(w.id); wine.registrySyncedAt = now; await wine.save(); }
+        if (wine.registryId && String(wine.registryId) !== String(w.id)) return { ok: false, code: 'conflict' };
+        if (!wine.registryId) {
+          wine.registryId = String(w.id); wine.registrySyncedAt = now;
+          // The row the other writer minted keeps a style of its own unless
+          // the registry's is stronger, as a linked local row does above.
+          await applyRegistryStyle(wine, w, { mayClear: false });
+          await wine.save();
+        }
       } else {
         throw err;
       }
@@ -374,6 +493,58 @@ async function adoptWine(registryId, userId) {
   indexLocally(wine._id);
   await wine.populate(POPULATE);
   return { ok: true, wine, created: !held };
+}
+
+/**
+ * Link a wine created HERE to the registry wine its contribution became
+ * (services/registryContributionOps, once the registry approved it), instead
+ * of copying that wine beside it: the row gets the registry id, then takes
+ * the registry's reviewed identity, profile, windows and values as a refresh
+ * would. Its bottles never move. What it set itself survives as on any copy:
+ * a drink window or value edited here, and a tasting profile curated here
+ * (marked heldLocally, so later refreshes keep it too), and descriptive
+ * fields the registry wine lacks (classification, LWIN, colour, region,
+ * grapes), as for any wine made here (applyRegistryUpdate).
+ * { ok: true, wine } | { ok: false, code } — duplicate (another row here
+ * already holds that registry wine: heldId; merging is a person's call),
+ * conflict (this row is linked to a different registry wine), gone (the row
+ * was deleted), not_found (the registry wine is gone), unavailable, disabled.
+ */
+async function linkContributedWine(wineId, registryId) {
+  if (!isEnabled()) return { ok: false, code: 'disabled' };
+  if (!isId(wineId) || !isId(registryId)) return { ok: false, code: 'invalid' };
+  const held = await WineDefinition.findOne({ registryId: { $eq: String(registryId) } }).select('_id').lean();
+  if (held && String(held._id) !== String(wineId)) return { ok: false, code: 'duplicate', heldId: held._id };
+  const wine = await WineDefinition.findOne({ _id: { $eq: String(wineId) } });
+  if (!wine) return { ok: false, code: 'gone' };
+  if (wine.registryId && String(wine.registryId) !== String(registryId)) return { ok: false, code: 'conflict' };
+  const finish = () => WineDefinition.updateOne({ _id: wine._id }, { $unset: { registryContribution: 1 } });
+  const w = await client.fetchWine(registryId);
+  if (!w) return { ok: false, code: 'unavailable' };
+  if (w.removed) return { ok: false, code: 'not_found' };
+  // Already a synced copy of this registry wine: an adoption by the same
+  // identity got there first, or a link of ours stamped the wine and then
+  // failed on its windows or values. Refreshed like any copy, so its rows
+  // keep the bridge's own stamps (re-linking would null the stamp and freeze
+  // them) and what was missing arrives.
+  if (wine.registryId && wine.registrySyncedAt) {
+    await applyRegistryUpdate(wine, w);
+    await finish();
+    return { ok: true, wine: await WineDefinition.findById(wine._id) };
+  }
+  const ap = wine.aiProfile;
+  if (ap && ap.source === 'curator' && ap.description) wine.aiProfile.heldLocally = true;
+  wine.registryId = String(w.id);
+  // No sync stamp: applyRegistryUpdate then reads the row as untouched and
+  // replaces the identity with the one the registry approved.
+  wine.registrySyncedAt = null;
+  await wine.save();
+  // The contribution state goes only once the link is complete: when the
+  // update below fails, the wine is still 'sent' with this registry id and
+  // no stamp, and the next sync runs the link again from here.
+  await applyRegistryUpdate(wine, w);
+  await finish();
+  return { ok: true, wine: await WineDefinition.findById(wine._id) };
 }
 
 /**
@@ -391,34 +562,69 @@ async function registrySearch(q, { limit = 10 } = {}) {
 
 /** One changed wine → the local copy, keeping local identity edits. */
 async function applyRegistryUpdate(local, w) {
-  const wine = await WineDefinition.findById(local._id);
+  const wine = await withStyle(WineDefinition.findById(local._id));
   if (!wine) return false;
   const prevSync = wine.registrySyncedAt || null;
   const untouchedLocally = !wine.registrySyncedAt || !wine.updatedAt || wine.updatedAt.getTime() <= wine.registrySyncedAt.getTime() + EDIT_SLACK_MS;
   const profile = profileFrom(w.profile);
   // A profile a person on this install curated after the last sync stays.
   const ap = wine.aiProfile;
+  // heldLocally: a profile curated here before the wine was ever linked
+  // (adoptWine, linkContributedWine), so no sync stamp can show it is local.
   const curatedHere = !!(ap && ap.source === 'curator'
-    && (touchedAfterSync(ap.verifiedAt, prevSync) || touchedAfterSync(ap.generatedAt, prevSync)));
+    && (ap.heldLocally || touchedAfterSync(ap.verifiedAt, prevSync) || touchedAfterSync(ap.generatedAt, prevSync)));
   if (untouchedLocally) {
     const tax = await resolveTaxonomy(w, wine.createdBy);
     const fields = identityFields(w, tax);
     // Never trade a picture for nothing: a wine the registry has no image for
     // must not blank one this install already shows.
     if (!fields.image && wine.image) { delete fields.image; delete fields.imageCredit; }
+    // A wine MADE here and linked to the registry (a contribution, or a
+    // local row an adoption matched) keeps what it holds and the registry
+    // wine lacks, at the link and at every refresh, until the registry has a
+    // value of its own. A pure copy (createdVia 'bridge') follows the registry
+    // as it is. The identity itself (name, producer, appellation, sweetness
+    // term) always follows the registry.
+    const keepLocalExtras = wine.createdVia !== 'bridge';
+    const keepClassification = keepLocalExtras && !hasClassification(classificationInput(w))
+      && (wine.classification || (wine.classifications && wine.classifications.length));
+    if (keepLocalExtras) {
+      // lwin is { lwin7 }: an object without the code is no code.
+      const empty = (k, v) => (k === 'lwin' ? !(v && v.lwin7) : v == null || v === '');
+      // A region belongs to its country: kept only while the country stays.
+      const countryMoves = fields.country && wine.country && String(fields.country) !== String(wine.country);
+      for (const k of ['lwin', 'region', 'colour', 'classification']) {
+        if (k === 'region' && countryMoves) continue;
+        if (empty(k, fields[k]) && !empty(k, wine[k])) delete fields[k];
+      }
+      if ((!fields.grapes || !fields.grapes.length) && wine.grapes && wine.grapes.length) delete fields.grapes;
+    }
+    // The review marker's age is when the question FIRST arose: a refresh that
+    // meets the same kind of question keeps `since` and refreshes the detail
+    // (a different unknown word is still one unresolved word).
+    const prevReview = wine.sweetnessReview;
     Object.assign(wine, fields);
+    if (fields.sweetnessReview && prevReview && prevReview.reason === fields.sweetnessReview.reason && prevReview.since) {
+      wine.sweetnessReview = { ...fields.sweetnessReview, since: prevReview.since };
+    }
     // Same as adopt: a colour the registry states is stored as stated.
     if (Object.prototype.hasOwnProperty.call(fields, 'colour')) stateColour(wine, fields.colour);
-    wine.normalizedKey = generateWineKey(w.name, w.producer || '', w.appellation || '');
+    // From the STORED name (an unknown word rides in it), as adoptWine keys.
+    wine.normalizedKey = generateWineKey(fields.name, w.producer || '', w.appellation || '', { sweetness: sweetnessKeyWord(tax) });
+    if (!keepClassification) await assignClassification(wine, classificationInput(w));
   } else if (!wine.image && remoteImage(w.image)) {
     wine.image = remoteImage(w.image); wine.imageCredit = w.imageCredit || null;
   }
+  // Descriptive, so applied on an edited copy too: the rule keeps a style
+  // held here unless the registry's source is stronger; only a copy whose
+  // last change was the previous sync follows the registry to "none".
+  await applyRegistryStyle(wine, w, { mayClear: untouchedLocally });
   if (profile && !curatedHere) wine.aiProfile = profile;
   // The stamp is taken HERE, immediately before the save, and reused for the
   // rows below. Using the run's start time meant `updatedAt` (stamped by the
   // pre-save hook at the real save moment) ran ahead of registrySyncedAt on
   // every wine past the first few seconds of a run, so the next run read the
-  // copy as locally edited and froze its identity forever (audit 2026-09-08).
+  // copy as locally edited and froze its identity forever.
   const stamp = new Date();
   wine.registrySyncedAt = stamp;
   try {
@@ -427,9 +633,11 @@ async function applyRegistryUpdate(local, w) {
     if (err && err.code === 11000) {
       // The registry's identity now collides with another local row: keep
       // the copy's old identity, take the rest.
-      const fresh = await WineDefinition.findById(local._id);
+      const fresh = await withStyle(WineDefinition.findById(local._id));
       if (!fresh) return false;
       if (profile && !curatedHere) fresh.aiProfile = profile;
+      // The style is not identity: it arrives even when the identity cannot.
+      await applyRegistryStyle(fresh, w, { mayClear: untouchedLocally });
       fresh.registrySyncedAt = stamp;
       await fresh.save();
     } else {
@@ -451,7 +659,7 @@ async function applyRegistryUpdate(local, w) {
  * per-wine sync date. Deriving it per wine meant the watermark never advanced
  * — every wine the registry had touched since the oldest adoption came back
  * changed, every week, until the daily fetch quota ran out, and the wines past
- * that point were never updated at all (audit 2026-09-08).
+ * that point were never updated at all.
  */
 async function refreshHeld({ now = new Date() } = {}) {
   if (!isEnabled()) return recordRefresh({ at: now, skipped: 'disabled' });
@@ -547,10 +755,19 @@ const REQUEST_IMAGE_EDGE = 1200;
  * when it cannot be decoded or still does not fit: the request goes without.
  */
 async function cleanRequestImage(dataUrl) {
+  return encodeRequestImage(Buffer.from(dataUrl.slice(dataUrl.indexOf(',') + 1), 'base64'));
+}
+
+/**
+ * Image bytes as they may leave the install: the same re-encode as
+ * cleanRequestImage, from a buffer. Also used for the wine picture a
+ * contribution carries (services/registryContributionOps). Null when the
+ * bytes cannot be decoded or do not fit.
+ */
+async function encodeRequestImage(input) {
   try {
     const sharp = require('sharp');
     const { MAX_PIXELS } = require('./imageSanitizer');
-    const input = Buffer.from(dataUrl.slice(dataUrl.indexOf(',') + 1), 'base64');
     const out = await sharp(input, { limitInputPixels: MAX_PIXELS })
       .rotate()
       .resize({ width: REQUEST_IMAGE_EDGE, height: REQUEST_IMAGE_EDGE, fit: 'inside', withoutEnlargement: true })
@@ -582,7 +799,7 @@ async function forwardRequest({ wineName, sourceUrl, sourceUrls, image, backImag
   // itself (syncForwardedRequests), so cellarion.app need not notify the key
   // owner as well. Only forwardAndTrackRequest may say so.
   if (follow) payload.follow = true;
-  // The extra links (#1460) only when there are any: a registry from before
+  // The extra links only when there are any: a registry from before
   // them ignores the field, and the first link rides as sourceUrl regardless.
   const links = Array.isArray(sourceUrls) ? sourceUrls.filter((u) => typeof u === 'string' && u) : [];
   if (links.length > 1) payload.sourceUrls = links;
@@ -722,6 +939,6 @@ function _reset() { lastRefresh = null; }
 
 module.exports = {
   isEnabled, adoptWine, registrySearch, refreshHeld, forwardCorrection, forwardValueFor, forwardRequest, status,
-  forwardAndTrackRequest, syncForwardedRequests,
-  refreshMode, setRefreshMode, REFRESH_MODES, profileFrom, REGISTRY_NOTE, bridgeState, _reset,
+  forwardAndTrackRequest, syncForwardedRequests, linkContributedWine, encodeRequestImage,
+  refreshMode, setRefreshMode, REGISTRY_NOTE, _reset,
 };

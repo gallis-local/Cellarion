@@ -2,10 +2,9 @@ const { normalizeString, normalizeProducerKey, foldProducerToken, tokenize } = r
 
 /**
  * Multi-character connectives / prepositions that cannot legitimately END a
- * wine name. "La Viña de" (producer "Madaras") is the launch symptom of
- * leaving one stranded: an exact-string suffix strip lopped the producer off
- * the tail of "La Viña de Madaras" and kept the linking word (support ticket
- * 2026-07-26; 10 such rows on prod).
+ * wine name. "La Viña de" (producer "Madaras") is the symptom of leaving one
+ * stranded: an exact-string suffix strip lops the producer off the tail of
+ * "La Viña de Madaras" and keeps the linking word.
  *
  * Lives HERE (not in nameChecks.js, which consumes it) so the suffix-strip
  * guard below can use it without a circular require — nameChecks requires
@@ -18,9 +17,7 @@ const { normalizeString, normalizeProducerKey, foldProducerToken, tokenize } = r
  * TAIL token it is the Romance preposition ("Barolo Dedicato a Renina"
  * truncated to "…Dedicato a"), never a name ending. Widen only from measured
  * evidence — scripts/scan-name-anomalies.js reports the hit list — and bump
- * the dangling-name-tail rule id in nameChecks.js when you do (v1→v2:
- * +by/+sans/+a, registry audit 2026-07-26 — "The Barry Bros by" and
- * "Vin Sans" were still mintable).
+ * the dangling-name-tail rule id in nameChecks.js when you do.
  */
 const DANGLING_TAIL_WORDS = new Set([
   'de', 'del', 'della', 'delle', 'dei', 'degli', 'di', 'du', 'des',
@@ -47,18 +44,16 @@ const TAIL_ARTICLES = new Set([
 // 'die' is deliberately NOT in that set. As a tail token after a connective it
 // is essentially never the German article — German takes the dative there
 // ("von der", "an der"), never "von die" — while "de Die" is the French town
-// in the Drôme that names a real appellation. Measured against prod
-// 2026-07-28: including it flagged exactly one row, Jaillance "Tradition
-// Clairette de Die", and that row is correct.
+// in the Drôme that names a real appellation: including it would flag a
+// correct "… Clairette de Die".
 
 /**
  * Does this candidate name end in a grammatically stranded connective?
  *
  * The ONE definition, shared by the create-time suffix-strip guard below and
- * the dangling-name-tail scan in nameChecks.js. They were separately written
- * last-token-only checks and so missed the same two-token shape (code audit
- * 2026-07-27, H2); keeping one implementation means the safety net cannot
- * again disagree with the guard it is meant to back up.
+ * the dangling-name-tail scan in nameChecks.js. Two separately written checks
+ * would share a blind spot; keeping one implementation means the safety net
+ * cannot disagree with the guard it is meant to back up.
  *
  * @param {string} candidate - a proposed wine name
  * @returns {boolean} true when the tail is stranded and the strip must be refused
@@ -129,8 +124,8 @@ function stripProducerSuffix(name, producer) {
   const remainder = rest.replace(/[\s\-–—]+$/, '').trim();
   if (remainder.length === 0) return null;
   // Never leave a stranded connective at the tail: "La Viña de Madaras" with
-  // producer "Madaras" must NOT strip to "La Viña de" — exactly how prod's 10
-  // dangling-name rows were minted (support ticket 2026-07-26). When the
+  // producer "Madaras" must NOT strip to "La Viña de" — that is how a
+  // dangling-name row gets minted. When the
   // producer token is grammatically part of the name, the full phrase IS the
   // name (same family as "Les Forts de Latour"); keeping it beats writing a
   // broken one. canonicalizeWineName loops this function on every registry
@@ -153,8 +148,8 @@ function stripProducerName(name, producer) {
  * Variant-tolerant twin of stripProducerPrefix: strips the producer's
  * COMPARISON-KEY tokens off the FRONT of a name, so the exact-string blind
  * spot — name "Felton Road Block 3 Pinot Noir" with producer "Felton Road
- * Wines Ltd" — still canonicalizes (registry duplicate analysis 2026-07-22:
- * every observed variant embed was a prefix).
+ * Wines Ltd" — still canonicalizes (the variant embeds the registry shows are
+ * prefixes).
  *
  * Rules, in order:
  *   - Leading words that normalize away entirely (house/stop words: "Fattoria",

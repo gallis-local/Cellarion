@@ -1,5 +1,5 @@
-// Public key vocabulary + values over MCP (#985 Slice B). All semantics live
-// in services/registryDataOps.js, shared with routes/registryData.js and
+// Public key vocabulary + values over MCP. All semantics live in
+// services/registryDataOps.js, shared with routes/registryData.js and
 // routes/admin/registryData.js. Users propose keys and suggest values;
 // admins decide — nothing auto-applies to the registry.
 const { z } = require('zod');
@@ -9,7 +9,7 @@ const { ok, fail, objectId } = require('../toolUtil');
 const { TYPES } = require('../../utils/personalDataTypes');
 // A suggestion or key proposal cannot be withdrawn, so a retry after an
 // ambiguous transport failure must be safe: idempotency_key claims/replays
-// through the ledger (support ticket 2026-09-12).
+// through the ledger.
 const { logAction, replay } = require('../actionLedger');
 // The replayable body stored on the ledger row: what ok() serialises.
 const envelopeOf = (summary, data) => ({ summary, data });
@@ -25,6 +25,7 @@ const FAIL_CODE = {
   banned: 'forbidden_scope',
   not_found: 'not_found',
   conflict: 'conflict',
+  in_use: 'conflict',
 };
 const svcFail = (r) => fail(FAIL_CODE[r.code] || 'invalid_input', r.message);
 
@@ -59,9 +60,9 @@ registerTool({
       wine_value: f.wineValue,
       overrides: f.overrides,
       // Who supplied a value is not something a reader is told (services/
-      // registryDataOps no longer even loads it). The FIELD stays, always null:
-      // docs/mcp-versioning.md forbids removing a response field in place, it
-      // was nullable from the start, and an agent wired against it keeps
+      // registryDataOps does not even load it). The FIELD stays, always null:
+      // docs/mcp-versioning.md forbids removing a response field within a
+      // major line, it is nullable, and an agent wired against it keeps
       // parsing. Drop it only with the next major line.
       contributed_by: null,
       // A pending suggestion (anyone's) holds this slot's one review slot —
@@ -112,11 +113,18 @@ registerTool({
     );
     if (!result.ok) return svcFail(result);
     const slot = result.value.vintage ? `for vintage ${result.value.vintage}` : 'for all vintages';
-    const envelope = envelopeOf(`Suggested ${result.value.key.name} = ${JSON.stringify(result.value.value)} ${slot} (admin will review)`, {
-      value_id: result.value._id,
-      vintage: result.value.vintage,
-      status: 'suggested',
-    });
+    const envelope = result.applied
+      // A server that does not review contributions published it as suggested.
+      ? envelopeOf(`Published ${result.value.key.name} = ${JSON.stringify(result.value.value)} ${slot} (this server does not review contributions)`, {
+        value_id: result.value._id,
+        vintage: result.value.vintage,
+        status: 'published',
+      })
+      : envelopeOf(`Suggested ${result.value.key.name} = ${JSON.stringify(result.value.value)} ${slot} (admin will review)`, {
+        value_id: result.value._id,
+        vintage: result.value.vintage,
+        status: 'suggested',
+      });
     await logAction(ctx, {
       tool: 'suggest_wine_public_value', action: 'suggest_value',
       detail: { wineId: String(args.wine_id), keyId: String(args.key_id), valueId: String(result.value._id), vintage: result.value.vintage || null },
@@ -154,10 +162,16 @@ registerTool({
       { via: 'mcp', req: ctx.req }
     );
     if (!result.ok) return svcFail(result);
-    const envelope = envelopeOf(`Proposed public key "${result.key.name}" (${result.key.type}) — admin will review`, {
-      key_id: result.key._id,
-      status: 'proposed',
-    });
+    const envelope = result.applied
+      // A server that does not review contributions accepted it as proposed.
+      ? envelopeOf(`Added public key "${result.key.name}" (${result.key.type}) — this server does not review contributions`, {
+        key_id: result.key._id,
+        status: 'accepted',
+      })
+      : envelopeOf(`Proposed public key "${result.key.name}" (${result.key.type}) — admin will review`, {
+        key_id: result.key._id,
+        status: 'proposed',
+      });
     await logAction(ctx, {
       tool: 'propose_registry_key', action: 'propose_key',
       detail: { keyId: String(result.key._id), name: result.key.name },
@@ -186,9 +200,9 @@ registerTool({
     'true. When a key is really a product question rather than a wine question, reject it with that as the ' +
     'reason and say so in a support ticket rather than accepting on your own.',
   scope: 'write',
-  // Sommelier + admin (Johan, 2026-08-23). Public wine data IS wine data, and
-  // the admin-only gate made the project owner the bottleneck on a queue fed
-  // by users — the same bottleneck somm-owned data exists to remove.
+  // Sommelier + admin. Public wine data IS wine data, and an admin-only gate
+  // makes the project owner the bottleneck on a queue fed by users — the same
+  // bottleneck somm-owned data exists to remove.
   //
   // Deliberately MORE permissive than the REST twin at
   // /api/admin/registry-data, which stays requireRole('admin'): that route
@@ -250,6 +264,67 @@ registerTool({
       ? (result.value.vintage ? ` for vintage ${result.value.vintage}` : ' for all vintages')
       : '';
     return ok(`Value ${result.value.status}${slot}`, { value: result.value });
+  },
+});
+
+// Changing the vocabulary itself: the same roles as deciding a key above,
+// the same service as the admin page (PATCH / DELETE
+// /api/admin/registry-data/keys/:id).
+registerTool({
+  name: 'update_registry_key',
+  title: 'Sommelier: change a public key\'s type, unit or allowed values',
+  description:
+    'Redefines a proposed or accepted key of the public vocabulary (key_id from review_registry_data or ' +
+    'get_wine_public_data): its type, its unit (integer/decimal) or its allowed values (enum, the full new list). ' +
+    'The name stays — it is the identifier. Every published or waiting value is read again under the new ' +
+    'definition: when all fit they are stored in the new form ("13,5 %" on a text field becomes 13.5 on a ' +
+    'decimal % field); when one does not, nothing changes and the error names the values to correct first. ' +
+    'Confirm the new definition with the user before calling. Not undoable through undo_last: call again with ' +
+    'the previous definition, which the reply carries.',
+  scope: 'write',
+  requireRole: ['somm', 'admin'],
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  inputSchema: {
+    key_id: objectId,
+    type: z.enum(TYPES).optional(),
+    unit: z.string().max(20).optional().describe('Integer/decimal keys; an empty string removes the unit'),
+    enum_options: z.array(z.string().max(40)).min(2).max(20).optional().describe('Enum keys: the complete new list'),
+  },
+  handler: async (args, ctx) => {
+    const result = await ops.updateKey(ctx.user.id, args.key_id, {
+      type: args.type, unit: args.unit, enumOptions: args.enum_options,
+    }, { req: ctx.req });
+    if (!result.ok) return svcFail(result);
+    const converted = result.converted ? ` — ${result.converted} value(s) stored in the new form` : '';
+    return ok(`Key "${result.key.name}" is now ${result.key.type}${result.key.unit ? ` (${result.key.unit})` : ''}${converted}`, {
+      key: result.key, previous: result.prev, converted: result.converted,
+    });
+  },
+});
+
+registerTool({
+  name: 'remove_registry_key',
+  title: 'Sommelier: take a key out of the public vocabulary',
+  description:
+    'Removes an accepted key from the public vocabulary (a proposed one is rejected with review_registry_data ' +
+    'instead). The key is kept as a removed record, so its name is free for a better-defined field. A key that ' +
+    'still holds values is refused with how many, unless remove_values=true: then its published values and ' +
+    'waiting suggestions are taken off the wine records with it (kept as history, not deleted) and waiting ' +
+    'suggesters are told. Confirm with the user before calling, and say how many values go when there are any. ' +
+    'Not undoable through undo_last.',
+  scope: 'write',
+  requireRole: ['somm', 'admin'],
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  inputSchema: {
+    key_id: objectId,
+    remove_values: z.boolean().optional().describe('Also take the key\'s published values and waiting suggestions off the wine records'),
+  },
+  handler: async (args, ctx) => {
+    const result = await ops.removeKey(ctx.user.id, args.key_id, { removeValues: args.remove_values === true, req: ctx.req });
+    if (!result.ok) return svcFail(result);
+    const { published, suggested } = result.removed;
+    const gone = published || suggested ? ` with ${published} published value(s) and ${suggested} waiting suggestion(s)` : '';
+    return ok(`Removed "${result.key.name}" from the vocabulary${gone}`, { key: result.key, removed: result.removed });
   },
 });
 

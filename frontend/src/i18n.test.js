@@ -20,7 +20,7 @@ vi.mock('virtual:locale-coverage', () => ({
   SHIPPED_CODES: ['en', 'sv'],
 }));
 
-const { default: i18n, shippedNavigatorLanguage, resolveLocaleCode, hasLanguagePreview } =
+const { default: i18n, shippedNavigatorLanguage, resolveLocaleCode, hasLanguagePreview, forgetDetectedLanguage, rememberLanguage } =
   await import('./i18n');
 
 describe('resolving a language tag to a locale directory', () => {
@@ -50,6 +50,22 @@ describe('resolving a language tag to a locale directory', () => {
     expect(resolveLocaleCode('pt-BR', ['en', 'pt_BR'])).toBe('pt_BR');
   });
 
+  test('sends Norwegian tags without a directory of their own to Bokmål', () => {
+    // Many Norwegian browsers and phones send the macrolanguage `no`, and
+    // Nynorsk readers manage Bokmål far better than English (#1798, item 1).
+    const withNb = ['en', 'nb', 'sv'];
+    expect(resolveLocaleCode('no', withNb)).toBe('nb');
+    expect(resolveLocaleCode('no-NO', withNb)).toBe('nb');
+    expect(resolveLocaleCode('nn', withNb)).toBe('nb');
+    expect(resolveLocaleCode('nn-NO', withNb)).toBe('nb');
+    expect(resolveLocaleCode('nb-NO', withNb)).toBe('nb');
+  });
+
+  test('lets a Nynorsk directory answer for nn once there is one', () => {
+    expect(resolveLocaleCode('nn', ['en', 'nb', 'nn'])).toBe('nn');
+    expect(resolveLocaleCode('nn-NO', ['en', 'nb', 'nn'])).toBe('nn');
+  });
+
   test('gives nothing for a language this build does not have', () => {
     expect(resolveLocaleCode('ja', dirs)).toBeUndefined();
     expect(resolveLocaleCode('', dirs)).toBeUndefined();
@@ -61,6 +77,11 @@ describe('automatic browser-language detection', () => {
   test('picks a finished language', () => {
     expect(shippedNavigatorLanguage(['sv-SE', 'sv'])).toBe('sv');
     expect(shippedNavigatorLanguage(['en-GB'])).toBe('en');
+  });
+
+  test('gives a `no` browser the finished Bokmål', () => {
+    expect(shippedNavigatorLanguage(['no', 'en-US'], ['en', 'nb', 'sv'])).toBe('nb');
+    expect(shippedNavigatorLanguage(['nn-NO'], ['en', 'nb', 'sv'])).toBe('nb');
   });
 
   test('never picks an unfinished one', () => {
@@ -116,6 +137,30 @@ describe('i18next wiring', () => {
 
   test('falls back to English so untranslated keys degrade rather than blank', () => {
     expect(i18n.options.fallbackLng).toContain('en');
+  });
+});
+
+describe('only a chosen language is remembered', () => {
+  const memory = (init = {}) => {
+    const m = new Map(Object.entries(init));
+    return { read: (k) => (m.has(k) ? m.get(k) : null), write: (k, v) => m.set(k, v), remove: (k) => m.delete(k), m };
+  };
+
+  test('detection stores nothing, so a browser keeps getting its own language once that language ships', () => {
+    expect(i18n.options.detection.caches).toEqual([]);
+  });
+
+  test('an English stored by an earlier visit, never chosen, is forgotten so the browser language decides again', () => {
+    const s = memory({ i18nextLng: 'en' });
+    forgetDetectedLanguage(s.read, s.remove);
+    expect(s.m.has('i18nextLng')).toBe(false);
+  });
+
+  test('a chosen language stays', () => {
+    const s = memory();
+    rememberLanguage('fr', s.write);
+    forgetDetectedLanguage(s.read, s.remove);
+    expect(s.read('i18nextLng')).toBe('fr');
   });
 });
 

@@ -76,7 +76,7 @@ export default function Recommendations() {
   };
 
   // A refused or failed delete throws, so the confirm dialog stays open and
-  // says why — it used to close as if the recommendation had gone.
+  // says why instead of closing as if the recommendation had gone.
   const handleDelete = async (id) => {
     const res = await deleteRecommendation(apiFetch, id);
     if (!res.ok) throw httpError(res, await res.json().catch(() => null));
@@ -105,7 +105,9 @@ export default function Recommendations() {
 
   return (
     <div className="recommendations-page">
-      <h1>{t('recommendations.title')}</h1>
+      <div className="page-header">
+        <h1>{t('recommendations.title')}</h1>
+      </div>
 
       <div className="rec-tabs">
         <button

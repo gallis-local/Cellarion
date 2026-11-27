@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 /**
- * McpActionLog — the write-safety ledger for MCP mutations (plan §5.3/§5.7 L4).
+ * McpActionLog — the write-safety ledger for MCP mutations.
  *
  * One row per mutating MCP tool call. Powers three things:
  *  1. Idempotency: a retrying/looping agent that resends the same
@@ -9,8 +9,8 @@ const mongoose = require('mongoose');
  *  2. undo_last: the newest un-reversed action is what "undo" undoes; `prev`
  *     snapshots whatever the reverse operation needs (e.g. the consumed-*
  *     fields so undoing a restore can re-consume identically).
- *  3. The "recent AI activity" timeline (frontend, Phase 2d) — what did my
- *     connected AI change, with one-click revert.
+ *  3. The "recent AI activity" timeline (frontend) — what did my connected
+ *     AI change, with one-click revert.
  *
  * Retention: 90 days (TTL below) — matches AuditLog's default; undo itself is
  * bounded much tighter by the bottle restore window. GDPR: registered in
@@ -28,18 +28,21 @@ const mcpActionLogSchema = new mongoose.Schema({
   action: { type: String, enum: ['pending', 'consume', 'restore', 'add', 'update', 'lot_update', 'undo_add', 'bulk_preview', 'bulk_add', 'somm_maturity', 'somm_maturity_remove', 'somm_wine_profile', 'somm_price', 'somm_price_decline', 'somm_proposal', 'somm_grape', 'cellar_create', 'rack_create', 'place', 'unplace', 'move', 'arrange_preview', 'arrange', 'tasting_note', 'attach_image', 'winelist_add', 'winelist_price', 'open', 'pour', 'close', 'personal_data',
     // A bottle on order marked as arrived (mark_arrived), and its undo.
     'arrive', 'unarrive',
-    // Irreversible writes that reach a human queue or the shared registry
-    // (support ticket 2026-09-12): recorded so an idempotency_key can replay
-    // them after an ambiguous transport failure. Never undo-eligible.
+    // Irreversible writes that reach a human queue or the shared registry:
+    // recorded so an idempotency_key can replay them after an ambiguous
+    // transport failure. Never undo-eligible.
     'support_ticket', 'support_reply', 'wine_request', 'suggest_correction', 'suggest_value', 'propose_key',
-    // An owner's answer to a curator's question (answer_curator_question,
-    // 2026-09-24): single-shot on the inquiry itself, so never undo-eligible.
+    // A drink moved to Other on the member's word (mark_not_wine): applied
+    // or filed for a curator; an admin restores a row — never undo-eligible.
+    'not_wine',
+    // An owner's answer to a curator's question (answer_curator_question):
+    // single-shot on the inquiry itself, so never undo-eligible.
     'inquiry_answer',
     // Curator queue closes (resolve_owner_inquiry, respond_to_wine_report,
-    // fix_pending_wine, review_image): notifications or a registry write are
-    // already out, so never undo-eligible.
-    'somm_owner_inquiry_resolve', 'somm_wine_report_close', 'somm_pending_fix', 'somm_image_review',
-    // Bottle corrections (2026-10-08): delete_bottle (reversible from the
+    // fix_pending_wine, merge_pending_wine, review_image): notifications or a
+    // registry write are already out, so never undo-eligible.
+    'somm_owner_inquiry_resolve', 'somm_wine_report_close', 'somm_pending_fix', 'somm_pending_merge', 'somm_image_review',
+    // Bottle corrections: delete_bottle (reversible from the
     // snapshot in prev), change_bottle_wine and set_bottle_default_image
     // (reversible); delete_bottle_image (the file is gone) and a wine change
     // on a bottle that had no wine before (nothing to go back to) are never
@@ -57,10 +60,10 @@ const mcpActionLogSchema = new mongoose.Schema({
   // idempotent retry so the caller can't tell the difference.
   result: { type: mongoose.Schema.Types.Mixed, default: null },
   // True while this row is an idempotency claim whose mutation has not yet
-  // completed (prior-audit M2: the claim is taken atomically BEFORE the write,
-  // so a concurrent same-key twin cannot double-execute). Cleared by logAction
-  // on success; deleted by releaseClaim when the tool fails; a crashed claim is
-  // reclaimable after a staleness window (and TTL-reaped regardless).
+  // completed (the claim is taken atomically BEFORE the write, so a concurrent
+  // same-key twin cannot double-execute). Cleared by logAction on success;
+  // deleted by releaseClaim when the tool fails; a crashed claim is reclaimable
+  // after a staleness window (and TTL-reaped regardless).
   pending: { type: Boolean, default: false },
   // Set once undo_last (or a manual revert) has reversed this action.
   reversed: { type: Boolean, default: false },
@@ -84,7 +87,7 @@ module.exports = mongoose.model('McpActionLog', mcpActionLogSchema);
 
 // Actions that are NOT real AI activity: the two preview stubs (shown, maybe
 // declined — changed nothing) and the transient `pending` idempotency claim
-// stub (actionLedger.js). SINGLE SOURCE (MCP-audit M1/F4) so the activity
-// timeline, the admin write count, AND the GDPR export all exclude the same
-// set and can't drift — a stub must never surface as "what your AI did".
+// stub (actionLedger.js). SINGLE SOURCE so the activity timeline, the admin
+// write count, AND the GDPR export all exclude the same set and can't drift —
+// a stub must never surface as "what your AI did".
 module.exports.NON_ACTIVITY_ACTIONS = ['bulk_preview', 'arrange_preview', 'pending'];

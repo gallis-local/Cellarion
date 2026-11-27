@@ -1,5 +1,5 @@
 /**
- * personalData service (#986) — the shared engine both the REST routes and
+ * personalData service — the shared engine both the REST routes and
  * the MCP tools call.
  *
  * Pins: wine-level visibility scoped to CURRENT cellar members (departed
@@ -93,8 +93,8 @@ describe('listForBottle', () => {
     expect(PersonalDataEntry.find).toHaveBeenCalledWith({
       wineDefinition: WINE,
       author: { $in: [ME, OTHER] },
-      // Vintage-scoped entries only surface on matching-vintage bottles
-      // (ticket 6a853211); a vintage-less bottle sees only unscoped entries.
+      // Vintage-scoped entries only surface on matching-vintage bottles;
+      // a vintage-less bottle sees only unscoped entries.
       $or: [{ vintage: null }, { vintage: null }],
     });
   });
@@ -228,9 +228,9 @@ describe('createEntry', () => {
 });
 
 /**
- * The add-bottle form (user ticket 6ab05cca) posts the same WINE-level field
- * once per bottle of a batch and re-posts it on a retry. Without this, a
- * six-bottle add wrote six identical ABV rows onto one wine record.
+ * The add-bottle form posts the same WINE-level field once per bottle of a
+ * batch and re-posts it on a retry. Without this, a six-bottle add would
+ * write six identical ABV rows onto one wine record.
  */
 describe('createEntry — dedupe', () => {
   const vintageBottle = { _id: BOTTLE_ID, wineDefinition: WINE, vintage: '2019' };
@@ -377,7 +377,7 @@ describe('deleteEntry', () => {
   });
 });
 
-describe('resolveKey by name (ticket 6aa6c90e: key_type only for a NEW key)', () => {
+describe('resolveKey by name (key_type only for a NEW key)', () => {
   test('an existing key is reused WITHOUT a type — the stored definition is the contract', async () => {
     PersonalDataKey.findOne.mockResolvedValue(abvKey);
     PersonalDataEntry.create.mockResolvedValue(entryDoc());
@@ -409,7 +409,7 @@ describe('resolveKey by name (ticket 6aa6c90e: key_type only for a NEW key)', ()
   });
 });
 
-describe('updateKey / deleteKey (ticket 6aa6c95e)', () => {
+describe('updateKey / deleteKey', () => {
   const keyDoc = (over = {}) => ({
     _id: KEY_ID, user: ME, name: 'Falstaff', nameKey: 'falstaff', type: 'decimal', unit: '/100',
     save: jest.fn().mockResolvedValue(undefined),
@@ -461,6 +461,51 @@ describe('updateKey / deleteKey (ticket 6aa6c95e)', () => {
     PersonalDataKey.findOne.mockResolvedValue(keyDoc({ type: 'text', unit: undefined }));
     expect(await svc.updateKey(ME, KEY_ID, { unit: 'pts' })).toMatchObject({ ok: false, code: 'invalid' });
     expect(await svc.updateKey(ME, KEY_ID, {})).toMatchObject({ ok: false, code: 'invalid' });
+  });
+
+  // A list key's allowed values can grow after its creation.
+  test('the allowed values of a list key can grow; the old list rides in prev', async () => {
+    const key = keyDoc({ type: 'enum', unit: undefined, enumOptions: ['cork', 'screwcap'] });
+    PersonalDataKey.findOne.mockResolvedValue(key);
+
+    const res = await svc.updateKey(ME, KEY_ID, { enumOptions: ['cork', 'screwcap', ' crown '] });
+
+    expect(res.ok).toBe(true);
+    expect(key.enumOptions).toEqual(['cork', 'screwcap', 'crown']);
+    expect(key.save).toHaveBeenCalled();
+    expect(res.prev).toEqual({ name: 'Falstaff', unit: null, enumOptions: ['cork', 'screwcap'] });
+    expect(res.key.enumOptions).toEqual(['cork', 'screwcap', 'crown']);
+    // Nothing left the list, so no entry's value had to be checked (the one
+    // distinct call is the viewer bump's bottle lookup).
+    expect(PersonalDataEntry.distinct).not.toHaveBeenCalledWith('value', expect.anything());
+  });
+
+  test('a value an entry still holds cannot leave the list; an unused one can', async () => {
+    const key = keyDoc({ type: 'enum', unit: undefined, enumOptions: ['cork', 'screwcap', 'crown'] });
+    PersonalDataKey.findOne.mockResolvedValue(key);
+
+    PersonalDataEntry.distinct.mockResolvedValueOnce(['crown']);
+    const refused = await svc.updateKey(ME, KEY_ID, { enumOptions: ['cork', 'screwcap'] });
+    expect(refused).toMatchObject({ ok: false, code: 'in_use' });
+    expect(refused.message).toMatch(/"crown" is still used by an entry/);
+    expect(PersonalDataEntry.distinct).toHaveBeenCalledWith('value', { key: KEY_ID, value: { $in: ['crown'] } });
+    expect(key.enumOptions).toEqual(['cork', 'screwcap', 'crown']);
+    expect(key.save).not.toHaveBeenCalled();
+
+    PersonalDataEntry.distinct.mockResolvedValueOnce([]);
+    const ok = await svc.updateKey(ME, KEY_ID, { enumOptions: ['cork', 'screwcap'] });
+    expect(ok.ok).toBe(true);
+    expect(key.enumOptions).toEqual(['cork', 'screwcap']);
+  });
+
+  test('allowed values on a non-list key, or a list outside the creation rules, are refused', async () => {
+    PersonalDataKey.findOne.mockResolvedValue(keyDoc());
+    expect(await svc.updateKey(ME, KEY_ID, { enumOptions: ['a', 'b'] })).toMatchObject({ ok: false, code: 'invalid' });
+
+    PersonalDataKey.findOne.mockResolvedValue(keyDoc({ type: 'enum', unit: undefined, enumOptions: ['a', 'b'] }));
+    expect(await svc.updateKey(ME, KEY_ID, { enumOptions: ['a'] })).toMatchObject({ ok: false, code: 'invalid' });
+    expect(await svc.updateKey(ME, KEY_ID, { enumOptions: ['a', 'x'.repeat(41)] })).toMatchObject({ ok: false, code: 'invalid' });
+    expect(await svc.updateKey(ME, KEY_ID, { enumOptions: Array.from({ length: 21 }, (_, i) => `v${i}`) })).toMatchObject({ ok: false, code: 'invalid' });
   });
 
   test('someone else\'s key is not_found, never an existence oracle', async () => {

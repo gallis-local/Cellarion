@@ -19,7 +19,7 @@ const { countWinesBy } = require('./taxonomy');
  *
  * The single file this replaces listed at most 5,000 wines (the most recently
  * updated) and 5,000 threads — with ~10.7k wines, over half of the public wine
- * pages were never offered to search engines (scaling audit 2026-09-25). The
+ * pages were never offered to search engines. The
  * parts stay on the /sitemap.xml path so they may list any URL of the site
  * (a sitemap only covers URLs under its own directory), and so no proxy change
  * is needed: nginx already forwards /sitemap.xml with its query string.
@@ -27,6 +27,7 @@ const { countWinesBy } = require('./taxonomy');
 
 const WINE_TYPES = ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'];
 const { MIN_WINES } = require('../config/taxonomyPages');
+const { FRONT_PAGE_LANGUAGES } = require('../config/languages');
 
 const SITE_URL = process.env.FRONTEND_URL || 'https://cellarion.app';
 
@@ -41,7 +42,7 @@ const URLS_PER_FILE = 40000;
 const CACHE_TTL_MS = 60 * 60 * 1000;
 const CACHE_MAX_CHARS = 16 * 1024 * 1024;
 
-// The rows the public pages serve (routes/og.js): a quarantined non-wine or a
+// The rows the public pages serve (routes/og/wine.js): a quarantined non-wine or a
 // half-identified wine — every private draft is one (draft ⇒ pendingIdentity)
 // — is a 404 there. Canaries ARE listed: their pages carry noindex, and being
 // on every path a copier walks is what they are for (models/WineDefinition).
@@ -85,6 +86,8 @@ async function buildIndex(urlsPerFile) {
 async function buildPages() {
   const staticPages = [
     { loc: '/', priority: '1.0', changefreq: 'weekly' },
+    // The front page at its own address in each front-page language (such as /fr).
+    ...FRONT_PAGE_LANGUAGES.map((lang) => ({ loc: `/${lang}`, priority: '1.0', changefreq: 'weekly' })),
     { loc: '/blog', priority: '0.8', changefreq: 'daily' },
     { loc: '/community/discussions', priority: '0.8', changefreq: 'daily' },
     { loc: '/help', priority: '0.6', changefreq: 'monthly' },
@@ -219,9 +222,9 @@ function createSitemapRouter({
   };
 
   const notFound = (res) => res.status(404).set({ 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' }).send('Not found');
-  // A part past the last file is remembered too, for the cache's lifetime:
+  // A part past the last file is remembered too, for the cache's lifetime, so
   // a crawler that keeps asking for ?part=wines-9 after the catalogue shrank
-  // used to run the filtered scan on every hit (release audit 2026-09-27, L).
+  // does not run the filtered scan on every hit.
   const NO_SUCH_PART = '<!-- no such part -->';
 
   // GET /sitemap.xml[?part=…]
@@ -257,4 +260,3 @@ function createSitemapRouter({
 
 module.exports = createSitemapRouter();
 module.exports.createSitemapRouter = createSitemapRouter;
-module.exports.URLS_PER_FILE = URLS_PER_FILE;

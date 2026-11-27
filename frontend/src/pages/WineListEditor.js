@@ -5,7 +5,9 @@ import { useAuth } from '../contexts/AuthContext';
 import { getWineList, updateWineList, publishWineList, unpublishWineList, uploadWineListLogo, getWineListStats, previewWineListPdf, getCellarWines } from '../api/wineLists';
 import { buildSections, groupingLevels, LEVEL_FIELDS } from '../utils/wineListSections';
 import WineListMenu from '../components/WineListMenu';
+import IntegerField from '../components/IntegerField';
 import './WineListEditor.css';
+import { formatVintage } from '../utils/vintage';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -27,7 +29,7 @@ const keyOf = (e) =>
 /**
  * Suggested glass price from the list's glass pricing rule.
  * MUST stay identical to the backend's canonical copy in
- * backend/src/utils/glassPrice.js (MCP-audit M4) — separate npm packages, one
+ * backend/src/utils/glassPrice.js — separate npm packages, one
  * rule. If you change the formula, change it in BOTH places.
  */
 const suggestGlassPrice = (listPrice, layout = {}) => {
@@ -62,8 +64,8 @@ function WineListEditor() {
   const [saveState, setSaveState] = useState('saved'); // saved | unsaved | saving | error
   // Why the last save failed: the server's own reason when it answered with
   // one, '' when it answered without, null when the request never got through.
-  // A refused save used to show as "check your connection" (support ticket
-  // 2026-10-09) — the reason the server gave is what the owner needs to see.
+  // A refused save must not show as "check your connection": the reason the
+  // server gave is what the owner needs to see.
   const [saveError, setSaveError] = useState(null);
   const [activeTab, setActiveTab] = useState('wines');
   const [error, setError] = useState(null);
@@ -526,7 +528,7 @@ function WineListEditor() {
   }[saveState];
 
   const renderVintageSize = (vintage, bottleSize) => {
-    const v = vintage || 'NV';
+    const v = formatVintage(vintage || 'NV', t);
     return bottleSize && bottleSize !== '750ml' ? `${v} (${bottleSize})` : v;
   };
 
@@ -1047,6 +1049,17 @@ function WineListEditor() {
           <label className="wle-checkbox">
             <input
               type="checkbox"
+              checked={layout.showStock || false}
+              onChange={e => setWineList({
+                ...wineList,
+                layout: { ...layout, showStock: e.target.checked }
+              })}
+            />
+            {t('wineLists.showStock', 'Show how many bottles there are of each wine')}
+          </label>
+          <label className="wle-checkbox">
+            <input
+              type="checkbox"
               checked={layout.newPageEachSection || false}
               onChange={e => setWineList({
                 ...wineList,
@@ -1062,15 +1075,11 @@ function WineListEditor() {
             <div className="wle-glass-calc-fields">
               <div className="form-group">
                 <label>{t('wineLists.glassesPerBottle')}</label>
-                <input
-                  type="number"
-                  min="1"
-                  max="20"
+                <IntegerField
+                  min={1}
+                  max={20}
                   value={layout.glassesPerBottle || 6}
-                  onChange={e => setWineList({
-                    ...wineList,
-                    layout: { ...layout, glassesPerBottle: parseInt(e.target.value) || 6 }
-                  })}
+                  onCommit={glassesPerBottle => setWineList({ ...wineList, layout: { ...layout, glassesPerBottle } })}
                   style={{ width: '80px' }}
                 />
               </div>

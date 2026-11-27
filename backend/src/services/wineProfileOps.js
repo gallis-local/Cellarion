@@ -1,10 +1,10 @@
 /**
  * Curator edits to a wine's tasting profile (WineDefinition.aiProfile).
  *
- * Why this exists (support ticket 2026-07-28): the AI enrichment generator
- * writes confident prose for wines it only half-knows rather than abstaining —
- * a Sandeman Vintage Port was described as "built for immediate drinking",
- * which inverts the single most important fact about the style. A sommelier
+ * Why this exists: the AI enrichment generator can write confident prose for
+ * wines it only half-knows rather than abstaining — e.g. a Vintage Port
+ * described as "built for immediate drinking", which inverts the single most
+ * important fact about the style. A sommelier
  * working the maturity queue is already researching that wine's drink window,
  * so they are the right person to correct the profile, and correcting it in
  * the same pass is the difference between the fix landing and the curator
@@ -22,6 +22,7 @@
 
 const { stripMarkdown } = require('../utils/stripMarkdown');
 const { WINE_COLOURS, stateColour } = require('../utils/wineColour');
+const { proseSignature, dropLocalizedIfProseChanged } = require('../utils/profileLanguage');
 
 // Mirrors the value sets the enrichment prompt is told to emit
 // (config/aiConfig.js) — an editable field must not accept a value the
@@ -32,7 +33,18 @@ const PROFILE_ENUMS = {
   tannin:    ['low', 'medium', 'high'],
   acidity:   ['low', 'medium', 'high'],
   sweetness: ['dry', 'off-dry', 'sweet'],
+  // Whether the wine needs air when young; the page turns it into decanting
+  // advice against the vintage's phase today (utils/servingUtils).
+  needsAir:  ['long', 'short', 'none'],
 };
+
+// The serving temperature, °C, as a pair: both or neither, min ≤ max. Stored
+// on the profile as a trait; null means the style's default applies.
+const SERVING_FIELDS = ['servingTempMin', 'servingTempMax'];
+// The serving trait as a whole: the range and the air need. A fact about how
+// the wine is served, not a verdict on the tasting prose (see applyProfilePatch).
+const SERVING_TRAIT_FIELDS = [...SERVING_FIELDS, 'needsAir'];
+const { SERVING_TEMP_MIN_C, SERVING_TEMP_MAX_C } = require('../utils/servingUtils');
 
 const LIST_FIELDS = {
   flavors:      { max: 10, maxLen: 40 },
@@ -49,12 +61,12 @@ const EDITABLE_FIELDS = [
   ...Object.keys(PROFILE_ENUMS),
   ...Object.keys(LIST_FIELDS),
   'description',
+  ...SERVING_FIELDS,
 ];
 
-// Structural RECORD fields a curator may also correct (support ticket
-// d4a1aef5: a vin jaune arrived typed "fortified" — a serving/storage hazard
-// — and the only field the curator could reach was the prose, which was
-// already right). Both are closed vocabularies and neither is a merge/join
+// Structural RECORD fields a curator may also correct (a vin jaune typed
+// "fortified" is a serving/storage hazard, and the prose alone cannot fix
+// it). Both are closed vocabularies and neither is a merge/join
 // key, which is exactly why they are safe here while producer/name/region/
 // appellation are not. They live on the wine document itself, NOT inside
 // aiProfile, and touching them alone does not claim the tasting profile was
@@ -93,7 +105,7 @@ function normalizeList(raw, { max, maxLen }) {
  * Validate a patch and return the cleaned values.
  *
  * Absent key = leave the field alone. Explicit null = clear it. That
- * distinction is the point: the ticket asks for FIELD-LEVEL abstention, so a
+ * distinction is the point: abstention is FIELD-LEVEL, so a
  * curator must be able to null the prose they don't trust while keeping the
  * structured descriptors that are correct (and that, unlike the prose, feed
  * the embedding text).
@@ -170,6 +182,14 @@ function validateProfilePatch(patch) {
       continue;
     }
 
+    if (SERVING_FIELDS.includes(field)) {
+      if (!Number.isInteger(value) || value < SERVING_TEMP_MIN_C || value > SERVING_TEMP_MAX_C) {
+        return { ok: false, error: `${field} must be a whole number of °C between ${SERVING_TEMP_MIN_C} and ${SERVING_TEMP_MAX_C} (or null to clear)` };
+      }
+      clean[field] = value;
+      continue;
+    }
+
     // description
     if (typeof value !== 'string') {
       return { ok: false, error: 'description must be a string (or null)' };
@@ -182,6 +202,19 @@ function validateProfilePatch(patch) {
       return { ok: false, error: `description must be ${DESCRIPTION_MAX} characters or fewer` };
     }
     clean[field] = text || null;
+  }
+
+  // The serving temperature is a range: both ends travel together, and a
+  // half-range would read as the style's default anyway (utils/servingUtils).
+  const [lo, hi] = SERVING_FIELDS;
+  if ((lo in clean) !== (hi in clean)) {
+    return { ok: false, error: `${lo} and ${hi} go together — set both, or clear both with null` };
+  }
+  if (lo in clean && (clean[lo] === null) !== (clean[hi] === null)) {
+    return { ok: false, error: `${lo} and ${hi} go together — set both, or clear both with null` };
+  }
+  if (lo in clean && clean[lo] !== null && clean[lo] > clean[hi]) {
+    return { ok: false, error: `${lo} must not be above ${hi}` };
   }
 
   return { ok: true, clean };
@@ -200,8 +233,8 @@ function validateProfilePatch(patch) {
  *          `names` echoes the CANONICAL display names, for response payloads.
  *          `substitutions` lists every input stored under a DIFFERENT name
  *          (synonym or static-map hop, e.g. "Tinta Roriz" → Tempranillo) —
- *          the write path must SAY when it overrides what the curator typed
- *          (somm ticket 2026-08-11), so callers surface these in responses.
+ *          the write path must SAY when it overrides what the curator typed,
+ *          so callers surface these in responses.
  *          Case/diacritic-only differences are not substitutions.
  */
 async function resolveGrapeIdsStrict(names) {
@@ -220,7 +253,7 @@ async function resolveGrapeIdsStrict(names) {
     // A name that normalizes to nothing (non-Latin scripts — normalizeString
     // strips non-ASCII word chars — or a bare percentage) is UNRESOLVABLE, not
     // ignorable: silently dropping it turned a set into a partial write, and an
-    // all-such list into an accidental CLEAR of wine.grapes (audit 2026-08-10).
+    // all-such list into an accidental CLEAR of wine.grapes.
     if (!normalizedName) { unmatched.push(raw); continue; }
     if (seen.has(normalizedName)) continue;
     seen.add(normalizedName);
@@ -284,9 +317,9 @@ function snapshotProfile(wine) {
  *   - A write that ONLY CLEARS profile values is a reset signal — "this is
  *     wrong", not "this is verified". On an AI-sourced profile it clears the
  *     fields and touches NO provenance, so the wine stays eligible for
- *     re-enrichment (support ticket d49ca3af: clearing used to curator-freeze
- *     the wine, locking exactly the worst-sourced rows out of the enrichment
- *     that would have fixed them). On an already-curator profile a clear is
+ *     re-enrichment (curator-freezing on a clear would lock exactly the
+ *     worst-sourced rows out of the enrichment that would fix them). On an
+ *     already-curator profile a clear is
  *     someone editing their own curated data and stays curator.
  *   - Record fields (type/grapes) live outside aiProfile and never claim the
  *     tasting profile was verified.
@@ -294,18 +327,27 @@ function snapshotProfile(wine) {
 function applyProfilePatch(wine, clean, userId, { now = new Date() } = {}) {
   if (!wine.aiProfile) wine.aiProfile = {};
   const profileEntries = Object.entries(clean).filter(([f]) => EDITABLE_FIELDS.includes(f));
+  const proseBefore = proseSignature(wine.aiProfile);
   for (const [field, value] of profileEntries) {
     wine.aiProfile[field] = value;
   }
+  // A curator write keeps generatedAt, so a translated copy of the old prose
+  // would still look fresh: it goes when the prose changed.
+  dropLocalizedIfProseChanged(wine.aiProfile, proseBefore);
   if (clean.type !== undefined) wine.type = clean.type;
   // stateColour, not a bare assignment: an explicit "none" sent with a retype
   // must not be re-inferred from the name by the model hook.
   if (clean.colour !== undefined) stateColour(wine, clean.colour);
   if (clean.grapes !== undefined) wine.grapes = clean.grapes;
 
+  // The serving trait says how the wine is served, not whether the tasting
+  // prose is right: written on its own it must not stamp the profile
+  // curator-verified, end a hold or freeze regeneration. Only the descriptors
+  // below carry that meaning.
+  const descriptorEntries = profileEntries.filter(([f]) => !SERVING_TRAIT_FIELDS.includes(f));
   const isClear = (v) => v === null || (Array.isArray(v) && v.length === 0);
-  const pureClear = profileEntries.length > 0 && profileEntries.every(([, v]) => isClear(v));
-  if (profileEntries.length > 0) {
+  const pureClear = descriptorEntries.length > 0 && descriptorEntries.every(([, v]) => isClear(v));
+  if (descriptorEntries.length > 0) {
     if (!pureClear || wine.aiProfile.source === 'curator') {
       wine.aiProfile.source = 'curator';
       wine.aiProfile.verifiedBy = userId || null;
@@ -317,8 +359,8 @@ function applyProfilePatch(wine, clean, userId, { now = new Date() } = {}) {
     // signal ("this is wrong") and returns the wine to the enrichable pool —
     // where, if the model still doubts the identity, it simply holds again.
     wine.aiProfile.heldAt = null;
-    wine.markModified('aiProfile');
   }
+  if (profileEntries.length > 0) wine.markModified('aiProfile');
   return wine;
 }
 
@@ -328,9 +370,13 @@ function applyProfilePatch(wine, clean, userId, { now = new Date() } = {}) {
  *  must not null a wine's type or re-hold / un-hold a wine. */
 function restoreProfile(wine, snap) {
   if (!wine.aiProfile) wine.aiProfile = {};
+  const proseBefore = proseSignature(wine.aiProfile);
   for (const f of EDITABLE_FIELDS) {
     wine.aiProfile[f] = Array.isArray(snap[f]) ? [...snap[f]] : (snap[f] ?? null);
   }
+  // Same rule as applyProfilePatch: restored prose is not the prose a stored
+  // translation was made from.
+  dropLocalizedIfProseChanged(wine.aiProfile, proseBefore);
   wine.aiProfile.source = snap.source || 'ai';
   wine.aiProfile.verifiedBy = snap.verifiedBy || null;
   wine.aiProfile.verifiedAt = snap.verifiedAt || null;
@@ -351,6 +397,7 @@ function restoreProfile(wine, snap) {
 module.exports = {
   PROFILE_ENUMS,
   LIST_FIELDS,
+  SERVING_FIELDS,
   EDITABLE_FIELDS,
   RECORD_FIELDS,
   WINE_TYPES,

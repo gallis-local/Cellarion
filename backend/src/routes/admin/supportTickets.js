@@ -11,20 +11,22 @@ const { parsePagination } = require('../../utils/pagination');
 const { isValidId } = require('../../utils/validation');
 // A row written straight to the model bypasses services/notifications, which
 // is what moves the recipient's notifications version for the cached token
-// polls (release audit 2026-10-09, L).
+// polls.
 const { bumpNotificationsVersion } = require('../../services/dataVersion');
 const { SUPPORT_CATEGORIES } = require('../../config/constants');
 const featureFlags = require('../../config/featureFlags');
 
 const TICKET_STATUSES = ['open', 'in_progress', 'closed'];
 const REPLY_EMAIL_TIMEOUT_MS = 10000;
+// models/SupportTicket: replies[].message and adminResponse are maxlength 5000.
+const REPLY_MAX_LENGTH = 5000;
 
 /**
- * Email the answer to the ticket's author too (2026-09-26): the in-app bell
- * alone never reached someone who asked and left. Only to a verified address,
+ * Email the answer to the ticket's author too: the in-app bell alone never
+ * reaches someone who asked and left. Only to a verified address,
  * and not when they turned support-reply emails off (a missing setting means
  * on) or objected to all Cellarion email (emailOptOutAt — an unsubscribe made
- * before this category existed covers it too; audit 2026-09-27 M7).
+ * before this category existed covers it too).
  * Best-effort and bounded: a mail outage must never fail or stall the reply
  * itself. Resolves to whether the email went out.
  */
@@ -101,8 +103,16 @@ router.put('/:id/respond', async (req, res) => {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
     const { adminResponse, status } = req.body;
 
-    if (!adminResponse || !adminResponse.trim()) {
+    if (typeof adminResponse !== 'string' || !adminResponse.trim()) {
       return res.status(400).json({ error: 'Response message is required' });
+    }
+    // The stored reply (replies[].message, adminResponse) holds at most 5000
+    // characters — the same cap a member's own reply has (services/accountOps
+    // replyToTicket). Checked on the text that is stored, before the save, so
+    // a long answer is a 400 the admin can act on instead of a validation 500.
+    const cleaned = stripHtml(adminResponse);
+    if (cleaned.trim().length > REPLY_MAX_LENGTH) {
+      return res.status(400).json({ error: `Response must be ${REPLY_MAX_LENGTH} characters or fewer (this one has ${cleaned.trim().length}). Split it into two replies.` });
     }
 
     const allowedStatuses = ['open', 'in_progress', 'closed'];
@@ -111,7 +121,6 @@ router.put('/:id/respond', async (req, res) => {
     const ticket = await SupportTicket.findById(req.params.id);
     if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
 
-    const cleaned = stripHtml(adminResponse);
     // adminResponse stays the LATEST response (pre-thread consumers render
     // it); the conversation itself lives in replies[] — appended here so the
     // thread view (web, admin, MCP list_my_tickets) shows every exchange.

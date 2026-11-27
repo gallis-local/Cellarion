@@ -91,10 +91,15 @@ function planFromPriceId(priceId) {
  * this max-rank guard). The Stripe subscription id is always recorded so a
  * later cancellation can be matched to it.
  *
+ * The first call for an account also stamps firstPaidAt, and no later call
+ * moves it. The admin statistics read that date to tell an account that paid
+ * from one that was only given a tier, so it is stamped even while a grant
+ * that outranks the Stripe plan holds the plan itself back.
+ *
  * @returns {object} the audit-friendly { from, to } plan transition
  */
 async function applyStripePlan(userId, plan, subscriptionId) {
-  const user = await User.findById(userId).select('plan planExpiresAt');
+  const user = await User.findById(userId).select('plan planExpiresAt firstPaidAt');
   if (!user) return null;
 
   const currentRank = PLAN_RANK[user.plan] ?? 0;
@@ -102,17 +107,18 @@ async function applyStripePlan(userId, plan, subscriptionId) {
   const planExpired = user.planExpiresAt && new Date(user.planExpiresAt) < new Date();
 
   // A Stripe-granted plan always leaves planExpiresAt null (set below); a
-  // time-limited admin / Cellar-Cred grant sets planExpiresAt in the future. So
-  // an UNEXPIRED planExpiresAt is the only thing that should hold off this
-  // webhook — and only while that grant outranks the incoming Stripe plan. When
+  // time-limited admin grant sets planExpiresAt in the future. So an UNEXPIRED
+  // planExpiresAt is the only thing that should hold off this webhook — and
+  // only while that grant outranks the incoming Stripe plan. When
   // the current plan is itself the Stripe entitlement (planExpiresAt null), the
   // webhook is authoritative for the user's own subscription and MUST honour a
-  // paid-tier DOWNGRADE (patron → supporter), not only an upgrade. The previous
-  // `newRank >= currentRank` guard silently dropped every downgrade, leaving the
-  // user on the higher tier they no longer pay for.
+  // paid-tier DOWNGRADE (patron → supporter), not only an upgrade. A
+  // `newRank >= currentRank` guard would silently drop every downgrade, leaving
+  // the user on the higher tier they no longer pay for.
   const activeGrantOutranks = !!user.planExpiresAt && !planExpired && currentRank > newRank;
 
   const update = { stripeSubscriptionId: subscriptionId };
+  if (!user.firstPaidAt) update.firstPaidAt = new Date();
   if (!activeGrantOutranks) {
     update.plan = plan;
     // Stamp the start only on a real change/re-activation, not on every routine
@@ -192,7 +198,7 @@ router.post('/checkout', requireAuth, async (req, res) => {
     // first — a subscription completed on an overwritten customer would be
     // invisible to /portal (scoped to the persisted id) and immune to the
     // customer.subscription.deleted reconcile, so the user could never cancel
-    // it (audit 2026-07-08, L-6).
+    // it.
     let customerId = user.stripeCustomerId;
     if (!customerId) {
       const customer = await s.customers.create({

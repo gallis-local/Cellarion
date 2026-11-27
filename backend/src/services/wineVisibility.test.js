@@ -116,7 +116,7 @@ describe('findVisibleWine — the drop-in replacement for findById', () => {
   });
 });
 
-// ─── Private drafts (support ticket 2026-09-12) ──────────────────────────────
+// ─── Private drafts ──────────────────────────────────────────────────────────
 
 describe('canSeeWine — a private draft is creator-only, curators included', () => {
   const draft = { draft: true, pendingIdentity: true, createdBy: ME };
@@ -171,10 +171,23 @@ describe('findVisibleWine — drafts via a shared cellar, and noDrafts', () => {
 
     expect(got).toBe(draftDoc);
     // Owner OR member: an editor's draft bottle in someone else's cellar must
-    // leave that owner able to read it (audit 2026-09-12).
+    // leave that owner able to read it.
     expect(Cellar.find).toHaveBeenCalledWith({ $or: [{ user: STRANGER }, { 'members.user': STRANGER }], deletedAt: null });
     expect(Bottle.exists).toHaveBeenCalledWith({ wineDefinition: WINE, cellar: { $in: ['c1'] } });
-    expect(WineDefinition.findOne).toHaveBeenLastCalledWith({ _id: WINE, draft: true });
+    // The re-read takes a draft or a wine waiting for a curator's check, and
+    // nothing else: a row pending for a missing producer stays hidden.
+    expect(WineDefinition.findOne).toHaveBeenLastCalledWith({ _id: WINE, $or: [{ draft: true }, { uncheckedIdentity: true }] });
+  });
+
+  test('viaSharedCellar: the same for a wine an editor imported that waits for a curator\'s check', async () => {
+    const uncheckedDoc = { _id: WINE, uncheckedIdentity: true, pendingIdentity: true, createdBy: ME };
+    WineDefinition.findOne
+      .mockReturnValueOnce(chain(null))
+      .mockReturnValueOnce(chain(uncheckedDoc));
+    Cellar.find.mockReturnValue({ distinct: jest.fn().mockResolvedValue(['c1']) });
+    Bottle.exists.mockResolvedValue({ _id: 'b1' });
+
+    expect(await findVisibleWine(WINE, { userId: STRANGER, roles: ['user'], viaSharedCellar: true })).toBe(uncheckedDoc);
   });
 
   test('viaSharedCellar: no shared cellar holds it → still not visible', async () => {

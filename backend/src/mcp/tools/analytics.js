@@ -1,4 +1,4 @@
-// Self-service analytics over MCP (#987): the same bounded query engine the
+// Self-service analytics over MCP: the same bounded query engine the
 // web table uses, exposed as a two-step pair the model can compose freely —
 // list_analytics_fields teaches the vocabulary (including THIS user's typed
 // personal keys and the public registry vocabulary), analyze_cellar runs one
@@ -84,14 +84,13 @@ registerTool({
       // "Invalid schema, missing type" on a node with no `type` keyword —
       // and HA aborts the WHOLE config entry on one tool's failure, so a
       // single untyped node takes every Cellarion tool offline in HA.
-      // Reported 2026-08-21 and reproduced against HA's own converter: the
-      // naive union with z.array(z.any()) still fails, because the empty {}
-      // simply moves down into `items`.
+      // Against HA's own converter the naive union with z.array(z.any())
+      // still fails, because the empty {} simply moves down into `items`.
       //
       // The union below is the engine's real contract, so nothing is coerced:
       // scalars for eq/gt/contains, arrays for `in` and the two-element
-      // `between`. anyOf itself is fine — HA has converted the 26 anyOf nodes
-      // in our other tools since July, and that was verified too.
+      // `between`. anyOf itself is fine — HA converts the anyOf nodes in our
+      // other tools.
       value: z.union([
         z.string(),
         z.number(),

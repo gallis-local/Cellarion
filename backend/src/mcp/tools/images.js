@@ -1,6 +1,6 @@
-// attach_bottle_image (plan §3.18) — the parity gap a real user hit: adding a
-// bottle over MCP but having no way to put its label photo on. Two input
-// modes for a caller with no file upload:
+// attach_bottle_image — parity with the web upload: a bottle added over MCP
+// needs a way to get its label photo on. Two input modes for a caller with
+// no file upload:
 //   - image_url: an https product/label image (e.g. the Systembolaget page's
 //     image). Downloaded server-side through the SSRF guard.
 //   - image_base64: raw bytes the caller already holds (a photo the user
@@ -63,12 +63,12 @@ registerTool({
     image_url: z.string().url().optional().describe('https URL of the image (retailer/CDN product image)'),
     image_base64: z.string().max(MAX_BASE64_CHARS).optional().describe('Base64 image data (no data: prefix needed); alternative to image_url'),
     credit: z.string().max(200).optional().describe('Optional attribution/source note — admin accounts only; silently ignored for regular users (matches the web app)'),
-    // A photo of the label alone, filling the frame (support ticket
-    // 2026-10-10): background removal expects a bottle and cuts a flat
-    // label's edges away, so its background is kept — the app's "Keep the
-    // background" for the same photo. Named for what the photo IS, not for
-    // what to do with it: the broad keep_background was set on whole-bottle
-    // photos, which then kept their backgrounds (#1455). A bottle-shaped
+    // A photo of the label alone, filling the frame: background removal
+    // expects a bottle and cuts a flat label's edges away, so its background
+    // is kept — the app's "Keep the background" for the same photo. Named for
+    // what the photo IS, not for what to do with it: a broad keep_background
+    // gets set on whole-bottle photos, which then keep their backgrounds.
+    // A bottle-shaped
     // picture is cut out even with the flag (see BOTTLE_SHAPED).
     label_only: z.boolean().optional().describe('true ONLY for a photo of the label alone, cropped or rectified so the label fills the frame (no bottle, table or shelf in it): it keeps its background, with no background removal (which expects a bottle and would cut the label\'s edges away). Never set it for a retailer product image or any photo with the bottle in it. A tall, narrow, bottle-shaped picture is cut out anyway, with a warning.'),
     // Kept in the schema so a caller that still sends it is not refused
@@ -98,9 +98,8 @@ registerTool({
     let bottleId = args.bottle_id;
     if (!bottleId) {
       // wine_id: the effect is per wine, so any of the user's bottles will do —
-      // the newest active one in a cellar the user can still edit (a bottle
-      // left in a cellar they were removed from must not be picked and then
-      // refused — audit 2026-09-07).
+      // the newest active one in a cellar the user can still edit (a bottle left
+      // in a cellar they were removed from must not be picked and then refused).
       const Cellar = require('../../models/Cellar');
       const editable = await Cellar.find({
         deletedAt: null,
@@ -136,17 +135,17 @@ registerTool({
     // Shared pipeline: validate + strip metadata + persist + background-remove.
     // wineDefinitionId makes the photo WINE-linked exactly like the web upload
     // (routes/images.js): it then shows on all the user's bottles of this wine
-    // and enters the registry-image review pipeline. Without it the photo was
-    // stranded on the single bottle — the "attached 5 times for 5 identical
-    // bottles" launch-day report.
+    // and enters the registry-image review pipeline. Without it the photo is
+    // stranded on the single bottle, and identical bottles each need their
+    // own copy.
     // credit is gated + sanitised INSIDE the shared pipeline (admin-only,
     // stripHtml) — same rule as the web upload route, one implementation.
     const wineDefinitionId = bottle.wineDefinition
       ? String(bottle.wineDefinition._id || bottle.wineDefinition)
       : null;
-    // What the user already had, so a duplicate is visible in the answer
-    // (support ticket 2026-09-06: "attach once per wine" could not be honoured
-    // with no way to look). Counts are a courtesy — never fatal.
+    // What the user already had, so a duplicate is visible in the answer and
+    // "attach once per wine" can be honoured. Counts are a courtesy — never
+    // fatal.
     const count = (p) => Promise.resolve(p).then((n) => (Number.isFinite(n) ? n : null)).catch(() => null);
     const photosBefore = await count(BottleImage.countDocuments({
       uploadedBy: ctx.user.id, status: { $ne: 'rejected' }, kind: { $ne: 'label-scan' },
@@ -155,7 +154,7 @@ registerTool({
     // The background is removed from every bottle photo and kept only for a
     // label-only one. The flag is the model's word for it, so a picture
     // shaped like a whole bottle (tall and narrow, as retailer product shots
-    // are) is cut out anyway: the #1455 rule holds even when a model sets
+    // are) is cut out anyway: the rule holds even when a model sets
     // label_only on the wrong photo. keep_background is ignored, and said so.
     const notes = [];
     let keepBackground = args.label_only === true;
@@ -176,7 +175,7 @@ registerTool({
     }, ctx.req);
     if (result.error) {
       // 4xx = the caller's image is bad (invalid_input); 5xx = a transient
-      // infra fault → `unavailable` (MCP-audit M3: not the agent's cadence).
+      // infra fault → `unavailable` (not the agent's cadence).
       return fail(result.error.status >= 500 ? 'unavailable' : 'invalid_input', result.error.message);
     }
     const image = result.image;
@@ -225,7 +224,7 @@ registerTool({
   },
 });
 
-// get_photo (support ticket 2026-09-07). get_bottle → photos and get_wine →
+// get_photo. get_bottle → photos and get_wine →
 // image hand out URLs, and an MCP client cannot open any of them: the uploads
 // sit behind the app, and Claude's fetch refuses URLs that arrive in tool
 // results. So the pixels travel as an MCP image content block instead, the

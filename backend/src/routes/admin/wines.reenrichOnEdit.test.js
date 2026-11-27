@@ -47,7 +47,7 @@ jest.mock('../../models/Country', () => ({ findById: jest.fn() }));
 jest.mock('../../services/vectorStore', () => ({}));
 jest.mock('../../services/imageProcessor', () => ({ unlinkImageFiles: jest.fn() }));
 jest.mock('../../services/embeddingJob', () => ({ embedSinglePair: jest.fn() }));
-jest.mock('../../services/search', () => ({ indexWine: jest.fn(), removeWine: jest.fn(), bulkIndexBottles: jest.fn() }));
+jest.mock('../../services/search', () => ({ indexWine: jest.fn(), removeWine: jest.fn() }));
 jest.mock('../../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../../services/indexNow', () => ({ submitUrls: jest.fn() }));
 jest.mock('../../services/findOrCreateWine', () => ({ findOrCreateWine: jest.fn() }));
@@ -139,6 +139,39 @@ test('a type change alone counts — the profile describes the wrong colour othe
   const res = await put({ name: 'Douro Tinto', producer: 'Fabelhaft', type: 'white' });
   expect(res.status).toBe(200);
   expect(reenrichAfterRecordEdit).toHaveBeenCalledWith(wine, true);
+});
+
+// classification joined the edit form: absent leaves
+// it alone, a value is normalised like the mint does it, and a change counts
+// as a profile input.
+describe('PUT classification', () => {
+  test('a new tier is stored and re-enriches', async () => {
+    const wine = mkWine();
+    WineDefinition.findById.mockResolvedValue(wine);
+    const res = await put({ name: 'Douro Tinto', producer: 'Fabelhaft', type: 'red', classification: 'Reserva' });
+    expect(res.status).toBe(200);
+    expect(wine.classification).toBe('Reserva');
+    expect(reenrichAfterRecordEdit).toHaveBeenCalledWith(wine, true);
+  });
+
+  test('a regulatory mark stores as no classification', async () => {
+    const wine = mkWine({ classification: 'Reserva' });
+    WineDefinition.findById.mockResolvedValue(wine);
+    const res = await put({ name: 'Douro Tinto', producer: 'Fabelhaft', type: 'red', classification: 'DOC' });
+    expect(res.status).toBe(200);
+    expect(wine.classification).toBeNull();
+  });
+
+  test('absent leaves the stored tier alone; a non-string is a 400', async () => {
+    const wine = mkWine({ classification: 'Reserva' });
+    WineDefinition.findById.mockResolvedValue(wine);
+    let res = await put({ name: 'Douro Tinto', producer: 'Fabelhaft', type: 'red' });
+    expect(res.status).toBe(200);
+    expect(wine.classification).toBe('Reserva');
+    res = await put({ name: 'Douro Tinto', producer: 'Fabelhaft', type: 'red', classification: 7 });
+    expect(res.status).toBe(400);
+    expect(wine.save).toHaveBeenCalledTimes(1);
+  });
 });
 
 // The edit runs the create route's checks (they were added to POST in

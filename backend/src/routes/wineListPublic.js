@@ -63,6 +63,9 @@ router.get('/:shareToken', async (req, res) => {
         type: w.type,
         byGlass: w.byGlass,
         lastBottle: w.lastBottle,
+        // Sent only when the owner shows counts (layout.showStock): this
+        // endpoint has no auth, so a count the list does not show is absent.
+        ...(w.bottleCount != null ? { bottleCount: w.bottleCount } : {}),
         // A list that hides its prices never sends them: this endpoint has
         // no auth, so "hidden" must mean absent from the payload.
         ...(hidePrices ? {} : { price: w.price, glassPrice: w.glassPrice }),
@@ -103,8 +106,8 @@ router.get('/:shareToken/pdf', async (req, res) => {
     if (!wineList) return res.status(404).json({ error: 'Wine list not found or not published' });
     if (!(await cellarIsActive(wineList))) return res.status(404).json({ error: 'Wine list not found or not published' });
 
-    // Defence-in-depth for the synchronous, heap-buffered render (security
-    // audit H1): the write-side pre-save cap stops any NEW list exceeding
+    // Defence-in-depth for the synchronous, heap-buffered render: the
+    // write-side pre-save cap stops any NEW list exceeding
     // MAX_ENTRIES_PER_LIST, but refuse to render a pre-existing over-cap list
     // here too rather than block the event loop / OOM the worker.
     const totalEntries = (wineList.autoGroupEntries?.length || 0) +

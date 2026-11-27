@@ -48,9 +48,9 @@ const MIN_VINTAGE_YEAR = 1900;
  * a profile so somms can attach drinking notes, Unknown does not.
  *
  * The upper bound is the CURRENT year. A later vintage cannot exist — the
- * grapes have not grown — and the old "+5 for en primeur" allowance let a
- * 2026 Italian frizzante be recorded in August 2026 with a confident AI
- * tasting note (support ticket 2026-08-20). En primeur is a purchase of a
+ * grapes have not grown — and a "+5 for en primeur" allowance would let a
+ * vintage that does not exist yet be recorded with a confident AI tasting
+ * note. En primeur is a purchase of a
  * past harvest (a 2025 Bordeaux bought in 2026), so it still passes.
  *
  * Accepts numbers, strings, and trims whitespace. Rejects anything that
@@ -121,4 +121,16 @@ function parseDrinkYear(raw, label = 'Drink year') {
   return { ok: true, value: n };
 }
 
-module.exports = { isValidId, coerceStringQuery, parseAndValidateVintage, parseDrinkYear, MIN_VINTAGE_YEAR, DRINK_YEAR_MIN, DRINK_YEAR_MAX };
+/**
+ * A rack slot position as a whole number, or null when it is not one: an
+ * integer, or a string of digits (a route parameter). Never parseInt: that
+ * reads "5abc" as 5, and a number too large to print in full ("1e+21") as 1,
+ * so a guard and the write behind it could end up looking at different slots.
+ * The rack's own range (1–max) is the caller's to check.
+ */
+function parseSlotPosition(raw) {
+  const n = typeof raw === 'number' ? raw : (typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : NaN);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+module.exports = { isValidId, coerceStringQuery, parseAndValidateVintage, parseDrinkYear, parseSlotPosition, DRINK_YEAR_MIN, DRINK_YEAR_MAX };

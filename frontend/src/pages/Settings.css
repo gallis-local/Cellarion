@@ -1,16 +1,6 @@
 .settings-page {
-  max-width: 500px;
+  max-width: var(--page-width-narrow);
   margin: 0 auto;
-}
-
-.settings-header {
-  margin-bottom: 1.5rem;
-}
-
-.settings-header h1 {
-  margin: 0;
-  font-family: var(--font-heading);
-  color: var(--color-text);
 }
 
 .settings-card {
@@ -334,6 +324,15 @@
 .api-token-meta {
   font-size: 0.85rem;
   color: var(--color-text-secondary, #777);
+}
+
+/* The routes-going-away warning on a token: the shared .alert-warning
+   colours (both themes), sized to sit inside the row. */
+.api-token-deprecated {
+  margin: 0.35rem 0 0;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
 }
 
 .api-token-plain {

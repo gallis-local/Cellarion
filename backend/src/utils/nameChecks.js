@@ -1,6 +1,6 @@
 /**
  * The registry NAME-CHECK registry: the row-shaped data-quality rules an admin
- * can clear a wine for (support ticket 2026-07-26). Every rule's verdict reads
+ * can clear a wine for. Every rule's verdict reads
  * NOTHING but `name` and `producer` — that invariant is what lets
  * WineDefinition's pre-validate hook be a complete invalidation chokepoint for
  * clearances (see the verifiedChecks field comment there).
@@ -56,7 +56,7 @@ const firstToken = (w) => normalizeString(w.name || '').split(' ')[0] || '';
  */
 const NAME_CHECKS = [
   {
-    // The pre-existing scan rule, unchanged, registered here so there is one
+    // The producer-in-name scan rule, registered here so there is one
     // implementation and one place a clearance id is declared.
     id: 'producer-in-name.v1',
     labelKey: 'producerInName',
@@ -64,16 +64,12 @@ const NAME_CHECKS = [
     detect: (w) => stripProducerName(w.name, w.producer) ?? stripProducerKeyPrefix(w.name, w.producer),
   },
   {
-    // Defect (b) from the ticket. A SAFETY NET for rows already in the
+    // A SAFETY NET for rows already in the
     // registry; preventing NEW ones is a guard in stripProducerSuffix itself.
-    // v2: DANGLING_TAIL_WORDS gained by/sans/a (registry audit 2026-07-26) —
-    // the id bump invalidates v1 clearances so every row is re-examined
-    // against the wider list (none existed at bump time).
-    // v3: delegate to producerPrefix.hasDanglingTail, which also catches a
-    // connective+article tail ("Clos de la"). This scan and the create-time
-    // guard had each written their own last-token-only test and so shared a
-    // blind spot — the net missed exactly what the guard let through (code
-    // audit 2026-07-27, H2). The id bump re-examines rows cleared under v2.
+    // Delegates to producerPrefix.hasDanglingTail, which also catches a
+    // connective+article tail ("Clos de la"): this scan and the create-time
+    // guard share that one test, so the net cannot miss what the guard lets
+    // through.
     id: 'dangling-name-tail.v3',
     labelKey: 'danglingTail',
     defaultActive: true,

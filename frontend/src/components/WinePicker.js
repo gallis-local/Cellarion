@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { identifyWineByText } from '../api/wines';
 import './WinePicker.css';
+import { formatVintage } from '../utils/vintage';
 
 /**
  * Wine search picker for journal pairings.
@@ -84,8 +85,7 @@ export default function WinePicker({ value, onChange, placeholder }) {
   // bottle or wine is gone — the entry renders producer, name and vintage
   // from the references while they exist. So it carries the producer (which
   // "Sauvignon" this was) and never the vintage: the vintage lives on the
-  // bottle reference, and a name that embedded it printed the year twice
-  // (chfish ticket 6aa6c200, 2026-09-13).
+  // bottle reference, and a name that embedded it would print the year twice.
   const fallbackName = (wine) => [wine.producer, wine.name].filter(Boolean).join(' ');
 
   const selectBottle = (bottle) => {
@@ -113,8 +113,7 @@ export default function WinePicker({ value, onChange, placeholder }) {
       const res = await identifyWineByText(apiFetch, query.trim());
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        // Previously an `if (res.ok)` with no else: a 429 or 403 flipped the
-        // button back with no feedback at all.
+        // A 429 or 403 must not just flip the button back with no feedback.
         setAiError(t('journal.aiFailed', 'Wine lookup is unavailable right now.'));
         return;
       }
@@ -190,7 +189,7 @@ export default function WinePicker({ value, onChange, placeholder }) {
                   <span className="wine-picker__option-icon">🍾</span>
                   <span className="wine-picker__option-text">
                     <strong>{b.wine.name}</strong>
-                    {b.vintage && <span className="wine-picker__vintage"> {b.vintage}</span>}
+                    {b.vintage && <span className="wine-picker__vintage"> {formatVintage(b.vintage, t)}</span>}
                     {b.wine.producer && <span className="wine-picker__producer"> · {b.wine.producer}</span>}
                   </span>
                 </button>
@@ -207,7 +206,7 @@ export default function WinePicker({ value, onChange, placeholder }) {
                   <span className="wine-picker__option-icon">🥂</span>
                   <span className="wine-picker__option-text">
                     <strong>{b.wine.name}</strong>
-                    {b.vintage && <span className="wine-picker__vintage"> {b.vintage}</span>}
+                    {b.vintage && <span className="wine-picker__vintage"> {formatVintage(b.vintage, t)}</span>}
                     {b.wine.producer && <span className="wine-picker__producer"> · {b.wine.producer}</span>}
                     {b.consumedAt && <span className="wine-picker__producer"> · {new Date(b.consumedAt).toLocaleDateString()}</span>}
                   </span>

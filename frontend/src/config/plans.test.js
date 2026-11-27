@@ -2,9 +2,11 @@ import {
   PLANS,
   PLAN_NAMES,
   PAID_PLAN_NAMES,
-  getPlanConfig,
+  planName,
+  planDescription,
 } from './plans';
 import backendPlans from '../../../backend/src/config/plans.js';
+import en from '../locales/en/translation.json';
 
 // ---------------------------------------------------------------------------
 // PLAN_NAMES
@@ -75,64 +77,70 @@ describe('backend config sync', () => {
 });
 
 // ---------------------------------------------------------------------------
-// getPlanConfig
+// PLANS
 // ---------------------------------------------------------------------------
-describe('getPlanConfig', () => {
+describe('PLANS', () => {
   it('returns correct config for free (Enthusiast) tier', () => {
-    const config = getPlanConfig('free');
+    const config = PLANS.free;
     expect(config.label).toBe('Enthusiast');
     expect(config.price).toBe(0);
   });
 
   it('returns correct config for supporter tier', () => {
-    const config = getPlanConfig('supporter');
+    const config = PLANS.supporter;
     expect(config.label).toBe('Supporter');
     expect(config.price).toBe(2);
     expect(config.annualPrice).toBe(24);
   });
 
   it('returns correct config for patron tier', () => {
-    const config = getPlanConfig('patron');
+    const config = PLANS.patron;
     expect(config.label).toBe('Patron');
     expect(config.price).toBe(5);
     expect(config.annualPrice).toBe(60);
   });
 
   it('returns correct config for benefactor tier', () => {
-    const config = getPlanConfig('benefactor');
+    const config = PLANS.benefactor;
     expect(config.label).toBe('Benefactor');
     expect(config.price).toBe(10);
     expect(config.annualPrice).toBe(120);
   });
 
-  it('falls back to free for unknown plan', () => {
-    const config = getPlanConfig('nonexistent');
-    expect(config).toEqual(PLANS.free);
-  });
-
-  it('falls back to free for undefined plan', () => {
-    const config = getPlanConfig(undefined);
-    expect(config).toEqual(PLANS.free);
-  });
-
-  it('falls back to free for null plan', () => {
-    const config = getPlanConfig(null);
-    expect(config).toEqual(PLANS.free);
-  });
-
-  it('returns an object with a featureList array', () => {
-    PLAN_NAMES.forEach(plan => {
-      const config = getPlanConfig(plan);
-      expect(Array.isArray(config.featureList)).toBe(true);
-      expect(config.featureList.length).toBeGreaterThan(0);
-    });
-  });
-
   it('returns an object with a description string', () => {
     PLAN_NAMES.forEach(plan => {
-      const config = getPlanConfig(plan);
+      const config = PLANS[plan];
       expect(typeof config.description).toBe('string');
       expect(config.description.length).toBeGreaterThan(0);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// planName / planDescription
+// ---------------------------------------------------------------------------
+describe('planName and planDescription', () => {
+  // Returns the key and the English fallback it was handed, so a test can
+  // check both what is looked up and what shows when the key is missing.
+  const t = (key, fallback) => `${key}|${fallback}`;
+
+  it('reads the badge keys, with the English label as fallback', () => {
+    for (const plan of PLAN_NAMES) {
+      expect(planName(plan, t)).toBe(`cellarCred.plan_${plan}|${PLANS[plan].label}`);
+      expect(planDescription(plan, t)).toBe(`plans.description.${plan}|${PLANS[plan].description}`);
+    }
+  });
+
+  it('treats a missing or unknown plan as free', () => {
+    expect(planName(undefined, t)).toBe(`cellarCred.plan_free|${PLANS.free.label}`);
+    expect(planName('nonexistent', t)).toBe(`cellarCred.plan_free|${PLANS.free.label}`);
+    expect(planDescription(null, t)).toBe(`plans.description.free|${PLANS.free.description}`);
+  });
+
+  it('has an English string for every plan, equal to the config', () => {
+    for (const plan of PLAN_NAMES) {
+      expect(en.cellarCred[`plan_${plan}`]).toBe(PLANS[plan].label);
+      expect(en.plans.description[plan]).toBe(PLANS[plan].description);
+    }
   });
 });

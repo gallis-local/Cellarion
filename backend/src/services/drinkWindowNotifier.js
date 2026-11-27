@@ -3,8 +3,9 @@
  *
  * Checks all users' active bottles against WineVintageProfile drink windows
  * and creates in-app (+ push) notifications when a bottle transitions to a new
- * maturity status. The email gathers them: at most one a week
- * (maybeSendDrinkWindowEmail).
+ * maturity status: one per wine, or one for all the wines of a cellar that
+ * reached the same status in the run when there are several (planNotifications).
+ * The email gathers them: at most one a week (maybeSendDrinkWindowEmail).
  *
  * First run is a "silent seed": it records each bottle's current status
  * without sending notifications, so only future transitions trigger alerts.
@@ -26,12 +27,11 @@ const { sendDrinkWindowDigest, EMAIL_VERIFICATION_ENABLED } = require('./mailgun
  *
  * The switch lives at `preferences.notifications.drinkWindow.email` — there is
  * NO top-level `notifications.email` flag (see utils/notifications.js). Reading
- * the wrong leaf previously evaluated to `undefined` for everyone and silently
- * disabled the entire digest. Extracted as a pure, testable predicate so that
- * regression is caught by a unit test rather than only in production.
+ * that one yields `undefined` for everyone and silently disables the entire
+ * digest, so this is a pure predicate a unit test pins.
  *
  * An objection to all Cellarion email (emailOptOutAt, the one-click
- * unsubscribe) wins over the per-category opt-in (audit 2026-09-27 M7).
+ * unsubscribe) wins over the per-category opt-in.
  *
  * @param {object} user  Lean user doc with preferences.notifications + emailVerified + emailOptOutAt
  * @param {boolean} emailVerificationEnabled  Whether the email channel is configured
@@ -54,9 +54,9 @@ async function runDrinkWindowCheck() {
   const isFirstRun = !seeded;
 
   // All users with drink-window notifications not explicitly turned off. The
-  // preference is an OBJECT ({ enabled, email, push }), so the old
-  // `drinkWindow: { $ne: false }` matched every user (an object is never === false)
-  // and the master opt-out did nothing — check the `.enabled` leaf instead.
+  // preference is an OBJECT ({ enabled, email, push }), and an object is never
+  // === false, so `drinkWindow: { $ne: false }` alone matches every user and
+  // ignores the master opt-out — the `.enabled` leaf carries it.
   const users = await User.find({
     // Exclude both opt-out shapes: the current object form ({ enabled: false })
     // AND a legacy scalar `drinkWindow: false` from the pre-object schema (whose
@@ -80,22 +80,22 @@ async function runDrinkWindowCheck() {
     }
     try {
       // Open-bottle expiry alerts share the drinkWindow category (and its
-      // opt-outs) but not the maturity seed — a bottle can only be open
-      // after the feature shipped, so there is nothing to silently seed.
+      // opt-outs) but not the maturity seed — every open bottle was opened
+      // with these alerts in place, so there is nothing to silently seed.
       totalNotified += await processOpenBottles(user);
     } catch (err) {
       console.error(`[drinkWindowNotifier] Open-bottle check failed for user ${user._id}:`, err.message);
     }
     try {
       // Reservation ("spoken for") alerts: same category and no seed, for the
-      // same reason — reservations can only exist after the feature shipped.
+      // same reason — every reservation was made with these alerts in place.
       totalNotified += await processReservations(user);
     } catch (err) {
       console.error(`[drinkWindowNotifier] Reservation check failed for user ${user._id}:`, err.message);
     }
     try {
-      // Orders past their expected month: same category, no seed (bottles on
-      // order can only exist after the feature shipped).
+      // Orders past their expected month: same category, no seed (every order
+      // was entered with these alerts in place).
       totalNotified += await processArrivals(user);
     } catch (err) {
       console.error(`[drinkWindowNotifier] Arrival check failed for user ${user._id}:`, err.message);
@@ -193,10 +193,13 @@ async function processUser(user, isFirstRun) {
     // Determine notification type based on transition
     let notifType = null;
 
-    if (maturityStatus === 'peak' && prevStatus !== 'peak' && prevStatus !== 'ending') {
-      notifType = 'peak';
-    } else if (maturityStatus === 'peak' && windowEnd && (windowEnd - currentYear) <= 1 && prevStatus !== 'ending') {
+    // 'ending' is tested before 'peak': a bottle first seen at peak in the last
+    // year of its window is announced once, as ending. Tested the other way
+    // round it is announced as peak today and as ending tomorrow.
+    if (maturityStatus === 'peak' && windowEnd && (windowEnd - currentYear) <= 1 && prevStatus !== 'ending') {
       notifType = 'ending';
+    } else if (maturityStatus === 'peak' && prevStatus !== 'peak' && prevStatus !== 'ending') {
+      notifType = 'peak';
     } else if (maturityStatus === 'declining' && prevStatus !== 'declining') {
       notifType = 'declining';
     } else if (maturityStatus === 'late' && prevStatus !== 'late' && prevStatus !== 'declining') {
@@ -221,12 +224,11 @@ async function processUser(user, isFirstRun) {
     }
 
     if (!notifType) {
-      // No notifiable transition — leave prevStatus alone. Silently
-      // rewriting it here used to flip a "sticky" marker like 'ending'
-      // back to 'peak' on no-op cron passes (because effectiveStatus
-      // falls back to maturityStatus when notifType is null), which then
-      // let the ending check re-fire the next day and produced duplicate
-      // notifications for the same bottle every other day.
+      // No notifiable transition — leave prevStatus alone. Rewriting it here
+      // would flip a "sticky" marker like 'ending' back to 'peak' on no-op
+      // cron passes (effectiveStatus falls back to maturityStatus when
+      // notifType is null), letting the ending check re-fire the next day and
+      // send duplicate notifications for the same bottle every other day.
       continue;
     }
 
@@ -267,30 +269,93 @@ async function processUser(user, isFirstRun) {
   // still updated for every bottle above, so a second transition (e.g.
   // peak → ending) still fires exactly one new notification when it
   // happens, rather than re-notifying for the same status.
+  // The cellar is part of the key: a wine held in two cellars counts in each
+  // cellar's group (planNotifications names it only once when it stands alone).
   const uniqueAlerts = [];
   const seenKeys = new Set();
   for (const alert of alerts) {
-    const key = `${alert.wdId}:${alert.vintage}:${alert.status}`;
+    const key = `${alert.cellarId}:${alert.wdId}:${alert.vintage}:${alert.status}`;
     if (!seenKeys.has(key)) {
       seenKeys.add(key);
       uniqueAlerts.push(alert);
     }
   }
 
-  // Create in-app notifications (also triggers push via the notification service)
-  for (const alert of uniqueAlerts) {
-    const { title, message, type } = buildNotification(alert);
-    const link = `/cellars/${alert.cellarId}?search=${encodeURIComponent(alert.name)}`;
-    // Pass the 'drinkWindow' category so the push gate honours the
-    // drinkWindow.push preference. Without it, createNotification falls back to
-    // the permissive "any push toggle on" path and pushes even when the user
-    // turned drinkWindow.push off.
+  // Create in-app notifications (also triggers push via the notification service).
+  // Pass the 'drinkWindow' category so the push gate honours the
+  // drinkWindow.push preference. Without it, createNotification falls back to
+  // the permissive "any push toggle on" path and pushes even when the user
+  // turned drinkWindow.push off.
+  const notifications = planNotifications(uniqueAlerts);
+  for (const { type, title, message, link } of notifications) {
     await createNotification(user._id, type, title, message, link, 'drinkWindow');
   }
 
   // The email is NOT sent here: maybeSendDrinkWindowEmail sends at most one a
   // week, built from every bottle notified since the last one.
-  return uniqueAlerts.length;
+  return notifications.length;
+}
+
+// From this many wines of one cellar reaching the same status in one run, the
+// bell gets ONE notification for them instead of one each. An import, a first
+// cellar fill and the turn of the year move hundreds of bottles at once.
+const GROUP_FROM = 3;
+
+// The cellar list filtered to the wines a grouped notification is about. The
+// values are the cellar page's ?maturity= buckets (frontend
+// utils/filterLabels.js MATURITY_I18N_KEY); 'ending' has no bucket of its own,
+// those wines are at peak.
+const GROUP_MATURITY_FILTER = { peak: 'peak', ending: 'peak', declining: 'late,declining' };
+
+/**
+ * Turn one run's alerts (one per wine, vintage and status) into the
+ * notifications to create: a wine alone, or with one other, gets its own
+ * notification linking its vintage page; GROUP_FROM or more of one cellar and
+ * status share one, linking the cellar filtered to that status.
+ *
+ * @param {Array<{cellarId, wdId, name, vintage, status}>} alerts
+ * @returns {Array<{type, title, message, link}>}
+ */
+function planNotifications(alerts) {
+  const groups = new Map();
+  for (const alert of alerts) {
+    const key = `${alert.cellarId}:${alert.status}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(alert);
+  }
+
+  // A wine held in two cellars is in each cellar's group, but gets one
+  // notification of its own at most: it is not announced alone in one cellar
+  // when another cellar's notification already covers it.
+  const wineKey = (alert) => `${alert.wdId}:${alert.vintage}:${alert.status}`;
+  const announced = new Set();
+  for (const list of groups.values()) {
+    if (list.length >= GROUP_FROM) list.forEach((alert) => announced.add(wineKey(alert)));
+  }
+
+  const out = [];
+  for (const list of groups.values()) {
+    if (list.length >= GROUP_FROM) {
+      const [first] = list;
+      out.push({
+        ...buildGroupNotification(first, list.length),
+        link: `/cellars/${first.cellarId}?maturity=${GROUP_MATURITY_FILTER[first.status] || GROUP_MATURITY_FILTER.declining}`,
+      });
+      continue;
+    }
+    for (const alert of list) {
+      if (announced.has(wineKey(alert))) continue;
+      announced.add(wineKey(alert));
+      out.push({
+        ...buildNotification(alert),
+        // The vintage page of the cellar: its drink window, its bottles and Drink.
+        // Not a ?search= link on the cellar list: that matches other wines of the
+        // same name and other vintages, and does nothing when the cellar is open.
+        link: `/cellars/${alert.cellarId}/vintages/${alert.wdId}/${encodeURIComponent(alert.vintage || 'NV')}`,
+      });
+    }
+  }
+  return out;
 }
 
 /**
@@ -474,6 +539,37 @@ function buildNotification(alert) {
   }
 }
 
+/**
+ * One notification for `count` wines of a cellar that reached the same status
+ * in one run, naming the first. It says where the wines ARE, not that they
+ * "entered" a window: after an import most of them were there already.
+ */
+function buildGroupNotification(alert, count) {
+  const wine = alert.vintage && alert.vintage !== 'NV' ? `${alert.name} ${alert.vintage}` : alert.name;
+  const others = count - 1;
+  switch (alert.status) {
+    case 'peak':
+      return {
+        type: 'drink_window_peak',
+        title: `${count} wines at peak maturity`,
+        message: `${wine} and ${others} other wines in your cellar are in their peak drinking window — time to enjoy them!`
+      };
+    case 'ending':
+      return {
+        type: 'drink_window_ending',
+        title: `${count} wines with their peak ending soon`,
+        message: `${wine} and ${others} other wines in your cellar are nearing the end of their peak window — don't miss them!`
+      };
+    case 'declining':
+    default:
+      return {
+        type: 'drink_window_past',
+        title: `${count} wines past their window`,
+        message: `${wine} and ${others} other wines in your cellar have passed their drinking window — drink them soon if at all.`
+      };
+  }
+}
+
 const EMAIL_GAP_MS = 7 * 24 * 60 * 60 * 1000;
 // Stored bottle markers that a notification announced, and how the email
 // words them: 'late' was announced as 'declining' (see processUser).
@@ -544,6 +640,6 @@ async function storeDrinkWindowDefaultsOff() {
 }
 
 module.exports = {
-  runDrinkWindowCheck, processUser, processOpenBottles, processReservations, processArrivals,
+  runDrinkWindowCheck, processUser, processReservations, processArrivals,
   shouldSendDigestEmail, maybeSendDrinkWindowEmail, storeDrinkWindowDefaultsOff, EMAIL_GAP_MS,
 };

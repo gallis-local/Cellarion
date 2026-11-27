@@ -7,6 +7,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { track } from '../utils/track';
 import { isHostedOrigin } from '../utils/mcpConnect';
 import './CellarChat.css';
+import { formatVintage } from '../utils/vintage';
 
 // ── Session storage keys ─────────────────────────────────────────────────────
 
@@ -37,6 +38,7 @@ const PROMPT_CATEGORIES = [
 // ── Sub-components ────────────────────────────────────────────────────────────
 
 function WineCard({ wine }) {
+  const { t } = useTranslation();
   const hasLink = wine.cellarId && wine.bottleId;
   const Wrapper = hasLink ? Link : 'div';
   const linkProps = hasLink
@@ -47,7 +49,7 @@ function WineCard({ wine }) {
     <Wrapper className="cellar-chat__wine-card" aria-label={wine.grapes?.join(', ')} {...linkProps}>
       <div className="cellar-chat__wine-card-name">{wine.name}</div>
       <div className="cellar-chat__wine-card-meta">
-        {wine.vintage} · {wine.producer}
+        {[wine.producer, formatVintage(wine.vintage, t)].filter(Boolean).join(' · ')}
       </div>
       {wine.region && (
         <div className="cellar-chat__wine-card-meta">{wine.region}</div>

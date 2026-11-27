@@ -1,6 +1,6 @@
 /**
- * A wine's COLOUR, kept apart from its TYPE (support ticket 2026-09-17,
- * "Colour Sparkling/Rosè"). Mirrors backend/src/utils/wineColour.js.
+ * A wine's COLOUR, kept apart from its TYPE. Mirrors
+ * backend/src/utils/wineColour.js.
  *
  * `wine.type` is one value, and three of its values — sparkling, dessert,
  * fortified — are styles that say nothing about colour. `wine.colour` records
@@ -24,8 +24,8 @@ export function recordedColour(wine) {
  * The key every SWATCH is drawn with — bottle placeholders, type pills, rack
  * slots, 3D bottles, list dots. The wine's type, except that a sparkling rosé
  * or sparkling red takes its colour: the sparkling swatch is what a white
- * sparkling wine looks like, and drawing a rosé that way is exactly what the
- * ticket reported. Dessert and fortified keep their own swatches — those
+ * sparkling wine looks like, and drawing a rosé that way would be wrong.
+ * Dessert and fortified keep their own swatches — those
  * already read as the style — and show their colour in the label instead.
  *
  * `fallback` is what the caller drew for an untyped wine before this helper
@@ -33,6 +33,9 @@ export function recordedColour(wine) {
  */
 export function swatchType(wine, fallback = null) {
   if (!wine) return fallback;
+  // A drink that is not wine (the Other category) draws its own neutral swatch,
+  // whatever type it was typed with before it was moved.
+  if (wine.nonWine === true) return 'other';
   const colour = recordedColour(wine);
   if (wine.type === 'sparkling' && (colour === 'rosé' || colour === 'red')) return colour;
   return wine.type || fallback;
@@ -54,6 +57,7 @@ const COMBINED_FALLBACK = {
  * recorded, otherwise the plain translated type. Null for an untyped wine.
  */
 export function wineTypeLabel(wine, t) {
+  if (wine?.nonWine === true) return t('statistics.typeLabels.other', 'Other');
   const type = wine?.type;
   if (!type) return null;
   const colour = recordedColour(wine);

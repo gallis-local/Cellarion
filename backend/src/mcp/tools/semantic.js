@@ -1,4 +1,4 @@
-// semantic_search_wines (plan §3.17, the Phase-3 half of the RAG split):
+// semantic_search_wines (the retrieval half of the RAG split):
 // free-text meaning search over the EXISTING wine embeddings. Unlike
 // find_similar_wines ($0 — reuses a stored vector), a free-text query needs ONE
 // Voyage query-embed, so this is the only MCP read with a real (fractional-cent)
@@ -9,7 +9,7 @@
 //   3. a query-vector cache, so repeats and rephrasings-into-identical-text
 //      are free and never re-debited.
 // Retrieval is cheap here; generation (the actual recommendation prose) happens
-// in the CALLER's model for free — never proxy an LLM for this (§5.2).
+// in the CALLER's model for free — never proxy an LLM for this.
 const { z } = require('zod');
 const Cellar = require('../../models/Cellar');
 const Bottle = require('../../models/Bottle');
@@ -152,16 +152,16 @@ registerTool({
 
     // Vectors outlive a quarantine (the flag does not change the embedding
     // text), so the document load is where a non-wine row stays out of
-    // semantic search, as it does out of keyword search (audit 2026-10-14).
+    // semantic search, as it does out of keyword search.
     const docs = await WineDefinition.find({ _id: { $in: ranked.map(([id]) => id) }, pendingIdentity: { $ne: true }, nonWine: { $ne: true } })
-      .select('name producer slug country region appellation classification grapes type colour communityRating')
-      .populate(['country', 'region', 'grapes'])
+      .select('name producer slug country region appellation classification labelSweetness sweetnessStyle grapes type colour communityRating')
+      .populate(['country', 'region', 'grapes', { path: 'labelSweetness', select: 'name band scale regulated -_id' }, { path: 'sweetnessStyle.term', select: 'name band scale regulated' }])
       .lean();
     const byId = new Map(docs.map((d) => [String(d._id), d]));
     const data = ranked
       .filter(([id]) => byId.has(id))
       .map(([id, m]) => ({
-        ...wineSummary(byId.get(id)),
+        ...wineSummary(byId.get(id), { termLoaded: true, styleLoaded: true }),
         similarity: Math.round(m.score * 1000) / 1000,
         embedded_vintage: m.vintage,
       }));
@@ -169,4 +169,4 @@ registerTool({
   },
 });
 
-module.exports = { takeEmbedSlot };
+module.exports = {};

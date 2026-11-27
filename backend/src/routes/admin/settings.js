@@ -85,10 +85,8 @@ router.patch('/rate-limits', async (req, res) => {
       requireIntInRange('aiGlobalDailyCap.max', aiGlobalDailyCap.max, 0, 10_000_000);
     }
 
-    // Per-user photo-upload burst. config/rateLimits.js documented this as
-    // "runtime-tunable by SuperAdmin" since it shipped, but it was never in
-    // this handler — the one claim without a lever. Floor 5 keeps a typo from
-    // effectively disabling uploads; window floor matches the other bursts.
+    // Per-user photo-upload burst (config/rateLimits.js). Floor 5 keeps a typo
+    // from effectively disabling uploads; window floor matches the other bursts.
     if (imageUploadBurst !== undefined) {
       requireIntInRange('imageUploadBurst.max',      imageUploadBurst.max,      5,      10_000);
       requireIntInRange('imageUploadBurst.windowMs', imageUploadBurst.windowMs, 60_000, 24 * 60 * 60 * 1000);
@@ -107,19 +105,19 @@ router.patch('/rate-limits', async (req, res) => {
 
     // MCP kill switches (0 = off, 1 = on). enabled=0 shuts the whole AI
     // surface; publicEnabled=0 shuts only the anonymous endpoint.
-    // userMax/ipMax are the protocol-endpoint limits (MCP-audit M8): per-USER
+    // userMax/ipMax are the protocol-endpoint limits: per-USER
     // fair share and the pre-auth per-IP flood guard. Floors keep a typo from
     // effectively bricking the surface (userMax 10 ≈ one short exchange);
     // ipMax must stay well above userMax or one shared egress IP throttles
     // before any user reaches their own allowance.
     // registerMax bounds OAuth Dynamic Client Registration per IP per hour. The
-    // floor is 10 (the old hardcoded value) rather than 0 — dropping it lower
+    // floor is 10 rather than 0 — dropping it lower
     // would block new connections outright rather than merely slow abuse.
     // oauthMax bounds the rest of the OAuth AS per IP per 15 min. Its floor is
     // deliberately high (100): every connected client refreshes its access
     // token at least hourly and a hosted platform does that for its whole user
     // base from one egress IP, so a low value here disconnects real people
-    // mid-conversation — the exact failure the exemption existed to prevent.
+    // mid-conversation — the exact failure the exemption exists to prevent.
     if (mcp !== undefined) {
       requireIntInRange('mcp.enabled',       mcp.enabled,       0, 1);
       requireIntInRange('mcp.publicEnabled', mcp.publicEnabled, 0, 1);
@@ -131,8 +129,8 @@ router.patch('/rate-limits', async (req, res) => {
 
     // The upper bounds are deliberately near the size of the registry: a cap
     // far above it refuses nobody, which is the safety mechanism switched off
-    // by a typo rather than by a decision (audit 2026-09-08).
-    // Registry lockdown (L4): DISTINCT wines per reader per UTC day — the
+    // by a typo rather than by a decision.
+    // Registry lockdown: DISTINCT wines per reader per UTC day — the
     // one number that tells a person browsing from a copier. The anonymous
     // cap refuses for the rest of the day; the member level only puts a
     // reader in the daily report. Floors keep a typo from refusing someone
@@ -287,6 +285,113 @@ router.get('/new-member-emails', async (req, res) => {
   }
 });
 
+// ── Review of contributions (config/contributionReview) ────────────────────
+// Who may switch it: the install's highest authority. Where a super admin is
+// configured (cellarion.app) only they may — turning review off there would
+// publish every member's contribution to a shared registry. On a server
+// without one (most self-hosted installs) any admin may.
+const { requireSuperAdmin, checkIsSuperAdmin } = require('../../middleware/superAdmin');
+const superAdminConfigured = () => !!(process.env.SUPER_ADMIN_EMAIL || '').trim();
+const requireReviewSwitcher = (req, res, next) => (superAdminConfigured() ? requireSuperAdmin(req, res, next) : next());
+
+// GET /api/admin/settings/contribution-review — { enabled, updatedAt,
+// canChange, waiting: { photos, values, fields, corrections } }: the switch,
+// whether this admin may change it, and what is still in the queues (turning
+// review off decides nothing already waiting).
+router.get('/contribution-review', async (req, res) => {
+  try {
+    const contributionReview = require('../../config/contributionReview');
+    const BottleImage = require('../../models/BottleImage');
+    const RegistryDataValue = require('../../models/RegistryDataValue');
+    const RegistryDataKey = require('../../models/RegistryDataKey');
+    const WineCorrectionProposal = require('../../models/WineCorrectionProposal');
+    const User = require('../../models/User');
+    let canChange = true;
+    if (superAdminConfigured()) {
+      const me = await User.findById(req.user.id).select('email').lean();
+      canChange = !!me && checkIsSuperAdmin(req, me.email);
+    }
+    const [photos, values, fields, corrections] = await Promise.all([
+      BottleImage.countDocuments({ status: 'processed', kind: { $ne: 'label-scan' } }),
+      RegistryDataValue.countDocuments({ status: 'suggested' }),
+      RegistryDataKey.countDocuments({ status: 'proposed' }),
+      WineCorrectionProposal.countDocuments({ status: 'pending' }),
+    ]);
+    res.json({ ...contributionReview.get(), canChange, waiting: { photos, values, fields, corrections } });
+  } catch (err) {
+    console.error('Admin get contribution-review error:', err);
+    res.status(500).json({ error: 'Failed to load the review setting' });
+  }
+});
+
+// PATCH /api/admin/settings/contribution-review — body { enabled }.
+router.patch('/contribution-review', requireReviewSwitcher, async (req, res) => {
+  try {
+    const { enabled } = req.body || {};
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be true or false' });
+    }
+    const contributionReview = require('../../config/contributionReview');
+    const doc = await updateSiteConfig('contributionReview', { enabled }, req.user.id);
+    contributionReview.set({ enabled, updatedAt: doc?.updatedAt ? new Date(doc.updatedAt).toISOString() : new Date().toISOString() });
+    logAudit(req, 'admin.settings.contribution_review.update', {}, { enabled });
+    res.json(contributionReview.get());
+  } catch (err) {
+    console.error('Admin update contribution-review error:', err);
+    res.status(500).json({ error: 'Failed to update the review setting' });
+  }
+});
+
+// ── How imports treat new wines (config/importPolicy) ──────────────────────
+// Changed by the same authority as the review switch above: checkNewWines
+// decides whether a member's file reaches the shared registry unchecked.
+const asyncHandler = require('../../utils/asyncHandler');
+const IMPORT_POLICY_FIELDS = ['aiLookup', 'checkNewWines'];
+
+// GET /api/admin/settings/import-policy — { aiLookup, checkNewWines,
+// updatedAt, canChange, reviewOn, checking, waiting, aiAvailable }: the two
+// switches, whether this admin may change them, whether the server reviews
+// contributions at all (checkNewWines does nothing without it), whether new
+// wines are in fact held back, how many wines wait for a check now, and
+// whether an AI provider is configured (aiLookup does nothing without one).
+router.get('/import-policy', asyncHandler(async (req, res) => {
+  const importPolicy = require('../../config/importPolicy');
+  const contributionReview = require('../../config/contributionReview');
+  const WineDefinition = require('../../models/WineDefinition');
+  const User = require('../../models/User');
+  let canChange = true;
+  if (superAdminConfigured()) {
+    const me = await User.findById(req.user.id).select('email').lean();
+    canChange = !!me && checkIsSuperAdmin(req, me.email);
+  }
+  const waiting = await WineDefinition.countDocuments({ uncheckedIdentity: true, identityUnavailable: { $ne: true }, draft: { $ne: true }, nonWine: { $ne: true } });
+  res.json({
+    ...importPolicy.get(), canChange, reviewOn: contributionReview.isOn(), checking: importPolicy.checksNewWines(), waiting,
+    // Whether there is an AI provider to look anything up with at all.
+    aiAvailable: require('../../services/aiProvider').isConfigured(),
+  });
+}));
+
+// PATCH /api/admin/settings/import-policy — body { aiLookup?, checkNewWines? }.
+// Turning checkNewWines off publishes nothing already waiting: those wines
+// stay in the curators' queue until each is checked.
+router.patch('/import-policy', requireReviewSwitcher, asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const sent = IMPORT_POLICY_FIELDS.filter((f) => body[f] !== undefined);
+  if (sent.length === 0) {
+    return res.status(400).json({ error: `Send at least one of: ${IMPORT_POLICY_FIELDS.join(', ')}` });
+  }
+  const bad = sent.find((f) => typeof body[f] !== 'boolean');
+  if (bad) return res.status(400).json({ error: `${bad} must be true or false` });
+
+  const importPolicy = require('../../config/importPolicy');
+  const { aiLookup, checkNewWines } = { ...importPolicy.get(), ...Object.fromEntries(sent.map((f) => [f, body[f]])) };
+  const doc = await updateSiteConfig('importPolicy', { aiLookup, checkNewWines }, req.user.id);
+  importPolicy.set({ aiLookup, checkNewWines, updatedAt: doc?.updatedAt ? new Date(doc.updatedAt).toISOString() : new Date().toISOString() });
+  logAudit(req, 'admin.settings.import_policy.update', {}, { aiLookup, checkNewWines });
+  res.json(importPolicy.get());
+}));
+
 // PATCH /api/admin/settings/new-member-emails — body { enabled }. Turning it
 // on starts from now: accounts created before that never get one.
 router.patch('/new-member-emails', async (req, res) => {
@@ -302,6 +407,78 @@ router.patch('/new-member-emails', async (req, res) => {
   } catch (err) {
     console.error('Admin update new-member-emails error:', err);
     res.status(500).json({ error: 'Failed to update the new-member email setting' });
+  }
+});
+
+// GET /api/admin/settings/inactive-accounts — the switch for deleting unused
+// accounts (services/inactiveAccounts), the rule it applies, what it would do
+// today (so the admin sees the effect before turning it on), and what it did
+// in the last 30 days.
+router.get('/inactive-accounts', async (req, res) => {
+  try {
+    const ia = require('../../services/inactiveAccounts');
+    const { EMAIL_VERIFICATION_ENABLED } = require('../../services/mailgun');
+    const AuditLog = require('../../models/AuditLog');
+    const since30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    // What the job did is read from its own audit rows (the stamps on accounts
+    // disappear when a timeline ends, so they would undercount).
+    const audited = (action, detail = {}) => AuditLog.countDocuments({ action, timestamp: { $gte: since30 }, ...detail });
+    const User = require('../../models/User');
+    const [settings, preview, onTimeline, firstNotices, finalNotices, deleted] = await Promise.all([
+      ia.getSettings(),
+      ia.preview(),
+      // Accounts on a timeline right now, whether or not a step is due today.
+      User.countDocuments({ 'inactivityNotice.firstSentAt': { $ne: null } }),
+      audited('user.inactivity_notice', { 'detail.notice': 'first' }),
+      audited('user.inactivity_notice', { 'detail.notice': 'final' }),
+      audited('user.inactivity_deleted'),
+    ]);
+    const today = preview.counts || {};
+    res.json({
+      ...settings,
+      mailConfigured: EMAIL_VERIFICATION_ENABLED,
+      rule: {
+        monthsWithContent: ia.MONTHS_WITH_CONTENT,
+        monthsEmpty: ia.MONTHS_EMPTY,
+        firstNoticeDays: ia.FIRST_NOTICE_DAYS,
+        finalNoticeDays: ia.FINAL_NOTICE_DAYS,
+      },
+      // Use has been recorded since this day; nobody counts as unused from
+      // earlier, so no account can be deleted before the earliest date.
+      trackedSince: preview.trackedSince,
+      earliestDeletion: ia.addMonths(preview.trackedSince, ia.MONTHS_EMPTY),
+      today: {
+        first: today.first || 0,
+        final: today.final || 0,
+        delete: today.delete || 0,
+        exempt: Object.entries(today)
+          .filter(([k]) => k.startsWith('skip:') && k !== 'skip:active')
+          .reduce((n, [, v]) => n + v, 0),
+      },
+      onTimeline,
+      last30Days: { firstNotices, finalNotices, deleted },
+    });
+  } catch (err) {
+    console.error('Admin get inactive-accounts error:', err);
+    res.status(500).json({ error: 'Failed to load the inactive-account setting' });
+  }
+});
+
+// PATCH /api/admin/settings/inactive-accounts — body { enabled }. Turning it
+// on restarts every timeline: nobody is deleted without a fresh 30-day notice.
+router.patch('/inactive-accounts', async (req, res) => {
+  try {
+    const { enabled } = req.body || {};
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be true or false' });
+    }
+    const { setEnabled } = require('../../services/inactiveAccounts');
+    const settings = await setEnabled(enabled, req.user.id);
+    logAudit(req, 'admin.settings.inactive_accounts.update', {}, { enabled });
+    res.json(settings);
+  } catch (err) {
+    console.error('Admin update inactive-accounts error:', err);
+    res.status(500).json({ error: 'Failed to update the inactive-account setting' });
   }
 });
 

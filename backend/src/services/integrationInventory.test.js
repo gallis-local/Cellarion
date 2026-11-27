@@ -13,7 +13,7 @@
  * heavy bottle fields are never read.
  */
 jest.mock('../models/Cellar', () => ({ find: jest.fn() }));
-jest.mock('../models/Bottle', () => ({ find: jest.fn() }));
+jest.mock('../models/Bottle', () => ({ find: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../models/Rack', () => ({ find: jest.fn() }));
 jest.mock('../models/WineDefinition', () => ({ find: jest.fn() }));
 jest.mock('./personalData', () => ({ listForBottles: jest.fn(async () => new Map()) }));
@@ -28,8 +28,8 @@ const Rack = require('../models/Rack');
 const WineDefinition = require('../models/WineDefinition');
 const { listForBottles } = require('./personalData');
 const {
-  assembleInventory, buildInventory, profileOf, inventoryTag,
-  BOTTLE_SELECT, RACK_SELECT, CELLAR_SELECT, PROFILE_SELECT, INVENTORY_WINE_POPULATE, INVENTORY_SCHEMA,
+  assembleInventory, buildInventory, profileOf, inventoryTag, parseInclude, CONSUMED_LIMIT,
+  BOTTLE_SELECT, CONSUMED_SELECT, RACK_SELECT, CELLAR_SELECT, PROFILE_SELECT, INVENTORY_WINE_POPULATE, INVENTORY_SCHEMA,
 } = require('./integrationInventory');
 
 const ME = 'u1';
@@ -92,6 +92,7 @@ describe('assembleInventory — the contract', () => {
       wine: 'w1',
       pending: null,
       cellar: 'c1',
+      status: 'active',
       vintage: '2015',
       size: '750ml',
       price: 350,
@@ -103,6 +104,7 @@ describe('assembleInventory — the contract', () => {
       purchaseLocation: 'Systembolaget',
       addedAt: '2025-01-02T10:00:00.000Z',
       opened: false,
+      consumed: null,
       maturity: 'early',
       window: { drinkFrom: NOW_YEAR - 1, peakFrom: NOW_YEAR + 2, peakUntil: NOW_YEAR + 6, drinkTo: NOW_YEAR + 10 },
       location: { rack: 'r1', rackName: 'Left cabinet', position: 14, shelf: 2, row: 2, col: 2 },
@@ -117,13 +119,19 @@ describe('assembleInventory — the contract', () => {
     expect(Object.keys(s.wines)).toEqual(['w1']);
     expect(s.wines.w1).toEqual({
       name: 'Château X',
+      displayName: 'Château X', // no label sweetness term: the name as it is
       producer: 'Château X',
       type: 'red',
+      category: 'wine',
       colour: null,
       country: 'France',
       region: 'Pauillac',
       appellation: 'Pauillac',
       classification: null,
+      labelSweetness: null,
+      sweetnessStyle: null,
+      sweetnessCategory: null,
+      sweetnessCategoryBasis: null,
       grapes: ['Cabernet Sauvignon', 'Tinta Pauillac'],
       image: '/api/uploads/thumbs/processed/w1.webp.webp',
       profile: {
@@ -131,6 +139,32 @@ describe('assembleInventory — the contract', () => {
         flavors: ['blackcurrant', 'cedar'], foodPairings: ['lamb'],
       },
     });
+  });
+
+  test('the sweetness category the load attached is sent, with what it rests on', () => {
+    const w = { ...bottle().wineDefinition, sweetnessCategory: 'off-dry', sweetnessCategoryBasis: 'name' };
+    const s = inv({ bottles: [bottle({ wineDefinition: w })] });
+    expect(s.wines.w1).toMatchObject({ sweetnessCategory: 'off-dry', sweetnessCategoryBasis: 'name' });
+  });
+
+  test('a wine with a sweetness style sends it in its documented shape, beside the label term and out of the name', () => {
+    const styled = {
+      ...WINE, _id: 'w2', name: 'Riesling Kabinett', labelSweetness: null,
+      sweetnessStyle: { term: { name: 'feinherb', band: 'off-dry', scale: 'still', regulated: false }, source: 'trade', url: 'https://merchant.example/kabinett' },
+    };
+    const s = inv({ bottles: [bottle({ wineDefinition: styled })] });
+    expect(s.wines.w2).toMatchObject({
+      displayName: 'Riesling Kabinett',
+      labelSweetness: null,
+      sweetnessStyle: { name: 'feinherb', band: 'off-dry', scale: 'still', regulated: false, source: 'trade', sourceUrl: 'https://merchant.example/kabinett' },
+    });
+  });
+
+  test('a style whose term cannot be read is left out — never null, never the stored shape', () => {
+    const dangling = { ...WINE, _id: 'w3', sweetnessStyle: { term: 'f'.repeat(24), source: 'trade', url: 'https://merchant.example/x' } };
+    const s = inv({ bottles: [bottle({ wineDefinition: dangling })] });
+    expect(s.wines.w3).not.toHaveProperty('sweetnessStyle');
+    expect(JSON.stringify(s.wines.w3)).not.toMatch(/merchant.example/);
   });
 
   test('a bottle waiting on a wine request: wine null, pending set', () => {
@@ -156,6 +190,29 @@ describe('assembleInventory — the contract', () => {
     });
     expect(JSON.stringify(b)).not.toMatch(/undefined/);
     expect(Object.values(b).some((v) => v === undefined)).toBe(false);
+  });
+
+  test('a bottle that left (include=consumed): its status, how it was finished, no maturity, the same shape', () => {
+    const [b] = inv({
+      racks: [],
+      bottles: [bottle({
+        status: 'gifted', consumedAt: new Date('2026-10-30T19:00:00Z'), consumedRating: 4.5, consumedRatingScale: '5',
+        consumedNote: '  To my sister  ', consumedReason: 'gifted',
+      })],
+    }).bottles;
+    expect(b).toMatchObject({
+      status: 'gifted', maturity: null, location: null,
+      consumed: { at: '2026-10-30T19:00:00.000Z', rating: 4.5, ratingScale: '5', note: 'To my sister' },
+      // The window is kept: it says whether it was opened in time.
+      window: { drinkFrom: NOW_YEAR - 1, peakFrom: NOW_YEAR + 2, peakUntil: NOW_YEAR + 6, drinkTo: NOW_YEAR + 10 },
+    });
+    expect(Object.keys(b)).toEqual(Object.keys(inv().bottles[0]));
+    // Nothing recorded → nulls; a scale only beside a rating.
+    const [bare] = inv({ bottles: [bottle({ status: 'drank', consumedRatingScale: '5' })] }).bottles;
+    expect(bare.consumed).toEqual({ at: null, rating: null, ratingScale: null, note: null });
+    // Every status that left; anything else (a legacy row without one) is active.
+    for (const status of ['drank', 'gifted', 'sold', 'other']) expect(inv({ bottles: [bottle({ status })] }).bottles[0].status).toBe(status);
+    expect(inv({ bottles: [bottle({ status: undefined })] }).bottles[0]).toMatchObject({ status: 'active', consumed: null });
   });
 
   test('the window is the curated one when the bottle has none of its own', () => {
@@ -251,7 +308,8 @@ describe('buildInventory — what is loaded', () => {
     const q = {
       select: (s) => { record.select = s; return q; },
       populate: (p) => { record.populate = p; return q; },
-      sort: () => q,
+      sort: (s) => { record.sort = s; return q; },
+      limit: (n) => { record.limit = n; return q; },
       lean: async () => result,
     };
     return q;
@@ -284,6 +342,68 @@ describe('buildInventory — what is loaded', () => {
     expect(s.wines.w1.profile).toEqual({ body: 'full', acidity: null, sweetness: null, tannin: null, flavors: [], foodPairings: [] });
   });
 
+  test('include=consumed: the stock as always, then the bottles that left — their own capped query, newest finished first', async () => {
+    const rec = { stock: {}, left: {} };
+    Cellar.find.mockReturnValue(chain([OWN]));
+    Bottle.find
+      .mockReturnValueOnce(chain([bottle()], rec.stock))
+      .mockReturnValueOnce(chain([bottle({ _id: 'b2', status: 'drank', consumedAt: new Date('2026-10-30T19:00:00Z') })], rec.left));
+    Bottle.countDocuments.mockResolvedValue(1);
+    Rack.find.mockReturnValue(chain([]));
+    WineDefinition.find.mockReturnValue(chain([]));
+
+    const s = await buildInventory(ME, { attachBottleImageUrls: jest.fn(async (bs) => bs), include: ['consumed'] });
+
+    const [stockQ, leftQ] = Bottle.find.mock.calls.slice(-2).map((c) => c[0]);
+    expect(stockQ.status.$nin).toEqual(expect.arrayContaining(['drank', 'gifted', 'sold', 'other', 'ordered']));
+    expect(rec.stock.select).toBe(BOTTLE_SELECT);
+    // On-order bottles stay out: the second query names exactly the statuses that left.
+    expect(leftQ).toEqual({ cellar: { $in: ['c1'] }, status: { $in: ['drank', 'gifted', 'sold', 'other'] } });
+    expect(rec.left.select).toBe(`${BOTTLE_SELECT} ${CONSUMED_SELECT}`);
+    expect(rec.left.sort).toEqual({ consumedAt: -1, _id: -1 });
+    expect(rec.left.limit).toBe(CONSUMED_LIMIT);
+    expect(Bottle.countDocuments).toHaveBeenCalledWith(leftQ);
+    expect(s.bottles.map((b) => [b.id, b.status])).toEqual([['b1', 'active'], ['b2', 'drank']]);
+    expect(s.bottles[1].consumed).toMatchObject({ at: '2026-10-30T19:00:00.000Z' });
+    expect(s).toMatchObject({ consumedTotal: 1, consumedTruncated: false });
+    expect(BOTTLE_SELECT.split(' ')).not.toEqual(expect.arrayContaining(CONSUMED_SELECT.split(' ')));
+    expect(CONSUMED_SELECT.split(' ').sort()).toEqual(['consumedAt', 'consumedNote', 'consumedRating', 'consumedRatingScale']);
+  });
+
+  test('a history past the cap: the newest CONSUMED_LIMIT, flagged as cut short; a bottle finished meanwhile is no cut', async () => {
+    expect(CONSUMED_LIMIT).toBe(10000);
+    const run = async (leftCount, total) => {
+      Cellar.find.mockReturnValue(chain([OWN]));
+      const left = Array.from({ length: leftCount }, (_, i) => ({ _id: `x${i}`, cellar: 'c1', status: 'drank', wineDefinition: null }));
+      Bottle.find.mockReturnValueOnce(chain([])).mockReturnValueOnce(chain(left));
+      Bottle.countDocuments.mockResolvedValue(total);
+      Rack.find.mockReturnValue(chain([]));
+      WineDefinition.find.mockReturnValue(chain([]));
+      return buildInventory(ME, { attachBottleImageUrls: async (bs) => bs, include: ['consumed'] });
+    };
+    const capped = await run(CONSUMED_LIMIT, 12345);
+    expect(capped.bottles).toHaveLength(CONSUMED_LIMIT);
+    expect(capped).toMatchObject({ consumedTotal: 12345, consumedTruncated: true });
+    // The count ran a moment after the list and saw one more: complete all the same.
+    expect(await run(40, 41)).toMatchObject({ consumedTotal: 41, consumedTruncated: false });
+  });
+
+  test('without include, no count and no summary fields; no cellars with include → an honest zero', async () => {
+    Cellar.find.mockReturnValue(chain([OWN]));
+    Bottle.find.mockReturnValue(chain([bottle()]));
+    Bottle.countDocuments.mockClear();
+    Rack.find.mockReturnValue(chain([]));
+    WineDefinition.find.mockReturnValue(chain([]));
+    const s = await buildInventory(ME, { attachBottleImageUrls: async (bs) => bs });
+    expect(Bottle.countDocuments).not.toHaveBeenCalled();
+    expect(s).not.toHaveProperty('consumedTotal');
+    expect(s).not.toHaveProperty('consumedTruncated');
+
+    Cellar.find.mockReturnValue(chain([]));
+    expect(await buildInventory(ME, { attachBottleImageUrls: jest.fn(), include: ['consumed'] }))
+      .toMatchObject({ bottles: [], consumedTotal: 0, consumedTruncated: false });
+  });
+
   test('projections: inclusion lists that leave the heavy and internal fields out', () => {
     const words = (s) => s.split(/\s+/);
     for (const heavy of ['cellarHistory', 'pours', 'barcode', 'purchaseUrl', 'occasion', 'reservedFor', 'consumedNote', 'user']) {
@@ -302,7 +422,10 @@ describe('buildInventory — what is loaded', () => {
       { path: 'country', select: 'name' },
       { path: 'region', select: 'name' },
       { path: 'grapes', select: 'name regionalNames' },
+      { path: 'labelSweetness', select: 'name band scale regulated -_id' },
+      { path: 'sweetnessStyle.term', select: 'name band scale regulated' },
     ]);
+    expect(wine.select.split(' ')).toEqual(expect.arrayContaining(['labelSweetness', 'sweetnessStyle']));
   });
 
   test('no cellars → an empty inventory without further queries', async () => {
@@ -328,5 +451,27 @@ describe('inventoryTag', () => {
     expect(inv).toMatch(/^W\/"[A-Za-z0-9_-]{27}"$/);
     expect(inv).not.toBe(await snapshotTag(ME, t));
     expect(inv).toBe(await snapshotTag(ME, t, { salt: 'inventory:1' }));
+    // include=consumed answers another document, so another tag space.
+    const all = await inventoryTag(ME, t, { include: ['consumed'] });
+    expect(all).not.toBe(inv);
+    expect(all).toBe(await snapshotTag(ME, t, { salt: 'inventory:1:consumed' }));
+    expect(await inventoryTag(ME, t, { include: [] })).toBe(inv);
+  });
+});
+
+describe('parseInclude', () => {
+  test('nothing → none; a list, repeats and spaces fold to one sorted set', () => {
+    expect(parseInclude(undefined)).toEqual({ include: [] });
+    expect(parseInclude('')).toEqual({ include: [] });
+    expect(parseInclude('consumed')).toEqual({ include: ['consumed'] });
+    expect(parseInclude(' consumed , consumed')).toEqual({ include: ['consumed'] });
+    expect(parseInclude(['consumed', 'consumed'])).toEqual({ include: ['consumed'] });
+  });
+
+  test('an unknown value is an error naming it (cut short), never ignored', () => {
+    expect(parseInclude('consumed,ordered')).toEqual({ error: 'Unknown include value "ordered". Supported: consumed.' });
+    expect(parseInclude('x'.repeat(100)).error).toBe(`Unknown include value "${'x'.repeat(40)}". Supported: consumed.`);
+    // ?include[a]=b arrives as an object: not a value we know.
+    expect(parseInclude({ a: 'b' }).error).toMatch(/^Unknown include value/);
   });
 });

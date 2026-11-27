@@ -6,6 +6,7 @@ const { requireAuth, requireNonDemo } = require('../middleware/auth');
 const { logAudit } = require('../services/audit');
 const eventBus = require('../services/eventBus');
 const { passwordConfirmLimiter } = require('../middleware/passwordConfirmLimiter');
+const { deprecatedUseView } = require('../services/apiDeprecationNotices');
 
 const { TOKEN_SCOPES, MAX_ACTIVE_TOKENS_PER_USER } = ApiToken;
 
@@ -99,12 +100,14 @@ router.post('/', requireAuth, requireNonDemo, authLimiter, async (req, res) => {
   }
 });
 
-// GET /api/tokens — list the caller's active tokens (metadata only)
+// GET /api/tokens — list the caller's active tokens (metadata only).
+// deprecatedUse: the routes on their way out this token still called lately,
+// and when they stop answering — or null (services/apiDeprecationNotices).
 router.get('/', requireAuth, async (req, res) => {
   try {
     const tokens = await ApiToken.find({ user: req.user.id, revokedAt: null })
       .sort({ createdAt: -1 })
-      .select('name scopes lastUsedAt createdAt')
+      .select('name scopes lastUsedAt createdAt deprecatedUse')
       .lean();
     res.json(tokens.map(t => ({
       id: t._id,
@@ -112,6 +115,7 @@ router.get('/', requireAuth, async (req, res) => {
       scopes: t.scopes,
       lastUsedAt: t.lastUsedAt,
       createdAt: t.createdAt,
+      deprecatedUse: deprecatedUseView(t.deprecatedUse),
     })));
   } catch (error) {
     console.error('List API tokens error:', error);
@@ -136,7 +140,7 @@ router.delete('/self', requireAuth, async (req, res) => {
     // and retired through the device routes (DELETE /api/climate/devices/:id
     // revokes + purges + deletes). Ending only the token here would leave a
     // device that can never post again, still counted and still alerting
-    // "offline" (post-ship audit 2026-09-12).
+    // "offline".
     if ((req.apiToken.scopes || []).includes('climate')) {
       return res.status(403).json({ error: 'A climate device token is retired by deleting its device (DELETE /api/climate/devices/:id), not by revoking the token alone' });
     }

@@ -81,6 +81,26 @@ test('a username with a space is explained before anything is sent', async () =>
   expect(registerMock).not.toHaveBeenCalled();
 });
 
+test('an email the server would refuse is explained before anything is sent', async () => {
+  routerLocation.search = '?mode=register';
+  render(<Login />);
+  fillRegister({ email: 'anna@example' });
+  submit();
+  expect(await screen.findByRole('alert')).toHaveTextContent(/whole email address/);
+  expect(registerMock).not.toHaveBeenCalled();
+});
+
+test('an address the server accepts once lowercased is not refused here', async () => {
+  // U+212A KELVIN SIGN lowercases to an ASCII "k", as the server does before its check.
+  routerLocation.search = '?mode=register';
+  render(<Login />);
+  fillRegister({ email: 'anna@\u212Aellare.se' });
+  // Submitted directly: jsdom's own email-field check would stop a button click first.
+  fireEvent.submit(document.querySelector('form'));
+  await waitFor(() => expect(registerMock).toHaveBeenCalled());
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
 test('registers with the trailing keyboard space trimmed', async () => {
   routerLocation.search = '?mode=register';
   render(<Login />);

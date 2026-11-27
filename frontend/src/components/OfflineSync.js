@@ -11,9 +11,8 @@ const RESEND_EVERY_MS = 30 * 1000;
 
 // Writes that change what the offline copy holds: cellars, bottles, racks and
 // bottle photos. Marking a notification read, saving a setting or posting in
-// the forum does not, and used to rebuild the whole copy anyway (scaling audit
-// 2026-09-25, item 11). A write the event doesn't name (the offline queue's own
-// sends) counts as a change.
+// the forum does not, and must not rebuild the whole copy. A write the event
+// doesn't name (the offline queue's own sends) counts as a change.
 const COPY_PATHS = /^\/api\/(bottles|cellars|racks|images)(\/|$)/;
 export function changesOfflineCopy(url) {
   if (!url) return true;
@@ -30,7 +29,7 @@ const ageOf = () => {
 };
 
 /**
- * Keeps the device's offline copy of the user's cellars fresh (#1355):
+ * Keeps the device's offline copy of the user's cellars fresh:
  * on start when it is more than a couple of minutes old, every 15 minutes
  * while the app is visible, when the app comes back to the foreground after
  * that long, and a few seconds after the user changes something. Online and

@@ -15,7 +15,7 @@ import './AdminModerationReports.css';
 
 // Moderation queue for discussion/reply reports.
 //
-// Surfaces the existing moderation endpoints that were previously without a UI:
+// The UI for the moderation endpoints:
 //   GET   /api/discussions/moderation/reports            — list reports by status
 //   PATCH /api/discussions/moderation/reports/:reportId  — mark resolved / dismissed
 //   POST  /api/discussions/moderation/ban                — ban the content author
@@ -409,10 +409,7 @@ function AdminModerationReports() {
       {confirmBan && selected && selectedTarget.author?._id && (
         <ConfirmModal
           title={t('discussions.banUserTitle')}
-          message={t('discussions.confirmBan', {
-            name: selectedAuthorName,
-            duration: t(`discussions.banDuration.${banDuration}`)
-          })}
+          message={t(`discussions.confirmBanFor.${banDuration}`, { name: selectedAuthorName })}
           confirmLabel={t('moderationReports.banAuthor')}
           confirmClass="btn btn-warning btn-small"
           onConfirm={handleBan}

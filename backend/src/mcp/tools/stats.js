@@ -13,10 +13,10 @@ const { ok } = require('../toolUtil');
 const topN = (v, n) => (Array.isArray(v) ? v.slice(0, n) : v);
 
 // Computing stats loads the user's entire bottle set — the REST route shields
-// that with a 2-min cache. MCP callers are automated and can repeat identical
+// that with its own cache. MCP callers are automated and can repeat identical
 // calls, so a short TTL cache here removes the recompute amplification (a 60s
-// stale window is irrelevant for portfolio numbers). No invalidation signature:
-// reads-only Phase 1 can't change the data through MCP anyway.
+// stale window is irrelevant for portfolio numbers). An audited mutation drops
+// the user's entries (bustStats below, called from services/audit.js).
 const statsCache = new Map(); // `${userId}:${currency}:${scale}` -> { at, result }
 const STATS_TTL_MS = 60 * 1000;
 const STATS_CACHE_MAX = 2000;
@@ -102,7 +102,7 @@ async function buildStats(userId, currencyOverride) {
   };
   if (statsCache.size >= STATS_CACHE_MAX) {
     // Evict the oldest half (insertion order) rather than a wholesale clear —
-    // one user's churn shouldn't cold-start everyone (grand-audit L29).
+    // one user's churn shouldn't cold-start everyone.
     let drop = Math.ceil(STATS_CACHE_MAX / 2);
     for (const k of statsCache.keys()) { if (drop-- <= 0) break; statsCache.delete(k); }
   }
@@ -112,7 +112,7 @@ async function buildStats(userId, currencyOverride) {
 
 /**
  * Drop this user's cached stats so the next read (tool or cellar://stats
- * resource) recomputes — called on any cellar mutation (grand-audit M3), so
+ * resource) recomputes — called on any cellar mutation, so
  * the stats_changed push doesn't tell a subscriber to re-read stale numbers.
  * Keys are `${userId}:${currency}:${scale}`.
  */

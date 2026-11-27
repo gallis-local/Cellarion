@@ -29,7 +29,9 @@ vi.mock('../components/DrinkOneModal', () => ({
   default: ({ bottles, onDone }) => <button type="button" onClick={() => onDone(bottles[0], 'gifted')}>drink-stub:{bottles.length}</button>,
 }));
 vi.mock('../components/EditVintageModal', () => ({
-  default: ({ bottles, onDone }) => <button type="button" onClick={onDone}>edit-stub:{bottles.map((b) => b._id).join(',')}</button>,
+  default: ({ bottles, focus, onDone }) => (
+    <button type="button" onClick={onDone}>edit-stub:{bottles.map((b) => b._id).join(',')}{focus ? `|focus:${focus}` : ''}</button>
+  ),
 }));
 vi.mock('../components/AddMoreBottlesModal', () => ({
   default: ({ bottle }) => <div data-testid="add-more">{bottle._id}:{bottle.vintage}</div>,
@@ -49,7 +51,22 @@ vi.mock('../components/BarcodeScanModal', () => ({
     </div>
   ),
 }));
-vi.mock('../components/ImageGallery', () => ({ default: ({ bottleId, vintage, vintageScope }) => <div data-testid="gallery">{bottleId}:{vintage}:{vintageScope ? 'all-bottles' : 'one-bottle'}</div> }));
+// `galleryPhotos = 0`: the gallery finds no photos and says so (onEmpty), as the real one does.
+let galleryPhotos = 1;
+vi.mock('../components/ImageGallery', async () => {
+  const { useEffect } = await import('react');
+  return {
+    default: function Gallery({ bottleId, vintage, vintageScope, onEmpty }) {
+      // After its fetch, as the real one: the page has settled by then.
+      useEffect(() => {
+        if (galleryPhotos !== 0) return undefined;
+        const timer = setTimeout(() => onEmpty?.(), 0);
+        return () => clearTimeout(timer);
+      }, [onEmpty]);
+      return <div data-testid="gallery">{bottleId}:{vintage}:{vintageScope ? 'all-bottles' : 'one-bottle'}</div>;
+    },
+  };
+});
 vi.mock('../components/ImageUpload', () => ({ default: ({ bottleId, wineDefinitionId }) => <div data-testid="upload">{bottleId}:{wineDefinitionId}</div> }));
 vi.mock('../components/bottle/WineReviewsCard', () => ({ default: ({ wine, vintage }) => <div data-testid="reviews">{wine._id}:{vintage}</div> }));
 vi.mock('../components/bottle/OwnerInquiryCard', () => ({ default: ({ wineId }) => <div data-testid="inquiry">{wineId}</div> }));
@@ -163,6 +180,30 @@ test('a row opens the bottle page, which is told to lead back here', async () =>
   expect(screen.getByTestId('where').textContent).toBe('/cellars/c1/bottles/b2|{"fromVintage":"/cellars/c1/vintages/w1/2015"}');
 });
 
+// Opened from the cellar list — "all my cellars" chosen on another cellar's
+// page — the way back is that list, and its bottles hand it on, so Drink,
+// Delete or Move on a bottle page lands on the list as it was left.
+test('opened from a cellar list, the page leads back to it and hands it on to its bottles', async () => {
+  renderPage({ pathname: '/cellars/c1/vintages/w1/2015', state: { cellarList: '/cellars/c2' } });
+  await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+  expect(screen.getByText('bottleDetail.backToCellar').closest('a')).toHaveAttribute('href', '/cellars/c2');
+  const rows = [...document.querySelectorAll('.cvb-bottle-list > li')];
+  fireEvent.click(within(rows[1]).getByRole('link'));
+  expect(screen.getByTestId('where').textContent)
+    .toBe('/cellars/c1/bottles/b2|{"fromVintage":"/cellars/c1/vintages/w1/2015","cellarList":"/cellars/c2"}');
+});
+
+test('opened from this cellar\'s own list, the back link keeps the cellar\'s name; a stray path is ignored', async () => {
+  const first = renderPage({ pathname: '/cellars/c1/vintages/w1/2015', state: { cellarList: '/cellars/c1' } });
+  await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+  expect(screen.getByText('history.backTo:{"cellarName":"Home"}').closest('a')).toHaveAttribute('href', '/cellars/c1');
+  first.unmount();
+
+  renderPage({ pathname: '/cellars/c1/vintages/w1/2015', state: { cellarList: '//evil.example/cellars/c2' } });
+  await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+  expect(screen.getByText('history.backTo:{"cellarName":"Home"}').closest('a')).toHaveAttribute('href', '/cellars/c1');
+});
+
 test('Drink, Edit vintage and Add act on this vintage\'s bottles; the page reloads after each', async () => {
   renderPage();
   await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
@@ -171,7 +212,7 @@ test('Drink, Edit vintage and Add act on this vintage\'s bottles; the page reloa
   page = { ...page, bottles: page.bottles.slice(1), total: 2 };
   fireEvent.click(await screen.findByText('drink-stub:3'));
   expect(await screen.findByText('cellarVintageBeta.kindLine:{"count":2,"cellar":"Home"}')).toBeInTheDocument();
-  // Said with Undo now, not only "Logged" (live walkthrough 2026-10-15).
+  // Said with Undo now, not only "Logged".
   expect(screen.getByRole('status')).toHaveTextContent('bottleNotice.takenOut');
   expect(screen.getByText('common.undo')).toBeInTheDocument();
 
@@ -262,7 +303,8 @@ test('what belongs to the wine and the vintage is here: photos, price, reviews, 
   // This vintage's photos — of every bottle of it in the cellar, through a
   // bottle of it; "Add a photo" uploads through the same bottle.
   expect(screen.getByTestId('gallery')).toHaveTextContent('b1:2015:all-bottles');
-  fireEvent.click(screen.getByText('cellarVintageBeta.addPhotoShort'));
+  fireEvent.click(screen.getAllByLabelText('cellarDetail.moreActions')[0]);
+  fireEvent.click(screen.getByText('cellarVintageBeta.addPhoto'));
   expect(await screen.findByTestId('upload')).toHaveTextContent('b1:w1');
   // Closing the window reloads the page (the photo may still be cut out).
   const loads = () => api.mock.calls.filter(([u]) => u === '/api/cellars/c1/vintages/w1/2015').length;
@@ -348,6 +390,28 @@ test('a private draft wine: no report, no recommendation, no price tracking (non
   expect(screen.queryByText('cellarVintageBeta.recommend')).toBeNull();
   // Its own photo and barcode are still the owner's to add.
   expect(screen.getByText('barcodeScan.title')).toBeInTheDocument();
+});
+
+test('"Add a photo" sits under the drawn bottle, and in the menu once there is a photo', async () => {
+  // A photo shown: no button under it, the menu has it.
+  const { unmount } = renderPage();
+  await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+  expect(await screen.findByTestId('gallery')).toBeInTheDocument();
+  expect(screen.queryByText('cellarVintageBeta.addPhotoShort')).toBeNull();
+  fireEvent.click(screen.getAllByLabelText('cellarDetail.moreActions')[0]);
+  expect(screen.getByText('cellarVintageBeta.addPhoto')).toBeInTheDocument();
+  unmount();
+
+  // No photo at all: the drawn bottle, with the button under it.
+  galleryPhotos = 0;
+  try {
+    renderPage();
+    await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+    fireEvent.click(await screen.findByText('cellarVintageBeta.addPhotoShort'));
+    expect(await screen.findByTestId('upload')).toHaveTextContent('b1:w1');
+  } finally {
+    galleryPhotos = 1;
+  }
 });
 
 test('a viewer and a demo account get no photo upload and no barcode', async () => {
@@ -497,7 +561,173 @@ describe('folding blocks', () => {
   });
 });
 
-// Release audit 2026-10-16: NV follows the bottle page's rule — a window
+// "Your drink window" has a way in of its own, for whoever may edit the
+// vintage: classic opens Edit vintage at its window years; early access
+// slides the window on the timeline's bar in place and saves it on every
+// bottle of the vintage here through the bulk route.
+describe('the vintage\'s own drink window', () => {
+  const windowBlock = () => screen.getByText('cellarVintage.yourWindow').closest('.cvb-block');
+  const noWindow = { drinkFrom: null, drinkTo: null };
+  const loads = () => api.mock.calls.filter(([u]) => u === '/api/cellars/c1/vintages/w1/2015').length;
+  const bulkCalls = () => api.mock.calls.filter(([u]) => u === '/api/bottles/bulk');
+  const sentBulk = () => JSON.parse(bulkCalls()[0][1].body);
+  const sliderYear = (name) => Number(screen.getByRole('slider', { name }).getAttribute('aria-valuenow'));
+  // The bulk route's answer; the page read back afterwards holds `after`.
+  const bulkAnswers = (answer, after) => {
+    const base = api.getMockImplementation();
+    api.mockImplementation(async (url, opts) => {
+      if (url !== '/api/bottles/bulk') return base(url, opts);
+      if (after) page = { ...page, bottles: page.bottles.map((b) => ({ ...b, ...after })) };
+      return answer;
+    });
+  };
+
+  describe('classic', () => {
+    test('"Not set yet. Set your own window" opens Edit vintage at its window', async () => {
+      page.bottles = page.bottles.map((b) => ({ ...b, ...noWindow }));
+      renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      // A space after the sentence, not a middle dot (". ·").
+      expect(windowBlock()).toHaveTextContent('cellarVintageBeta.notSet bottleDetail.windowSetOwn');
+      expect(windowBlock()).not.toHaveTextContent('·');
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'bottleDetail.windowSetOwn' }));
+      expect(await screen.findByText('edit-stub:b1,b2,b3|focus:drinkWindow')).toBeInTheDocument();
+    });
+
+    test('a shared window gets "Change"; differing windows "Set one window for all" — both open it at the window', async () => {
+      const { unmount } = renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      expect(within(windowBlock()).getByText('2025–2045')).toBeInTheDocument();
+      // After the years the link keeps its middle dot.
+      expect(windowBlock()).toHaveTextContent('2025–2045 · bottleDetail.windowChange');
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'bottleDetail.windowChangeLabel' }));
+      expect(await screen.findByText('edit-stub:b1,b2,b3|focus:drinkWindow')).toBeInTheDocument();
+      unmount();
+
+      page.bottles[1] = { ...page.bottles[1], drinkFrom: 2027 };
+      renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      expect(windowBlock()).toHaveTextContent('cellarVintageBeta.windowDiffers cellarVintageBeta.windowSetForAll');
+      expect(windowBlock()).not.toHaveTextContent('·');
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'cellarVintageBeta.windowSetForAll' }));
+      expect(await screen.findByText('edit-stub:b1,b2,b3|focus:drinkWindow')).toBeInTheDocument();
+    });
+
+    test('Edit vintage itself still opens at the top of the dialog', async () => {
+      renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      fireEvent.click(screen.getAllByText('cellarVintageBeta.editVintage')[0]);
+      expect(await screen.findByText('edit-stub:b1,b2,b3')).toBeInTheDocument();
+    });
+
+    test('a viewer of a shared cellar reads the window but gets no link', async () => {
+      page.cellar.userRole = 'viewer';
+      const { unmount } = renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      expect(within(windowBlock()).getByText('2025–2045')).toBeInTheDocument();
+      expect(within(windowBlock()).queryByRole('button')).toBeNull();
+      unmount();
+      page.bottles = page.bottles.map((b) => ({ ...b, ...noWindow }));
+      renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      expect(windowBlock()).toHaveTextContent('cellarVintageBeta.notSet');
+      expect(within(windowBlock()).queryByRole('button')).toBeNull();
+    });
+  });
+
+  describe('early access', () => {
+    beforeEach(() => { __setFeatureFlagsForTest([{ key: 'maturityTimeline', state: 'beta' }]); });
+    afterEach(() => { __setFeatureFlagsForTest([]); });
+
+    test('a shared window is a timeline with its own status; Adjust saves the four years on every bottle, then the page reloads', async () => {
+      bulkAnswers(ok({ done: 3, doneIds: ['b1', 'b2', 'b3'], skipped: [] }), { drinkFrom: 2026 });
+      renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      const timeline = within(windowBlock()).getByTestId('maturity-timeline');
+      expect(timeline.querySelector('.mt-now-label')).toHaveTextContent(`${new Date().getFullYear()} · bottleDetail.personalDrinkNow`);
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'bottleDetail.windowAdjustLabel' }));
+      expect([sliderYear('bottleDetail.windowHandleDrinkFrom'), sliderYear('bottleDetail.windowHandleDrinkTo')]).toEqual([2025, 2045]);
+      fireEvent.keyDown(screen.getByRole('slider', { name: 'bottleDetail.windowHandleDrinkFrom' }), { key: 'ArrowRight' });
+      // The editor says it writes to every bottle here, as Edit vintage does.
+      expect(within(windowBlock()).getByText('editVintage.intro:3')).toBeInTheDocument();
+      const before = loads();
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'editVintage.submit' }));
+
+      expect(await screen.findByText('cellarVintageBeta.savedNote')).toBeInTheDocument();
+      expect(sentBulk()).toEqual({
+        action: 'update',
+        bottleIds: ['b1', 'b2', 'b3'],
+        fields: { drinkFrom: 2026, peakFrom: null, peakUntil: null, drinkTo: 2045 },
+      });
+      await waitFor(() => expect(screen.queryByRole('slider')).toBeNull());
+      expect(loads()).toBe(before + 1);
+      // The page as reloaded, the keyboard back on its action.
+      expect(within(windowBlock()).getByRole('button', { name: 'bottleDetail.windowAdjustLabel' })).toHaveFocus();
+    });
+
+    test('windows that differ: "Set one window for all" starts from the sommelier\'s years and sets one window on every bottle', async () => {
+      page.bottles[1] = { ...page.bottles[1], drinkFrom: 2027 };
+      bulkAnswers(ok({ done: 3, doneIds: ['b1', 'b2', 'b3'], skipped: [] }));
+      renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      // The sommelier's window (2030–2045) has loaded.
+      await screen.findByText('2030–2045');
+      expect(within(windowBlock()).queryByTestId('maturity-timeline')).toBeNull();
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'cellarVintageBeta.windowSetForAll' }));
+      expect([sliderYear('bottleDetail.windowHandleDrinkFrom'), sliderYear('bottleDetail.windowHandleDrinkTo')]).toEqual([2030, 2045]);
+      // Not a window of their own yet: nothing to remove.
+      expect(screen.queryByRole('button', { name: 'bottleDetail.windowRemoveMine' })).toBeNull();
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'editVintage.submit' }));
+      await waitFor(() => expect(bulkCalls()).toHaveLength(1));
+      expect(sentBulk()).toEqual({
+        action: 'update',
+        bottleIds: ['b1', 'b2', 'b3'],
+        fields: { drinkFrom: 2030, peakFrom: null, peakUntil: null, drinkTo: 2045 },
+      });
+    });
+
+    test('not set yet: "Set your own window" opens the editor in place', async () => {
+      page.bottles = page.bottles.map((b) => ({ ...b, ...noWindow }));
+      renderPage();
+      await screen.findByText('2030–2045');
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'bottleDetail.windowSetOwn' }));
+      expect(within(windowBlock()).getAllByRole('slider')).toHaveLength(2);
+      // Cancel leaves the bottles alone.
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'common.cancel' }));
+      expect(screen.queryByRole('slider')).toBeNull();
+      expect(bulkCalls()).toHaveLength(0);
+      expect(within(windowBlock()).getByRole('button', { name: 'bottleDetail.windowSetOwn' })).toHaveFocus();
+    });
+
+    test('bottles the bulk route skips are counted in the notice; a refusal keeps the editor open with its message', async () => {
+      bulkAnswers(ok({ done: 2, doneIds: ['b1', 'b2'], skipped: [{ id: 'b3', reason: 'invalid' }] }));
+      const { unmount } = renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'bottleDetail.windowAdjustLabel' }));
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'editVintage.submit' }));
+      expect(await screen.findByText('bulk.doneInfo:2 bulk.windowSkippedInfo:1')).toBeInTheDocument();
+      unmount();
+
+      bulkAnswers({ ok: false, status: 403, json: async () => ({ error: 'Not allowed' }) });
+      renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'bottleDetail.windowAdjustLabel' }));
+      fireEvent.click(within(windowBlock()).getByRole('button', { name: 'editVintage.submit' }));
+      expect(await within(windowBlock()).findByRole('alert')).toHaveTextContent('Not allowed');
+      expect(within(windowBlock()).getAllByRole('slider')).toHaveLength(2);
+    });
+
+    test('a viewer sees the timeline, with no Adjust', async () => {
+      page.cellar.userRole = 'viewer';
+      renderPage();
+      await screen.findByText('cellarVintageBeta.kindLine:{"count":3,"cellar":"Home"}');
+      expect(within(windowBlock()).getByTestId('maturity-timeline')).toBeInTheDocument();
+      expect(within(windowBlock()).queryByRole('button')).toBeNull();
+    });
+  });
+});
+
+// NV follows the bottle page's rule — a window
 // only in relative mode and with a year to measure from.
 describe('NV maturity', () => {
   const nvPage = (bottles) => ({ ...page, vintage: 'NV', bottles, total: bottles.length });

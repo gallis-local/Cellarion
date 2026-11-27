@@ -32,21 +32,19 @@ jest.mock('../../models/Grape', () => ({ find: jest.fn() }));
 jest.mock('../../services/notifications', () => ({ createNotification: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../../services/indexNow', () => ({ submitUrls: jest.fn() }));
-jest.mock('../../services/search', () => ({ indexWine: jest.fn(), bulkIndexBottles: jest.fn() }));
+jest.mock('../../services/search', () => ({ indexWine: jest.fn() }));
 jest.mock('../../services/embeddingJob', () => ({ reembedActiveVintages: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../../services/enrichmentJob', () => ({
   reenrichAfterRecordEdit: jest.fn(),
   // The REAL snapshot — pure and dependency-free, so nothing is gained by
-  // mirroring it, and a hand mirror rots the day the field list changes (it
-  // gained `classification` the very release this mock was written in;
-  // audit 2026-08-16).
+  // mirroring it, and a hand mirror rots the day the field list changes.
   profileInputsSnapshot: jest.requireActual('../../services/enrichmentJob').profileInputsSnapshot,
 }));
 jest.mock('../../services/findOrCreateWine', () => ({ findOrCreateRegion: jest.fn() }));
 // Identity by default so the tier-strip assertions below still read the
 // normalizeAppellation output; the curated-registry test overrides it.
 jest.mock('../../services/appellationResolve', () => ({ resolveCanonicalAppellation: jest.fn(async (v) => v) }));
-// The producer-spelling lookups (2026-09-28) are unit-tested in
+// The producer-spelling lookups are unit-tested in
 // services/producerSpelling.test.js; here they are the seam. No split unless a
 // test says so (reset in beforeEach), so every other test approves as before.
 jest.mock('../../services/producerSpelling', () => ({
@@ -56,13 +54,24 @@ jest.mock('../../services/producerSpelling', () => ({
 }));
 // The extracted merge helper — the whole point of the extraction is that this
 // route invokes IT rather than re-implementing the machinery.
-jest.mock('./wines', () => ({ performWineMerge: jest.fn() }));
+jest.mock('../../services/wineMergeOps', () => ({ performWineMerge: jest.fn() }));
 // Grape resolution is the somm's own set_wine_profile helper; the route must
 // call it rather than touching the Grape collection itself, so it is mocked
 // and asserted on. WINE_TYPES stays real — it is a constant list.
 jest.mock('../../services/wineProfileOps', () => ({
   WINE_TYPES: ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'],
   resolveGrapeIdsStrict: jest.fn(),
+}));
+// The proposer's Cellar Cred is the helper's business (services/suggestionCred,
+// unit-tested there); here it is the seam the approve must go through.
+jest.mock('../../services/suggestionCred', () => ({
+  awardProposal: jest.fn().mockResolvedValue(true),
+  settleNonWineProposals: jest.fn().mockResolvedValue({ awarded: 0, reversed: 0 }),
+}));
+// The classification write rule reads the taxonomy; only its answer matters here.
+jest.mock('../../services/classificationOps', () => ({
+  ...jest.requireActual('../../services/classificationOps'),
+  assignClassification: jest.fn(),
 }));
 
 const express = require('express');
@@ -75,7 +84,7 @@ const Bottle = require('../../models/Bottle');
 const Country = require('../../models/Country');
 const Grape = require('../../models/Grape');
 const { createNotification } = require('../../services/notifications');
-const { performWineMerge } = require('./wines');
+const { performWineMerge } = require('../../services/wineMergeOps');
 const { resolveCanonicalAppellation } = require('../../services/appellationResolve');
 const searchService = require('../../services/search');
 const { generateWineKey } = require('../../utils/normalize');
@@ -167,9 +176,9 @@ describe('GET / (list)', () => {
     expect(pipeline.some(s => s.$sort && s.$sort._pendingFirst === 1)).toBe(true);
   });
 
-  // 2026-09-28: a proposal a merge or a delete closed is 'closed', not
-  // 'rejected'. The decided tab shows all three non-pending states, and the
-  // status filter accepts the new one.
+  // A proposal a merge or a delete closed is 'closed', not 'rejected'. The
+  // decided tab shows all three non-pending states, and the status filter
+  // accepts 'closed'.
   test('the decided view spans approved, rejected and closed; ?status=closed filters to the lifecycle closures', async () => {
     WineCorrectionProposal.aggregate.mockResolvedValue([]);
     WineCorrectionProposal.countDocuments.mockResolvedValue(0);
@@ -181,8 +190,8 @@ describe('GET / (list)', () => {
     expect(WineCorrectionProposal.aggregate.mock.calls[1][0][0]).toEqual({ $match: { status: 'closed' } });
   });
 
-  // Support ticket 2026-09-12: later filings by the same proposer ride along
-  // with their own reason/evidence; the original reason stays the original.
+  // Later filings by the same proposer ride along with their own
+  // reason/evidence; the original reason stays the original.
   test('amendments are projected with their own reason and evidence, fields defaulting to []', async () => {
     WineCorrectionProposal.aggregate.mockResolvedValue([{
       _id: P1, kind: 'field_correction', status: 'pending',
@@ -207,7 +216,7 @@ describe('GET / (list)', () => {
   });
 
   // The web grape picker lets a user deliberately propose a variety the
-  // taxonomy lacks (support ticket 2026-09-17). Approving refuses it until the
+  // taxonomy lacks. Approving refuses it until the
   // variety exists — so the list says which names those are, up front.
   describe('a proposed variety the taxonomy does not have', () => {
     const rowWith = (over) => ({
@@ -254,11 +263,46 @@ describe('GET / (list)', () => {
       expect(Grape.find).not.toHaveBeenCalled();
     });
   });
+
+  // A sweetness style is three values in one field: the diff row reads
+  // "term (source)" on both sides, and the page that names the proposed term
+  // rides along for the reviewer to open.
+  describe('a proposed sweetness style', () => {
+    const URL = 'https://merchant.example/kabinett';
+    const rowWith = (wineStyle) => ({
+      _id: P1, kind: 'field_correction', status: 'pending',
+      proposer: { _id: ADMIN_ID, username: 'rudi' },
+      wineDefinition: { _id: W1, name: 'Riesling Kabinett', producer: 'Weingut X', sweetnessStyle: wineStyle },
+      proposedFields: { sweetnessStyle: { term: 'feinherb', source: 'trade', url: URL } },
+      currentSnapshot: { producer: 'Weingut X', name: 'Riesling Kabinett', sweetnessStyle: null },
+      reason: 'The merchant calls this cuvée feinherb.',
+      createdAt: '2026-09-18T00:00:00.000Z',
+    });
+
+    test('reads as one diff row with its link, against a wine that has none', async () => {
+      WineCorrectionProposal.aggregate.mockResolvedValue([rowWith(null)]);
+      WineCorrectionProposal.countDocuments.mockResolvedValueOnce(1).mockResolvedValueOnce(1);
+      const row = (await (await get('?status=pending')).json()).proposals[0];
+      expect(row.diff).toEqual({ sweetnessStyle: { current: null, proposed: 'feinherb (trade)', url: URL } });
+      // The wine's sweetness style is asked for: the path is select: false.
+      const winePopulate = WineCorrectionProposal.populate.mock.calls[0][1].find((p) => p.path === 'wineDefinition');
+      expect(winePopulate.select.split(' ')).toContain('sweetnessStyle');
+      expect(winePopulate.populate).toContainEqual({ path: 'sweetnessStyle.term', select: 'name' });
+    });
+
+    test('shows the style the wine carries now on the current side', async () => {
+      WineCorrectionProposal.aggregate.mockResolvedValue([rowWith({ term: { name: 'fruchtsüß' }, source: 'producer', url: 'https://estate.example/' })]);
+      WineCorrectionProposal.countDocuments.mockResolvedValueOnce(1).mockResolvedValueOnce(1);
+      const row = (await (await get('?status=pending')).json()).proposals[0];
+      expect(row.diff.sweetnessStyle).toEqual({ current: 'fruchtsüß (producer)', proposed: 'feinherb (trade)', url: URL });
+      expect(row.wineDefinition.sweetnessStyle).toBe('fruchtsüß (producer)');
+    });
+  });
 });
 
-// Every other submitter-facing queue told its submitter what happened; a
-// decided correction recorded it where only a GDPR export could reach — while
-// the bottle page promised "you'll see the outcome" (2026-09-18).
+// Like every other submitter-facing queue, a decided correction tells its
+// submitter what happened — the bottle page promises "you'll see the
+// outcome", so the decision must not live only where a GDPR export reaches.
 describe('telling the submitter', () => {
   const USER_ID = '64b000000000000000000002';
   const userProposal = (over = {}) => ({
@@ -322,8 +366,8 @@ describe('telling the submitter', () => {
   });
 
   // The decision is claimed and audited BEFORE the label is read. A failed read
-  // used to bubble up as a 500: the admin retried into a 409, and the submitter
-  // never heard (pre-deploy audit 2026-09-18).
+  // must not bubble up as a 500: the admin would retry into a 409, and the
+  // submitter would never hear.
   test('a failed label lookup on reject still answers 200 and still tells the submitter', async () => {
     WineCorrectionProposal.findOneAndUpdate.mockResolvedValue(userProposal());
     WineDefinition.findById.mockReturnValue({ select: () => ({ lean: async () => { throw new Error('primary stepped down'); } }) });
@@ -374,18 +418,17 @@ describe('POST /:id/approve', () => {
     expect(wine.save).toHaveBeenCalled();
     expect(searchService.indexWine).toHaveBeenCalledWith(W1);
     // IndexNow parity with the PUT: an approved identity fix changes the
-    // public wine page and must ping crawlers the same way (audit 2026-08-10).
+    // public wine page and must ping crawlers the same way.
     expect(require('../../services/indexNow').submitUrls).toHaveBeenCalledWith(`/wines/${W1}`);
     // The receipt lands on the row.
     const noteSet = WineCorrectionProposal.updateOne.mock.calls.at(-1);
     expect(noteSet[1].$set.appliedNote).toMatch(/Applied/);
   });
 
-  // Parity with the admin PUT (gap found live 2026-08-16: approving
-  // "Fabelhaft" → "Niepoort" left the négociant-fiction profile attached
-  // until a manual force re-enrich): an approved change to a profile-feeding
-  // field hands the wine to the re-enrich follow-through — and ONLY a real
-  // change does.
+  // Parity with the admin PUT (otherwise a producer fix such as "Fabelhaft" →
+  // "Niepoort" keeps the old profile attached until a manual force
+  // re-enrich): an approved change to a profile-feeding field hands the wine
+  // to the re-enrich follow-through — and ONLY a real change does.
   test('field_correction: a real producer change triggers the re-enrich follow-through', async () => {
     claim({ _id: P1, kind: 'field_correction', wineDefinition: W1, proposedFields: { producer: 'Niepoort' } });
     const wine = { _id: W1, name: 'Douro Tinto', producer: 'Fabelhaft', appellation: 'Douro', country: 'c1', save: jest.fn().mockResolvedValue(undefined) };
@@ -397,11 +440,10 @@ describe('POST /:id/approve', () => {
     expect(reenrichAfterRecordEdit).toHaveBeenCalledWith(wine, true);
   });
 
-  // Type and grapes became proposable on 2026-08-19 (somm ticket 6a85ad44):
-  // until then a curator could SEE a wine stored red on nothing but white
-  // grapes and had no route to propose the fix, so every one came back to an
-  // admin by hand.
-  describe('type and grapes (the fields a curator could not propose before)', () => {
+  // Type and grapes are proposable: a curator who SEES a wine stored red on
+  // nothing but white grapes has a route to propose the fix instead of
+  // handing every one back to an admin.
+  describe('type and grapes (proposable fields)', () => {
     const { resolveGrapeIdsStrict } = require('../../services/wineProfileOps');
 
     test('applies a corrected type', async () => {
@@ -489,10 +531,10 @@ describe('POST /:id/approve', () => {
     expect(reenrichAfterRecordEdit).toHaveBeenCalledWith(wine, false);
   });
 
-  // The "Yecla DO" case (prod, 2026-08-12): approving a proposal used to store
-  // the tier-stripped string directly, so a decoration normalizeAppellation
-  // deliberately cannot strip survived onto the wine. The stored value must
-  // now come from the curated-registry resolver, not from the normalizer.
+  // The "Yecla DO" case: storing the tier-stripped string directly would let
+  // a decoration normalizeAppellation deliberately cannot strip survive onto
+  // the wine. The stored value comes from the curated-registry resolver, not
+  // from the normalizer.
   test('field_correction: the STORED appellation is the resolver\'s canonical spelling', async () => {
     resolveCanonicalAppellation.mockResolvedValueOnce('Yecla');
     claim({ _id: P1, kind: 'field_correction', wineDefinition: W1, proposedFields: { appellation: ' Yecla DO ' } });
@@ -537,8 +579,8 @@ describe('POST /:id/approve', () => {
     expect(revert).toBeTruthy();
   });
 
-  // Support ticket 2026-09-17 ("Colour Sparkling/Rosè"): a colour is judged
-  // against the type the wine has once THIS proposal's own type is applied.
+  // A colour is judged against the type the wine has once THIS proposal's own
+  // type is applied.
   test('field_correction: colour applies on a style type — including one the same proposal sets', async () => {
     claim({ _id: P1, kind: 'field_correction', wineDefinition: W1, proposedFields: { type: 'sparkling', colour: 'rosé' } });
     const wine = { _id: W1, name: 'Rosé Extra Brut', producer: 'Maso Martis', appellation: 'Trento', type: 'rosé', country: 'c1', save: jest.fn().mockResolvedValue(undefined) };
@@ -571,6 +613,23 @@ describe('POST /:id/approve', () => {
     expect((await res.json()).error).toMatch(/Unknown colour "orange"/);
     const revert = WineCorrectionProposal.updateOne.mock.calls.find(c => c[1]?.$set?.status === 'pending');
     expect(revert).toBeTruthy();
+  });
+
+  test('field_correction: a tier the classification list lacks → 400 and the claim is reverted', async () => {
+    const { assignClassification } = require('../../services/classificationOps');
+    claim({ _id: P1, kind: 'field_correction', wineDefinition: W1, proposedFields: { classification: 'Gran Cru Supremo' } });
+    const wine = { _id: W1, name: 'X', producer: 'Y', country: 'c1', save: jest.fn() };
+    WineDefinition.findById.mockResolvedValue(wine);
+    assignClassification.mockResolvedValueOnce({ ok: false, message: '"Gran Cru Supremo" is not in the registry\'s classification list.' });
+
+    const res = await post(`/${P1}/approve`);
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/classification list/);
+    // Back to the queue: an approved row with nothing applied is the
+    // half-approved state the claim revert exists to prevent.
+    const revert = WineCorrectionProposal.updateOne.mock.calls.find(c => c[1]?.$set?.status === 'pending');
+    expect(revert).toBeTruthy();
+    expect(wine.save).not.toHaveBeenCalled();
   });
 
   test('merge: invokes the EXTRACTED performWineMerge with source=proposal wine, target=mergeTargetId', async () => {
@@ -611,7 +670,9 @@ describe('POST /:id/approve', () => {
     expect(WineVintageProfile.deleteMany).toHaveBeenCalledWith({ wineDefinition: W1, status: 'pending' });
     expect((await res.json()).appliedNote).toMatch(/2 pending/);
     expect(searchService.indexWine).toHaveBeenCalledWith(W1);
-    // The vectors go with the row (audit 2026-10-14): nothing left for
+    // Earlier flags a restore took back stand again with the quarantine.
+    expect(require('../../services/suggestionCred').settleNonWineProposals).toHaveBeenCalledWith(W1, true);
+    // The vectors go with the row: nothing left for
     // semantic search or the similar-wines graph to find.
     expect(require('../../models/WineEmbedding').deleteMany).toHaveBeenCalledWith({ wineDefinition: W1 });
   });
@@ -628,10 +689,10 @@ describe('POST /:id/approve', () => {
   });
 });
 
-// 2026-09-28: approving producer corrections gave 9 wines in one week a
-// spelling the rest of their producer did not use ("Château Lagrézette" beside
-// "Chateau Lagrezette"), each a split the weekly registry-health check rang
-// for. A producer change into a split now needs the admin's pick.
+// An approved producer correction can give a wine a spelling the rest of its
+// producer does not use ("Château Lagrézette" beside "Chateau Lagrezette"),
+// a split the weekly registry-health check rings for. A producer change into
+// a split needs the admin's pick.
 describe('producer spelling splits', () => {
   const { otherProducerSpellings, planProducerRename } = require('../../services/producerSpelling');
   const { logAudit } = require('../../services/audit');
@@ -656,8 +717,8 @@ describe('producer spelling splits', () => {
     const data = await res.json();
     expect(data).toMatchObject({ code: 'producer_spelling_split', proposed: 'Château Lagrézette', spellings: OTHERS });
     expect(data.error).toMatch(/"Chateau Lagrezette" \(3 wines\)/);
-    // No claim, so no revert that could collide with a re-filed proposal (review
-    // 2026-09-28) — and no region minted for a refused approve.
+    // No claim, so no revert that could collide with a re-filed proposal —
+    // and no region minted for a refused approve.
     expect(WineCorrectionProposal.findOneAndUpdate).not.toHaveBeenCalled();
     expect(findOrCreateRegion).not.toHaveBeenCalled();
     expect(wine.save).not.toHaveBeenCalled();
@@ -773,6 +834,32 @@ describe('producer spelling splits', () => {
     expect((await res.json()).appliedNote).toMatch(/1 other wine renamed to "Château Lagrézette"/);
   });
 
+  // The corrected wine's own key is reserved so no sibling is renamed onto it.
+  // A termed wine's key carries its term's word (the hook appends it at the
+  // save): a bare reserved key would reserve a key nobody holds.
+  test('the reserved key of a TERMED wine carries its term', async () => {
+    const { primeSweetnessCache } = require('../../services/sweetnessOps');
+    const SW = 'e'.repeat(24);
+    primeSweetnessCache([{ _id: SW, name: 'trocken', scale: 'still', band: 'dry', country: null, synonyms: [] }]);
+    try {
+      claim(proposal());
+      const wine = { ...wineDoc(), labelSweetness: SW };
+      WineDefinition.findById.mockResolvedValue(wine);
+      otherProducerSpellings.mockResolvedValue(OTHERS);
+      planProducerRename.mockResolvedValue({ wines: [], clashes: [], tooMany: 0 });
+
+      const res = await post(`/${P1}/approve`, { producerSpelling: 'renameAll', renameSpellings: ['Chateau Lagrezette'] });
+      expect(res.status).toBe(200);
+      expect(planProducerRename).toHaveBeenCalledWith(['Chateau Lagrezette'], 'Château Lagrézette', 'c1', {
+        excludeWineId: W1,
+        reservedKeys: [generateWineKey('Le Pigeonnier', 'Château Lagrézette', 'Cahors', { sweetness: 'trocken' })],
+      });
+      expect(planProducerRename.mock.calls[0][3].reservedKeys[0]).not.toBe(generateWineKey('Le Pigeonnier', 'Château Lagrézette', 'Cahors'));
+    } finally {
+      primeSweetnessCache(null);
+    }
+  });
+
   test('a rename has to name its spellings — and only listed ones', async () => {
     let res = await post(`/${P1}/approve`, { producerSpelling: 'renameAll' });
     expect(res.status).toBe(400);
@@ -884,10 +971,22 @@ describe('POST /:id/reject', () => {
     res = await post(`/${P1}/reject`, { reason: 'Late second opinion.' });
     expect(res.status).toBe(409);
   });
+
+  test('a reason may fill what the proposal row stores: 2000 characters are kept whole, 2001 are refused', async () => {
+    WineCorrectionProposal.findOneAndUpdate.mockResolvedValueOnce({ _id: P1, kind: 'merge', wineDefinition: W1 });
+    const long = 'x'.repeat(2000);
+    expect((await post(`/${P1}/reject`, { reason: long })).status).toBe(200);
+    expect(WineCorrectionProposal.findOneAndUpdate.mock.calls[0][1].$set.rejectReason).toBe(long);
+
+    const res = await post(`/${P1}/reject`, { reason: 'x'.repeat(2001) });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe('Reject reason must be at most 2000 characters');
+    expect(WineCorrectionProposal.findOneAndUpdate).toHaveBeenCalledTimes(1);
+  });
 });
 
 /**
- * Bulk decisions (ticket 6a8162c5 ask #3 — the middle road): each id runs the
+ * Bulk decisions: each id runs the
  * EXACT single-decision machinery, so what these pin is the batch envelope —
  * per-row outcomes, one row's failure never blocking the rest, dedupe, and
  * the bounds/reason gates deciding NOTHING when they fail.
@@ -966,12 +1065,15 @@ describe('POST /bulk-approve and /bulk-reject', () => {
     const res = await post('/bulk-reject', { ids: [P1], reason: 'x' });
     expect(res.status).toBe(400);
     expect(WineCorrectionProposal.findOneAndUpdate).not.toHaveBeenCalled();
+    // The same upper bound as the single reject.
+    expect((await post('/bulk-reject', { ids: [P1], reason: 'x'.repeat(2001) })).status).toBe(400);
+    expect(WineCorrectionProposal.findOneAndUpdate).not.toHaveBeenCalled();
   });
 });
 
 /**
- * Bulk follow-through is deferred and per-WINE (audit 2026-08-16): firing per
- * proposal let an early re-enrich race later same-batch applies, and cost one
+ * Bulk follow-through is deferred and per-WINE: firing per
+ * proposal would let an early re-enrich race later same-batch applies, and cost one
  * forced AI call per proposal instead of per wine.
  */
 describe('bulk-approve follow-through', () => {
@@ -1006,5 +1108,76 @@ describe('bulk-approve follow-through', () => {
     expect(reenrichAfterRecordEdit).toHaveBeenCalledWith(wine1, true);
     expect(reenrichAfterRecordEdit).toHaveBeenCalledWith(wine2, true);
     expect(reembedActiveVintages).toHaveBeenCalledTimes(2);
+  });
+});
+
+// An accepted correction earns its proposer Cellar Cred — the daily
+// suggestion budget rises with it. Who earns, and once only, is
+// services/suggestionCred's rule; the route's job is to call it for every
+// approve that applied, single or bulk, and for nothing else.
+describe('Cellar Cred for the proposer', () => {
+  const { awardProposal } = require('../../services/suggestionCred');
+  const MEMBER_ID = '64b000000000000000000002';
+  const P2 = '64b0000000000000000000a2';
+  const P3 = '64b0000000000000000000a3';
+  const fix = (id, over = {}) => ({
+    _id: id, kind: 'field_correction', wineDefinition: W1, proposer: MEMBER_ID, decidedBy: ADMIN_ID,
+    status: 'approved', proposedFields: { producer: 'Niepoort' }, ...over,
+  });
+  const wine = () => ({ _id: W1, name: 'Douro Tinto', producer: 'Fabelhaft', appellation: 'Douro', country: 'c1', save: jest.fn().mockResolvedValue(undefined) });
+
+  test('a single approve that applied awards the approved row — after its receipt is written', async () => {
+    WineCorrectionProposal.findOneAndUpdate.mockResolvedValue(fix(P1));
+    WineDefinition.findById.mockResolvedValue(wine());
+
+    expect((await post(`/${P1}/approve`)).status).toBe(200);
+    expect(awardProposal).toHaveBeenCalledTimes(1);
+    expect(awardProposal.mock.calls[0][0]).toMatchObject({ _id: P1, proposer: MEMBER_ID, status: 'approved' });
+    // The helper only pays a row that carries its appliedNote.
+    const noteWrite = WineCorrectionProposal.updateOne.mock.calls.findIndex((c) => c[1]?.$set?.appliedNote);
+    expect(WineCorrectionProposal.updateOne.mock.invocationCallOrder[noteWrite])
+      .toBeLessThan(awardProposal.mock.invocationCallOrder[0]);
+  });
+
+  test('every kind goes through the same award — a merge and a non-wine flag too', async () => {
+    WineCorrectionProposal.findOneAndUpdate.mockResolvedValueOnce(fix(P1, { kind: 'merge', mergeTargetId: W2, proposedFields: undefined }));
+    performWineMerge.mockResolvedValue({ bottlesMoved: 0, imageAction: 'none', source: {}, target: { name: 'Barolo', producer: 'Pira' } });
+    expect((await post(`/${P1}/approve`)).status).toBe(200);
+
+    WineCorrectionProposal.findOneAndUpdate.mockResolvedValueOnce(fix(P2, { kind: 'non_wine', proposedFields: undefined }));
+    WineDefinition.findById.mockResolvedValue({ ...wine(), nonWine: false });
+    WineVintageProfile.deleteMany.mockResolvedValue({ deletedCount: 0 });
+    expect((await post(`/${P2}/approve`)).status).toBe(200);
+
+    expect(awardProposal.mock.calls.map((c) => [c[0]._id, c[0].kind])).toEqual([[P1, 'merge'], [P2, 'non_wine']]);
+  });
+
+  test('bulk-approve awards each row that applied, and none that did not', async () => {
+    WineCorrectionProposal.findOneAndUpdate
+      .mockResolvedValueOnce(fix(P1))
+      .mockResolvedValueOnce(null) // decided elsewhere → 409
+      .mockResolvedValueOnce(fix(P3, { proposedFields: { name: 'Reserva' } }));
+    WineCorrectionProposal.exists.mockResolvedValueOnce(true);
+    WineDefinition.findById.mockImplementation(async () => wine());
+
+    const data = await (await post('/bulk-approve', { ids: [P1, P2, P3] })).json();
+    expect(data.approved).toBe(2);
+    expect(awardProposal.mock.calls.map((c) => c[0]._id)).toEqual([P1, P3]);
+  });
+
+  test('an approve that could not apply — claim reverted — awards nothing', async () => {
+    WineCorrectionProposal.findOneAndUpdate.mockResolvedValue(fix(P1, { proposedFields: { name: 'Barolo' } }));
+    WineDefinition.findById.mockResolvedValue({ ...wine(), save: jest.fn().mockRejectedValue(Object.assign(new Error('dup'), { code: 11000 })) });
+
+    expect((await post(`/${P1}/approve`)).status).toBe(409);
+    expect(awardProposal).not.toHaveBeenCalled();
+  });
+
+  test('a rejection awards nothing', async () => {
+    WineCorrectionProposal.findOneAndUpdate.mockResolvedValue(fix(P1, { status: 'rejected' }));
+    WineDefinition.findById.mockReturnValue({ select: () => ({ lean: async () => ({ _id: W1, name: 'Douro Tinto', producer: 'Fabelhaft' }) }) });
+
+    expect((await post(`/${P1}/reject`, { reason: 'The label says otherwise.' })).status).toBe(200);
+    expect(awardProposal).not.toHaveBeenCalled();
   });
 });

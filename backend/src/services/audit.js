@@ -16,16 +16,39 @@ const STATS_CHANGED_PREFIXES = ['bottle.', 'cellar.'];
 // the data version), MCP rack reads, the token bottle list. They move the data
 // version and the MCP caches like wine-data changes, without the stats push.
 // Climate device and bounds changes ride in the cellar list (cellar.climate),
-// which token polls read from memory (release audit 2026-10-09, L).
+// which token polls read from memory.
 const DATA_CHANGED_PREFIXES = [...STATS_CHANGED_PREFIXES, 'rack.', 'climate.'];
 
-// Invalidate a user's MCP read caches on any wine-data mutation (grand-audit
-// M3). Lazy-required so these MCP modules stay off audit's load path (they pull
-// the tool registry, whose search dep is ESM-only and unparseable by jest —
-// the #702 failure mode). Never throws: a cache miss must not fail a mutation.
+// Rack changes send their own event, racks_changed: where bottles are has
+// changed, the statistics have not. A racking session is hundreds of
+// placements and a stream client refreshes on every event, so a user hears of
+// the first change at once and then at most once per RACK_NUDGE_MS while the
+// changes go on (the last one is always announced).
+const RACK_PREFIX = 'rack.';
+const RACK_NUDGE_MS = 30 * 1000;
+const rackNudges = new Map(); // userId -> { again: action | null }
+function nudgeRacks(userId, action) {
+  const key = String(userId);
+  const quiet = rackNudges.get(key);
+  if (quiet) { quiet.again = action; return; }
+  eventBus.emit(key, 'racks_changed', { reason: action });
+  const state = { again: null };
+  rackNudges.set(key, state);
+  const timer = setTimeout(() => {
+    rackNudges.delete(key);
+    if (state.again) nudgeRacks(key, state.again);
+  }, RACK_NUDGE_MS);
+  // Never hold the process open for a pending nudge.
+  timer.unref?.();
+}
+
+// Invalidate a user's MCP read caches on any wine-data mutation. Lazy-required
+// so these MCP modules stay off audit's load path (they pull the tool
+// registry, whose search dep is ESM-only and unparseable by jest). Never
+// throws: a cache miss must not fail a mutation.
 //
-// Debounced per user (MCP-audit M10): a bulk_add of 24 bottles fires 24 bottle.
-// audits within milliseconds, each doing two full Map scans (up to ~4000 string
+// Debounced per user: a bulk_add of 24 bottles fires 24 bottle.* audits
+// within milliseconds, each doing two full Map scans (up to ~4000 string
 // compares) for the SAME user — the first bust already cleared everything, the
 // rest are pure waste. Collapse repeats within a short window; the cache already
 // tolerates a 60s stale window, so a sub-window skip can never serve stale data
@@ -71,7 +94,11 @@ function logAudit(req, action, resource = {}, detail = {}) {
     actor: {
       userId:    req?.user?.id    || null,
       role:      req?.user?.roles?.[0]  || (req ? 'anonymous' : 'system'),
-      ipAddress: getClientIp(req)
+      ipAddress: getClientIp(req),
+      // Set by middleware/apiTokenAuth.js, and carried by an MCP session's
+      // request snapshot (mcp/requestSnapshot.js). Only a well-formed id: a
+      // value the schema cannot cast would fail the whole row.
+      ...(typeof req?.apiToken?.id === 'string' && /^[a-f0-9]{24}$/i.test(req.apiToken.id) ? { tokenId: req.apiToken.id } : {})
     },
     action,
     resource,
@@ -79,7 +106,7 @@ function logAudit(req, action, resource = {}, detail = {}) {
     userAgent: req?.headers?.['user-agent']
   };
 
-  // Structured stdout log — visible in docker logs. REDACTED (L-16): the
+  // Structured stdout log — visible in docker logs. REDACTED: the
   // container/log-aggregation stream is an independent copy of the audit trail
   // with no TTL and no erasure path, so it must never carry identifiers. Only
   // actor userId + role, the action, and the resource type/ids are emitted
@@ -98,8 +125,10 @@ function logAudit(req, action, resource = {}, detail = {}) {
     },
   }, action);
 
-  // Persist to MongoDB asynchronously — never blocks the response
-  AuditLog.create(entry).catch(err =>
+  // Persist to MongoDB asynchronously — never blocks the response. The
+  // promise (which never rejects) is returned at the end for the rare caller
+  // that must wait for the row, such as a script about to disconnect.
+  const persisted = AuditLog.create(entry).catch(err =>
     logger.error({ err }, 'Failed to persist audit log entry')
   );
 
@@ -110,13 +139,15 @@ function logAudit(req, action, resource = {}, detail = {}) {
     // Bust the MCP read caches and move the data version (services/dataVersion
     // — the REST stats and polling caches) for the affected user BEFORE the
     // push, so a client that re-reads on the nudge recomputes instead of being
-    // served the old answer (grand-audit M3). Lazy-require keeps the MCP
-    // modules off audit's load path. Same owner-resolution as the push below.
+    // served the old answer. Lazy-require keeps the MCP modules off audit's
+    // load path. Same owner-resolution as the push below.
     const statsChanged = STATS_CHANGED_PREFIXES.some(p => action.startsWith(p));
+    const racksChanged = action.startsWith(RACK_PREFIX);
     const touch = (userId) => {
       bumpDataVersion(userId);
       bustMcpCaches(userId);
       if (statsChanged) eventBus.emit(userId, 'stats_changed', { reason: action });
+      if (racksChanged) nudgeRacks(userId, action);
     };
     touch(entry.actor.userId);
 
@@ -125,10 +156,14 @@ function logAudit(req, action, resource = {}, detail = {}) {
     // changed — invalidate and nudge them too. Prefer the cellar
     // requireBottleAccess already loaded onto the request; otherwise resolve
     // the owner from the audited cellarId. Always: the owner's caches must
-    // move even when nobody has a push stream open (until 2026-09 this lookup
-    // ran only while streams existed, which also left the owner's MCP caches
-    // stale for their 60 s window).
-    const ownerFromReq = req?.cellar?.user;
+    // move even when nobody has a push stream open, or the owner's MCP caches
+    // stay stale for their 60 s window. The request's cellar speaks only for a
+    // row about that cellar: a move writes its move.in row on the destination,
+    // whose owner may be someone else.
+    const reqCellar = req?.cellar;
+    const rowIsAboutReqCellar = !reqCellar?._id || !resource.cellarId
+      || String(reqCellar._id) === String(resource.cellarId);
+    const ownerFromReq = rowIsAboutReqCellar ? reqCellar?.user : null;
     if (ownerFromReq) {
       if (String(ownerFromReq) !== String(entry.actor.userId)) touch(ownerFromReq);
     } else if (resource.cellarId) {
@@ -146,6 +181,7 @@ function logAudit(req, action, resource = {}, detail = {}) {
       }
     }
   }
+  return persisted;
 }
 
 module.exports = { logAudit, logger };

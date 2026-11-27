@@ -29,6 +29,8 @@ const { parsePagination } = require('../utils/pagination');
 const { escapeRegex } = require('../utils/sanitize');
 const { redactUrlCredentials } = require('../utils/redactUrl');
 const { coerceStringQuery } = require('../utils/validation');
+const asyncHandler = require('../utils/asyncHandler');
+const { AI_TEXT_LANGUAGES, normalizeAiTextLanguage } = require('../utils/profileLanguage');
 const { PROMPT_MAX_LENGTHS, CONSUMED_STATUSES, NOT_IN_CELLAR_STATUSES } = require('../config/constants');
 
 const router = express.Router();
@@ -335,7 +337,7 @@ router.get('/backups', async (req, res) => {
     const stale = ageHours == null || ageHours > 26;
     // The job records the repository string it used. If an operator ever puts
     // credentials in it (rest:https://user:pass@host/…) they must not reach the
-    // browser (audit 2026-09 F05-5) — the script redacts too, this is the backstop.
+    // browser — the script redacts too, this is the backstop.
     res.json({ configured: true, stale, ageHours, ...doc, repo: redactUrlCredentials(doc.repo) });
   } catch (error) {
     console.error('[superadmin] backups error:', error);
@@ -394,6 +396,8 @@ router.get('/ai', async (req, res) => {
       config: cfg,
       // Each editable prompt's cap, for the page's character counters.
       promptLimits: PROMPT_MAX_LENGTHS,
+      // The codes the AI-text language select offers (utils/profileLanguage).
+      aiTextLanguages: Object.keys(AI_TEXT_LANGUAGES),
       job: jobStatus,
       enrichmentJob: enrichStatus,
       enrichment: { totalWines, enrichedWines },
@@ -430,7 +434,7 @@ router.patch('/ai/chat-limit', async (req, res) => {
   try {
     const current = aiConfig.getRaw();
     const updated = { ...current, chatDailyLimit: limit };
-    await updateSiteConfig('aiConfig', updated, req.user.id);
+    await updateSiteConfig('aiConfig', aiConfig.stripDefaultPrompts(updated), req.user.id);
     aiConfig.set(updated);
     res.json({ chatDailyLimit: limit });
   } catch (error) {
@@ -441,8 +445,8 @@ router.patch('/ai/chat-limit', async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // PATCH /api/superadmin/ai/enrichment-gate
-// The two publication-gate thresholds (ticket 6a83e765, calibrated 2026-08-18
-// — floor 0.40 / unknown-bar 0.55). Stored like every other aiConfig key, so
+// The two publication-gate thresholds (defaults: floor 0.40 / unknown-bar
+// 0.55). Stored like every other aiConfig key, so
 // tuning never needs a release; load() clamps junk back to the defaults.
 // ---------------------------------------------------------------------------
 router.patch('/ai/enrichment-gate', async (req, res) => {
@@ -458,7 +462,7 @@ router.patch('/ai/enrichment-gate', async (req, res) => {
   try {
     const current = aiConfig.getRaw();
     const updated = { ...current, enrichmentHoldConfidenceFloor: floor, enrichmentHoldUnknownConfidenceBar: unknownBar };
-    await updateSiteConfig('aiConfig', updated, req.user.id);
+    await updateSiteConfig('aiConfig', aiConfig.stripDefaultPrompts(updated), req.user.id);
     aiConfig.set(updated);
     res.json({ enrichmentHoldConfidenceFloor: floor, enrichmentHoldUnknownConfidenceBar: unknownBar });
   } catch (error) {
@@ -469,7 +473,7 @@ router.patch('/ai/enrichment-gate', async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // PATCH /api/superadmin/ai/enrichment-on-add
-// Who pays for a new wine's first profile (Johan 2026-08-21). At ~120 new
+// Who pays for a new wine's first profile. At ~120 new
 // wines a day the per-add hook — not the admin batch runs — is the steady API
 // spend, and it targets the least reliable population: freshly scanned labels
 // with no region, where the generation gate spends two calls and publishes
@@ -498,7 +502,7 @@ router.patch('/ai/enrichment-on-add', async (req, res) => {
       ...(sommMaturitySuggestEnabled !== undefined ? { sommMaturitySuggestEnabled } : {}),
       ...(sommPriceSuggestEnabled !== undefined ? { sommPriceSuggestEnabled } : {}),
     };
-    await updateSiteConfig('aiConfig', updated, req.user.id);
+    await updateSiteConfig('aiConfig', aiConfig.stripDefaultPrompts(updated), req.user.id);
     aiConfig.set(updated);
     // Attribution rides on updateSiteConfig(req.user.id), same as the gate
     // and search knobs above — no separate audit row.
@@ -515,7 +519,7 @@ router.patch('/ai/enrichment-on-add', async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // PATCH /api/superadmin/ai/enrichment-search
-// The web-search rescue pilot's two knobs (2026-08-19): kill-switch + daily
+// The web-search rescue pilot's two knobs: kill-switch + daily
 // cap. Same aiConfig storage as the gate above — turning the pilot off never
 // needs a release, and load() clamps junk back to the defaults (on / 5).
 // ---------------------------------------------------------------------------
@@ -531,7 +535,7 @@ router.patch('/ai/enrichment-search', async (req, res) => {
   try {
     const current = aiConfig.getRaw();
     const updated = { ...current, enrichmentSearchEnabled: enabled, enrichmentSearchDailyCap: dailyCap };
-    await updateSiteConfig('aiConfig', updated, req.user.id);
+    await updateSiteConfig('aiConfig', aiConfig.stripDefaultPrompts(updated), req.user.id);
     aiConfig.set(updated);
     res.json({ enrichmentSearchEnabled: enabled, enrichmentSearchDailyCap: dailyCap });
   } catch (error) {
@@ -542,7 +546,7 @@ router.patch('/ai/enrichment-search', async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // PATCH /api/superadmin/ai/prompt-caching
-// The prompt-caching switch (2026-09-25): on, the label-scan instructions and
+// The prompt-caching switch: on, the label-scan instructions and
 // the import lookup's fixed rules carry Anthropic's cache marker (see
 // services/labelScan.systemBlock); off, they are billed at the full price. A
 // pure cost switch — the prompt the model reads is the same either way.
@@ -555,7 +559,7 @@ router.patch('/ai/prompt-caching', async (req, res) => {
   try {
     const current = aiConfig.getRaw();
     const updated = { ...current, promptCaching: enabled };
-    await updateSiteConfig('aiConfig', updated, req.user.id);
+    await updateSiteConfig('aiConfig', aiConfig.stripDefaultPrompts(updated), req.user.id);
     aiConfig.set(updated);
     res.json({ promptCaching: enabled });
   } catch (error) {
@@ -563,6 +567,32 @@ router.patch('/ai/prompt-caching', async (req, res) => {
     res.status(500).json({ error: 'Failed to save prompt caching' });
   }
 });
+
+// ---------------------------------------------------------------------------
+// PATCH /api/superadmin/ai/text-language  { language: '' | 'de' | … }
+// The language for the AI-written wine texts (utils/profileLanguage): a
+// shipped language code, or ''/'en' for off. Off is stored as NO key, so the
+// document is the one it was before the setting existed. Only the tasting
+// profile's prose is translated, into a copy beside the English; existing
+// wines keep English until their profile is written again. Audit-logged like
+// the feature flags: it changes what the AI writes into every new profile.
+// ---------------------------------------------------------------------------
+router.patch('/ai/text-language', asyncHandler(async (req, res) => {
+  const raw = req.body ? req.body.language : undefined;
+  if (typeof raw !== 'string') {
+    return res.status(400).json({ error: 'language must be a string' });
+  }
+  const language = normalizeAiTextLanguage(raw);
+  if (!language && !['', 'en'].includes(raw.trim().toLowerCase())) {
+    return res.status(400).json({ error: `language must be one of: ${['', ...Object.keys(AI_TEXT_LANGUAGES)].map((c) => `'${c}'`).join(', ')}` });
+  }
+  const { aiTextLanguage: before, ...rest } = aiConfig.getRaw();
+  const updated = language ? { ...rest, aiTextLanguage: language } : rest;
+  await updateSiteConfig('aiConfig', aiConfig.stripDefaultPrompts(updated), req.user.id);
+  aiConfig.set(updated);
+  logAudit(req, 'superadmin.ai_text_language', { type: 'aiConfig' }, { from: before || null, to: language || null });
+  res.json({ aiTextLanguage: language });
+}));
 
 // ---------------------------------------------------------------------------
 // GET /api/superadmin/ai/costs?days=30
@@ -605,7 +635,7 @@ function registerPromptRoute(path, configKey, saveErrorMsg) {
     try {
       const current = aiConfig.getRaw();
       const updated = { ...current, [configKey]: prompt.trim() };
-      await updateSiteConfig('aiConfig', updated, req.user.id);
+      await updateSiteConfig('aiConfig', aiConfig.stripDefaultPrompts(updated), req.user.id);
       aiConfig.set(updated);
       res.json({ [configKey]: updated[configKey] });
     } catch (error) {
@@ -628,7 +658,7 @@ function registerModelRoute(path, configKey, saveErrorMsg) {
     try {
       const current = aiConfig.getRaw();
       const updated = { ...current, [configKey]: model };
-      await updateSiteConfig('aiConfig', updated, req.user.id);
+      await updateSiteConfig('aiConfig', aiConfig.stripDefaultPrompts(updated), req.user.id);
       aiConfig.set(updated);
       res.json({ [configKey]: model });
     } catch (error) {
@@ -687,7 +717,7 @@ router.patch('/ai/chat-model', async (req, res) => {
       chatModel: model,
       chatModelFallback: effectiveFallback,
     };
-    await updateSiteConfig('aiConfig', updated, req.user.id);
+    await updateSiteConfig('aiConfig', aiConfig.stripDefaultPrompts(updated), req.user.id);
     aiConfig.set(updated);
     res.json({ chatModel: model, chatModelFallback: updated.chatModelFallback });
   } catch (error) {

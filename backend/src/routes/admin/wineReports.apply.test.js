@@ -11,7 +11,7 @@ process.env.JWT_SECRET = 'test-secret';
 jest.mock('../../models/WineReport', () => ({ findById: jest.fn(), find: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../../models/WineDefinition', () => ({ findById: jest.fn() }));
 jest.mock('../../models/Bottle', () => ({ distinct: jest.fn().mockResolvedValue([]) }));
-jest.mock('../../services/search', () => ({ indexWine: jest.fn().mockResolvedValue(undefined), bulkIndexBottles: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../../services/search', () => ({ indexWine: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../../services/appellationResolve', () => ({ resolveCanonicalAppellation: jest.fn(async (v) => v) }));
 jest.mock('../../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../../utils/cellarCred', () => ({ incrementCred: jest.fn().mockResolvedValue(undefined) }));
@@ -192,7 +192,7 @@ describe('resolve with applySuggestion — follow-through', () => {
     expect(reenrichAfterRecordEdit).toHaveBeenCalledWith(w, false);
   });
 
-  // Release audit 2026-10-23: a pending row's creator can report it, and that
+  // A pending row's creator can report it, and that
   // row's public page answers 404 for everyone else — never announced.
   test('a pending or non-wine row is corrected but not announced to IndexNow', async () => {
     for (const flag of [{ pendingIdentity: true }, { nonWine: true }]) {

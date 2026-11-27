@@ -1,14 +1,15 @@
-// Public/growth tools (plan Phase 6 §3.9): the blog guides (cornerstone AEO
-// content), data the public website already serves, never user data and never
-// an AI call ($0 rule for the anonymous endpoint is absolute). Curated drink
-// windows live here too but are for signed-in connections only (scope 'read'):
-// they are the registry data most worth protecting, so the anonymous surface
-// does not list the tool.
+// Public/growth tools: the blog guides (cornerstone AEO content), data the
+// public website already serves, never user data and never an AI call ($0
+// rule for the anonymous endpoint is absolute). Curated drink windows live
+// here too but are for signed-in connections only (scope 'read'): they are
+// the registry data most worth protecting, so the anonymous surface does not
+// list the tool.
 const { z } = require('zod');
 const { registerTool } = require('../registry');
 const { isValidId } = require('../../utils/validation');
 const { ok, fail } = require('../toolUtil');
 const { siteBaseUrl } = require('../../utils/siteUrl');
+const { windowPhase } = require('../../utils/maturityClassify');
 
 registerTool({
   name: 'drink_window_for',
@@ -32,7 +33,11 @@ registerTool({
     if (!isValidId(String(args.wine_id || ''))) {
       return fail('invalid_input', 'wine_id must be a 24-hex id from search_registry.');
     }
-    const wine = await WineDefinition.findById(args.wine_id).select('name producer type pendingIdentity').lean();
+    // labelSweetness rides along: a curator reading windows wants to know a
+    // "Spätlese" is the trocken one, and the name does not say so.
+    const wine = await WineDefinition.findById(args.wine_id).select('name producer type pendingIdentity labelSweetness sweetnessStyle')
+      .populate('labelSweetness', 'name band scale regulated -_id')
+      .populate('sweetnessStyle.term', 'name band scale regulated').lean();
     // A pendingIdentity row is not registry content yet (and has no reviewed
     // maturity rows anyway, since it never enters the somm queue). Same
     // not_found a missing id gets.
@@ -41,7 +46,9 @@ registerTool({
     }
 
     const filter = { wineDefinition: wine._id, status: 'reviewed' };
-    if (args.vintage) filter.vintage = String(args.vintage).trim();
+    // The vintage as the profiles store it ("nv" in any case is NV), the same
+    // form the sommelier tools address a row by.
+    if (args.vintage) filter.vintage = require('../../services/maturityOps').canonicalVintage(args.vintage);
     // Window years only — never sommNotes or curator identity.
     const profiles = await WineVintageProfile.find(filter)
       .select('vintage relative earlyFrom earlyUntil peakFrom peakUntil lateFrom lateUntil')
@@ -57,13 +64,12 @@ registerTool({
         peak: { from: p.peakFrom ?? null, until: p.peakUntil ?? null },
         late: { from: p.lateFrom ?? null, until: p.lateUntil ?? null },
       };
+      // Read the way the app reads a bottle of this vintage
+      // (utils/maturityClassify), in this tool's own words.
       let now = null;
       if (!p.relative) {
-        if (p.peakFrom && currentYear < p.peakFrom) now = (p.earlyFrom && currentYear >= p.earlyFrom) ? 'early' : 'not_ready';
-        else if (p.peakUntil && currentYear <= p.peakUntil) now = 'peak';
-        else if (p.lateUntil && currentYear <= p.lateUntil) now = 'late';
-        else if (p.peakUntil || p.lateUntil) now = 'past';
-        else if (p.peakFrom && currentYear >= p.peakFrom) now = 'peak';
+        const phase = windowPhase(p, currentYear);
+        now = phase === 'not-ready' ? 'not_ready' : phase === 'declining' ? 'past' : phase;
       }
       return {
         vintage: p.vintage,
@@ -77,9 +83,14 @@ registerTool({
         warnings: ['No sommelier-reviewed window exists for this wine/vintage yet — any guidance you give is your own estimate; say so.'],
       });
     }
+    const { labelSweetnessOut, sweetnessStyleFields, wineDisplayName } = require('../toolUtil');
     return ok(
-      `${data.length} curated vintage window(s) for ${wine.name}${wine.producer ? ` (${wine.producer})` : ''}`,
-      { wine_id: wine._id, name: wine.name, producer: wine.producer || null, type: wine.type || null, vintages: data }
+      `${data.length} curated vintage window(s) for ${wineDisplayName(wine)}${wine.producer ? ` (${wine.producer})` : ''}`,
+      {
+        wine_id: wine._id, name: wine.name, display_name: wineDisplayName(wine), label_sweetness: labelSweetnessOut(wine),
+        ...sweetnessStyleFields(wine, { loaded: true }),
+        producer: wine.producer || null, type: wine.type || null, vintages: data,
+      }
     );
   },
 });
@@ -91,8 +102,9 @@ registerTool({
   title: 'List wine guides & articles',
   description:
     'Cellarion\'s published guides and blog articles (cellar management, drink windows, storage, buying) — title, ' +
-    'slug, excerpt and tags. Call when the user wants a how-to or background reading; follow with read_guide for ' +
-    'the full text.',
+    'slug, language, excerpt and tags, one entry per article with its versions in other languages under ' +
+    'translations. Call when the user wants a how-to or background reading; follow with read_guide for the full ' +
+    'text, in the user\'s language when a translation has it.',
   scope: 'public',
   annotations: { readOnlyHint: true, openWorldHint: false },
   inputSchema: {
@@ -111,20 +123,34 @@ registerTool({
     const BlogPost = require('../../models/BlogPost');
     const limit = Math.min(Math.max(parseInt(args.limit, 10) || 10, 1), GUIDE_LIST_LIMIT);
     const offset = Math.max(parseInt(args.offset, 10) || 0, 0);
-    const filter = { status: 'published' };
+    // Originals only: a translation is listed under its original rather than
+    // as an article of its own (services/blogLanguage.js has the rule).
+    const filter = { status: 'published', translationOf: null };
     if (args.tag && String(args.tag).trim()) filter.tags = String(args.tag).trim().toLowerCase();
     const [total, posts] = await Promise.all([
       BlogPost.countDocuments(filter),
       BlogPost.find(filter).sort({ publishedAt: -1 }).skip(offset).limit(limit)
-        .select('title slug excerpt tags publishedAt').lean(),
+        .select('title slug excerpt tags publishedAt language').lean(),
     ]);
+    const translations = posts.length === 0 ? [] : await BlogPost.find({
+      status: 'published', translationOf: { $in: posts.map((p) => p._id) },
+    }).select('slug language translationOf').lean();
+    const byOriginal = new Map();
+    for (const t of translations) {
+      if (!t.translationOf) continue;
+      const key = String(t.translationOf);
+      if (!byOriginal.has(key)) byOriginal.set(key, []);
+      byOriginal.get(key).push({ language: t.language, slug: t.slug, public_url: `${siteBaseUrl()}/blog/${t.slug}` });
+    }
     return ok(`${posts.length} of ${total} published guide(s)`, posts.map((p) => ({
       slug: p.slug,
       title: p.title,
+      language: p.language || 'en',
       excerpt: p.excerpt || null,
       tags: p.tags || [],
       published_at: p.publishedAt,
       public_url: `${siteBaseUrl()}/blog/${p.slug}`,
+      translations: byOriginal.get(String(p._id)) || [],
     })), { page: { limit, offset, total } });
   },
 });
@@ -143,12 +169,17 @@ registerTool({
   handler: async (args) => {
     const BlogPost = require('../../models/BlogPost');
     const post = await BlogPost.findOne({ slug: String(args.slug).trim().toLowerCase(), status: 'published' })
-      .select('title slug excerpt tags publishedAt content').lean();
+      .select('title slug excerpt tags publishedAt content language translationOf').lean();
     if (!post) return fail('not_found', 'No published article with that slug. Use list_guides for valid slugs.');
     const truncated = post.content.length > GUIDE_MAX_CHARS;
+    const { alternatesOf } = require('../../services/blogLanguage');
+    const versions = (await alternatesOf(post)).filter((v) => v.slug !== post.slug);
     return ok(`"${post.title}"`, {
       slug: post.slug,
       title: post.title,
+      language: post.language || 'en',
+      // The same article in other languages; for a translation, its original is one of them.
+      other_languages: versions.map((v) => ({ ...v, public_url: `${siteBaseUrl()}/blog/${v.slug}` })),
       excerpt: post.excerpt || null,
       tags: post.tags || [],
       published_at: post.publishedAt,

@@ -1,6 +1,5 @@
 /**
- * Canonical wine identity — the durable duplicate-prevention key
- * (REGISTRY_DUPLICATE_ANALYSIS_2026-07-22, phase 1).
+ * Canonical wine identity — the durable duplicate-prevention key.
  *
  *   canonicalKey = normalizeProducerKey(producer)
  *                + ':' + normalizeWineName(canonicalizeWineName(name, producer))
@@ -10,7 +9,9 @@
  * canonical key collapses the three variance axes that mint duplicates:
  * producer spelling variants ("Felton Road Wines Ltd" ≡ "Felton Road"),
  * producer-in-name embeds ("Felton Road Block 3 Pinot Noir" ≡ "Block 3 Pinot
- * Noir"), and appellation tier suffixes ("Barolo DOCG" ≡ "Barolo").
+ * Noir"), and appellation tier suffixes ("Barolo DOCG" ≡ "Barolo"). Like
+ * normalizedKey it reads a Champagne cru form ("Champagne Grand Cru") as
+ * Champagne (utils/champagneCru).
  *
  * It is deliberately NON-unique: findOrCreateWine uses it as the first lookup
  * (a canonical duplicate can't be minted, because the lookup finds the
@@ -22,26 +23,35 @@
  * different-country guard.
  */
 
-const { normalizeString, normalizeWineName, normalizeProducerKey, normalizeAppellation } = require('./normalize');
+const { normalizeString, normalizeWineName, normalizeProducerKey, normalizeAppellation, isProductionMethodOnly, sweetnessKeySegment } = require('./normalize');
 const { canonicalizeWineName } = require('./producerPrefix');
+const { withoutChampagneCru } = require('./champagneCru');
 
 // An all-stopword producer ("Domaine", "Cantina") has an EMPTY comparison key
 // — falling back to the raw normalized string keeps such producers distinct
 // from each other instead of sharing one canonical bucket. Mirrors the raw
 // fallback in wineMatching.producerSimilarity.
 //
-// Exported (2026-08-14): services/producerSpelling.js scans the canonicalKey
+// Exported: services/producerSpelling.js scans the canonicalKey
 // index by this exact segment, so the two must be one computation — a private
 // copy there would drift the moment either fold rule changes.
 const producerSegment = (producer) =>
   normalizeProducerKey(producer || '') || normalizeString(producer || '');
 
-function computeCanonicalKey(name, producer, appellation = '') {
+// `sweetness` = the wine's label sweetness term (the printed word), when it has
+// one: it rides on the key as the same suffix generateWineKey adds, so a
+// Kabinett trocken and the Kabinett never share a canonical identity once the
+// word has left the name. Absent, the key carries no suffix.
+function computeCanonicalKey(name, producer, appellation = '', { sweetness = null } = {}) {
   const nameKey = normalizeWineName(canonicalizeWineName(name || '', producer || ''));
-  const appellationKey = normalizeString(
-    normalizeAppellation(typeof appellation === 'string' ? appellation : '') || ''
+  // A production method on its own ("Méthode Traditionnelle") is no
+  // appellation: it keys as none, the way generateWineKey and the model hook
+  // treat it. A Champagne cru form keys as Champagne, once the mark is
+  // stripped ("Champagne Grand Cru AOC").
+  const appellationKey = isProductionMethodOnly(appellation) ? '' : normalizeString(
+    withoutChampagneCru(normalizeAppellation(typeof appellation === 'string' ? appellation : '') || '')
   );
-  return `${producerSegment(producer)}:${nameKey}:${appellationKey}`;
+  return `${producerSegment(producer)}:${nameKey}:${appellationKey}${sweetnessKeySegment(sweetness)}`;
 }
 
 /**

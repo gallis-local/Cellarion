@@ -2,14 +2,13 @@
  * The "lot": every ACTIVE bottle of the same wine AND vintage in the user's
  * OWN cellars — the case journey's definition of a case (Cellarion has no
  * case entity). The drink window, and the price of a case bought as one
- * lot, are properties of the wine and vintage rather than of one bottle
- * (support ticket 2026-09-06: six identical updates for six bottles), so the
+ * lot, are properties of the wine and vintage rather than of one bottle, so the
  * bottle edit form's "also apply to the other N", the bulk bar and
  * update_bottle's apply_to_lot all write to the lot found HERE — one
  * definition, one query.
  *
  * Owned cellars only: bottles in a cellar shared with the user belong to its
- * owner's decisions (the bulk bar is owner-only for the same reason). Bottle
+ * owner's decisions, so a lot never reaches into one. Bottle
  * size is deliberately NOT part of the key — a magnum ages differently, but
  * the request was wine + vintage, and the checkbox is opt-in per save.
  *
@@ -32,7 +31,7 @@ const LOT_FIELDS = ['drinkFrom', 'drinkTo', 'peakFrom', 'peakUntil', 'price', 'c
 // page's "Edit vintage" sends its note through the bulk route the same way.
 const LOT_FIELDS_ON_REQUEST = ['notes', 'purchaseDate', 'purchaseLocation', 'purchaseUrl'];
 // Same ceiling as the bulk route (BULK_MAX): each sibling costs a save, a
-// search index update and an audit row, sequentially (audit 2026-09-07).
+// search index update and an audit row, sequentially.
 const LOT_LIMIT = 500;
 
 async function lotSiblingQuery(userId, bottle) {

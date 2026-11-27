@@ -33,10 +33,9 @@ const wineRequestSchema = new mongoose.Schema({
       message: 'Please provide a valid URL'
     }
   },
-  // Every link the requester gave, in their order, sourceUrl first. One link
-  // was all a request could carry; a winery page and a review page give a
-  // curator different evidence (#1460). sourceUrl stays the first of these,
-  // for the readers and the older installs that know only one.
+  // Every link the requester gave, in their order, sourceUrl first: a winery
+  // page and a review page give a curator different evidence. sourceUrl stays
+  // the first of these, for the readers and the installs that know only one.
   // The service (accountOps.collectSourceUrls) is the real gate; the schema
   // repeats the shape so a later writer that bypasses it cannot store a
   // javascript: entry the admin page renders as a link.
@@ -57,26 +56,31 @@ const wineRequestSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
-  // The back label (#1460): often the producer, the appellation and the
-  // importer the front leaves out. Same shapes as image — an http(s) link or
-  // an inline data: image under the cap (services/accountOps
-  // MAX_IMAGE_REF_LENGTH, repeated here) — shown to the reviewing admin beside
-  // the front. Never the wine's picture; on approval it may be published as
-  // one of the wine's gallery photos (routes/admin/wineRequests.js).
+  // The back label: often the producer, the appellation and the importer the
+  // front leaves out. Same shapes as image — an http(s) link or an inline
+  // data: image under the cap (services/accountOps MAX_IMAGE_REF_LENGTH,
+  // repeated here) — shown to the reviewing admin beside the front. Never the
+  // wine's picture; on approval it may be published as one of the wine's
+  // gallery photos (routes/admin/wineRequests.js).
   backImage: {
     type: String,
     trim: true,
     maxlength: 500000
   },
-  // What the import FILE said about the wine (CellarTracker / Vivino / Ploc
-  // all name these). Plain strings for the curator's benefit — prefilled on
-  // the admin page, never written to the registry until the request is
-  // resolved (support ticket 2026-09-05: 243 requests had to be re-derived).
+  // What an import FILE said about the wine (CellarTracker / Vivino / Ploc
+  // all name these), or what a self-hosted install holds for a wine it
+  // contributed (the last four come only from a contribution). Plain strings
+  // for the curator's benefit — prefilled or shown on the admin page, never
+  // written to the registry until the request is resolved.
   hints: {
     country: { type: String, trim: true, maxlength: 100 },
     region: { type: String, trim: true, maxlength: 100 },
     appellation: { type: String, trim: true, maxlength: 150 },
-    type: { type: String, trim: true, maxlength: 20 }
+    type: { type: String, trim: true, maxlength: 20 },
+    classification: { type: String, trim: true, maxlength: 150 },
+    colour: { type: String, trim: true, maxlength: 20 },
+    sweetness: { type: String, trim: true, maxlength: 40 },
+    lwin: { type: String, trim: true, maxlength: 20 }
   },
   user: {
     type: mongoose.Schema.Types.ObjectId,
@@ -118,6 +122,15 @@ const wineRequestSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
+  // When a decision (resolve or reject) took this request to work on it, or
+  // null. One decision holds a pending request at a time, so a second one is
+  // refused before it creates a wine or detaches a bottle. Cleared when the
+  // decision is stored or given up; a claim older than the service's limit is
+  // an abandoned one and may be taken over (services/wineRequestOps).
+  claimedAt: {
+    type: Date,
+    default: null
+  },
   // Self-hosted installs only (Registry Bridge): the id the shared registry
   // gave this request when it was forwarded there, and when its outcome was
   // last asked for. A request answered on cellarion.app finishes here too
@@ -133,15 +146,42 @@ const wineRequestSchema = new mongoose.Schema({
   },
   // Registry side (cellarion.app) only, on a request a self-hosted install
   // filed through the bridge: when that install showed it follows THIS
-  // request — it asked what became of it (GET /v1/requests, v1.252.0+) or
-  // said so when forwarding it. Such an install finishes the request itself
-  // and notifies its own requester, so the decision here does not notify the
-  // key owner a second time (services/wineRequestOps). Null = no sign the
-  // install will ever hear (older than v1.252.0, or forwarded before it
-  // upgraded): the notification here is then the only one, and it stays.
+  // request — it asked what became of it (GET /v1/requests) or said so when
+  // forwarding it. Such an install finishes the request itself and notifies
+  // its own requester, so the decision here does not notify the key owner a
+  // second time (services/wineRequestOps). Null = no sign the install will
+  // ever hear (it never asked about this request): the notification here is
+  // then the only one, and it stays.
   installFollowsAt: {
     type: Date,
     default: null
+  },
+  // Registry side only: the contributing install's own id for the wine (opaque
+  // here). "The same wine sent again" is the same id from the same account,
+  // never a name match: two wines of one producer may share a name.
+  contributionRef: {
+    type: String,
+    default: null,
+    maxlength: 24
+  },
+  // Registry side only, on a wine a self-hosted install CONTRIBUTED (POST
+  // /api/bridge/v1/contributions): the drink windows that install set on it,
+  // one per year vintage. Never published from here. When the request is
+  // resolved, each becomes a PENDING suggestion in the maturity queue
+  // (services/wineRequestOps → maturityOps.seedSuggestedWindows), and a
+  // curator adjusts it to the registry's rules and reviews it, or not.
+  proposedWindows: {
+    type: [{
+      _id: false,
+      vintage: { type: String, trim: true, maxlength: 4 },
+      earlyFrom: { type: Number, min: 1900, max: 2200 },
+      earlyUntil: { type: Number, min: 1900, max: 2200 },
+      peakFrom: { type: Number, min: 1900, max: 2200 },
+      peakUntil: { type: Number, min: 1900, max: 2200 },
+      lateFrom: { type: Number, min: 1900, max: 2200 },
+      lateUntil: { type: Number, min: 1900, max: 2200 },
+    }],
+    default: undefined
   },
   createdAt: {
     type: Date,

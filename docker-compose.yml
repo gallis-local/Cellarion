@@ -8,7 +8,7 @@ services:
     # Digest-pinned (security audit L-11): mongo:7 is a moving minor tag.
     # Dependabot's docker-compose ecosystem bumps this; the tag is kept for
     # readability.
-    image: mongo:7@sha256:340c1c56fb10e95cf79ff547f8664b96bc6ead9909bc355238cbf865a9695a6f
+    image: mongo:7@sha256:9896df581dfd0718b7abe112f4c37598d0986c54060e4ec1384997e6503c8c71
     container_name: cellarion-mongo
     restart: unless-stopped
     security_opt:
@@ -48,7 +48,7 @@ services:
     # Digest-pinned (security audit L-11) to the multi-arch index digest, so
     # amd64 and arm64 hosts both pull. Dependabot's docker-compose ecosystem
     # bumps the tag and digest together.
-    image: getmeili/meilisearch:v1.45.1@sha256:ac40212f9e5a7526d8007586e3e46fb0441d29dd36c7b02fa2341d2c9a1f6493
+    image: getmeili/meilisearch:v1.56.2@sha256:9600db22be3fcbf3d506176d3a73dd70a65c5719d9aa1d2837355b75afb8f4fb
     container_name: cellarion-meilisearch
     restart: unless-stopped
     security_opt:
@@ -155,6 +155,7 @@ services:
       - MAILGUN_FROM=${MAILGUN_FROM:-}
       - MAILGUN_API_URL=${MAILGUN_API_URL:-}
       - SUPPORT_REPLY_TO=${SUPPORT_REPLY_TO:-}
+      - SUPPORT_SIGNATURE=${SUPPORT_SIGNATURE:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
       # Self-hosted AI provider (issue #698) — optional; unset keeps Anthropic.
@@ -291,7 +292,7 @@ services:
     # Digest-pinned (security audit L-11): `:postgresql-latest` is a fully
     # moving tag — the worst supply-chain case. Dependabot's docker-compose
     # ecosystem bumps it.
-    image: ghcr.io/umami-software/umami:postgresql-latest@sha256:8edfe4beaef13f9d1300619fa264ef250a3688df9cc54d24ca830ca31cb475ec
+    image: ghcr.io/umami-software/umami:postgresql-latest@sha256:b64f40400d77bcadd39cf5c62a1e368c99524ca442024f96e1133355a19a5dbc
     container_name: cellarion-umami
     restart: unless-stopped
     # Opt-in: only starts with `docker compose --profile analytics up`. It is
@@ -331,7 +332,7 @@ services:
   umami-db:
     # Digest-pinned (security audit L-11). Dependabot's docker-compose ecosystem
     # bumps it.
-    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
     container_name: cellarion-umami-db
     restart: unless-stopped
     profiles: ["analytics"]

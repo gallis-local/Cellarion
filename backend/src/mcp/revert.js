@@ -14,13 +14,10 @@ const { consumeBottle, restoreBottle, RESTORE_WINDOW_MS } = require('../services
 const { logAction } = require('./actionLedger');
 const { resolveBottleAccess } = require('./toolUtil');
 
-// Actions a caller may reverse given their scopes. Reversing a write-class
-// action needs the write grant (a consume-only token must never gain
-// delete-a-bottle power through undo).
 // Release a claim made before a mutation that then failed, so the ledger row
-// stays un-reversed and the undo can be retried (grand-audit M1: claiming
-// reversed:true and then hitting a VersionError on save() left the row marked
-// undone while nothing was actually restored — the retry then found nothing).
+// stays un-reversed and the undo can be retried: a row left reversed:true
+// after a failed save() (a VersionError) would read as undone while nothing
+// was restored, and the retry would find nothing.
 // The idempotencyKey was nulled at claim time and stays null; that only means
 // the ORIGINAL action can't idempotency-replay, which is fine — it already ran.
 async function unclaim(rowId) {
@@ -40,6 +37,9 @@ async function bumpPersonalData(userId, audience, keyId = null) {
 }
 const entryAudienceOf = (level, bottle) => (level === 'wine' ? { wineLevel: true } : { bottleIds: [bottle] });
 
+// Actions a caller may reverse given their scopes. Reversing a write-class
+// action needs the write grant (a consume-only token must never gain
+// delete-a-bottle power through undo).
 const CONSUME_REVERSIBLE = ['consume', 'restore', 'open', 'pour', 'close'];
 const WRITE_REVERSIBLE = ['add', 'update', 'lot_update', 'bulk_add', 'arrive', 'somm_maturity', 'somm_maturity_remove',
   'somm_wine_profile', 'somm_price', 'somm_price_decline', 'somm_proposal',
@@ -415,7 +415,7 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
     return ok(envelope.summary, envelope.data);
   }
 
-  // Personal typed key/value data (#986) — entries are always the caller's
+  // Personal typed key/value data — entries are always the caller's
   // own (only the author ever writes them), so every op is author-scoped and
   // needs no cellar-role re-check.
   if (row.action === 'personal_data') {
@@ -498,7 +498,7 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
       // prev carries ONLY the fields that action changed (a rename-only row
       // has no unit, and vice versa), so undoing a rename never touches a unit
       // set elsewhere. A unit restore obeys the same rule as the forward path:
-      // never on a key that holds entries (audit 2026-09-14 M2).
+      // never on a key that holds entries.
       const prev = row.prev || {};
       const restoresUnit = Object.prototype.hasOwnProperty.call(prev, 'unit') && (prev.unit || null) !== (key.unit || null);
       if (restoresUnit) {
@@ -509,8 +509,22 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
           return fail('conflict', `"${key.name}" now holds ${entries} entr${entries === 1 ? 'y' : 'ies'} — its unit is part of what each value means and cannot be changed back. Nothing was changed.`);
         }
       }
+      // The old allowed values of a list key come back under the forward
+      // rule too: a value an entry holds TODAY must stay on the list.
+      const restoresOptions = Object.prototype.hasOwnProperty.call(prev, 'enumOptions') && key.type === 'enum';
+      if (restoresOptions) {
+        const PersonalDataEntry = require('../models/PersonalDataEntry');
+        const back = Array.isArray(prev.enumOptions) ? prev.enumOptions : [];
+        const dropped = (key.enumOptions || []).filter((o) => !back.includes(o));
+        const inUse = dropped.length ? await PersonalDataEntry.distinct('value', { key: key._id, value: { $in: dropped } }) : [];
+        if (inUse.length > 0) {
+          await unclaim(row._id);
+          return fail('conflict', `${inUse.map((v) => `"${v}"`).join(', ')} ${inUse.length === 1 ? 'is' : 'are'} now used by an entry — the old list cannot come back. Nothing was changed.`);
+        }
+      }
       if (prev.name) { key.name = prev.name; key.nameKey = prev.name.toLowerCase(); }
       if (restoresUnit) key.unit = prev.unit || undefined;
+      if (restoresOptions) key.enumOptions = Array.isArray(prev.enumOptions) ? prev.enumOptions : undefined;
       try {
         await key.save();
       } catch (err) {
@@ -520,8 +534,12 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
       }
       await bumpPersonalData(ctx.user.id, null, key._id);
       const envelope = {
-        summary: `Undid key change — "${key.name}"${restoresUnit ? ` (unit ${JSON.stringify(key.unit || null)})` : ''} restored`,
-        data: { undone: 'update_personal_key', key_id: key._id, restored: { name: key.name, unit: key.unit || null } },
+        summary: `Undid key change — "${key.name}"${restoresUnit ? ` (unit ${JSON.stringify(key.unit || null)})` : ''}${restoresOptions ? ` (allowed values: ${(key.enumOptions || []).join(', ')})` : ''} restored`,
+        data: {
+          undone: 'update_personal_key',
+          key_id: key._id,
+          restored: { name: key.name, unit: key.unit || null, ...(restoresOptions ? { options: key.enumOptions || null } : {}) },
+        },
       };
       await logAction(ctx, { tool: 'undo_last', action: 'personal_data', viaUndo: true, detail: { undid: String(row._id) }, result: envelope });
       return ok(envelope.summary, envelope.data);
@@ -621,16 +639,10 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
     const claimed = await McpActionLog.findOneAndUpdate({ _id: row._id, reversed: false }, { $set: { reversed: true, idempotencyKey: null } });
     if (!claimed) return fail('conflict', 'That action is already being undone by another request.');
 
-    const WineVintageProfile = require('../models/WineVintageProfile');
     try {
-      // Direct upsert rather than utils/vintageProfile's helper: that one
-      // swallows errors (seeding is best-effort), but an undo must fail
-      // loudly so the ledger row can be unclaimed and retried.
-      await WineVintageProfile.findOneAndUpdate(
-        { wineDefinition: prev.wineDefinition, vintage: prev.vintage },
-        { $setOnInsert: { wineDefinition: prev.wineDefinition, vintage: prev.vintage, status: 'pending' } },
-        { upsert: true }
-      );
+      // The pending stub comes back by upsert; the service fails loudly so
+      // the ledger row can be unclaimed and retried (services/maturityOps).
+      await require('../services/maturityOps').reseedPendingRow(prev);
     } catch (err) {
       await unclaim(row._id); // nothing restored yet → let the undo be retried
       throw err;
@@ -664,28 +676,11 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
     const claimed = await McpActionLog.findOneAndUpdate({ _id: row._id, reversed: false }, { $set: { reversed: true, idempotencyKey: null } });
     if (!claimed) return fail('conflict', 'That action is already being undone by another request.');
 
-    const PriceTrackingRequest = require('../models/PriceTrackingRequest');
-    const PriceTrackingSkip = require('../models/PriceTrackingSkip');
+    let restored;
     try {
-      // Upsert, not insert: if a user re-requested the pair the instant the
-      // skip lifted (or a concurrent undo raced this one), the row is simply
-      // found and the undo still lands on "the request is back in the queue".
-      await PriceTrackingRequest.findOneAndUpdate(
-        { wineDefinition: prev.wineDefinition, vintage: prev.vintage },
-        { $setOnInsert: {
-          wineDefinition: prev.wineDefinition,
-          vintage: prev.vintage,
-          requesters: prev.requesters || [],
-          firstRequestedAt: prev.firstRequestedAt || new Date(),
-          lastRequestedAt: prev.lastRequestedAt || new Date(),
-        } },
-        { upsert: true }
-      );
-      if (prev.skipCreated) {
-        // Only the suppression THIS decline created — scoped to the caller,
-        // like the somm_price snapshot delete below.
-        await PriceTrackingSkip.deleteOne({ wineDefinition: prev.wineDefinition, vintage: prev.vintage, skippedBy: ctx.user.id });
-      }
+      // The request comes back by upsert and only the suppression THIS decline
+      // created is lifted, scoped to the caller (services/priceOps).
+      restored = await require('../services/priceOps').restoreDeclinedRequest(prev, ctx.user.id);
     } catch (err) {
       await unclaim(row._id); // nothing restored yet → let the undo be retried
       throw err;
@@ -695,7 +690,7 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
 
     const envelope = {
       summary: `Undid price-request decline — vintage ${prev.vintage} is back in the price queue and can be requested again`,
-      data: { undone: 'reject_price_request', vintage: prev.vintage, requesters_restored: (prev.requesters || []).length },
+      data: { undone: 'reject_price_request', vintage: prev.vintage, requesters_restored: restored?.requestersRestored ?? (prev.requesters || []).length },
     };
     await logAction(ctx, { tool: 'undo_last', action: row.action, viaUndo: true, detail: { undid: String(row._id) }, result: envelope });
     return ok(envelope.summary, envelope.data);
@@ -771,31 +766,29 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
 
     let envelope;
     if (row.action === 'somm_price') {
-      const WineVintagePrice = require('../models/WineVintagePrice');
-      const del = await WineVintagePrice.deleteOne({ _id: row.detail?.entryId, setBy: ctx.user.id });
+      let del;
+      try {
+        del = await require('../services/priceOps').removePriceSnapshot({ entryId: row.detail?.entryId, actorId: ctx.user.id });
+      } catch (err) {
+        await unclaim(row._id); // nothing removed → let the undo be retried
+        throw err;
+      }
       logAudit(ctx.req, 'somm.price.add.undo', { type: 'wine', id: row.detail?.wineId },
         { vintage: row.detail?.vintage, entryId: row.detail?.entryId, removed: !!del.deletedCount, via: 'undo', ledgerRow: String(row._id) });
       envelope = { summary: del.deletedCount ? `Undid price entry — snapshot for vintage ${row.detail?.vintage} removed` : 'Price snapshot was already gone; ledger marked undone.', data: { undone: 'set_vintage_price', removed: !!del.deletedCount } };
     } else {
       const prev = row.prev || {};
-      for (const f of ['earlyFrom', 'earlyUntil', 'peakFrom', 'peakUntil', 'lateFrom', 'lateUntil']) {
-        profile[f] = prev[f] === null || prev[f] === undefined ? undefined : prev[f];
-      }
-      profile.sommNotes = prev.sommNotes === null ? undefined : prev.sommNotes;
-      profile.status = prev.status || 'pending';
-      profile.relative = !!prev.relative;
-      profile.setBy = prev.setBy || null;
-      profile.setAt = prev.setAt || null;
       try {
-        await profile.save();
+        // The snapshot re-applied field for field, saved, and the owners'
+        // data version moved (services/maturityOps).
+        await require('../services/maturityOps').restoreWindow(profile, prev);
       } catch (err) {
-        await unclaim(row._id); // failed → let the undo be retried (was unguarded, M1 class)
+        await unclaim(row._id); // failed → let the undo be retried
         if (err?.name === 'VersionError') return fail('conflict', 'The profile changed mid-undo — retry.');
+        // The row left the queue between the load above and this save.
+        if (err?.name === 'DocumentNotFoundError') return fail('conflict', 'That maturity profile no longer exists; nothing was changed.');
         throw err;
       }
-      // The restored window changes the owners' maturity statistics like the
-      // write it undoes did: move their data version. Never throws.
-      require('../services/dataVersion').bumpWineOwners([profile.wineDefinition]);
       // reset_maturity_row ledgers as somm_maturity too, marked detail.reset.
       logAudit(ctx.req, row.detail?.reset ? 'somm.maturity.reset.undo' : 'somm.maturity.review.undo',
         { type: 'wine', id: profile.wineDefinition },
@@ -856,9 +849,9 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
     const ids = Object.keys(prevById);
     if (!ids.length) return fail('conflict', 'That lot update has no recorded previous values; nothing was changed.');
     // The bottles are independent: one removed since (added by mistake, then
-    // undone) has nothing to restore and must not block the rest (audit
-    // 2026-09-07). A bottle that still exists but is no longer editable does
-    // block — restoring around it would leave the lot uneven on purpose.
+    // undone) has nothing to restore and must not block the rest. A bottle
+    // that still exists but is no longer editable does block — restoring
+    // around it would leave the lot uneven on purpose.
     const resolved = [];
     const missing = [];
     for (const id of ids) {
@@ -881,10 +874,10 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
       } catch (err) { failures.push({ bottle_id: String(b._id), error: err.message }); }
     }
     if (failures.length) {
-      // Keep the row undoable for exactly what is still outstanding (audit
-      // 2026-09-07: a claimed-but-partial undo could never be retried).
-      // Nothing restored → plain unclaim; some restored → prev shrinks to the
-      // failed bottles so the next undo touches only those.
+      // Keep the row undoable for exactly what is still outstanding, so a
+      // claimed-but-partial undo can be retried. Nothing restored → plain
+      // unclaim; some restored → prev shrinks to the failed bottles so the
+      // next undo touches only those.
       const outstanding = {};
       for (const f of failures) outstanding[f.bottle_id] = prevById[f.bottle_id];
       await McpActionLog.updateOne({ _id: row._id }, { $set: { reversed: false, prev: outstanding } }).catch(() => {});
@@ -906,11 +899,11 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
     return ok(envelope.summary, envelope.data);
   }
 
-  // Open-bottle tracking: open / pour / close (issue #835). Changed-since
+  // Open-bottle tracking: open / pour / close. Changed-since
   // guards compare against what THIS action recorded, so an undo never
   // clobbers open-state the user changed by hand in between.
   if (['open', 'pour', 'close'].includes(row.action)) {
-    const { closeBottle } = require('../services/bottleOps');
+    const { closeBottle, putBackInSlot, removeFromRacks } = require('../services/bottleOps');
     const { logAudit } = require('../services/audit');
     const access = await resolveBottleAccess(ctx.user.id, row.bottle, 'editor');
     if (!access) return fail('conflict', 'The bottle from that action is no longer accessible; nothing was changed.');
@@ -919,7 +912,7 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
     // Consumed since the action: the open-bottle fields on a consumed record
     // are preserved DRINKING HISTORY (consume deliberately keeps them) — an
     // undo must never rewrite or erase them. Same invariant the restore-undo
-    // branch enforces on status (2026-07-30 audit).
+    // branch enforces on status.
     if (CONSUMED_STATUSES.includes(bottle.status)) {
       return fail('conflict', 'That cannot be undone: the bottle has been consumed since, and its open-bottle history is part of the consumption record now. Use restore_bottle first if the consume itself was the mistake. Nothing was changed.');
     }
@@ -946,7 +939,11 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
         await unclaim(row._id); // nothing changed → let the undo be retried
         return fail('conflict', `Cannot undo that open: ${result.error.message}`);
       }
-      const envelope = { summary: `Undid open — ${bottleLabel(bottle)} is unopened again`, data: { undone: 'open_bottle', bottle_id: bottle._id, open: false } };
+      const back = result.putBack;
+      const envelope = {
+        summary: `Undid open — ${bottleLabel(bottle)} is unopened again${back ? `, back in slot ${back.position}` : ''}`,
+        data: { undone: 'open_bottle', bottle_id: bottle._id, open: false, put_back: back ? { rack_id: back.rackId, rack_name: back.rackName || null, position: back.position } : null },
+      };
       await logAction(ctx, { tool: 'undo_last', action: 'close', viaUndo: true, bottle: bottle._id, cellar: bottle.cellar, detail: { undid: String(row._id) }, result: envelope });
       return ok(envelope.summary, envelope.data);
     }
@@ -965,6 +962,10 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
       const claimed = await McpActionLog.findOneAndUpdate({ _id: row._id, reversed: false }, { $set: { reversed: true, idempotencyKey: null } });
       if (!claimed) return fail('conflict', 'That action is already being undone by another request.');
       let closedToo = false;
+      let back = null;
+      const from = bottle.openedFromSlot
+        ? { rack: bottle.openedFromSlot.rack, position: bottle.openedFromSlot.position }
+        : null;
       try {
         bottle.pours.splice(bottle.pours.length - count, count);
         // The pour that implicitly OPENED the bottle undoes the open too — but
@@ -975,6 +976,7 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
           bottle.openedAt = null;
           bottle.preservationMethod = undefined;
           bottle.openBottleNotifiedAt = null;
+          bottle.openedFromSlot = null;
           closedToo = true;
         }
         await bottle.save();
@@ -983,9 +985,14 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
         if (err?.name === 'VersionError') return fail('conflict', 'The bottle changed mid-undo — retry.');
         throw err;
       }
-      logAudit(ctx.req, closedToo ? 'bottle.open_undo' : 'bottle.pour_undo', { type: 'bottle', id: bottle._id, cellarId: bottle.cellar });
+      // The implicit open took it out of its rack: back into that slot, as
+      // closeBottle does, while the slot is free.
+      if (closedToo && from) back = await putBackInSlot(bottle._id, bottle.cellar, from);
+      const undone = { type: 'bottle', id: bottle._id, cellarId: bottle.cellar };
+      if (back) logAudit(ctx.req, 'bottle.open_undo', undone, { putBackInRack: true });
+      else logAudit(ctx.req, closedToo ? 'bottle.open_undo' : 'bottle.pour_undo', undone);
       const envelope = {
-        summary: `Undid pour — ${count > 1 ? `${count} glasses` : 'a glass'} removed from ${bottleLabel(bottle)}${closedToo ? ' (and its implicit open cleared)' : ''}`,
+        summary: `Undid pour — ${count > 1 ? `${count} glasses` : 'a glass'} removed from ${bottleLabel(bottle)}${closedToo ? ' (and its implicit open cleared)' : ''}${back ? `, back in slot ${back.position}` : ''}`,
         data: { undone: 'pour_glass', bottle_id: bottle._id, pours_removed: count, open: !closedToo },
       };
       await logAction(ctx, { tool: 'undo_last', action: 'pour', viaUndo: true, bottle: bottle._id, cellar: bottle.cellar, detail: { undid: String(row._id) }, result: envelope });
@@ -1007,11 +1014,24 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
       bottle.preservationMethod = prev.preservationMethod || undefined;
       bottle.pours = (prev.pours || []).map((p) => ({ at: p.at, ml: p.ml }));
       bottle.openBottleNotifiedAt = prev.openBottleNotifiedAt ? new Date(prev.openBottleNotifiedAt) : null;
+      bottle.openedFromSlot = prev.openedFromSlot
+        ? { rack: prev.openedFromSlot.rack, position: prev.openedFromSlot.position }
+        : null;
       await bottle.save();
     } catch (err) {
       await unclaim(row._id); // nothing persisted → let the undo be retried
       if (err?.name === 'VersionError') return fail('conflict', 'The bottle changed mid-undo — retry.');
       throw err;
+    }
+    // The close put it back in its slot: out again, as it was while open —
+    // only while it still sits in exactly that slot (moved since: leave it).
+    const putBack = row.detail?.putBack;
+    if (putBack && prev.openedFromSlot) {
+      const stillThere = await Rack.exists({
+        _id: prev.openedFromSlot.rack,
+        slots: { $elemMatch: { bottle: bottle._id, position: prev.openedFromSlot.position } },
+      });
+      if (stillThere) await removeFromRacks(bottle._id);
     }
     logAudit(ctx.req, 'bottle.open', { type: 'bottle', id: bottle._id, cellarId: bottle.cellar }, { preservationMethod: bottle.preservationMethod, via: 'undo' });
     const envelope = {
@@ -1052,7 +1072,7 @@ async function revertLedgerRow(row, ctx, { ok, fail }) {
     reverseEntry = { action: 'update', prev: result.prev };
   } else if (row.action === 'consume') {
     // consumedAt rides along so that undoing THIS undo re-consumes on the day
-    // the user actually recorded, not on the day of the undo (audit 2026-09-14).
+    // the user actually recorded, not on the day of the undo.
     const prevSnapshot = { reason: bottle.consumedReason || bottle.status, note: bottle.consumedNote, rating: bottle.consumedRating, ratingScale: bottle.consumedRatingScale, consumedAt: bottle.consumedAt || undefined };
     const result = await restoreBottle(bottle, ctx.req);
     if (result.error) return fail('conflict', `Cannot undo that consume: ${result.error.message}`);

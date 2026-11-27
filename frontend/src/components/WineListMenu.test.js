@@ -42,9 +42,19 @@ describe('WineListMenu', () => {
     ] }]} />);
     expect(screen.getAllByText('Sista flaskan')).toHaveLength(1);
   });
+
+  test('a wine with a count shows it on its details line, in the list language; without one, nothing', () => {
+    render(<WineListMenu language="sv" sections={[{ title: 'Röda', level: 0, wines: [
+      wine({ key: 'a', bottleCount: 3 }),
+      wine({ key: 'b', name: 'Rioja', producer: 'Muga', region: 'Rioja', grapes: [] }),
+    ] }]} />);
+    expect(screen.getByText('Conterno — Piedmont · Nebbiolo · 3 flaskor')).toBeInTheDocument();
+    expect(screen.getByText('Muga — Rioja')).toBeInTheDocument();
+    expect(screen.queryByText(/flaskor|flaska/)).toHaveTextContent('3 flaskor');
+  });
 });
 
-describe('WineListMenu price symbol spacing (support ticket 2026-09-12)', () => {
+describe('WineListMenu price symbol spacing', () => {
   test('a lettered currency gets a space, a sign does not', () => {
     const { unmount } = render(<WineListMenu layout={{ currencySymbol: 'CHF' }} sections={[{ title: 'R', level: 0, wines: [wine({ price: 16, byGlass: true, glassPrice: 9 })] }]} />);
     expect(screen.getByText('CHF 16 / CHF 9 glass')).toBeInTheDocument();

@@ -3,6 +3,16 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { updateSommWineProfile } from '../api/somm';
 
+// Two decimals in the app's language ("0,87" in Bokmål), not the "0.87" toFixed
+// gives whatever the language.
+const formatConfidence = (value, locale) => {
+  try {
+    return new Intl.NumberFormat(locale || 'en', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+  } catch {
+    return value.toFixed(2);
+  }
+};
+
 // Mirrors PROFILE_ENUMS in backend/src/services/wineProfileOps.js — the
 // validator rejects anything else, so these pickers and that list must agree.
 const ENUMS = {
@@ -21,19 +31,19 @@ const textToList = (text) =>
  * curator can judge it against the drink window they are setting — and fix it
  * in the same pass.
  *
- * Support ticket 2026-07-28: the generator writes confident prose for wines it
- * only half-knows (a Sandeman Vintage Port came back "built for immediate
- * drinking"). Before this panel a curator who noticed simply worked around it
- * and the wrong prose stayed on the wine for every owner.
+ * The generator writes confident prose for wines it only half-knows (a
+ * Vintage Port described as "built for immediate drinking", say). A curator
+ * who notices must be able to fix it here; otherwise the wrong prose stays on
+ * the wine for every owner.
  *
  * `confidence` is displayed but deliberately NOT used to hide anything: it is
- * the model's self-rating, not a correctness score, and the row that prompted
- * this ticket rated itself 0.6.
+ * the model's self-rating, not a correctness score, and a wrong profile can
+ * still rate itself well above zero.
  *
  * Props: wine (the populated wineDefinition), onSaved(aiProfile).
  */
 function SommWineProfilePanel({ wine, onSaved }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { apiFetch } = useAuth();
 
   const ap = wine?.aiProfile || null;
@@ -50,6 +60,12 @@ function SommWineProfilePanel({ wine, onSaved }) {
     flavors:      listToText(ap?.flavors),
     foodPairings: listToText(ap?.foodPairings),
     description:  ap?.description || '',
+    // The serving trait: a temperature range (°C) and whether the wine needs
+    // air when young. Blank = the style's default; the page composes the
+    // advice from the trait and the vintage's phase on the day it is read.
+    servingTempMin: ap?.servingTempMin ?? '',
+    servingTempMax: ap?.servingTempMax ?? '',
+    needsAir:       ap?.needsAir || '',
   });
 
   const set = (field) => (e) => setForm(f => ({ ...f, [field]: e.target.value }));
@@ -62,7 +78,7 @@ function SommWineProfilePanel({ wine, onSaved }) {
     setErr(null);
     try {
       // Empty string means "clear this field", which the API models as null —
-      // the field-level abstention the ticket asked for: a curator can drop
+      // a field-level abstention: a curator can drop
       // prose they don't trust without touching the descriptors that are right.
       const payload = {
         body:         form.body || null,
@@ -72,6 +88,9 @@ function SommWineProfilePanel({ wine, onSaved }) {
         flavors:      textToList(form.flavors),
         foodPairings: textToList(form.foodPairings),
         description:  form.description.trim() || null,
+        servingTempMin: form.servingTempMin === '' ? null : Number(form.servingTempMin),
+        servingTempMax: form.servingTempMax === '' ? null : Number(form.servingTempMax),
+        needsAir:       form.needsAir || null,
       };
       const res = await updateSommWineProfile(apiFetch, wine._id, payload);
       const data = await res.json().catch(() => ({}));
@@ -111,7 +130,7 @@ function SommWineProfilePanel({ wine, onSaved }) {
           </span>
           {!isCurator && profile.confidence != null && (
             <span className="somm-profile-confidence" title={t('somm.profile.confidenceTitle')}>
-              {t('somm.profile.confidenceLabel')} {profile.confidence.toFixed(2)}
+              {t('somm.profile.confidenceLabel')} {formatConfidence(profile.confidence, i18n.language)}
             </span>
           )}
           <button type="button" className="btn btn-secondary btn-small somm-profile-edit-btn" onClick={() => setEditing(true)}>
@@ -125,6 +144,14 @@ function SommWineProfilePanel({ wine, onSaved }) {
         )}
         {profile.foodPairings?.length > 0 && (
           <p className="somm-profile-line"><strong>{t('somm.profile.pairings')}:</strong> {profile.foodPairings.join(', ')}</p>
+        )}
+        {(profile.servingTempMin != null || profile.needsAir) && (
+          <p className="somm-profile-line"><strong>{t('somm.profile.serving')}:</strong>{' '}
+            {[
+              profile.servingTempMin != null ? `${profile.servingTempMin}–${profile.servingTempMax} °C` : null,
+              profile.needsAir ? t(`somm.profile.needsAirValue.${profile.needsAir}`) : null,
+            ].filter(Boolean).join(' · ')}
+          </p>
         )}
       </div>
     );
@@ -166,6 +193,30 @@ function SommWineProfilePanel({ wine, onSaved }) {
         <textarea rows={3} value={form.description} onChange={set('description')} disabled={saving}
           maxLength={1000} placeholder={t('somm.profile.descriptionPlaceholder')} />
       </label>
+
+      <div className="somm-profile-grid">
+        <label className="somm-profile-field">
+          <span>{t('somm.profile.servingTemp')}</span>
+          <span className="somm-profile-range">
+            <input type="number" min={0} max={30} step={1} value={form.servingTempMin} onChange={set('servingTempMin')}
+              disabled={saving} aria-label={t('somm.profile.servingTempMinAria', 'Serving temperature, lower end (°C)')} />
+            {' – '}
+            <input type="number" min={0} max={30} step={1} value={form.servingTempMax} onChange={set('servingTempMax')}
+              disabled={saving} aria-label={t('somm.profile.servingTempMaxAria', 'Serving temperature, upper end (°C)')} />
+          </span>
+          <small className="somm-profile-hint">{t('somm.profile.servingTempHint')}</small>
+        </label>
+        <label className="somm-profile-field">
+          <span>{t('somm.profile.needsAir')}</span>
+          <select value={form.needsAir} onChange={set('needsAir')} disabled={saving}>
+            <option value="">{t('somm.profile.needsAirDefault')}</option>
+            {['long', 'short', 'none'].map(v => (
+              <option key={v} value={v}>{t(`somm.profile.needsAirValue.${v}`)}</option>
+            ))}
+          </select>
+          <small className="somm-profile-hint">{t('somm.profile.needsAirHint')}</small>
+        </label>
+      </div>
 
       <div className="somm-profile-actions">
         <button type="button" className="btn btn-primary btn-small" onClick={handleSave} disabled={saving}>

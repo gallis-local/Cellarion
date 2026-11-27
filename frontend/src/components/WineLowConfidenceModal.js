@@ -18,7 +18,10 @@ const PAGE_SIZE = 50;
  *
  * "Mark reviewed" records profileReviewedAt; the clearance self-invalidates
  * when the wine is re-enriched (new generatedAt), so an edited wine whose
- * fresh profile is still doubtful re-surfaces by itself. Sibling of
+ * fresh profile is still doubtful re-surfaces by itself. On a row whose
+ * producer is flagged it is a verdict: the server clears the flag and its
+ * note for good (the answer says suspectCleared), so no Undo is offered for
+ * it. Whether a row counts as reviewed is the server's `reviewed`. Sibling of
  * WineProducerInNameModal.
  *
  * Props: apiFetch (from useAuth()), onClose(), onChanged().
@@ -118,7 +121,8 @@ function WineLowConfidenceModal({ apiFetch, onClose, onChanged }) {
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
         showSuccess(t('admin.wines.lowConfidence.reviewed', { name: wine.name }));
-        setPendingUndo({ wine });
+        // A verdict on a flagged producer cannot be taken back from here.
+        setPendingUndo(data.suspectCleared ? null : { wine });
         if (includeReviewed) { fetchPage(page); onChanged?.(); }
         else { resolvedDelta.current += 1; removeRow(wine._id); }
       } else {
@@ -144,11 +148,14 @@ function WineLowConfidenceModal({ apiFetch, onClose, onChanged }) {
         fetchPage(page);
         onChanged?.();
       } else {
+        // The row has left the list, so a message on the row would be shown
+        // nowhere: the refusal goes to the top of the dialog, and the Undo
+        // banner stays for another try.
         const data = await res.json().catch(() => ({}));
-        setRowError(wine._id, data.error || t('common.actionFailed', { status: res.status }));
+        setError(data.error || t('common.actionFailed', { status: res.status }));
       }
     } catch {
-      setRowError(wine._id, t('common.networkError'));
+      setError(t('common.networkError'));
     } finally {
       setPending(null);
     }
@@ -195,9 +202,12 @@ function WineLowConfidenceModal({ apiFetch, onClose, onChanged }) {
     whiteSpace: 'nowrap',
   };
 
-  const isReviewed = (w) =>
-    w.profileReviewedAt && w.generatedAt &&
-    new Date(w.profileReviewedAt) >= new Date(w.generatedAt);
+  // The server's own answer; the two timestamps only for a server that does
+  // not send it yet.
+  const isReviewed = (w) => (typeof w.reviewed === 'boolean'
+    ? w.reviewed
+    : Boolean(w.profileReviewedAt && w.generatedAt &&
+      new Date(w.profileReviewedAt) >= new Date(w.generatedAt)));
 
   return (
     <Modal title={t('admin.wines.lowConfidence.title')} onClose={onClose} showClose wide>

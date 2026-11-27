@@ -13,6 +13,10 @@ const rateLimit = require('express-rate-limit');
 const Country = require('../models/Country');
 const Region = require('../models/Region');
 const Grape = require('../models/Grape');
+const Classification = require('../models/Classification');
+const { loadTaxonomy } = require('../services/classificationOps');
+const SweetnessTerm = require('../models/SweetnessTerm');
+const { loadTerms } = require('../services/sweetnessOps');
 const WineDefinition = require('../models/WineDefinition');
 const { parsePagination } = require('../utils/pagination');
 const { baseLanguage, localizedName } = require('../utils/localizedName');
@@ -30,10 +34,10 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   // Key on the real client, as every other per-IP limiter does. Without it
-  // the key was req.ip — the Cloudflare edge on the hosted instance — so every
-  // visitor arriving through the same edge shared ONE 60-request bucket, and
-  // this router also serves /display-names, which the logged-in app loads
-  // (audit 2026-09-02, phase 1).
+  // the key would be req.ip — the Cloudflare edge on the hosted instance — so
+  // every visitor arriving through the same edge would share ONE 60-request
+  // bucket, and this router also serves /display-names, which the logged-in
+  // app loads.
   keyGenerator: rateLimitKey,
 });
 router.use(limiter);
@@ -60,9 +64,9 @@ async function countWinesBy(field, { unwind = false } = {}) {
   const pipeline = unwind
     ? [
         { $match: { nonWine: { $ne: true }, pendingIdentity: { $ne: true }, canary: { $ne: true } } },
-        // $setUnion dedups the array first: the old countDocuments({grapes: id})
-        // counted a wine once however many times the grape appeared in its
-        // array; a bare $unwind would count every occurrence.
+        // $setUnion dedups the array first: a wine counts once however many
+        // times the grape appears in its array; a bare $unwind would count
+        // every occurrence.
         { $project: { values: { $setUnion: [`$${field}`, []] } } },
         { $unwind: '$values' },
         { $group: { _id: '$values', count: { $sum: 1 } } },
@@ -87,13 +91,13 @@ function clearTaxonomyListCache() {
 // Shared wine projection for public lists
 const WINE_PROJECTION = 'name producer slug type colour appellation region country image communityRating';
 
-// Registry lockdown (2026-09-06, L2): these four listings are the one
-// unauthenticated surface that pages through the registry. At 100 a page with
-// an offset up to a million they enumerated every wine in a single limiter
-// window; nobody legitimate reads page 400 of a country. 48 a page, 2,000
-// deep, `total` still returned so the client can show it.
+// Registry lockdown: these four listings are the one unauthenticated surface
+// that pages through the registry. Large pages with an unbounded offset would
+// enumerate every wine in a single limiter window; nobody legitimate reads
+// page 400 of a country. 48 a page, 2,000 deep, `total` still returned so the
+// client can show it.
 const WINE_PAGE = { limit: 24, maxLimit: 48, maxOffset: 2000 };
-// Canaries (L4) sit in the DEEP pages only — a customer browsing the first
+// Canaries sit in the DEEP pages only — a customer browsing the first
 // screens never meets one, a walker paging to the end does. `total` always
 // excludes them so the visible page count is honest.
 const CANARY_DEPTH = 480;
@@ -338,8 +342,8 @@ router.get('/grapes', async (req, res) => {
 
 /**
  * GET /api/taxonomy/grape-names — the whole grape vocabulary, for the grape
- * picker on the bottle page's "suggest a fix" form (support ticket 2026-09-17:
- * a comma-separated text box is no way to enter varieties).
+ * picker on the bottle page's "suggest a fix" form (a comma-separated text box
+ * is no way to enter varieties).
  *
  * Unlike /grapes above this is NOT gated on MIN_WINES: a correction has to be
  * able to name a rare variety, which is exactly the one no public page exists
@@ -359,7 +363,7 @@ router.get('/grapes', async (req, res) => {
 router.get('/grape-names', requireAuth, async (req, res) => {
   // Set on the two success paths only: stamped up front, a 500 went out
   // cacheable for an hour too, and the picker's "Try again" would have been
-  // answered from the browser's cache (pre-deploy audit 2026-09-18).
+  // answered from the browser's cache.
   const cacheable = () => res.set('Cache-Control', 'private, max-age=3600');
   try {
     const cached = getCachedList('grape-names');
@@ -387,6 +391,96 @@ router.get('/grape-names', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('[taxonomy] grape names error:', err);
     res.status(500).json({ error: 'Failed to fetch grape names' });
+  }
+});
+
+// ── Classifications ─────────────────────────────────────────────────────────
+
+/**
+ * GET /api/taxonomy/classifications — the classification taxonomy for the
+ * pickers (the admin wine form, a member's draft form): every quality tier
+ * with its kind, system, country and accepted spellings, plus how many wines
+ * carry it. A user-minted row nobody reviewed and no wine uses is left out,
+ * as for grape names. Rows come from the write rule's own in-memory copy, so
+ * a row an admin just added is offered at once; the counts are cached.
+ * Signed-in only, like grape-names.
+ */
+router.get('/classifications', requireAuth, async (req, res) => {
+  const cacheable = () => res.set('Cache-Control', 'private, max-age=30');
+  try {
+    const tax = await loadTaxonomy();
+    let counts = getCachedList('classification-counts');
+    if (!counts) {
+      counts = await countWinesBy('classifications', { unwind: true });
+      listCache.set('classification-counts', { at: Date.now(), body: counts });
+    }
+    const countryIds = [...new Set(tax.rows.map((c) => c.country && String(c.country._id || c.country)).filter(Boolean))];
+    const countries = countryIds.length
+      ? new Map((await Country.find({ _id: { $in: countryIds } }).select('name').lean()).map((c) => [String(c._id), c.name]))
+      : new Map();
+    const classifications = [];
+    for (const c of tax.rows) {
+      const wineCount = counts.get(String(c._id)) || 0;
+      if (c.createdByUser && !c.reviewedAt && wineCount === 0) continue;
+      const countryId = c.country ? String(c.country._id || c.country) : null;
+      classifications.push({
+        _id: c._id, name: c.name, kind: c.kind, system: c.system || null,
+        country: countryId ? { _id: countryId, name: countries.get(countryId) || null } : null,
+        synonyms: c.synonyms || [], wineCount,
+      });
+    }
+    classifications.sort((a, b) => a.name.localeCompare(b.name));
+    cacheable();
+    res.json({ classifications, kinds: Classification.KINDS });
+  } catch (err) {
+    console.error('[taxonomy] classifications list error:', err);
+    res.status(500).json({ error: 'Failed to fetch classifications' });
+  }
+});
+
+// ── Sweetness terms ─────────────────────────────────────────────────────────
+
+/**
+ * GET /api/taxonomy/sweetness-terms[?scale=still|sparkling] — the label
+ * sweetness terms for the pickers: every term with
+ * its scale, band, system, country, the regulated flag and accepted spellings,
+ * plus how many wines carry it. A user-minted row nobody reviewed and no wine
+ * uses is left out, as for classifications. Rows come from the in-memory copy
+ * (services/sweetnessOps), so a row an admin just added is offered at once;
+ * the counts are cached. Signed-in only, like classifications.
+ */
+router.get('/sweetness-terms', requireAuth, async (req, res) => {
+  const cacheable = () => res.set('Cache-Control', 'private, max-age=30');
+  try {
+    const scale = typeof req.query.scale === 'string' && SweetnessTerm.SCALES.includes(req.query.scale) ? req.query.scale : null;
+    const terms = await loadTerms();
+    let counts = getCachedList('sweetness-term-counts');
+    if (!counts) {
+      counts = await countWinesBy('labelSweetness');
+      listCache.set('sweetness-term-counts', { at: Date.now(), body: counts });
+    }
+    const countryIds = [...new Set(terms.rows.map((r) => r.country && String(r.country._id || r.country)).filter(Boolean))];
+    const countries = countryIds.length
+      ? new Map((await Country.find({ _id: { $in: countryIds } }).select('name').lean()).map((c) => [String(c._id), c.name]))
+      : new Map();
+    const out = [];
+    for (const r of terms.rows) {
+      if (scale && r.scale !== scale) continue;
+      const wineCount = counts.get(String(r._id)) || 0;
+      if (r.createdByUser && !r.reviewedAt && wineCount === 0) continue;
+      const countryId = r.country ? String(r.country._id || r.country) : null;
+      out.push({
+        _id: r._id, name: r.name, scale: r.scale, band: r.band, system: r.system || null, regulated: r.regulated !== false,
+        country: countryId ? { _id: countryId, name: countries.get(countryId) || null } : null,
+        synonyms: r.synonyms || [], wineCount,
+      });
+    }
+    out.sort((a, b) => a.scale.localeCompare(b.scale) || a.name.localeCompare(b.name));
+    cacheable();
+    res.json({ terms: out, scales: SweetnessTerm.SCALES, bands: SweetnessTerm.BANDS });
+  } catch (err) {
+    console.error('[taxonomy] sweetness terms list error:', err);
+    res.status(500).json({ error: 'Failed to fetch sweetness terms' });
   }
 });
 

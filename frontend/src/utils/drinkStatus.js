@@ -16,6 +16,10 @@ const CURRENT_YEAR = new Date().getFullYear();
  */
 export function getMaturityStatus(profile, anchorYear, year = CURRENT_YEAR) {
   if (!profile || profile.status !== 'reviewed') return null;
+  // A relative (NV) window counts years from the bottle's own purchase year.
+  // Without that year its numbers are offsets, never calendar years: no
+  // status, as the server answers (backend utils/maturityUtils.resolveWindowForBottle).
+  if (profile.relative && !Number.isFinite(anchorYear)) return null;
   const { earlyFrom, earlyUntil, peakFrom, peakUntil, lateFrom, lateUntil } = resolveWindow(profile, anchorYear);
 
   // Need at least one window boundary to classify
@@ -28,8 +32,8 @@ export function getMaturityStatus(profile, anchorYear, year = CURRENT_YEAR) {
   if (peakUntil  && year <= peakUntil)               return { status: 'peak' };
   if (lateFrom   && year <  lateFrom)                return { status: 'peak', hint: 'lateFrom', year: lateFrom };
   if (lateUntil  && year <= lateUntil)               return { status: 'late' };
-  // A late phase with no end stays late once it has begun (release audit
-  // 2026-10-13: it fell through to "Optimal maturity").
+  // A late phase with no end stays late once it has begun, rather than
+  // falling through to the peak check below.
   if (lateFrom   && !lateUntil && year >= lateFrom)  return { status: 'late' };
   if ((lateUntil && year >  lateUntil) ||
       (peakUntil && year >  peakUntil && !lateFrom)) return { status: 'declining' };
@@ -66,17 +70,31 @@ export function getPersonalWindowStatus(bottle, currentYear = CURRENT_YEAR) {
   if (from === null && to === null && peakFrom === null && peakUntil === null) return null;
 
   // With the optional peak set, the personal window carries the same five
-  // stages the sommelier profile has always had ("drinkable ≠ peak"):
+  // stages as the sommelier profile ("drinkable ≠ peak"):
   // not-ready | early (drinkFrom..peakFrom) | peak | late (peakUntil..drinkTo)
-  // | declining. Without it, the whole span stays 'peak' — the historical
-  // behaviour. MUST stay in step with backend classifyPersonalWindow
-  // (utils/maturityUtils).
+  // | declining. Without it, the whole span stays 'peak'. MUST stay in step
+  // with backend classifyPersonalWindow (utils/maturityUtils).
   let status = 'peak';
   if (from !== null && currentYear < from) status = 'not-ready';
   else if (to !== null && currentYear > to) status = 'declining';
   else if (peakFrom !== null && currentYear < peakFrom) status = 'early';
   else if (peakUntil !== null && currentYear > peakUntil) status = 'late';
   return { status, from, to, peakFrom, peakUntil, source: 'personal' };
+}
+
+/**
+ * A personal window's badge text, translated: the status, with the year of
+ * the next change where one is coming ("Not ready — from 2028").
+ */
+export function personalWindowBadgeText(pw, t) {
+  if (!pw) return '';
+  switch (pw.status) {
+    case 'not-ready': return t('bottleDetail.personalNotReady', { year: pw.from });
+    case 'declining': return t('bottleDetail.personalPast');
+    case 'early':     return t('bottleDetail.personalEarly', { year: pw.peakFrom });
+    case 'late':      return t('bottleDetail.personalLate');
+    default:          return t('bottleDetail.personalDrinkNow');
+  }
 }
 
 /**

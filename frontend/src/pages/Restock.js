@@ -6,6 +6,7 @@ import { getStatsOverview } from '../api/stats';
 import { getRestockAlerts, dismissRestockAlert } from '../api/restockAlerts';
 import { writeStored } from '../utils/safeStorage';
 import './Restock.css';
+import { formatVintage } from '../utils/vintage';
 
 // Shared restock math for one category dimension: one entry per consumed
 // name, where rate = bottles consumed per month over the consumption window
@@ -155,9 +156,9 @@ export default function Restock() {
   };
 
   // Auto-clear dismisses whose stock has since increased (user bought more).
-  // Runs as an effect, NOT during render: the old in-filter version called
-  // setState/localStorage per item from the same stale snapshot, so clearing
-  // two items in one pass stomped each other's updates.
+  // Runs as an effect, NOT during render: clearing inside the filter would
+  // call setState/localStorage per item from the same stale snapshot, so
+  // clearing two items in one pass would stomp each other's updates.
   useEffect(() => {
     const stale = allCategories.filter(item => {
       const key = `${item.category}:${item.name}`;
@@ -181,7 +182,9 @@ export default function Restock() {
   if (!stats || allCategories.length === 0) {
     return (
       <div className="restock-page">
-        <h1>{t('restock.title', 'Smart Restock')}</h1>
+        <div className="page-header">
+          <h1>{t('restock.title', 'Smart Restock')}</h1>
+        </div>
         <div className="restock-empty">
           <p>{t('restock.noData', 'Not enough data yet. Consume some bottles so we can analyze your drinking patterns.')}</p>
           <Link to="/cellars" className="btn btn-primary">{t('restock.goToCellars', 'Go to Cellars')}</Link>
@@ -194,8 +197,12 @@ export default function Restock() {
 
   return (
     <div className="restock-page">
-      <h1>{t('restock.title', 'Smart Restock')}</h1>
-      <p className="restock-subtitle">{t('restock.subtitle', 'Based on your consumption patterns and current inventory.')}</p>
+      <div className="page-header">
+        <div>
+          <h1>{t('restock.title', 'Smart Restock')}</h1>
+          <p className="page-subtitle">{t('restock.subtitle', 'Based on your consumption patterns and current inventory.')}</p>
+        </div>
+      </div>
 
       {/* Pace overview */}
       {paceInfo && paceInfo.avgOutputPerYear > 0 && (
@@ -237,7 +244,7 @@ export default function Restock() {
               <div className="restock-alert-card__content">
                 <strong>{alert.wineName}</strong>
                 {alert.wineProducer && <span className="restock-alert-card__producer"> · {alert.wineProducer}</span>}
-                {alert.vintage && alert.vintage !== 'NV' && <span className="restock-alert-card__vintage"> {alert.vintage}</span>}
+                {alert.vintage && alert.vintage !== 'NV' && <span className="restock-alert-card__vintage">{alert.wineProducer ? ' · ' : ' '}{formatVintage(alert.vintage, t)}</span>}
                 <p className="restock-alert-card__message">
                   {t('restock.alertMessage', 'No similar wines left in your cellar. Consider restocking.')}
                 </p>

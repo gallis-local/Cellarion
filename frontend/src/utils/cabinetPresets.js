@@ -63,8 +63,8 @@ export const CABINET_PRESETS = [
   { key: 'liebherrWsbli7731', group: 'liebherrGrandCru', shelves: 6, cols: 8, shelfRows: [8, 8, 8, 8, 6, 5], twoDeep: true, alternate: true, capacity: 324 },
   // WPbl 5001 (glass door) / WSbl 5001 (solid door): 196 bottles in five
   // compartments, front and back sections each — the maker's loading diagram
-  // as an owner mapped it against the manual (support tickets 2026-08-31 and
-  // 2026-09-15). The three middle shelves stack as a honeycomb four levels
+  // as mapped against the manual. The three middle shelves stack as a
+  // honeycomb four levels
   // high, 6 in front of 5 then 5 in front of 6 (44 each); the top and bottom
   // shelves are four levels of 4 in front of 4, staggered (32 each):
   // 2 × 32 + 3 × 44 = 196 exactly.
@@ -120,11 +120,9 @@ export const CABINET_PRESETS = [
   // (piled 4 / 3). The top shelf is the diagram's own: 4 front to back + 1
   // across, with 3 in the grooves on top — 5 wide, alternating, the level
   // above counted from the 4 behind the bottle across (rackLayouts
-  // .cabinetRowWidth; it used to be drawn as 2 × 4, the same 8 stacked 4 on
-  // 3). Shown only with early access 'cabinetSideways', which draws the
-  // bottles that lie across.
+  // .cabinetRowWidth).
   {
-    key: 'kingsbottleAtelierDuo', group: 'kingsbottle', feature: 'cabinetSideways', shelves: 15, cols: 6, twoDeep: false,
+    key: 'kingsbottleAtelierDuo', group: 'kingsbottle', shelves: 15, cols: 6, twoDeep: false,
     shelfRows: [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
     shelfCols: [5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 4],
     shelfAlternate: [true, false, false, false, false, false, false, false, false, false, false, false, false, false, true],

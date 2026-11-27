@@ -13,6 +13,7 @@ import { useFeature } from '../utils/featureFlags';
 import { isReserved, reservationSummary } from '../utils/reservation';
 import { slotLabel } from '../utils/slotLabel';
 import OpenBottlePanel from '../components/bottle/OpenBottlePanel';
+import TakeOutOfRackChoice, { takeOutState } from '../components/bottle/TakeOutOfRackChoice';
 import { PRESERVATION_METHODS } from '../utils/openBottle';
 import { fetchRates } from '../utils/currency';
 import SITE_URL from '../config/siteUrl';
@@ -33,10 +34,12 @@ import { useCollapsedBlocks } from '../utils/collapsedBlocks';
 import DialogBox from '../components/DialogBox';
 import JournalPrompt, { journalPromptOptedOut } from '../components/JournalPrompt';
 import { swatchType, wineTypeLabel } from '../utils/wineColour';
+import { formatVintage } from '../utils/vintage';
 import './BottleDetail.css';
 import { backLabel as backLabelText } from '../utils/backLabel';
 import { isSafeInternalPath } from '../utils/postLoginRedirect';
-import { backPlaceLabel, RETURNING } from '../utils/useBackHere';
+import { backPlaceLabel, cellarListFrom, RETURNING } from '../utils/useBackHere';
+import { keepSweetnessReading } from '../utils/sweetnessCategory';
 
 // Lazy-load heavy components only needed on user interaction
 const ReportWineModal = lazy(() => import('../components/ReportWineModal'));
@@ -66,6 +69,18 @@ function BottleDetail() {
   const handedBack = handedPlace && isSafeInternalPath(location.state?.backTo)
     ? { to: location.state.backTo, label: t(handedPlace[0], handedPlace[1]) }
     : null;
+  // After an action that ends the visit (Drink, Delete, Move), go back to the
+  // cellar list the visit started from when that list handed itself over
+  // (directly, or through the vintage page) — as a coming back, so its scope
+  // ("all my cellars"), filters and place are restored the way Back restores
+  // them. Otherwise this bottle's own cellar list. The notice (with Undo)
+  // rides along either way.
+  const cellarList = cellarListFrom(location.state);
+  const leaveToList = (bottleNotice) => {
+    const notice = bottleNotice ? { bottleNotice } : {};
+    if (cellarList) navigate(cellarList, { state: { ...RETURNING, ...notice } });
+    else navigate(`/cellars/${cellarId}`, bottleNotice ? { state: notice } : undefined);
+  };
   // Opened from a row on the vintage page: back goes there.
   // Only an in-app cellar path is taken from the router state.
   const fromVintage = typeof location.state?.fromVintage === 'string' && location.state.fromVintage.startsWith('/cellars/')
@@ -75,6 +90,9 @@ function BottleDetail() {
   const [userRole, setUserRole] = useState(null);
   const [cellarColor, setCellarColor] = useState(null);
   const [rackInfo, setRackInfo] = useState(null);
+  // Whether the cellar has any rack: an unplaced bottle offers "Place in a
+  // rack" only then.
+  const [cellarHasRacks, setCellarHasRacks] = useState(false);
   // The other active bottles of this wine and vintage in the viewer's own
   // cellars (from the bottle response) — drives the edit form's "also apply
   // the drink window and price to the other N" checkbox, and the outcome
@@ -82,12 +100,18 @@ function BottleDetail() {
   const [lotSiblingIds, setLotSiblingIds] = useState([]);
   const [lotMsg, setLotMsg] = useState(null);
   const [vintageProfile, setVintageProfile] = useState(null);
+  // Bumped when the consumed card shares the bottle as a review: the reviews card reloads.
+  const [reviewsVersion, setReviewsVersion] = useState(0);
   const [priceHistory, setPriceHistory] = useState(null);
   const [currentRelease, setCurrentRelease] = useState(null);
   const [rates, setRates] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [editing, setEditing] = useState(false);
+  // Where the edit form opens: at its top from the Edit buttons, at the
+  // drink-window years from the window's own link in the details.
+  const [editFocus, setEditFocus] = useState(null);
+  useEffect(() => { if (!editing) setEditFocus(null); }, [editing]);
   const [consumeOpen, setConsumeOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const [changeWineOpen, setChangeWineOpen] = useState(false);
@@ -101,15 +125,14 @@ function BottleDetail() {
   // wrong DATA is corrected there, with the right value, not reported in prose.
   const [suggestFixSignal, setSuggestFixSignal] = useState(0);
   // Cards that fold to their title row and stay folded, as on the vintage
-  // page (2026-10-14). The SAME block names as there: the same card folded on
+  // page. The SAME block names as there: the same card folded on
   // one page is folded on the other — "the stuff I don't want to see" is not
   // per page. Remembered on the account (preferences.collapsedBlocks).
   const { isCollapsed, toggle: toggleBlock, expand: expandBlocks } = useCollapsedBlocks();
   const blockProps = (blockId, label) => ({ id: blockId, label, collapsed: isCollapsed(blockId), onToggle: () => toggleBlock(blockId) });
   // What the last draft publish / attach did; survives the refetch that
-  // unmounts the draft banner. Cleared when the page moves to another bottle.
+  // unmounts the draft banner.
   const [draftNotice, setDraftNotice] = useState(null);
-  useEffect(() => { setDraftNotice(null); }, [bottleId]);
   const [addMoreOpen, setAddMoreOpen] = useState(false);
   const [pickOpen, setPickOpen] = useState(false);
   const [barcodeOpen, setBarcodeOpen] = useState(false);
@@ -123,11 +146,17 @@ function BottleDetail() {
   const leaveNoticeRef = useRef(null);
   const [openPickerOpen, setOpenPickerOpen] = useState(false);
   const [openingMethod, setOpeningMethod] = useState('coravin');
+  // "Take it out of the rack": null follows the method's default (Coravin
+  // stays in its slot); true/false once ticked or unticked. Each opening of
+  // the dialog starts from the default again.
+  const [takeOutTouched, setTakeOutTouched] = useState(null);
+  useEffect(() => { if (openPickerOpen) setTakeOutTouched(null); }, [openPickerOpen]);
+  const takeOut = takeOutState(openingMethod, takeOutTouched);
   const [openingBusy, setOpeningBusy] = useState(false);
   const [pendingImage, setPendingImage] = useState(null);
   const [defaultImage, setDefaultImage] = useState(null);
   // The vintage's official photo with its credit, and the viewer's own photo
-  // of another vintage as the last resort (ticket 2026-10-09).
+  // of another vintage as the last resort.
   const [vintageImage, setVintageImage] = useState(null);
   const [otherVintageImage, setOtherVintageImage] = useState(null);
 
@@ -136,9 +165,8 @@ function BottleDetail() {
   }, [bottleId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const fetchBottle = async () => {
-    // A new bottle id on the same mounted page (a notification link from
-    // bottle A to bottle B) must not carry A's edit form or A's lot banner
-    // over (audit 2026-09-07).
+    // Every load starts from the view: the lot banner goes and an open edit
+    // form closes. (Another bottle is another page: see BottlePage below.)
     setLotMsg(null);
     setEditing(false);
     try {
@@ -149,38 +177,23 @@ function BottleDetail() {
         setUserRole(data.userRole);
         setCellarColor(data.cellarColor || null);
         setCurrentRelease(data.currentRelease || null);
-        // The bottle's rack placement now arrives ON the bottle response
-        // (2026-08-22). The old fetchRackInfo downloaded every rack with all
-        // slots plus the full 3D layout — the two heaviest requests on this
-        // page — to find one bottle id in the browser; the server answers the
-        // same question with one indexed query. That per-open cost is what
-        // let an ordinary editing session hit the API rate limit.
+        // The bottle's rack placement arrives ON the bottle response: the
+        // server finds it with one indexed query, where finding it in the
+        // browser would download every rack with all slots plus the full 3D
+        // layout — the two heaviest requests on this page — on every open,
+        // enough for an ordinary editing session to hit the API rate limit.
         setRackInfo(data.rackInfo || null);
+        setCellarHasRacks(!!data.cellarHasRacks);
         setLotSiblingIds(Array.isArray(data.lotSiblingIds) ? data.lotSiblingIds : []);
-        if (data.pendingImageUrl) {
-          const url = data.pendingImageUrl.startsWith('http')
-            ? data.pendingImageUrl
-            : `${API_URL}${data.pendingImageUrl}`;
-          setPendingImage(url);
-        }
-        if (data.defaultImageUrl) {
-          const url = data.defaultImageUrl.startsWith('http')
-            ? data.defaultImageUrl
-            : `${API_URL}${data.defaultImageUrl}`;
-          setDefaultImage(url);
-        }
-        if (data.vintageImageUrl) {
-          const url = data.vintageImageUrl.startsWith('http')
-            ? data.vintageImageUrl
-            : `${API_URL}${data.vintageImageUrl}`;
-          setVintageImage({ url, credit: data.vintageImageCredit || null });
-        }
-        if (data.otherVintageImageUrl) {
-          const url = data.otherVintageImageUrl.startsWith('http')
-            ? data.otherVintageImageUrl
-            : `${API_URL}${data.otherVintageImageUrl}`;
-          setOtherVintageImage(url);
-        }
+        // The photos are what THIS answer says, also when it says "none": a
+        // reload after the photo went must not keep showing it.
+        const absolute = (url) => (!url ? null : url.startsWith('http') ? url : `${API_URL}${url}`);
+        setPendingImage(absolute(data.pendingImageUrl));
+        setDefaultImage(absolute(data.defaultImageUrl));
+        setVintageImage(data.vintageImageUrl
+          ? { url: absolute(data.vintageImageUrl), credit: data.vintageImageCredit || null }
+          : null);
+        setOtherVintageImage(absolute(data.otherVintageImageUrl));
         // Fetch the sommelier maturity profile. NV bottles (non-vintage
         // Champagne / Cap Classique blends) get a profile too — somms can set a
         // drink window for them — so we fetch it for NV as well; only truly
@@ -227,8 +240,14 @@ function BottleDetail() {
     }
   };
 
+  // The page's own bottle replaced by a write's answer: the wine keeps the
+  // sweetness reading the page read with it (utils/sweetnessCategory).
+  const takeBottle = (updated) => setBottle((prev) => (updated && typeof updated === 'object'
+    ? { ...updated, wineDefinition: keepSweetnessReading(prev?.wineDefinition, updated.wineDefinition) }
+    : updated));
+
   const handleBottleUpdated = (updated, lotOutcome = null) => {
-    setBottle(updated);
+    takeBottle(updated);
     setEditing(false);
     setLotMsg(lotOutcome);
   };
@@ -237,9 +256,8 @@ function BottleDetail() {
   const noticeName = () => bottleNoticeName(bottle);
 
   // "Added by mistake?" / "Cancel order": the bottle goes to the cellar's
-  // Recently deleted (POST /:id/undo now trashes it), not away for good — it
-  // used to be the one delete in the app with no way back, while selecting the
-  // same bottle and deleting it could be undone for TRASH_DAYS. The list it
+  // Recently deleted (POST /:id/undo trashes it), not away for good — the
+  // same TRASH_DAYS way back as a delete from the cellar list. The list it
   // returns to offers Undo at once.
   const handleMistakeConfirm = async () => {
     if (mistakeBusy) return;
@@ -248,9 +266,12 @@ function BottleDetail() {
       const res = await undoBottle(apiFetch, bottleId);
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.batchId) {
-        const bottleNotice = { kind: 'deleted', bottleId, batchId: data.batchId, name: noticeName(), onOrder: isOnOrder(bottle) };
+        // cellarId: the batch is in THIS cellar's Recently deleted, also when the
+        // list it returns to is another cellar's "all my cellars" view.
+        const bottleNotice = { kind: 'deleted', bottleId, batchId: data.batchId, cellarId, name: noticeName(), onOrder: isOnOrder(bottle) };
         // A cancelled order goes back to the list it came from.
-        navigate(isOnOrder(bottle) ? `/cellars/${cellarId}/on-order` : `/cellars/${cellarId}`, { state: { bottleNotice } });
+        if (isOnOrder(bottle)) navigate(`/cellars/${cellarId}/on-order`, { state: { bottleNotice } });
+        else leaveToList(bottleNotice);
       } else {
         setMistakeOpen(false);
         setError(data.error || t('bottleDetail.mistakeError', 'Could not move the bottle to Recently deleted. Please try again.'));
@@ -266,9 +287,12 @@ function BottleDetail() {
   const handleOpenBottle = async () => {
     setOpeningBusy(true);
     try {
-      const res = await openBottle(apiFetch, bottleId, openingMethod);
+      // Only a bottle in a rack has a slot to leave.
+      const res = await openBottle(apiFetch, bottleId, openingMethod, rackInfo ? { takeOutOfRack: takeOut } : {});
       const data = await res.json();
       if (res.ok) {
+        // Out of its slot now (also when the open was queued offline).
+        if (rackInfo && takeOut) setRackInfo(null);
         setBottle(prev => ({
           ...prev,
           openedAt: data.bottle.openedAt,
@@ -299,7 +323,7 @@ function BottleDetail() {
           setConsumeOpen(false);
           setJournalPromptOpen(true);
         } else {
-          navigate(`/cellars/${cellarId}`, { state: { bottleNotice: leaveNoticeRef.current } });
+          leaveToList(leaveNoticeRef.current);
         }
       } else {
         // Close the modal so the inline error banner is visible behind it.
@@ -326,8 +350,9 @@ function BottleDetail() {
   const isConsumed = bottle?.status && bottle.status !== 'active' && !onOrderNow;
   const canEdit = !isConsumed && (userRole === 'owner' || userRole === 'editor');
   const canEditConsumed = isConsumed && (userRole === 'owner' || userRole === 'editor');
-  // v1: move only active (or on-order) bottles, and only between cellars you own.
-  const canMove = !isConsumed && userRole === 'owner';
+  // Active (or on-order) bottles move between cellars the user owns or edits:
+  // the same rights as editing the bottle (the server's rackOps.MOVE_MIN_ROLE).
+  const canMove = canEdit;
   const arrivalMonth = onOrderNow ? formatArrivalMonth(bottle.expectedArrival, i18n.language) : '';
   const arrivalLate = onOrderNow && isArrivalLate(bottle.expectedArrival);
   const backTo = fromChat
@@ -354,8 +379,8 @@ function BottleDetail() {
   // past it the button is hidden and the endpoint refuses.
   const canRestore = canEditConsumed && withinRestoreWindow(bottle);
   // "Add again": new bottles of this wine and vintage, copied from this one —
-  // the drunk bottle's page had no way to buy it again (Add more bottles is
-  // for bottles still in the cellar). Same gate as Add more bottles.
+  // the drunk bottle's way to buy it again (Add more bottles is for bottles
+  // still in the cellar). Same gate as Add more bottles.
   const canAddAgain = canEditConsumed && !!wine && !user?.isDemo;
 
   // Shared overflow-menu contents — same list used by the desktop header ⋮ and
@@ -363,11 +388,11 @@ function BottleDetail() {
   // drift between the page's two action surfaces.
   const overflowItems = (
     <>
-      {/* "Add more bottles" — the support answer to "I added Qty 1, how do I
-          make it 6?" without re-searching in Add Bottle (promised 2026-08-10).
-          Needs a real registry wine to clone (pending-request bottles have
-          none) and a non-demo account (POST /api/bottles is requireNonDemo,
-          same gate that hides the Add Bottle form in the demo). */}
+      {/* "Add more bottles" — more of this wine and vintage (one bottle
+          becomes six) without re-searching in Add Bottle. Needs a real
+          registry wine to clone (pending-request bottles have none) and a
+          non-demo account (POST /api/bottles is requireNonDemo, same gate
+          that hides the Add Bottle form in the demo). */}
       {canEdit && wine && !user?.isDemo && !onOrderNow && (
         <button className="bd-overflow-item" role="menuitem" onClick={() => { setAddMoreOpen(true); setBdMoreOpen(false); }}>
           <span aria-hidden="true">➕</span> {t('bottleDetail.addMore.action', 'Add more bottles')}
@@ -380,9 +405,9 @@ function BottleDetail() {
           <span aria-hidden="true">📍</span> {t('pickLists.addAction', 'Add to pick list')}
         </button>
       )}
-      {/* The retail barcode, for a bottle already in the cellar — until now
-          only Add Bottle could read one. Demo accounts cannot (each code is
-          a vote in the shared barcode lookup; the server refuses too). */}
+      {/* The retail barcode, for a bottle already in the cellar, not only at
+          the add. Demo accounts cannot (each code is a vote in the shared
+          barcode lookup; the server refuses too). */}
       {canEdit && !user?.isDemo && (
         <button className="bd-overflow-item" role="menuitem" onClick={() => { setBarcodeOpen(true); setBdMoreOpen(false); }}>
           <span aria-hidden="true">📷</span> {bottle?.barcode ? t('barcodeScan.titleChange', 'Change barcode') : t('barcodeScan.title', 'Add barcode')}
@@ -432,12 +457,14 @@ function BottleDetail() {
 
   const handleMoved = () => {
     setMoveOpen(false);
-    navigate(`/cellars/${cellarId}`); // stay with the source cellar — back to its list
+    leaveToList(); // stay with the source cellar (or the list this visit started from)
   };
 
-  const handleAddedMore = (n) => {
+  const handleAddedMore = (n, vintage) => {
     setAddMoreOpen(false);
-    setAddMoreMsg(t('bottleDetail.addMore.success', { count: n }));
+    setAddMoreMsg(vintage && vintage !== bottle?.vintage
+      ? t('bottleDetail.addMore.successOtherVintage', { count: n, vintage: formatVintage(vintage, t) })
+      : t('bottleDetail.addMore.success', { count: n }));
     // Same refresh path every other mutation on this page uses (edit, open):
     // re-pull the bottle + its cellar/rack context after the cellar changed.
     fetchBottle();
@@ -515,7 +542,8 @@ function BottleDetail() {
       {/* ── Clean header ── */}
       <div className="bd-page-header">
         <div className="bd-header-top">
-          <Link to={backTo} state={RETURNING} className="back-link">
+          {/* Back to the vintage page keeps the cellar list it was opened from. */}
+          <Link to={backTo} state={cellarList && backTo === fromVintage ? { ...RETURNING, cellarList } : RETURNING} className="back-link">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
             {backLabelText(backLabel)}
           </Link>
@@ -581,7 +609,11 @@ function BottleDetail() {
         <OpenBottlePanel
           bottle={bottle}
           canEdit={canEdit}
-          onBottleChange={(patch) => setBottle(prev => ({ ...prev, ...patch }))}
+          onBottleChange={(patch, data) => {
+            setBottle(prev => ({ ...prev, ...patch }));
+            // Undoing an open that took it out of its rack put it back: show where.
+            if (data?.putBack) fetchBottle();
+          }}
           onFinish={() => setConsumeOpen(true)}
         />
       )}
@@ -658,13 +690,13 @@ function BottleDetail() {
               {/* A pending-identity wine has no producer yet. Say so plainly
                   rather than rendering a bare "· France": the owner otherwise
                   has no way to know their wine is awaiting curation, and won't
-                  understand why it can't be found in search (audit L-3 + the
-                  product finding). No action is required of them — promotion
-                  is automatic — so this is a statement, not a prompt. */}
+                  understand why it can't be found in search. No action is
+                  required of them — promotion is automatic — so this is a
+                  statement, not a prompt. */}
               {displayProducer || <em className="bd-producer-pending">{t('bottleDetail.producerPending')}</em>}
               {wine?.country?.name && <span className="bd-country">{displayProducer ? ' · ' : ' — '}{wine.country.name}</span>}
             </p>
-            {wine?.type && (
+            {(wine?.type || wine?.nonWine) && (
               <span className={`wine-type-pill ${swatchType(wine)}`}>{wineTypeLabel(wine, t)}</span>
             )}
           </div>
@@ -675,11 +707,13 @@ function BottleDetail() {
           wine has an open inquiry addressed to the viewer). Demo visitors are
           excluded: their ephemeral accounts can never respond (requireNonDemo)
           and the shop-window must not dead-end into a 403. ── */}
-      {wine?._id && !user?.isDemo && <OwnerInquiryCard apiFetch={apiFetch} wineId={wine._id} />}
+      {/* Keyed by the wine: after "change wine" the question, the typed
+          answer and its "sent" belong to the wine before. */}
+      {wine?._id && !user?.isDemo && <OwnerInquiryCard key={wine._id} apiFetch={apiFetch} wineId={wine._id} />}
 
       {/* ── Consumption details (history bottles only) ── */}
       {isConsumed && (
-        <ConsumedDetails bottle={bottle} canEdit={canEditConsumed} onUpdate={setBottle} />
+        <ConsumedDetails bottle={bottle} canEdit={canEditConsumed} onUpdate={takeBottle} onReviewSaved={() => setReviewsVersion((v) => v + 1)} />
       )}
 
       {/* Undo an accidental removal — only within the 2-day restore window */}
@@ -710,6 +744,7 @@ function BottleDetail() {
         <EditForm
           bottle={bottle}
           lotSiblingIds={lotSiblingIds}
+          focus={editFocus}
           onSaved={handleBottleUpdated}
           onCancel={() => setEditing(false)}
           onImageUploaded={(url) => setPendingImage(url)}
@@ -718,6 +753,7 @@ function BottleDetail() {
         <ViewDetails
           bottle={bottle}
           rackInfo={rackInfo}
+          cellarHasRacks={cellarHasRacks}
           cellarId={cellarId}
           vintageProfile={vintageProfile}
           priceHistory={priceHistory}
@@ -726,28 +762,30 @@ function BottleDetail() {
           userCurrency={user?.preferences?.currency || 'USD'}
           canEdit={canEdit}
           hasImage={!!(defaultImage || pendingImage || bottle.wineDefinition?.image)}
-          onEdit={() => setEditing(true)}
+          onEdit={(opts) => { setEditFocus(opts?.focus === 'drinkWindow' ? 'drinkWindow' : null); setEditing(true); }}
           suggestFixSignal={suggestFixSignal}
           recordFold={blockProps('vintage.record', t('wineRecord.title', 'Wine record'))}
           onRemove={() => setConsumeOpen(true)}
           onReportWine={(reason) => { setReportWineOpen(true); setReportDefaultReason(typeof reason === 'string' ? reason : null); }}
           wineDraft={bottle.wineDraft || null}
           onDraftChanged={(notice) => { setDraftNotice(typeof notice === 'string' ? notice : null); fetchBottle(); }}
+          onWineChanged={fetchBottle}
+          onBottleChange={(patch) => setBottle(prev => ({ ...prev, ...patch }))}
           draftNotice={draftNotice}
         />
       )}
 
-      {/* ── Personal typed key/value data (#986) — content card, renders once.
+      {/* ── Personal typed key/value data — content card, renders once.
           Demo visitors are excluded: writes are requireNonDemo and their
           ephemeral accounts would orphan shared-visible rows. ── */}
       {!user?.isDemo && (
         <CollapsibleBlock {...blockProps('vintage.personal', t('personalData.title', 'Your wine data'))}>
-          <PersonalDataCard apiFetch={apiFetch} bottleId={bottleId} currentUserId={user?.id} wineId={wine?._id} vintage={bottle?.vintage} />
+          <PersonalDataCard key={wine?._id || 'no-wine'} apiFetch={apiFetch} bottleId={bottleId} currentUserId={user?.id} wineId={wine?._id} vintage={bottle?.vintage} />
         </CollapsibleBlock>
       )}
 
       {/* ── The viewer's other bottles of this wine, and what happened to the
-          ones already drunk (support ticket 2026-09-16). Hides itself when
+          ones already drunk. Hides itself when
           there is nothing to say. Personal, so it sits with the personal
           cards, above the registry's profile and the community reviews. ── */}
       <CollapsibleBlock {...blockProps('vintage.history', t('lotHistory.title', 'This wine in your cellar'))}>
@@ -772,7 +810,7 @@ function BottleDetail() {
 
       {/* ── Reviews (the wine's and this vintage's; shared with the vintage page) ── */}
       <CollapsibleBlock {...blockProps('vintage.reviews', t('reviews.communityReviews', 'Reviews'))}>
-        <WineReviewsCard wine={wine} vintage={bottle?.vintage} communityRating={wine?.communityRating} />
+        <WineReviewsCard wine={wine} vintage={bottle?.vintage} communityRating={wine?.communityRating} refreshKey={reviewsVersion} />
       </CollapsibleBlock>
 
       </>}
@@ -934,7 +972,7 @@ function BottleDetail() {
             // demo, not a private draft — same gate as WineRecordSection) AND
             // while the record is on screen: the edit form replaces it, and the
             // tasting-profile report button stays clickable there, so the
-            // hand-off would have been a dead click (pre-deploy audit 2026-09-18).
+            // hand-off would have been a dead click.
             onSuggestFix={!editing && !user?.isDemo && bottle.wineDefinition.draft !== true
               // The form opens in the wine record: unfold it if it is folded.
               ? () => { setReportWineOpen(false); setReportDefaultReason(null); expandBlocks('vintage.record'); setSuggestFixSignal(n => n + 1); }
@@ -956,7 +994,7 @@ function BottleDetail() {
             bottle={bottle}
             onDone={() => {
               setJournalPromptOpen(false);
-              navigate(`/cellars/${cellarId}`, { state: { bottleNotice: leaveNoticeRef.current } });
+              leaveToList(leaveNoticeRef.current);
             }}
           />
         )}
@@ -988,6 +1026,9 @@ function BottleDetail() {
                   </label>
                 ))}
               </div>
+              {rackInfo && (
+                <TakeOutOfRackChoice checked={takeOut} onChange={setTakeOutTouched} disabled={openingBusy} />
+              )}
               <div className="modal-actions">
                 <button className="btn btn-secondary" onClick={() => setOpenPickerOpen(false)} disabled={openingBusy}>
                   {t('common.cancel')}
@@ -1004,5 +1045,12 @@ function BottleDetail() {
   );
 }
 
+// The page of one bottle, keyed by its address. A link from one bottle to
+// another (a notification, the search in the header, Back) starts a fresh
+// page: no photo, banner, open form or price history of the bottle before.
+function BottlePage() {
+  const { id, bottleId } = useParams();
+  return <BottleDetail key={`${id}/${bottleId}`} />;
+}
 
-export default BottleDetail;
+export default BottlePage;

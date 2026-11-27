@@ -1,5 +1,5 @@
 /**
- * Offline snapshot (#1355) — the document a device keeps to show its user's
+ * Offline snapshot — the document a device keeps to show its user's
  * cellars, racks and bottles with no network.
  */
 jest.mock('../models/Cellar', () => ({ find: jest.fn() }));
@@ -185,7 +185,7 @@ describe('snapshotTag', () => {
   });
 });
 
-// The copy's size (scaling audit 2026-09-25, item 11): taxonomy rows cut to
+// The copy's size: taxonomy rows cut to
 // what the offline screens show, and inline data: images left out.
 describe('a slim copy', () => {
   const { SNAPSHOT_WINE_POPULATE } = require('./offlineSnapshot');
@@ -196,7 +196,13 @@ describe('a slim copy', () => {
       { path: 'country', select: 'name slug code' },
       { path: 'region', select: 'name slug country' },
       { path: 'grapes', select: 'name slug color' },
+      // The label sweetness term as the API shape, no id: a card shows it.
+      { path: 'labelSweetness', select: 'name band scale regulated -_id' },
+      // The sweetness style's term beside it.
+      { path: 'sweetnessStyle.term', select: 'name band scale regulated' },
     ]);
+    // A lean read sends the style in its outgoing shape (utils/sweetnessStyle shapeSweetnessStyle).
+    expect(typeof wine.transform).toBe('function');
     // Everything the cellar list excludes from a wine stays excluded.
     expect(wine.select).toMatch(/-aiProfile/);
   });

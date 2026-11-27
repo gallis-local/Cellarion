@@ -6,7 +6,7 @@
  *    `route` from here for its "Go to …" links. It matches a section to its
  *    own key by lowercasing the id and dropping everything but letters and
  *    digits, so `on-order` here is `onOrder` there.
- * 2. The crawler page /og/help (routes/og.js), which prints every section.
+ * 2. The crawler page /og/help (routes/og/site.js), which prints every section.
  *
  * It says what the Help page says (`help.sections.*` in
  * frontend/src/locales/en/translation.json), section for section; the words
@@ -37,7 +37,7 @@ const sections = [
     details: [
       'Create a cellar: on My Cellars, tap "+ New Cellar" and type a name.',
       'Each cellar is a separate bottle collection.',
-      'Open a cellar to see its bottles. Search by name, producer, grape or region, narrow the list with Filters, and sort it by date added, name, vintage, price, number of bottles or maturity.',
+      'Open a cellar to see its bottles. Search by name, producer, grape or region, narrow the list with Filters, and sort it by date added, name, vintage, price, number of bottles or maturity. The search also finds a bottle by the text and list values under More data in its Wine record, and in Your wine data.',
       'The strip at the top of a cellar switches between its views: Bottles, Overview, Racks, Room View, History and Cellar Book. Overview shows the number of bottles and wines, the total value and the average price.',
       'The ⋮ menu at the top right holds the cellar\'s actions: Edit Cellar, Set Color, Share, Wine Lists, Import Bottles, Export, Audit Log, Recently deleted and Delete Cellar. Some are for the cellar\'s owner only.',
     ],
@@ -61,6 +61,19 @@ const sections = [
       'The bottle page\'s ⋮ menu also has "Add more bottles", "Move to another cellar" and "Added by mistake?". A bottle added by mistake goes to Recently deleted, where you can bring it back for 30 days.',
     ],
     tourId: 'add-bottle',
+  },
+  {
+    id: 'notes-and-reviews',
+    title: 'Ratings, notes, journal and reviews',
+    route: null,
+    tourId: null,
+    summary: 'Four places to write about a wine, and who sees each.',
+    details: [
+      'Rating and notes on a bottle: your own notes about that bottle. They stay with it, and anyone you share the cellar with sees them too.',
+      'When you drink a bottle, the rating and note you give it then go with it to the cellar\'s History, so you can look back on how it was.',
+      'A journal entry is the moment: the occasion, the food, the people, and how the wine showed. Only you can see your journal entries; marking one public only tells the members you tagged in it that they were mentioned.',
+      'A review is about the wine, for other members: it shows on the wine\'s page for everyone, unless you mark it private. After drinking a bottle, "Share as review" starts one from the rating and note you already wrote.',
+    ],
   },
   {
     id: 'vintage-page',
@@ -436,7 +449,7 @@ const sections = [
     summary: 'Blog, supporting Cellarion, support tickets and NFC tags.',
     details: [
       'Blog (/blog): wine articles and guides.',
-      `Support Us (/supporter): every feature is free for everyone, on the free Enthusiast tier too. ${tierLine()}, also available yearly, are voluntary gifts that fund development and unlock nothing extra. A custom or one-time amount can be given through GitHub Sponsors.`,
+      `Support Us (/supporter): every feature is free for everyone. ${tierLine()}, also available yearly, are voluntary gifts that fund development and unlock nothing extra. A custom or one-time amount can be given through GitHub Sponsors.`,
       'Support (/support): look in Help first; if you are still stuck, send a support ticket.',
       'NFC tags: attach NFC tags to racks — scan with your phone to open the rack directly.',
     ],

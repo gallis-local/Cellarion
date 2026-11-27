@@ -3,13 +3,12 @@
  *
  * Loads the rich, original markdown descriptions for grapes, countries and
  * regions from src/data/taxonomy-descriptions/*.json and writes them onto the
- * matching taxonomy documents. These replace the earlier plain-prose
- * descriptions with consistent, structured markdown (rendered on the public
- * /grapes, /regions, /countries pages and served to AI via the MCP
+ * matching taxonomy documents: consistent, structured markdown (rendered on
+ * the public /grapes, /regions, /countries pages and served to AI via the MCP
  * describe_* tools).
  *
  * Content was written for this project (not copied from any source) and
- * fact-checked; see the generating workflow in the 2026-07-18 taxonomy work.
+ * fact-checked.
  *
  * Matching:
  *   grapes    → Grape by normalizedName
@@ -38,7 +37,7 @@ const { normalizeString } = require('../utils/normalize');
 const APPLY = process.argv.includes('--apply');
 const DATA = path.join(__dirname, '..', 'data', 'taxonomy-descriptions');
 
-// Hand-curated entries left untouched (Johan's Swedish home-market prose).
+// Hand-curated entries left untouched (the Swedish home-market prose).
 // Keyed by "<kind>:<normalizedName>".
 const PRESERVE = new Set(['country:sweden', 'region:skane', 'region:norrland']);
 

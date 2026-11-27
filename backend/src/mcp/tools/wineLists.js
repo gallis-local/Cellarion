@@ -1,6 +1,6 @@
-// Wine-list MCP tools (plan §3.13, Phase 7): the restaurant/sommelier menu
-// feature over MCP. list_wine_lists / get_wine_list [read] +
-// add_to_list / update_list_pricing [write].
+// Wine-list MCP tools: the restaurant/sommelier menu feature over MCP.
+// list_wine_lists / get_wine_list [read] + add_to_list / update_list_pricing
+// [write].
 //
 // Wine lists are USER-OWNED documents (routes/wineLists.js is requireAuth
 // only, no somm role) — so these are scope-gated personal tools, not
@@ -20,12 +20,12 @@ const { registerTool } = require('../registry');
 const { logAudit } = require('../../services/audit');
 const { ok, fail, objectId, pageParams, wineSummary } = require('../toolUtil');
 const { logAction, replay } = require('../actionLedger');
-// Single source for the glass-price rule (MCP-audit M4) — identical to the web
-// editor's, and now floored at one step so a cheap wine no longer suggests 0.
+// Single source for the glass-price rule — identical to the web
+// editor's, and floored at one step so a cheap wine never suggests 0.
 const { suggestGlassPrice } = require('../../utils/glassPrice');
 // get_wine_list reads the SAME rendered structure the app and the PDF use —
-// nested auto-mode headings and live per-entry stock (support ticket
-// 2026-09-12: a client could not see the grouping of the menu it was reading).
+// nested auto-mode headings and live per-entry stock, so a client sees the
+// grouping of the menu it is reading.
 const { loadWineMap, entryKey, ownerWineFilter } = require('../../services/wineListData');
 const { buildSections, groupingLevels } = require('../../services/wineListPdf');
 
@@ -55,7 +55,7 @@ const entryOut = (e) => ({
 });
 
 // Find every entry for a wine in the ACTIVE container only — the same set
-// get_wine_list renders (grand-audit M4). Scanning both containers made a
+// get_wine_list renders. Scanning both containers made a
 // wine present in both (a list mode-flipped from auto to custom) look like a
 // duplicate with identical disambiguators (permanently un-editable), and let
 // update_list_pricing edit an entry hidden from the rendered menu. The
@@ -193,6 +193,7 @@ registerTool({
       currency: list.layout?.currency || 'USD',
       hide_prices: !!list.layout?.hidePrices,
       mark_last_bottle: !!list.layout?.markLastBottle,
+      show_stock: !!list.layout?.showStock,
       glass_pricing_rule: {
         glasses_per_bottle: list.layout?.glassesPerBottle ?? 6,
         markup_percent: list.layout?.glassMarkup ?? 0,
@@ -236,7 +237,7 @@ registerTool({
       // by them or held in a cellar of theirs. A stranger's hidden row reads
       // as not_found, so what can be added is exactly what will render.
       ownerWineFilter(ctx.user.id, [args.wine_id])
-        .then((filter) => WineDefinition.findOne(filter).populate('country region')),
+        .then((filter) => WineDefinition.findOne(filter).select('+sweetnessStyle').populate(['country', 'region', { path: 'labelSweetness', select: 'name band scale regulated -_id' }, { path: 'sweetnessStyle.term', select: 'name band scale regulated' }])),
     ]);
     if (!list) return fail('not_found', 'No such wine list. Use list_wine_lists for valid ids.');
     if (!wine) return fail('not_found', 'No such registry wine. Find the wine_id via search_registry or a bottle\'s wine.');
@@ -244,7 +245,7 @@ registerTool({
     // Trim to match the schema (trim: true) BEFORE we save and record the
     // ledger detail — otherwise the saved entry is "2019" while the undo
     // detail keeps "2019 ", and winelist_add undo's strict compare misses the
-    // entry (grand-audit L7/L11), and the dupe check leaks near-duplicates.
+    // entry, and the dupe check leaks near-duplicates.
     const vintage = (args.vintage || 'NV').trim() || 'NV';
     const bottleSize = (args.bottle_size || '750ml').trim() || '750ml';
     const dupes = findEntries(list, wine._id, { vintage, bottleSize });
@@ -313,7 +314,7 @@ registerTool({
       data: {
         list_id: list._id,
         section: sectionTitle,
-        wine: wineSummary(wine),
+        wine: wineSummary(wine, { termLoaded: true, styleLoaded: true }),
         vintage,
         bottle_size: bottleSize,
         list_price: args.list_price ?? null,

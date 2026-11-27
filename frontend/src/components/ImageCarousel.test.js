@@ -19,9 +19,9 @@ vi.mock('../contexts/AuthContext', () => ({
 
 const { default: ImageCarousel } = await import('./ImageCarousel');
 
-// Support ticket 2026-09-03: an admin-rejected photo (files deleted, both URLs
-// nulled) reached this carousel, `src.startsWith` threw, and the page-level
-// ErrorBoundary replaced the whole bottle page with "Something went wrong".
+// An admin-rejected photo (files deleted, both URLs nulled) must not throw
+// here: `src.startsWith` on null would let the page-level ErrorBoundary
+// replace the whole bottle page with "Something went wrong".
 describe('ImageCarousel and a row with no URL', () => {
   test('renders an empty frame instead of throwing', () => {
     const images = [{ _id: 'dead', processedUrl: null, originalUrl: null, status: 'rejected' }];
@@ -52,7 +52,7 @@ describe('ImageCarousel state pill', () => {
   });
 });
 
-// Support ticket 2026-10-09: a wine-level photo of ANOTHER vintage names its
+// A wine-level photo of ANOTHER vintage names its
 // year on the slide, so a 2016 bottle showing the 2015 label says so.
 describe('ImageCarousel vintage tag', () => {
   test('a photo of another year is tagged; the bottle\'s own year and untagged photos are not', () => {
@@ -64,5 +64,21 @@ describe('ImageCarousel vintage tag', () => {
     expect(screen.queryByRole('note')).toBeNull();
     rerender(<ImageCarousel images={[{ _id: 'a', processedUrl: '/api/uploads/processed/a.png', vintage: '2015' }]} />);
     expect(screen.queryByRole('note')).toBeNull(); // no bottle vintage to compare with
+  });
+});
+
+// On the vintage page (no default star) the report flag takes the corner
+// itself, rather than keeping the star's room free on top of the "Published" pill.
+describe('ImageCarousel report / delete control', () => {
+  const photo = [{ _id: 'a', processedUrl: '/api/uploads/processed/a.png', status: 'approved', mine: true, assignedToWine: true }];
+
+  test('takes the corner when there is no default star', () => {
+    render(<ImageCarousel images={photo} onReport={() => {}} />);
+    expect(screen.getByLabelText('Report this photo')).toHaveClass('carousel-action-btn--corner');
+  });
+
+  test('stays left of the default star when there is one', () => {
+    render(<ImageCarousel images={photo} onReport={() => {}} onSetDefault={() => {}} />);
+    expect(screen.getByLabelText('Report this photo')).not.toHaveClass('carousel-action-btn--corner');
   });
 });

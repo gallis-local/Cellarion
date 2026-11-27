@@ -1,20 +1,18 @@
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const User = require('../models/User');
+const { markActive } = require('./lastActive');
 
 // Central place for issuing the access/refresh token pair and handling the
 // refresh cookie. Shared by the password login flow (routes/auth.js) and the
 // SSO flow (routes/oauth.js) so both mint IDENTICAL sessions — same JWT claims,
 // same rotating + path-scoped refresh cookie, same absolute-lifetime cap.
 //
-// Sessions are PER DEVICE (2026-09-04). The account used to hold ONE refresh
-// token hash, so signing in on the phone silently signed the laptop out: its
-// cookie no longer matched anything, the next /refresh got a 401, and the
-// client treated that as "session dead". On the hosted instance 247 of 313
-// consecutive logins over two weeks were exactly that — the same person moving
-// between devices. Now `user.sessions[]` carries one entry per signed-in
+// Sessions are PER DEVICE: `user.sessions[]` carries one entry per signed-in
 // browser; /refresh rotates only its own entry and /logout removes only its
-// own entry. Password change/reset and account deletion still revoke ALL.
+// own entry, so signing in on the phone never signs the laptop out (with one
+// refresh token per account, the laptop's next /refresh would get a 401).
+// Password change/reset and account deletion revoke ALL.
 
 // Generate short-lived access token (default 15 min)
 const generateAccessToken = (user) => {
@@ -30,16 +28,16 @@ const generateAccessToken = (user) => {
 const generateRefreshToken = () => crypto.randomBytes(64).toString('hex');
 const hashRefreshToken = (token) => crypto.createHash('sha256').update(String(token)).digest('hex');
 
-// Secure flag for the refresh cookie (L-22): dedicated COOKIE_SECURE override
-// ('true'/'false'), falling back to the old NODE_ENV inference when unset.
-// Self-hosters serving plain HTTP must set COOKIE_SECURE=false once the image
-// ships with NODE_ENV=production, or the browser will drop the cookie.
+// Secure flag for the refresh cookie: dedicated COOKIE_SECURE override
+// ('true'/'false'), falling back to NODE_ENV inference when unset. The image
+// ships with NODE_ENV=production, so self-hosters serving plain HTTP must set
+// COOKIE_SECURE=false or the browser drops the cookie.
 const COOKIE_SECURE = process.env.COOKIE_SECURE
   ? process.env.COOKIE_SECURE === 'true'
   : process.env.NODE_ENV === 'production';
 
 // Cookie options for the httpOnly refresh token. path-scoped to /api/auth
-// (L-23) so the 30-day credential only rides on auth endpoints instead of
+// so the 30-day credential only rides on auth endpoints instead of
 // every backend request (uploads, JSON APIs, SSE) where it could land in
 // logs/proxies. sameSite:'lax' is what lets the cookie survive the top-level
 // OAuth redirect back from the identity provider.
@@ -55,9 +53,9 @@ const refreshCookieOptions = { ...refreshCookieBase, maxAge: 7 * 24 * 60 * 60 * 
 
 // Clear the refresh cookie. clearCookie only removes a cookie whose path
 // matches, so we clear BOTH the scoped path and the legacy path '/' — sessions
-// issued before the /api/auth scoping (L-23) still carry a path=/ cookie until
+// issued before the /api/auth scoping still carry a path=/ cookie until
 // their next rotation, and clearing only the scoped variant would silently
-// leave the old credential behind. The legacy clear can be dropped once all
+// leave that credential behind. The legacy clear can be dropped once all
 // pre-scoping sessions have aged out (30-day absolute lifetime).
 // Uses refreshCookieBase (no maxAge): passing maxAge to clearCookie makes
 // Express re-derive a FUTURE expiry, leaving an empty cookie behind instead
@@ -154,8 +152,8 @@ const sessionForCookie = (user, req) => {
  * Returns null when it matches nothing, otherwise { user, session } plus:
  *  - reused: true / race: bool — the token was rotated away; `race` says it
  *    happened inside REUSE_GRACE_MS (benign) or not (theft signal)
- *  - migrated: true — a pre-sessions single-token row was adopted in place
- *    (the caller's rotation persists it), so the rollout signs nobody out
+ *  - migrated: true — a row still on the single-token fields was adopted in
+ *    place (the caller's rotation persists it), so its owner stays signed in
  */
 const resolveRefreshSession = async (token) => {
   const hash = hashRefreshToken(token);
@@ -213,6 +211,7 @@ const issueTokens = async (user, res, { rememberMe, session, client, expiresAt }
     session.rotatedAt = new Date(now);
     session.hash = hash;
     session.lastUsedAt = new Date(now);
+    markActive(user, now);
     // Backfill legacy sessions (null) so every session eventually gets a cap;
     // never EXTEND an existing one — an attacker who keeps rotating a stolen
     // token is still cut off at the original deadline.
@@ -240,7 +239,10 @@ const issueTokens = async (user, res, { rememberMe, session, client, expiresAt }
 };
 
 // Start a device session on a user doc: drop expired entries, evict the
-// least-recently-used one at the cap, append the new one.
+// least-recently-used one at the cap, append the new one. Also records the
+// day as active: here rather than in issueTokens, because saveWithNewSession
+// replays only this function onto a fresh copy after a version conflict, and
+// any change made to the doc before it would make the save non-replayable.
 const addSession = (user, entry, now) => {
   pruneSessions(user, now);
   const list = sessionsOf(user);
@@ -252,6 +254,7 @@ const addSession = (user, entry, now) => {
     list.splice(oldest, 1);
   }
   list.push(entry);
+  markActive(user, now);
 };
 
 const NEW_SESSION_ATTEMPTS = 5;
@@ -262,17 +265,14 @@ const NEW_SESSION_ATTEMPTS = 5;
  * Two sign-ins of one account at the same moment (a double-clicked button,
  * two devices) both change the same sessions array, and Mongoose's version
  * check fails the later save with a VersionError — a "Login failed" for a
- * sign-in that was fine. Pure-JS bcrypt used to hide this by serialising
- * logins on the event loop; the native one lets them overlap.
+ * sign-in that was fine. The native bcrypt hashes off the event loop, so
+ * such logins really do overlap.
  *
  * When the new session is the ONLY unsaved change, it is re-applied to a
  * fresh copy and saved again. A doc carrying ANY other unsaved change — a
  * password change persists through here, with every old session revoked;
  * so would a revocation that touched only `sessions` — is never replayed
- * from a fresh copy, which would silently drop it; its conflict is thrown,
- * as before. (Until 2026-09-27 a sessions-only change counted as replayable
- * — no caller made one, but the guard now says what it means; release
- * audit, L.)
+ * from a fresh copy, which would silently drop it; its conflict is thrown.
  */
 async function saveWithNewSession(user, entry, now) {
   const replayable = !user.isNew
@@ -296,19 +296,12 @@ async function saveWithNewSession(user, entry, now) {
 }
 
 module.exports = {
-  generateAccessToken,
   generateRefreshToken,
   hashRefreshToken,
   COOKIE_SECURE,
-  refreshCookieBase,
-  refreshCookieOptions,
   clearRefreshCookie,
-  buildCookieOptions,
-  REFRESH_ABSOLUTE_LIFETIME_MS,
   MAX_SESSIONS_PER_USER,
-  REUSE_GRACE_MS,
   clientHint,
-  pruneSessions,
   removeSession,
   revokeAllSessions,
   sessionForCookie,

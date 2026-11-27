@@ -5,7 +5,7 @@
  * the lazy expiry sweep every queue read runs (the bottleOps pattern: REST
  * and MCP must not drift on recipient building or conflict semantics).
  *
- * The OWNER side lives here too (2026-09-24): the recipient view and the
+ * The OWNER side lives here too: the recipient view and the
  * single-shot answer are shared by routes/ownerInquiries.js (the bottle-page
  * card) and the MCP tools list_curator_questions / answer_curator_question
  * (mcp/tools/ownerQuestions.js), so the privacy projection and the claim
@@ -50,9 +50,9 @@ const wineLabel = (wine) => [wine?.producer, wine?.name].filter(Boolean).join(' 
 // An inquiry a recipient may still see/answer: open or answered, and not
 // expired. Expired rows are excluded query-time on the owner paths (they run
 // no global writes); the curator queue reads run the closing sweep for the
-// open ones, and keeps the answered ones until a curator resolves them. Until
-// 2026-09-27 an answered inquiry had no expiry here, so other recipients could
-// keep adding answers to a months-old question (release audit, L).
+// open ones, and keeps the answered ones until a curator resolves them. An
+// answered inquiry expires here too, so other recipients cannot keep adding
+// answers to a months-old question.
 const activeFor = (now) => ([
   { status: 'answered', expiresAt: { $gt: now } },
   { status: 'open', expiresAt: { $gt: now } },
@@ -70,18 +70,25 @@ const visibleFor = (now) => ([
 
 /**
  * The caller's RECIPIENT view of their inquiries: question, wine, THEIR
- * bottle and THEIR response state only. Other recipients' identities and
- * answers never leave the server here — an owner must not learn who else
- * owns the wine (privacy). `resolutionNote` is absent BY DESIGN: it is the
- * curator's private record, and only `ownerReply` was written to be read
- * here. Newest first, capped at 50.
+ * bottle and THEIR response state only (see recipientRow). Callers: GET
+ * /api/owner-inquiries/mine (the questions page with places; the bottle card
+ * scoped to one wine) and the MCP tool list_curator_questions. Returns rows
+ * newest first, capped at 50.
+ *
+ * Other recipients' identities and answers never leave the server here — an
+ * owner must not learn who else owns the wine (privacy). `resolutionNote` is
+ * absent BY DESIGN: it is the curator's private record, and only `ownerReply`
+ * was written to be read here.
  *
  * @param {string} userId
  * @param {object} [opts]
  * @param {string} [opts.wineId]  narrow to one wine; an invalid id yields []
  *   rather than a cast error (what the BottleDetail card asks)
+ * @param {boolean} [opts.withPlaces]  also give each row the `cellar` and
+ *   `vintage` of a bottle of the wine on the caller's shelf (withBottlePlaces).
+ *   Off by default: it costs more queries, and only the questions page shows it.
  */
-async function listInquiriesForRecipient(userId, { wineId } = {}) {
+async function listInquiriesForRecipient(userId, { wineId, withPlaces = false } = {}) {
   const filter = {
     'recipients.user': userId,
     $or: visibleFor(new Date()),
@@ -97,9 +104,62 @@ async function listInquiriesForRecipient(userId, { wineId } = {}) {
     .populate('wineDefinition', 'name producer')
     .lean();
 
-  return rows
+  const views = rows
     .filter((i) => recipientMaySee(i, userId))
     .map((i) => recipientRow(i, userId));
+  return withPlaces ? withBottlePlaces(userId, views) : views;
+}
+
+// Cellars the caller can open: live ones they own or are a member of.
+const reachableCellars = (userId) => ({ $or: [{ user: userId }, { 'members.user': userId }], deletedAt: null });
+
+// Where the member can go and read the label: a bottle OF THE INQUIRY'S WINE
+// on a shelf in a cellar they can open. The bottle that made them a recipient
+// while it still is one (it may since have been drunk, deleted or re-linked to
+// another wine), else their newest such bottle of the wine; with none, cellar
+// and vintage are null. Three queries for the whole list, whatever its length.
+// Only cellars the caller can open are searched and the inquiry's other
+// recipients are never read, so a place says nothing about who else was asked.
+async function withBottlePlaces(userId, views) {
+  const noPlace = (v) => ({ ...v, cellar: null, vintage: null });
+  const wineIds = [...new Set(views.map((v) => v.wine?._id).filter(Boolean).map(String))];
+  if (!wineIds.length) return views.map(noPlace);
+  const cellars = await Cellar.find(reachableCellars(userId)).select('name').lean();
+  if (!cellars.length) return views.map(noPlace);
+
+  // Object ids by hand: an aggregate $match is not cast by Mongoose.
+  const onShelf = {
+    wineDefinition: { $in: wineIds.map((id) => new mongoose.Types.ObjectId(id)) },
+    cellar: { $in: cellars.map((c) => c._id) },
+    status: { $nin: NOT_IN_CELLAR_STATUSES },
+  };
+  const recordedIds = [...new Set(views.map((v) => v.bottle).filter(Boolean).map(String))];
+  const [recorded, newest] = await Promise.all([
+    recordedIds.length
+      ? Bottle.find({ _id: { $in: recordedIds }, ...onShelf }).select('wineDefinition cellar vintage').lean()
+      : [],
+    // One bottle per wine however many the member holds: the answer is
+    // bounded by the list's wines, not by the size of their cellar.
+    Bottle.aggregate([
+      { $match: onShelf },
+      { $sort: { createdAt: -1, _id: -1 } },
+      { $group: { _id: '$wineDefinition', cellar: { $first: '$cellar' }, vintage: { $first: '$vintage' } } },
+    ]),
+  ]);
+
+  const cellarById = new Map(cellars.map((c) => [String(c._id), c]));
+  const recordedById = new Map(recorded.map((b) => [String(b._id), b]));
+  const newestByWine = new Map(newest.map((b) => [String(b._id), b]));
+  return views.map((v) => {
+    if (!v.wine) return noPlace(v);
+    const wineId = String(v.wine._id);
+    const own = v.bottle ? recordedById.get(String(v.bottle)) : null;
+    // A recorded bottle re-linked to another wine is not a bottle of this one.
+    const bottle = (own && String(own.wineDefinition) === wineId ? own : null) || newestByWine.get(wineId);
+    const cellar = bottle ? cellarById.get(String(bottle.cellar)) : null;
+    if (!cellar) return noPlace(v);
+    return { ...v, cellar: { _id: cellar._id, name: cellar.name }, vintage: bottle.vintage || null };
+  });
 }
 
 // A resolved row is worth showing only to someone who answered it.
@@ -107,12 +167,15 @@ const recipientMaySee = (i, userId) => i.status !== 'resolved'
   || (i.recipients || []).some((r) => String(r.user) === String(userId) && r.response);
 
 // The recipient's view of one inquiry: their own row only, never other
-// recipients' answers.
+// recipients' answers. The stored 'answered' means SOMEONE answered; to a
+// recipient who has not, it would say another owner replied, so they see
+// 'open' until they answer themselves. 'resolved' and 'closed' pass through:
+// neither says whether anyone answered.
 function recipientRow(i, userId) {
   const mine = (i.recipients || []).find((r) => String(r.user) === String(userId));
   return {
     _id: i._id,
-    status: i.status,
+    status: i.status === 'answered' && !mine?.response ? 'open' : i.status,
     question: i.question,
     wine: i.wineDefinition
       ? { _id: i.wineDefinition._id, name: i.wineDefinition.name, producer: i.wineDefinition.producer || null }
@@ -139,15 +202,14 @@ const questionLink = (inquiryId) => `/questions/${inquiryId}`;
  * bottle's page shows the question card too — it is keyed by the wine). Only
  * cellars that still exist and that they own or are a member of. Resolved
  * when the notification is clicked, so a bottle or cellar deleted after the
- * question went out no longer leads to "bottle not found" (support ticket
- * 2026-10-14).
+ * question went out does not lead to "bottle not found".
  */
 async function liveBottleLink(userId, wineId, preferBottleId) {
   if (!wineId || !isValidId(String(wineId))) return null;
-  const cellarIds = await Cellar.find({ $or: [{ user: userId }, { 'members.user': userId }], deletedAt: null }).distinct('_id');
+  const cellarIds = await Cellar.find(reachableCellars(userId)).distinct('_id');
   if (!cellarIds.length) return null;
   // The original bottle by id: found however many bottles of the wine there
-  // are, not only among the newest of them (pre-release audit 2026-10-14).
+  // are, not only among the newest of them.
   const preferred = preferBottleId && isValidId(String(preferBottleId))
     ? await Bottle.findOne({ _id: preferBottleId, wineDefinition: wineId, cellar: { $in: cellarIds } }).select('cellar').lean()
     : null;
@@ -162,10 +224,11 @@ async function liveBottleLink(userId, wineId, preferBottleId) {
 }
 
 /**
- * One inquiry addressed to the caller, as the list shows it, plus `link`: a
- * bottle page of the wine they can open now (null when they have none left —
- * the question then shows on its own page). Someone else's inquiry, a
- * missing one and one no longer visible all answer not_found alike.
+ * One inquiry addressed to the caller, in the recipient view (without the
+ * list's cellar and vintage), plus `link`: a bottle page of the wine they can
+ * open now (null when they have none left — the question then shows on its
+ * own page). Someone else's inquiry, a missing one and one no longer visible
+ * all answer not_found alike.
  *
  * @returns {Promise<{ok:true, inquiry:object} | {ok:false, code:'not_found', message:string}>}
  */
@@ -303,17 +366,17 @@ async function buildRecipients(wineId) {
     { $match: { wineDefinition: wineOid, status: statusMatch } },
     // Only bottles in a cellar that still exists: a bottle in a cellar its
     // owner deleted keeps its status, but nobody can open it, so a question
-    // linked to it led to "bottle not found" (support ticket 2026-10-14). An
-    // owner whose only bottles sat in a deleted cellar is not asked at all.
+    // linked to it would lead to "bottle not found". An owner whose only
+    // bottles sit in a deleted cellar is not asked at all.
     { $lookup: { from: 'cellars', localField: 'cellar', foreignField: '_id', as: 'liveCellar', pipeline: [{ $match: { deletedAt: null } }, { $project: { _id: 1 } }] } },
     { $match: { 'liveCellar.0': { $exists: true } } },
     { $sort: { createdAt: -1 } },
-    // latest makes the cap DETERMINISTIC ($group emits undefined order —
-    // audit 2026-08-11 L-3: without the re-sort the 20 kept were arbitrary).
+    // latest makes the cap DETERMINISTIC: $group emits undefined order, and
+    // without the re-sort on it the RECIPIENT_CAP kept would be arbitrary.
     { $group: { _id: '$user', bottle: { $first: '$_id' }, cellar: { $first: '$cellar' }, latest: { $first: '$createdAt' } } },
     // Demo visitors hold clones of real registry wines but can never answer
-    // (respond is requireNonDemo) — without this exclusion they crowd real
-    // owners out of the cap (audit 2026-08-11 frontend MEDIUM).
+    // (respond is requireNonDemo) — without this exclusion they would crowd
+    // real owners out of the cap.
     { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'owner' } },
     { $match: { 'owner.isDemo': { $ne: true } } },
     { $sort: { latest: -1 } },
@@ -365,20 +428,19 @@ async function createOwnerInquiry({ wineId, userId, via = 'rest', question, req 
 
   const wine = await WineDefinition.findById(wineId).select('name producer pendingIdentity draft');
   // A private draft answers not_found: nobody but its creator knows it exists,
-  // and the creator IS the owner (draft design 2026-09-12). `draft` is in the
-  // projection above, so the check can see it.
+  // and the creator IS the owner. `draft` is in the projection above, so the
+  // check can see it.
   if (!wine || wine.draft === true) {
     return { ok: false, code: 'not_found', message: 'No registry wine with that id.' };
   }
-  // Pending-identity wines are deliberately ASKABLE. This used to be refused on
-  // the reasoning that the only owner is the creator, so asking them adds
-  // nothing over reading the scan — but those two things don't connect. When the
-  // scan is unreadable (a washed-out producer line, a label that simply doesn't
-  // print the producer, a photo of a screen), the owner is holding the bottle
-  // and can read the BACK label, which carries "Mis en bouteille par…". That is
-  // strictly more information than the curator has, and it is the only path that
-  // resolves the row at all. Refusing it left such wines stuck in the queue
-  // forever with no escalation (found in use, 2026-08-12).
+  // Pending-identity wines are deliberately ASKABLE, even though the only owner
+  // is often the creator, whose scan the curator already has. When the scan is
+  // unreadable (a washed-out producer line, a label that simply doesn't print
+  // the producer, a photo of a screen), the owner is holding the bottle and
+  // can read the BACK label, which carries "Mis en bouteille par…". That is
+  // strictly more information than the curator has, and it is the only path
+  // that resolves the row at all: refusing it would leave such wines stuck in
+  // the queue forever with no escalation.
 
   const { recipients, fallbackUsed } = await buildRecipients(wine._id);
   if (recipients.length === 0) {
@@ -405,11 +467,10 @@ async function createOwnerInquiry({ wineId, userId, via = 'rest', question, req 
   }
 
   // In-app + push (existing notification consent surfaces), and email: the
-  // bell alone left every question unanswered (2026-10-20). The link opens the
-  // QUESTION, which finds the owner's bottle when they click: a bottle link
-  // written now goes dead when the bottle or its cellar is deleted later
-  // (support ticket 2026-10-14). Batch call: one insertMany + capped push
-  // fan-out.
+  // bell alone leaves questions unanswered. The link opens the QUESTION,
+  // which finds the owner's bottle when they click: a bottle link written now
+  // goes dead when the bottle or its cellar is deleted later. Batch call: one
+  // insertMany + capped push fan-out.
   const label = wineLabel(wine);
   createNotifications(recipients.map((r) => ({
     userId: r.user,
@@ -538,7 +599,7 @@ async function resolveOwnerInquiry({ inquiryId, userId, note, ownerReply, via = 
   // notification failure must not un-resolve an inquiry that is already
   // written (the wine-report close draws the same line). The link opens the
   // question, which finds a bottle of the wine the owner can open when they
-  // click (support ticket 2026-10-14) — the reply shows on its card.
+  // click — the reply shows on its card.
   const fallback = `Thank you — your answer helped settle the record for ${label}.`;
   createNotifications(answered.map((r) => ({
     userId: r.user,
@@ -604,7 +665,7 @@ async function queryInquiryPage(filter, { limit, offset }) {
 }
 
 /**
- * Wine-merge lifecycle (called by performWineMerge, routes/admin/wines.js):
+ * Wine-merge lifecycle (called by performWineMerge, services/wineMergeOps.js):
  * ACTIVE inquiries follow the bottles to the keeper. 'answered' rows always
  * re-point — they carry owner answers that must stay reachable in the queue.
  * The (at most one) 'open' row re-points too, unless the keeper already has
@@ -653,8 +714,8 @@ async function repointInquiriesForWineMerge(sourceId, targetId, keeperLabel, req
 }
 
 /**
- * Wine-delete lifecycle (#916 pattern): with the wine gone there is nothing
- * left to verify — close every active inquiry with the reason on the row.
+ * Wine-delete lifecycle: with the wine gone there is nothing left to verify
+ * — close every active inquiry with the reason on the row.
  */
 async function closeInquiriesForWineDelete(wineId, req = null) {
   const res = await WineOwnerInquiry.updateMany(

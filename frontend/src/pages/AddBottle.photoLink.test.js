@@ -6,7 +6,7 @@
  * When the server refuses a custom field, the add stops at a notice — and the
  * link used to run only from the notice's Close button. Leaving the page any
  * other way stranded the photos: no bottle, no wine, a row in the admin queue
- * that nobody could act on until the 30-day sweep (audit 2026-09-27 M1).
+ * that nobody could act on until the 30-day sweep.
  *
  * Locked here: the link is made before the notice is shown, and once only.
  *
@@ -31,6 +31,7 @@ vi.mock('../contexts/AuthContext', () => ({
 }));
 vi.mock('react-router-dom', () => ({
   useParams: () => ({ id: 'cellar1' }),
+  useLocation: () => ({ state: null }),
   useNavigate: () => navigateMock,
   Link: ({ children }) => <a href="/">{children}</a>,
 }));
@@ -145,6 +146,31 @@ describe('AddBottle — linking the uploaded photos', () => {
     // Dismissing resumes the flow, and links once only.
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/cellars/cellar1', expect.objectContaining({ state: { addedNotice: expect.any(Object) } })));
     expect(linkCalls()).toHaveLength(1);
+  });
+
+  test('a link the server refuses is tried again when the flow resumes', async () => {
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let linkTries = 0;
+    routeApi((n) => (n === 1
+      ? { customFieldErrors: [{ key: 'ABV', error: 'You already use "ABV" as a text key' }] }
+      : {}));
+    const answer = apiFetchMock.getMockImplementation();
+    apiFetchMock.mockImplementation(async (url, opts) => {
+      if (url !== '/api/images/link-to-bottle') return answer(url, opts);
+      linkTries += 1;
+      return linkTries === 1 ? jsonRes({ error: 'Too many requests' }, false, 429) : jsonRes({ linked: 1 });
+    });
+    await uploadAndSubmitWithFields();
+
+    await waitFor(() =>
+      expect(screen.getByText('addBottle.customFieldsNotSaved')).toBeInTheDocument());
+    await waitFor(() => expect(linkCalls()).toHaveLength(1));
+
+    // Closing the notice resumes the flow: the refused link gets its second try.
+    await act(async () => { fireEvent.click(screen.getByText('common.close')); });
+    await waitFor(() => expect(linkCalls()).toHaveLength(2));
+    expect(linkCalls()[1]).toEqual({ bottleId: 'b1', imageIds: ['img-1'] });
+    quiet.mockRestore();
   });
 
   test('a clean add links the photos once, on the way to the cellar', async () => {

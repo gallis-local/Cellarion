@@ -1,11 +1,10 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const { requireAuth, requireRole } = require('../../middleware/auth');
-const { normalizeString, normalizeAppellation, normalizeAppellationKey, sanitizeTaxonomyName } = require('../../utils/normalize');
+const { normalizeString, sanitizeTaxonomyName } = require('../../utils/normalize');
 const Country = require('../../models/Country');
 const Region = require('../../models/Region');
 const Grape = require('../../models/Grape');
-const Appellation = require('../../models/Appellation');
 const WineDefinition = require('../../models/WineDefinition');
 const searchService = require('../../services/search');
 const { logAudit } = require('../../services/audit');
@@ -15,12 +14,9 @@ const { distinctSizes, normalizeAll, remap } = require('../../services/bottleSiz
 const { mergeGrapes, mergeRegions, mergeCountries } = require('../../services/taxonomyMerge');
 const { findDuplicateClusters } = require('../../utils/taxonomyDuplicates');
 const { sanitizeTranslations } = require('../../utils/localizedName');
-const {
-  listUnmatchedAppellations, appellationRefsError,
-  dismissUnmatchedAppellation, restoreDismissedAppellation, listDismissedAppellations,
-} = require('../../services/taxonomyReview');
 const { validateGrapeRegionalNames, computeRegionalNameWarnings } = require('../../services/grapeRegionalNames');
 const { BOTTLE_SIZES } = require('../../config/bottleSizes');
+const { needsHumanReview, wineCountsByRef, wineCountsByGrape } = require('../../services/taxonomyUsage');
 
 const router = express.Router();
 
@@ -32,88 +28,6 @@ router.use(requireAuth, requireRole('admin'));
 // immediately instead of after the TTL.
 const { clearTaxonomyListCache } = require('../taxonomy');
 
-// ── Usage counts for the admin lists ─────────────────────────────────────────
-// The taxonomy UI gained merge/delete power (strategy 2026-07-29 R5), and both
-// verbs need the same context to be used safely: how many wines actually
-// reference this doc. Delete already refuses non-zero usage server-side; the
-// count makes that visible BEFORE the click, and for merges it tells the admin
-// which of two spellings is the real one (merge the 1-wine typo into the
-// 300-wine canonical, never the reverse).
-
-/**
- * Does this user-minted taxonomy row actually need a human to look at it?
- *
- * Two separate facts, deliberately: `createdByUser` records that a user write
- * minted this document rather than a curator (services/findOrCreateWine), and
- * `reviewedAt` records whether a human has since looked. They were one boolean
- * named `pendingReview` until 2026-08-31, and that name is most of this story
- * — it promised an action for a field that only ever recorded an origin, so
- * every mint looked like a task and the pile only grew.
- *
- * Measured on production (2026-08-31): of 164 regions minted in one month, 161
- * were in genuine use and exactly one was junk. At a ~1% hit rate the sensible
- * response to any row is "approve without looking", which is the same as not
- * reading it — so nobody did, and the real defect hiding in there (the Loire
- * split across four documents) went unnoticed for weeks. Being flagged never
- * revealed it: all four were flagged, individually.
- *
- * So the screen asks a better question than "who made this?". A document
- * already carrying wines has been proven real by use, in a way an approval
- * click adds nothing to. What deserves a human is the one nobody uses: that is
- * where the junk was ("Wine of Hungary", 0 wines) and where a typo would sit.
- *
- * `createdByUser` is never cleared by anything. It stays as the record of where
- * the document came from — the curator has found that provenance useful, and
- * tidying a screen is no reason to delete it. Approving stamps `reviewedAt`
- * instead. Duplicates are a separate question with their own scan
- * (GET /regions/duplicate-candidates).
- *
- * @param {{createdByUser?: boolean, reviewedAt?: Date|null}} doc
- * @param {number} wineCount
- * @returns {boolean}
- */
-function needsHumanReview(doc, wineCount) {
-  return !!doc?.createdByUser && !doc?.reviewedAt && wineCount === 0;
-}
-
-/** Map<idString, wineCount> for a ref field ('country' | 'region'). */
-async function wineCountsByRef(field) {
-  const rows = await WineDefinition.aggregate([
-    // Quarantined rows don't count as "in use" — mirror taxonomyReview.js.
-    { $match: { [field]: { $ne: null }, nonWine: { $ne: true }, pendingIdentity: { $ne: true } } },
-    { $group: { _id: `$${field}`, n: { $sum: 1 } } },
-  ]);
-  return new Map(rows.map(r => [String(r._id), r.n]));
-}
-
-/** Map<grapeIdString, wineCount> (grapes is an array field). */
-async function wineCountsByGrape() {
-  const rows = await WineDefinition.aggregate([
-    { $match: { nonWine: { $ne: true }, pendingIdentity: { $ne: true } } },
-    { $unwind: '$grapes' },
-    { $group: { _id: '$grapes', n: { $sum: 1 } } },
-  ]);
-  return new Map(rows.map(r => [String(r._id), r.n]));
-}
-
-/**
- * Map<normalizedAppellation, wineCount>. Wines store the appellation as free
- * text (not a ref — see routes/admin/import.js), so the join is by normalized
- * string: the same normalization both writers apply.
- */
-async function wineCountsByAppellation() {
-  const rows = await WineDefinition.aggregate([
-    { $match: { appellation: { $nin: [null, ''] }, nonWine: { $ne: true }, pendingIdentity: { $ne: true } } },
-    { $group: { _id: '$appellation', n: { $sum: 1 } } },
-  ]);
-  const map = new Map();
-  for (const r of rows) {
-    const key = normalizeAppellationKey(normalizeAppellation(r._id || '') || r._id || '');
-    if (!key) continue;
-    map.set(key, (map.get(key) || 0) + r.n);
-  }
-  return map;
-}
 router.use((req, res, next) => {
   if (req.method !== 'GET') {
     res.on('finish', () => {
@@ -158,7 +72,7 @@ router.post('/countries', async (req, res) => {
     const normalizedName = normalizeString(name);
 
     const country = new Country({
-      // Audit 2026-09 D01-1: same cap + control-character strip as Region/Grape.
+      // Same cap + control-character strip as Region/Grape.
       name: sanitizeTaxonomyName(name),
       code: code?.trim().toUpperCase(),
       normalizedName,
@@ -331,8 +245,8 @@ router.post('/regions', async (req, res) => {
 
     const region = new Region({
       // Bounded like every other write path — the display name is stored
-      // separately from normalizedName and was only trimmed, so it could hold
-      // newlines and unbounded length (security audit 2026-08-03).
+      // separately from normalizedName, and trimming alone would let it hold
+      // newlines and unbounded length.
       name: sanitizeTaxonomyName(name),
       normalizedName,
       country,
@@ -673,10 +587,6 @@ router.delete('/grapes/:id', async (req, res) => {
   }
 });
 
-// POST /api/admin/taxonomy/regions/:id/approve — record that a human looked
-// a user-write mint set (strategy 2026-07-29 R3). Approval is its own verb,
-// not a PUT side effect: editing a region to fix a typo must not silently
-// count as "a human vouched for this".
 // ── Display-name translations ────────────────────────────────────────────────
 
 // Only the two taxonomies that genuinely change language. Appellations are
@@ -723,13 +633,17 @@ router.put('/:kind(countries|regions)/:id/translations', async (req, res) => {
   }
 });
 
+// POST /api/admin/taxonomy/regions/:id/approve — record that a human looked
+// at a region a user write minted. Approval is its own verb, not a PUT side
+// effect: editing a region to fix a typo must not silently count as "a human
+// vouched for this".
 router.post('/regions/:id/approve', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
     const region = await Region.findById(req.params.id);
     if (!region) return res.status(404).json({ error: 'Region not found' });
     // Idempotent like the MCP tool: a second click must not write a second
-    // audit entry for a no-op (audit 2026-07-29, REST/MCP drift).
+    // audit entry for a no-op.
     if (region.reviewedAt) return res.json({ region, already: true });
     // Stamp the review. createdByUser is NEVER cleared: it records where the
     // document came from, which stays true however many people look at it.
@@ -748,8 +662,8 @@ router.post('/regions/:id/approve', async (req, res) => {
 });
 
 // POST /api/admin/taxonomy/grapes/:id/approve — record that a human looked
-// a user-write mint set (somm ticket 6a942a60: bottle-add/import minted
-// "Honey" and "Alvarão" straight into the shared taxonomy). Mirrors the
+// at a grape a user write minted (bottle-add and import can mint a grape
+// straight into the shared taxonomy). Mirrors the
 // regions verb above: approval is its own verb, not a PUT side effect —
 // editing a grape to fix a typo must not silently count as "a human vouched
 // for this". A near-miss mint gets MERGED from the queue instead (the
@@ -778,10 +692,9 @@ router.post('/grapes/:id/approve', async (req, res) => {
 
 // GET /api/admin/taxonomy/regions/duplicate-candidates
 //
-// Regions that are the same place under different names. Built after the Loire
-// was found split across FOUR documents holding 208 wines between them
-// (2026-08-31) — a split nothing surfaced, because the names share almost no
-// characters and the registry's fuzzy wine scan cannot see it.
+// Regions that are the same place under different names. Nothing else
+// surfaces such a split: the names can share almost no characters, and the
+// registry's fuzzy wine scan cannot see it.
 //
 // utils/taxonomyDuplicates explains the rule and why its stop list is short.
 // The output is a PROPOSAL: every cluster is merged by hand through the merge
@@ -825,7 +738,7 @@ router.get('/regions/duplicate-candidates', async (req, res) => {
     const counts = new Map(
       (await WineDefinition.aggregate([
         // Quarantined and pending-identity rows are not "in use" — the same
-        // exclusion wineCountsByRef() applies above, so this screen and the
+        // exclusion wineCountsByRef() applies (services/taxonomyUsage), so this screen and the
         // taxonomy list agree about the same region. It also decides the merge
         // TARGET below: without it, a document whose bulk is quarantined junk
         // could outrank the real region and pull its wines into itself.
@@ -898,298 +811,6 @@ for (const [path, { fn, type }] of Object.entries(MERGERS)) {
   });
 }
 
-// ===== APPELLATIONS =====
-
-// Input validation for the two write routes below, mirroring the MCP
-// promote_appellation schema byte-for-byte (name ≤200; synonyms at most 10
-// strings of ≤200 chars) so the two curation surfaces cannot drift. REST
-// previously validated neither the synonym element type nor the array length,
-// and normalizedSynonyms is an INDEXED multikey field, so an unbounded array
-// grew the index — while a non-string element failed the Mongoose cast into a
-// 500 (security audit 2026-07-30 L-1).
-const APPELLATION_NAME_MAX = 200;
-const APPELLATION_SYNONYMS_MAX = 10;
-
-/**
- * typeof, not truthiness (security audit 2026-07-30 L-2): a JSON body value
- * like {"$ne":null} is truthy, and the .trim() below would throw a TypeError
- * that the route's catch turns into a 500. Nothing is exploitable — it throws
- * before any Mongo query — but the answer should be a 400.
- *
- * @returns {string|null} the error message, or null when the name is valid.
- */
-function appellationNameError(name) {
-  if (typeof name !== 'string' || !name.trim()) return 'Appellation name is required';
-  // The mint chokepoint caps wine fields at 200; a longer curated name would be
-  // adopted onto wines past that cap (audit 2026-07-29 A1).
-  if (name.trim().length > APPELLATION_NAME_MAX) {
-    return `Appellation name must be ${APPELLATION_NAME_MAX} characters or fewer`;
-  }
-  return null;
-}
-
-/**
- * @returns {{error: string}|{value: string[]|undefined}} trimmed, de-duplicated
- *   synonyms — `undefined` rather than [] when nothing survives, matching the
- *   schema's `default: undefined` so an empty list leaves no array behind for
- *   the normalizedSynonyms lookup to scan.
- */
-function validateAppellationSynonyms(synonyms) {
-  if (!Array.isArray(synonyms)) return { error: 'synonyms must be an array of strings' };
-  if (synonyms.length > APPELLATION_SYNONYMS_MAX) {
-    return { error: `At most ${APPELLATION_SYNONYMS_MAX} synonyms per appellation` };
-  }
-  const out = [];
-  const seen = new Set();
-  for (const raw of synonyms) {
-    if (typeof raw !== 'string') return { error: 'synonyms must be an array of strings' };
-    const value = raw.trim().replace(/\s+/g, ' ');
-    if (!value) continue;
-    if (value.length > APPELLATION_NAME_MAX) {
-      return { error: `Each synonym must be ${APPELLATION_NAME_MAX} characters or fewer` };
-    }
-    const key = value.toLowerCase();
-    if (seen.has(key)) continue; // an admin pasting a list shouldn't create dupes
-    seen.add(key);
-    out.push(value);
-  }
-  return { value: out.length ? out : undefined };
-}
-
-// GET /api/admin/taxonomy/appellations/unmatched — the appellation review
-// queue (strategy 2026-07-29 R2). Wines store appellations as free text; this
-// lists every distinct normalized string that NO curated Appellation doc (by
-// name or synonym) covers, with the majority display spelling and the
-// majority country/region so the admin can promote it in one click (the
-// existing create endpoint) or fix the wines. Unknown values are reviewed,
-// never rejected — adding a bottle must not be blocked by taxonomy.
-router.get('/appellations/unmatched', async (req, res) => {
-  try {
-    const items = await listUnmatchedAppellations();
-    res.json({ total: items.length, items });
-  } catch (error) {
-    console.error('Unmatched appellations error:', error);
-    res.status(500).json({ error: 'Failed to list unmatched appellations' });
-  }
-});
-
-// POST /api/admin/taxonomy/appellations/unmatched/dismiss — reviewed and
-// judged NOT promotable (a quality tier, a fantasy name, a label slogan).
-// Persists a skip so the live aggregate stops resurfacing the string
-// (ticket 6a842d5e — the terminal state the price queue got with declines).
-// The audit target carries no ObjectId (the subject is a string key, and
-// target.id is typed ObjectId) — key and name ride in the details.
-router.post('/appellations/unmatched/dismiss', async (req, res) => {
-  try {
-    const result = await dismissUnmatchedAppellation({
-      name: req.body?.name, reason: req.body?.reason, userId: req.user.id,
-    });
-    if (result.error) return res.status(400).json({ error: result.error });
-    logAudit(req, 'admin.taxonomy.appellationDismiss', { type: 'appellation' },
-      { key: result.key, name: result.name, reason: req.body?.reason, already: !result.created });
-    res.status(result.created ? 201 : 200).json(result);
-  } catch (error) {
-    console.error('Dismiss unmatched appellation error:', error);
-    res.status(500).json({ error: 'Failed to dismiss appellation' });
-  }
-});
-
-// GET /api/admin/taxonomy/appellations/dismissed — the restorable record of
-// what was reviewed and rejected, newest first.
-router.get('/appellations/dismissed', async (req, res) => {
-  try {
-    const items = await listDismissedAppellations();
-    res.json({ total: items.length, items });
-  } catch (error) {
-    console.error('Dismissed appellations error:', error);
-    res.status(500).json({ error: 'Failed to list dismissed appellations' });
-  }
-});
-
-// POST /api/admin/taxonomy/appellations/dismissed/restore — lift a dismissal;
-// the string re-enters the unmatched queue while wines still carry it.
-router.post('/appellations/dismissed/restore', async (req, res) => {
-  try {
-    const result = await restoreDismissedAppellation(req.body?.name);
-    if (result.error) return res.status(400).json({ error: result.error });
-    if (!result.restored) return res.status(404).json({ error: 'No dismissal recorded for that string' });
-    logAudit(req, 'admin.taxonomy.appellationRestore', { type: 'appellation' }, { key: result.key });
-    res.json(result);
-  } catch (error) {
-    console.error('Restore dismissed appellation error:', error);
-    res.status(500).json({ error: 'Failed to restore appellation' });
-  }
-});
-
-// GET /api/admin/taxonomy/appellations - List (filter by country and/or region)
-router.get('/appellations', async (req, res) => {
-  try {
-    const { country, region } = req.query;
-    const filter = {};
-    if (country) {
-      if (!mongoose.Types.ObjectId.isValid(country)) {
-        return res.status(400).json({ error: 'Invalid country id' });
-      }
-      filter.country = country;
-    }
-    if (region) {
-      if (!mongoose.Types.ObjectId.isValid(region)) {
-        return res.status(400).json({ error: 'Invalid region id' });
-      }
-      filter.region = region;
-    }
-
-    const [appellations, wineCounts] = await Promise.all([
-      Appellation.find(filter)
-        .populate('country', 'name')
-        .populate('region', 'name')
-        .sort({ name: 1 })
-        .lean(),
-      wineCountsByAppellation(),
-    ]);
-    // Free-text join: wines carry the appellation as a string, so a doc's
-    // usage is every wine whose normalized string matches its normalizedName.
-    const rows = appellations.map(a => ({
-      ...a,
-      wineCount: wineCounts.get(a.normalizedName || normalizeAppellationKey(a.name || '')) || 0,
-    }));
-
-    res.json({ count: rows.length, appellations: rows });
-  } catch (error) {
-    console.error('Get appellations error:', error);
-    res.status(500).json({ error: 'Failed to get appellations' });
-  }
-});
-
-// POST /api/admin/taxonomy/appellations - Create appellation
-router.post('/appellations', async (req, res) => {
-  try {
-    const { name, country, region, synonyms } = req.body;
-
-    const nameError = appellationNameError(name);
-    if (nameError) return res.status(400).json({ error: nameError });
-    if (!country) {
-      return res.status(400).json({ error: 'Country is required' });
-    }
-    // Both refs verified: the ids must exist and the region must belong to the
-    // country (code audit 2026-07-30) — the schema declares the refs but
-    // enforces neither, so a cross-country region would sit silently wrong in
-    // curated taxonomy until the appellation-hierarchy work inherited it.
-    const refsError = await appellationRefsError(country, region);
-    if (refsError) return res.status(400).json({ error: refsError });
-
-    let cleanSynonyms;
-    if (synonyms !== undefined && synonyms !== null) {
-      const checked = validateAppellationSynonyms(synonyms);
-      if (checked.error) return res.status(400).json({ error: checked.error });
-      cleanSynonyms = checked.value;
-    }
-
-    const normalizedName = normalizeAppellationKey(name);
-
-    const appellation = new Appellation({
-      name: name.trim(),
-      normalizedName,
-      country,
-      region: region || null,
-      synonyms: cleanSynonyms,
-      createdBy: req.user.id
-    });
-
-    await appellation.save();
-    await appellation.populate('country', 'name');
-    await appellation.populate('region', 'name');
-
-    logAudit(req, 'admin.taxonomy.create',
-      { type: 'appellation', id: appellation._id },
-      { name: appellation.name }
-    );
-    res.status(201).json({ appellation });
-  } catch (error) {
-    if (error.code === 11000) {
-      return res.status(400).json({ error: 'Appellation already exists in this country' });
-    }
-    console.error('Create appellation error:', error);
-    res.status(500).json({ error: 'Failed to create appellation' });
-  }
-});
-
-// PUT /api/admin/taxonomy/appellations/:id - Update appellation
-router.put('/appellations/:id', async (req, res) => {
-  try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
-    const { name, region, synonyms } = req.body;
-
-    const appellation = await Appellation.findById(req.params.id);
-    if (!appellation) {
-      return res.status(404).json({ error: 'Appellation not found' });
-    }
-
-    // An absent name leaves it alone (partial update); a PRESENT one is
-    // validated, so a non-string can no longer reach .trim().
-    if (name !== undefined && name !== null) {
-      const nameError = appellationNameError(name);
-      if (nameError) return res.status(400).json({ error: nameError });
-      appellation.name = name.trim();
-      appellation.normalizedName = normalizeAppellationKey(name);
-    }
-    if (region !== undefined) {
-      // Clearing (null/'') is always fine; SETTING a region re-validates it
-      // against the appellation's country — update was the easiest drift path,
-      // since a correctly created doc could be re-pointed at any region.
-      if (region) {
-        const refsError = await appellationRefsError(appellation.country, region);
-        if (refsError) return res.status(400).json({ error: refsError });
-      }
-      appellation.region = region || null;
-    }
-    if (synonyms !== undefined) {
-      // null clears the list, matching how the rest of the admin surface
-      // distinguishes "leave alone" (absent) from "clear" (explicit null).
-      if (synonyms === null) {
-        appellation.synonyms = undefined;
-      } else {
-        const checked = validateAppellationSynonyms(synonyms);
-        if (checked.error) return res.status(400).json({ error: checked.error });
-        appellation.synonyms = checked.value;
-      }
-    }
-
-    await appellation.save();
-    await appellation.populate('country', 'name');
-    await appellation.populate('region', 'name');
-    logAudit(req, 'admin.taxonomy.update',
-      { type: 'appellation', id: appellation._id },
-      { name: appellation.name }
-    );
-
-    res.json({ appellation });
-  } catch (error) {
-    console.error('Update appellation error:', error);
-    res.status(500).json({ error: 'Failed to update appellation' });
-  }
-});
-
-// DELETE /api/admin/taxonomy/appellations/:id - Delete appellation
-router.delete('/appellations/:id', async (req, res) => {
-  try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid ID' });
-    const appellation = await Appellation.findById(req.params.id);
-    if (!appellation) {
-      return res.status(404).json({ error: 'Appellation not found' });
-    }
-
-    logAudit(req, 'admin.taxonomy.delete',
-      { type: 'appellation', id: appellation._id },
-      { name: appellation.name }
-    );
-    await appellation.deleteOne();
-    res.json({ message: 'Appellation deleted successfully' });
-  } catch (error) {
-    console.error('Delete appellation error:', error);
-    res.status(500).json({ error: 'Failed to delete appellation' });
-  }
-});
 
 // ===== BOTTLE SIZES =====
 
@@ -1239,12 +860,20 @@ router.post('/bottle-sizes/normalize-all', async (req, res) => {
   }
 });
 
+// The appellation, classification and sweetness-term routes have their own
+// files. They are mounted after the cache-clearing middleware at the top of
+// this file, so a write in them drops the public taxonomy list cache too.
+const appellationRoutes = require('./taxonomyAppellations');
+router.use(appellationRoutes);
+router.use(require('./taxonomyClassifications'));
+router.use(require('./taxonomySweetnessTerms'));
+
 module.exports = router;
-// The appellation input validators are exported for their unit tests (same
-// pattern as admin/import.js mapRow): they are pure and DB-free, and they are
-// the half of the REST/MCP parity contract that lives on this side.
-module.exports.appellationNameError = appellationNameError;
-module.exports.validateAppellationSynonyms = validateAppellationSynonyms;
+// The appellation input validators live in routes/admin/taxonomyAppellations;
+// re-exported here for taxonomy.appellationInput.test.js, which reads them
+// from this router.
+module.exports.appellationNameError = appellationRoutes.appellationNameError;
+module.exports.validateAppellationSynonyms = appellationRoutes.validateAppellationSynonyms;
 // The grape regional-name validators live in services/grapeRegionalNames;
 // re-exported here for taxonomy.grapeRegionalNames.test.js, which tests them
 // through the router (the DB lookups inside are mocked there).

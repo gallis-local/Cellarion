@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
+import ImportPolicySwitch from './ImportPolicySwitch';
 import { useTranslation } from 'react-i18next';
-import { Link } from 'react-router-dom';
 import Modal from './Modal';
-import { sommGetPendingWines, sommFixPendingWine } from '../api/somm';
+import { sommGetPendingWines, sommFixPendingWine, sommMergePendingWine } from '../api/somm';
 
 const PAGE_SIZE = 25;
 
@@ -27,6 +27,8 @@ const PAGE_SIZE = 25;
  *   apiFetch  — from useAuth()
  *   onClose() — close the modal
  */
+const WINE_TYPES = ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified'];
+
 function WinePendingIdentityModal({ apiFetch, onClose }) {
   const { t } = useTranslation();
 
@@ -45,17 +47,21 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
   const [saving, setSaving] = useState(false);
   // Keyed by wine id, NOT a single string: the error renders inside every
   // non-editing row, so one shared value paints the same red paragraph under
-  // all 25 rows and follows the curator through paging (audit HIGH-1).
+  // all 25 rows and follows the curator through paging.
   const [rowErrors, setRowErrors] = useState({});
+  // The published wine a fix collided with, per row: the fix cannot go
+  // through, and the row is that wine. Offered as a merge.
+  const [duplicates, setDuplicates] = useState({});
+  // What the last write answered. It stays through the reload that follows the
+  // write, and goes when the curator pages, changes a filter or writes again.
   const [successMsg, setSuccessMsg] = useState(null);
 
   const fetchPage = useCallback(async (p) => {
     setLoading(true);
     setError(null);
-    // Stale row errors and a stale green banner must not survive a reload —
-    // they would follow the curator through paging and filter changes.
+    // Row errors belong to the rows that were on screen; they do not follow
+    // the curator into the next load.
     setRowErrors({});
-    setSuccessMsg(null);
     try {
       const params = new URLSearchParams({ page: p, limit: PAGE_SIZE });
       if (viaFilter) params.set('createdVia', viaFilter);
@@ -82,6 +88,10 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
 
   useEffect(() => { fetchPage(page); }, [fetchPage, page]);
 
+  // The curator moved on: the last write's confirmation is about the view
+  // they left, so it goes with it.
+  const moveToPage = (nextPage) => { setSuccessMsg(null); setPage(nextPage); };
+
   const startEdit = (w) => {
     setRowErrors({});
     setEditing(w._id);
@@ -92,10 +102,44 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
       regionName: w.regionName || '',
       countryName: w.countryName || '',
       grapeNames: (w.grapeNames || []).join(', '),
+      // A wine from a file often has none: publishing it without one leaves
+      // every owner with a wine of no colour.
+      type: w.type || '',
     });
   };
 
   const cancelEdit = () => { setEditing(null); setDraft(null); setRowErrors({}); };
+
+  /** A refused write: keep the reason, and the duplicate it names when it names one. */
+  const refused = (wineId, res, data) => {
+    setRowErrors({ [wineId]: data.error || `Failed to save (${res.status})` });
+    setDuplicates(res.status === 409 && data.duplicate?.published ? { [wineId]: data.duplicate } : {});
+  };
+
+  /** The row is the published wine the fix collided with: move its bottles there. */
+  const mergeInto = async (wineId, duplicate) => {
+    const label = [duplicate.producer, duplicate.name].filter(Boolean).join(' — ');
+    if (!window.confirm(t('admin.wines.pendingIdentity.mergeConfirm', { wine: label }))) return;
+    setSaving(true);
+    setSuccessMsg(null);
+    try {
+      const res = await sommMergePendingWine(apiFetch, wineId, duplicate.wineId);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setRowErrors({ [wineId]: data.error || `Failed to save (${res.status})` });
+        return;
+      }
+      setRowErrors({});
+      setDuplicates({});
+      setSuccessMsg(data.message);
+      cancelEdit();
+      await refetchAfterWrite();
+    } catch {
+      setRowErrors({ [wineId]: t('common.networkError') });
+    } finally {
+      setSaving(false);
+    }
+  };
 
   /**
    * Re-read the current page after a write, stepping back when the row that
@@ -103,10 +147,12 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
    * index would show "nothing waiting" while rows sit on page 1).
    */
   const refetchAfterWrite = async () => {
-    const rowLeavesList = !showUnavailable;   // with the filter on, a dispositioned row stays visible (audit LOW-5)
-    const nextPage = rowLeavesList && wines.length === 1 && page > 1 ? page - 1 : page;
-    if (nextPage !== page) setPage(nextPage);
-    await fetchPage(nextPage);
+    const rowLeavesList = !showUnavailable;   // with the filter on, a dispositioned row stays visible
+    const stepBack = rowLeavesList && wines.length === 1 && page > 1;
+    // A new page number is loaded by the effect above; loading it here as
+    // well would ask the server twice.
+    if (stepBack) setPage(page - 1);
+    else await fetchPage(page);
   };
 
   /**
@@ -120,6 +166,7 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
     if (value && !window.confirm(t('admin.wines.pendingIdentity.unavailableConfirm'))) return;
     setSaving(true);
     setRowErrors({});
+    setSuccessMsg(null);
     try {
       const res = await sommFixPendingWine(apiFetch, wineId, { identityUnavailable: value });
       const data = await res.json().catch(() => ({}));
@@ -136,9 +183,35 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
     }
   };
 
+  /**
+   * Publish a wine that waits for a check as it stands: its details are right.
+   * (A wine that needs corrections is published by saving them.)
+   */
+  const publish = async (wineId) => {
+    setSaving(true);
+    setRowErrors({});
+    setSuccessMsg(null);
+    try {
+      const res = await sommFixPendingWine(apiFetch, wineId, { identityChecked: true });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        refused(wineId, res, data);
+        return;
+      }
+      setDuplicates({});
+      setSuccessMsg(data.message);
+      await refetchAfterWrite();
+    } catch {
+      setRowErrors({ [wineId]: t('common.networkError') });
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const save = async (wineId) => {
     setSaving(true);
     setRowErrors({});
+    setSuccessMsg(null);
     try {
       // Only send what the curator actually typed — an untouched field must
       // not be echoed back as a "change" (and an empty producer would be
@@ -150,13 +223,22 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
       patch.regionName = draft.regionName.trim();
       if (draft.countryName.trim()) patch.countryName = draft.countryName.trim();
       patch.grapeNames = draft.grapeNames.split(',').map(g => g.trim()).filter(Boolean);
+      if (draft.type) patch.type = draft.type;
+      // For a wine that waits for a check, the curator's corrections ARE the
+      // check: saving them publishes it, as completing the producer publishes
+      // any other row here. Only once it has a producer: without one the
+      // server refuses the check and would save nothing, and a curator must
+      // be able to save the place or the grapes of a row they cannot finish.
+      const row = (wines || []).find(w => w._id === wineId);
+      if (row?.unchecked && (patch.producer || row.producer)) patch.identityChecked = true;
 
       const res = await sommFixPendingWine(apiFetch, wineId, patch);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setRowErrors({ [wineId]: data.error || `Failed to save (${res.status})` });
+        refused(wineId, res, data);
         return;
       }
+      setDuplicates({});
       setSuccessMsg(data.message);
       cancelEdit();
       await refetchAfterWrite();
@@ -198,15 +280,17 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
 
   return (
     <Modal title={t('admin.wines.pendingIdentity.title')} onClose={onClose} showClose wide>
+      <ImportPolicySwitch />
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
         <span style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary, #666)' }}>
           {t('admin.wines.pendingIdentity.intro')}
+          {(wines || []).some(w => w.unchecked) && <> {t('admin.wines.pendingIdentity.uncheckedIntro')}</>}
         </span>
         <label style={{ fontSize: '0.85rem' }}>
           {t('admin.wines.pendingIdentity.sourceLabel')}:{' '}
           <select
             value={viaFilter}
-            onChange={e => { setViaFilter(e.target.value); setPage(1); }}
+            onChange={e => { setViaFilter(e.target.value); moveToPage(1); }}
             disabled={loading || saving}
           >
             <option value="">{t('admin.wines.pendingIdentity.allSources')}</option>
@@ -217,7 +301,7 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
           <input
             type="checkbox"
             checked={showUnavailable}
-            onChange={e => { setShowUnavailable(e.target.checked); setPage(1); }}
+            onChange={e => { setShowUnavailable(e.target.checked); moveToPage(1); }}
             disabled={loading || saving}
           />{' '}
           {t('admin.wines.pendingIdentity.showUnavailable', { n: unavailableTotal })}
@@ -229,7 +313,7 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
       {loading && <p>{t('common.loading')}</p>}
       {/* "every wine has a usable identity" is only true of an UNFILTERED
           empty queue. With a source filter on, or with dispositioned rows
-          hidden, it asserts the exact opposite of the truth (audit M-3). */}
+          hidden, it asserts the exact opposite of the truth. */}
       {wines !== null && !loading && wines.length === 0 && !error && (
         <p>{(viaFilter || unavailableTotal > 0)
           ? t('admin.wines.pendingIdentity.emptyFiltered', { n: unavailableTotal })
@@ -303,7 +387,7 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
                         <>
                           {/* Deliberately NOT a link: /wines/:id renders from
                               the public route, which excludes pending rows — so
-                              every link here would 404 (audit H-1). The row's
+                              every link here would 404. The row's
                               own edit form + photos are the working surface. */}
                           <strong>{w.name}</strong>
                           <div style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary, #666)' }}>
@@ -313,6 +397,11 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
                           {w.identityUnavailable && (
                             <div style={{ fontSize: '0.75rem', color: 'var(--color-text-secondary, #888)' }}>
                               {t('admin.wines.pendingIdentity.unavailableBadge')}
+                            </div>
+                          )}
+                          {w.unchecked && (
+                            <div style={{ fontSize: '0.75rem', color: 'var(--color-text-secondary, #888)' }}>
+                              {t('admin.wines.pendingIdentity.uncheckedBadge')}
                             </div>
                           )}
                           {/* What the front and back labels disagreed about at
@@ -343,10 +432,21 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
                             placeholder={t('admin.wines.pendingIdentity.regionPlaceholder')}
                             onChange={e => setDraft(d => ({ ...d, regionName: e.target.value }))}
                           />
+                          <select
+                            value={draft.type}
+                            aria-label={t('admin.wines.pendingIdentity.typeLabel')}
+                            onChange={e => setDraft(d => ({ ...d, type: e.target.value }))}
+                          >
+                            <option value="">{t('admin.wines.pendingIdentity.noType')}</option>
+                            {WINE_TYPES.map(v => <option key={v} value={v}>{t(`statistics.typeLabels.${v}`, v)}</option>)}
+                          </select>
                         </div>
                       ) : (
                         <span style={{ fontSize: '0.85rem' }}>
                           {[w.countryName, w.regionName].filter(Boolean).join(' · ') || '—'}
+                          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary, #666)' }}>
+                            {w.type ? t(`statistics.typeLabels.${w.type}`, w.type) : <em>{t('admin.wines.pendingIdentity.noType')}</em>}
+                          </div>
                         </span>
                       )}
                     </td>
@@ -360,18 +460,40 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
                       {editing === w._id ? (
                         <>
                           <button className="btn btn-primary btn-sm" disabled={saving} onClick={() => save(w._id)}>
-                            {saving ? t('common.saving') : t('common.save')}
+                            {saving ? t('common.saving') : (w.unchecked ? t('admin.wines.pendingIdentity.saveAndPublish') : t('common.save'))}
                           </button>{' '}
                           <button className="btn btn-secondary btn-sm" disabled={saving} onClick={cancelEdit}>
                             {t('common.cancel')}
                           </button>
                           {rowErrors[w._id] && <div className="alert alert-error" style={{ marginTop: 6 }}>{rowErrors[w._id]}</div>}
+                          {duplicates[w._id] && (
+                            <button
+                              className="btn btn-secondary btn-sm"
+                              style={{ marginTop: 6 }}
+                              disabled={saving}
+                              onClick={() => mergeInto(w._id, duplicates[w._id])}
+                            >
+                              {t('admin.wines.pendingIdentity.mergeBtn', { wine: [duplicates[w._id].producer, duplicates[w._id].name].filter(Boolean).join(' — ') })}
+                            </button>
+                          )}
                         </>
                       ) : (
                         <>
                           <button className="btn btn-secondary btn-sm" disabled={saving} onClick={() => startEdit(w)}>
                             {t('admin.wines.pendingIdentity.fixBtn')}
                           </button>{' '}
+                          {w.unchecked && w.producer && (
+                            <>
+                              <button
+                                className="btn btn-secondary btn-sm"
+                                disabled={saving}
+                                title={t('admin.wines.pendingIdentity.publishTitle')}
+                                onClick={() => publish(w._id)}
+                              >
+                                {t('admin.wines.pendingIdentity.publishBtn')}
+                              </button>{' '}
+                            </>
+                          )}
                           {/* A DISPOSITION, not a fix: the row leaves the queue
                               and the wine stays pending and out of the registry.
                               Last resort — ask the bottle's owner first. */}
@@ -381,7 +503,7 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
                                (one click vs reading a photo and typing), and a
                                queue emptied this way is a queue that stopped
                                working. Muted link styling marks it an escape
-                               hatch (audit MEDIUM-2). */
+                               hatch. */
                             className="btn btn-sm"
                             style={{
                               background: 'none',
@@ -400,6 +522,16 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
                               : t('admin.wines.pendingIdentity.unavailableBtn')}
                           </button>
                           {rowErrors[w._id] && <div className="alert alert-error" style={{ marginTop: 6 }}>{rowErrors[w._id]}</div>}
+                          {duplicates[w._id] && (
+                            <button
+                              className="btn btn-secondary btn-sm"
+                              style={{ marginTop: 6 }}
+                              disabled={saving}
+                              onClick={() => mergeInto(w._id, duplicates[w._id])}
+                            >
+                              {t('admin.wines.pendingIdentity.mergeBtn', { wine: [duplicates[w._id].producer, duplicates[w._id].name].filter(Boolean).join(' — ') })}
+                            </button>
+                          )}
                         </>
                       )}
                     </td>
@@ -413,11 +545,11 @@ function WinePendingIdentityModal({ apiFetch, onClose }) {
 
       {pages > 1 && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 12 }}>
-          <button className="btn btn-secondary btn-sm" disabled={page <= 1 || loading} onClick={() => setPage(p => p - 1)}>
+          <button className="btn btn-secondary btn-sm" disabled={page <= 1 || loading} onClick={() => moveToPage(page - 1)}>
             {t('common.previous')}
           </button>
           <span style={{ fontSize: '0.85rem' }}>{t('admin.audit.page', { current: page, total: pages })}</span>
-          <button className="btn btn-secondary btn-sm" disabled={page >= pages || loading} onClick={() => setPage(p => p + 1)}>
+          <button className="btn btn-secondary btn-sm" disabled={page >= pages || loading} onClick={() => moveToPage(page + 1)}>
             {t('common.next')}
           </button>
           <span style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary, #888)' }}>

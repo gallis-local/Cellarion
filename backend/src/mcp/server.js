@@ -49,7 +49,7 @@ const rateLimited = (message) => ({
 // module, so a case of 12 costs 12 — see mcp/mutationBudget.js.
 const { takeMutationSlot, ipKeyFor, WRITE_WINDOW_MS } = require('./mutationBudget');
 // Cross-request tool-call budget per caller (user id / anon IP) — caps read
-// amplification the per-request cap and per-IP HTTP limiter can't (M-4).
+// amplification the per-request cap and per-IP HTTP limiter can't.
 const { withinCallBudget } = require('./callBudget');
 
 const callBudgetExceeded = () =>
@@ -124,15 +124,15 @@ function budgetedHandler(tool, ctx, state) {
       recordUsage(ctx, 'tool', tool.name, true, 'rate_limited');
       return rateLimited(`Too many tool calls in one request (max ${maxCalls}). Send fewer calls per batch and paginate instead.`);
     }
-    // Cross-request caller budget — bounds read amplification (M-4).
+    // Cross-request caller budget — bounds read amplification.
     if (!withinCallBudget(ctx)) {
       recordUsage(ctx, 'tool', tool.name, true, 'rate_limited');
       return callBudgetExceeded();
     }
     if (tool.annotations?.readOnlyHint === false) {
-      // Fail-closed for the anonymous surface (audit P6-L2): if a mutating
-      // tool is ever mis-scoped 'public', refuse cleanly instead of running a
-      // userless mutation (and crashing on ctx.user.id below).
+      // Fail-closed for the anonymous surface: if a mutating tool is ever
+      // mis-scoped 'public', refuse cleanly instead of running a userless
+      // mutation (and crashing on ctx.user.id below).
       if (ctx.anonymous || !ctx.user) {
         recordUsage(ctx, 'tool', tool.name, true, 'forbidden_scope');
         return {
@@ -142,18 +142,18 @@ function budgetedHandler(tool, ctx, state) {
       }
       // Self-budgeted tools (bulk_add, auto_arrange) charge the write budget
       // themselves — per ITEM on apply, nothing on preview — so the generic
-      // one-slot-per-call charge here would double-count (MCP-audit M7).
+      // one-slot-per-call charge here would double-count.
       if (!tool.selfBudgeted && !takeMutationSlot(String(ctx.user.id), 1, ipKeyFor(ctx))) {
         recordUsage(ctx, 'tool', tool.name, true, 'rate_limited');
         return rateLimited('Too many cellar changes in a short time — wait a few minutes before mutating again. Reads still work.');
       }
     }
     const run = withUsage(ctx, 'tool', tool.name, () => tool.handler(args || {}, ctx), (out) => out && out.isError);
-    // Idempotency-claim hygiene (prior-audit M2): replay() reserves the key
-    // BEFORE the mutation; a call that then fails never reaches logAction, so
-    // its pending claim must be dropped here or the key stays locked until the
-    // stale window. One place instead of a release call in every tool's every
-    // fail path. Success paths are untouched (logAction completed the claim).
+    // Idempotency-claim hygiene: replay() reserves the key BEFORE the
+    // mutation; a call that then fails never reaches logAction, so its pending
+    // claim must be dropped here or the key stays locked until the stale
+    // window. One place instead of a release call in every tool's every fail
+    // path. Success paths are untouched (logAction completed the claim).
     const key = args?.idempotency_key;
     if (key && ctx.user && run && typeof run.then === 'function') {
       const { releaseClaim } = require('./actionLedger');
@@ -175,7 +175,7 @@ function budgetedHandler(tool, ctx, state) {
 // client could talk around. ctx = { user, scopes }.
 //
 // opts.session (mcp/sessions.js) switches on STATEFUL extras: the resources
-// subscribe capability + handlers wired to the event bus (plan §4), and an
+// subscribe capability + handlers wired to the event bus, and an
 // externally-owned call-budget state that the route resets per request (a
 // long-lived session must budget per REQUEST, not per lifetime).
 async function buildServer(ctx, opts = {}) {
@@ -190,9 +190,9 @@ async function buildServer(ctx, opts = {}) {
     }
   );
   const state = opts.callState || { calls: 0 };
-  // The anonymous surface gets a tighter per-request batch budget (audit
-  // P6-L3): 20 read_guide calls at the 30k cap would be ~600KB from one
-  // unauthenticated 10KB request. Authenticated callers keep the full cap.
+  // The anonymous surface gets a tighter per-request batch budget: 20
+  // read_guide calls at the 30k cap would be ~600KB from one unauthenticated
+  // 10KB request. Authenticated callers keep the full cap.
   if (ctx.anonymous) state.max = 10;
   for (const tool of toolsForScopes(ctx.scopes, ctx.user?.roles || [])) {
     server.registerTool(
@@ -259,10 +259,10 @@ async function wireSubscriptions(server, ctx, session) {
       session.busUnsub = eventBusRef().addListener(session.userId, (event) => {
         for (const u of EVENT_RESOURCE_MAP[event] || []) {
           if (session.subscriptions.has(u)) {
-            // Only a DELIVERED push counts as session activity (audit LOW-2:
-            // refreshing on every user event — including web-app activity the
-            // session never subscribed to — would keep an otherwise-dead
-            // session, and any stale privileges in it, warm for the full 2h).
+            // Only a DELIVERED push counts as session activity: refreshing on
+            // every user event — including web-app activity the session never
+            // subscribed to — would keep an otherwise-dead session, and any
+            // stale privileges in it, warm for the full 2h.
             session.lastSeenAt = Date.now();
             server.server.sendResourceUpdated({ uri: u }).catch((err) => {
               // Most commonly: the client never opened (or lost) its
@@ -351,7 +351,7 @@ async function handleMcpRequest(req, res, ctx) {
   await transport.handleRequest(req, res, req.body);
 }
 
-// Initialize a STATEFUL session (plan §4): a long-lived server+transport pair
+// Initialize a STATEFUL session: a long-lived server+transport pair
 // keyed by Mcp-Session-Id, giving the client a standalone GET/SSE stream and
 // resources/subscribe pushes. Returns true when the request was handled, or
 // false when a session cap was hit — the caller then falls back to stateless
@@ -368,8 +368,8 @@ async function initStatefulSession(req, res, ctx) {
     // POSTs on one session may interleave req refs — same-user cosmetic only.
     // Keep an ATTRIBUTION SNAPSHOT, never the Express request: the request
     // carries the parsed JSON body (up to 2 MB under /api/mcp) and a session
-    // lives 30 min idle / 2 h, so 200 pinned bodies would exhaust the heap
-    // (audit 2026-09 M01-1). Everything logAudit, the ledger and the budgets
+    // lives 30 min idle / 2 h, so 200 pinned bodies would exhaust the heap.
+    // Everything logAudit, the ledger and the budgets
     // read from ctx.req is in the snapshot.
     session.ctx = { user: ctx.user, scopes: ctx.scopes, req: snapshotRequest(ctx.req) };
     const server = await buildServer(session.ctx, { session, callState: session.callState });
@@ -402,5 +402,5 @@ async function initStatefulSession(req, res, ctx) {
 module.exports = {
   handleMcpRequest, initStatefulSession,
   budgetedHandler, budgetedResourceHandler, budgetedPromptHandler, MAX_CALLS_PER_REQUEST,
-  takeMutationSlot, WRITE_WINDOW_MS, EVENT_RESOURCE_MAP,
+  takeMutationSlot, WRITE_WINDOW_MS,
 };

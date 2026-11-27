@@ -97,7 +97,7 @@ test('not emailed when the user turned support-reply emails off', async () => {
   expect(Notification.create).toHaveBeenCalled(); // the bell still gets it
 });
 
-// Audit 2026-09-27 M7: someone who clicked "unsubscribe from all" before this
+// Someone who clicked "unsubscribe from all" before this
 // category existed has no supportReply flag stored — the objection itself
 // (emailOptOutAt) must stop the mail. The bell still carries the answer.
 test('not emailed to someone who unsubscribed from all Cellarion email, even with no support-reply flag stored', async () => {
@@ -133,4 +133,37 @@ test('a mail failure never fails the reply', async () => {
   expect(logAudit).toHaveBeenCalledWith(expect.anything(), 'support.ticket.responded',
     { type: 'SupportTicket', id: TICKET_ID }, { status: 'closed', emailed: false });
   spy.mockRestore();
+});
+
+// The stored reply holds at most 5000 characters (models/SupportTicket). A
+// longer answer is refused up front with a 400 the admin can act on: nothing
+// is saved, notified, emailed or audited.
+test('a reply longer than 5000 characters is a 400, and nothing is saved, sent or audited', async () => {
+  const res = await respond({ adminResponse: 'x'.repeat(5001), status: 'closed' });
+
+  expect(res.status).toBe(400);
+  expect((await res.json()).error).toMatch(/5000 characters or fewer/);
+  expect(ticket.save).not.toHaveBeenCalled();
+  expect(Notification.create).not.toHaveBeenCalled();
+  expect(sendSupportReplyEmail).not.toHaveBeenCalled();
+  expect(logAudit).not.toHaveBeenCalled();
+});
+
+test('a reply of exactly 5000 characters is stored', async () => {
+  const res = await respond({ adminResponse: 'x'.repeat(5000), status: 'closed' });
+
+  expect(res.status).toBe(200);
+  expect(ticket.save).toHaveBeenCalled();
+});
+
+test('the cap counts the stored text: markup that is stripped does not count', async () => {
+  const res = await respond({ adminResponse: `<b>${'x'.repeat(5000)}</b>`, status: 'closed' });
+
+  expect(res.status).toBe(200);
+  expect(ticket.replies[0].message).toBe('x'.repeat(5000));
+});
+
+test('a reply that is not a string is a 400, not a 500', async () => {
+  const res = await respond({ adminResponse: 42, status: 'closed' });
+  expect(res.status).toBe(400);
 });

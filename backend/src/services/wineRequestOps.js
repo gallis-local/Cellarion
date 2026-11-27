@@ -13,17 +13,71 @@
  * the hourly sync holds a loaded request for minutes while it copies wines,
  * and an admin deciding the same request meanwhile must not be overwritten.
  * The one that comes second gets null back and changes nothing more.
+ *
+ * One decision works on a request at a time. A decision first takes the
+ * request (claimRequest), and only the holder goes on: an admin's resolve
+ * creates the wine and its pictures BEFORE the status write, so two resolves
+ * that both passed the "is it pending?" look each created one. The admin
+ * routes take the request before they do anything; the bridge sync lets the
+ * two functions here take it.
  */
+const WineRequest = require('../models/WineRequest');
 const Bottle = require('../models/Bottle');
 const BottleImage = require('../models/BottleImage');
 const { bumpDataVersion } = require('./dataVersion');
 const { createNotification } = require('./notifications');
 const { stripHtml } = require('../utils/sanitize');
 const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
+const { seedSuggestedWindows } = require('./maturityOps');
+const { logAudit } = require('./audit');
+
+// How long a claim holds. A resolve that creates a wine also cuts out and
+// stores its pictures; past this the claim is taken to be an abandoned one
+// (the process ended mid-decision) and the request can be decided again.
+const CLAIM_MS = 5 * 60 * 1000;
+
+/**
+ * Take a pending request for one decision. Callers: the admin resolve and
+ * reject routes (routes/admin/wineRequests.js), and the two functions below
+ * for a caller that has not taken it (the Registry Bridge request sync).
+ * Returns { request } — the request as stored, now held by the caller — or
+ * { refused: 'decided' } when it is no longer pending (or not there), or
+ * { refused: 'busy' } when another decision holds it.
+ */
+async function claimRequest(requestId) {
+  const now = new Date();
+  const request = await WineRequest.findOneAndUpdate(
+    { _id: requestId, status: 'pending', $or: [{ claimedAt: null }, { claimedAt: { $lt: new Date(now.getTime() - CLAIM_MS) } }] },
+    { $set: { claimedAt: now } },
+    { new: true }
+  );
+  if (request) return { request };
+  const pending = await WineRequest.exists({ _id: requestId, status: 'pending' });
+  return { refused: pending ? 'busy' : 'decided' };
+}
+
+/**
+ * Give a request back undecided: the decision was refused or failed. Only a
+ * pending request has a claim to clear. Callers: the admin routes.
+ */
+async function releaseRequestClaim(requestId) {
+  await WineRequest.updateOne({ _id: requestId, status: 'pending' }, { $set: { claimedAt: null } });
+}
+
+// True when the caller may go on with its decision: it already holds the
+// request, or takes it here.
+async function heldForDecision(wineRequest, holdsClaim) {
+  if (holdsClaim) return true;
+  const claim = await claimRequest(wineRequest._id);
+  return !claim.refused;
+}
 
 // Save only if the stored request is still pending (Mongoose adds `$where`
-// to the save's filter). False when someone else decided it first.
+// to the save's filter). False when someone else decided it first. The
+// decision is stored, so the claim goes with the same write.
 async function savePending(wineRequest) {
+  wineRequest.claimedAt = null;
+  wineRequest.markModified('claimedAt');
   wineRequest.$where = { status: 'pending' };
   try {
     await wineRequest.save();
@@ -43,8 +97,8 @@ async function savePending(wineRequest) {
 // notifies the local user. The key owner's account here never filed anything
 // in this app, so a second bell on cellarion.app is noise, and it reads as the
 // two accounts being linked by something other than the key.
-// The bell here stays when the install will never hear: one older than
-// v1.252.0, a request forwarded before it upgraded (no installFollowsAt), or a
+// The bell here stays when the install will never hear: a request without
+// installFollowsAt (an older install, or one forwarded before it upgraded), or a
 // resolve to a wine the bridge does not serve (pending identity / not a wine —
 // the sync cannot copy it, so it never finishes there). Bridge corrections and
 // values have no sync at all, so their notifications always stay.
@@ -60,9 +114,12 @@ function answeredByInstall(wineRequest, linkedWine = null) {
  * Mark the request resolved against `linkedWine`, then move the bottles that
  * waited on it onto the wine, stamp their photos with it, queue their
  * vintages for a drink window, and tell the requester.
- * Returns { backfilledCount }, or null when the request was no longer pending.
+ * Returns { backfilledCount }, or null when the request was no longer pending
+ * or another decision holds it. `holdsClaim`: the caller took the request
+ * with claimRequest; otherwise it is taken here.
  */
-async function completeRequestResolve(wineRequest, linkedWine, { resolvedBy = null, adminNotes = '' } = {}) {
+async function completeRequestResolve(wineRequest, linkedWine, { resolvedBy = null, adminNotes = '', holdsClaim = false } = {}) {
+  if (!(await heldForDecision(wineRequest, holdsClaim))) return null;
   wineRequest.status = 'resolved';
   wineRequest.resolvedBy = resolvedBy;
   wineRequest.resolvedAt = new Date();
@@ -91,8 +148,8 @@ async function completeRequestResolve(wineRequest, linkedWine, { resolvedBy = nu
 
     // Photos uploaded while these bottles waited for their wine carry no
     // wineDefinition; stamp it now so the by-wine photo lookups (cellar
-    // list, bottle page) see them on every bottle of the wine (support
-    // ticket 2026-09-07). Best-effort — a failure here must not undo the link.
+    // list, bottle page) see them on every bottle of the wine. Best-effort —
+    // a failure here must not undo the link.
     if (pendingBottleIds.length) {
       BottleImage.updateMany(
         { bottle: { $in: pendingBottleIds }, wineDefinition: null },
@@ -102,10 +159,21 @@ async function completeRequestResolve(wineRequest, linkedWine, { resolvedBy = nu
 
     // Now that these bottles have a real wineDefinition, put each wine+vintage
     // into the sommelier maturity queue — mirroring the hand-add and matched-
-    // import paths. Without this, wines that entered via an import "request"
-    // never surfaced for a somm to set a drink window.
+    // import paths. Without this, wines that enter via an import "request"
+    // would never surface for a somm to set a drink window.
     for (const vintage of pendingVintages) {
       await ensurePendingVintageProfile(linkedWine._id, vintage);
+    }
+
+    // The drink windows a self-hosted install contributed with this wine go
+    // to the maturity queue as suggestions beside the curator's empty window,
+    // never into it.
+    if (Array.isArray(wineRequest.proposedWindows) && wineRequest.proposedWindows.length) {
+      const vintages = await seedSuggestedWindows(linkedWine._id, wineRequest.proposedWindows, { requestId: wineRequest._id });
+      if (vintages.length) {
+        logAudit(null, 'wineRequest.windows.suggested', { type: 'wine', id: linkedWine._id },
+          { requestId: String(wineRequest._id), vintages });
+      }
     }
   }
 
@@ -129,10 +197,11 @@ async function completeRequestResolve(wineRequest, linkedWine, { resolvedBy = nu
  * Mark the request rejected with `adminNotes` as the reason, after detaching
  * the bottles that waited on it, and tell the requester.
  * Returns { bottlesDetached }, or null when the request was no longer pending
- * (a resolve that won the race has already moved the bottles, so the detach
- * below found none).
+ * or another decision holds it (nothing is detached then). `holdsClaim`: as
+ * for completeRequestResolve.
  */
-async function completeRequestReject(wineRequest, { resolvedBy = null, adminNotes } = {}) {
+async function completeRequestReject(wineRequest, { resolvedBy = null, adminNotes, holdsClaim = false } = {}) {
+  if (!(await heldForDecision(wineRequest, holdsClaim))) return null;
   // Detach any bottles that were imported pending this request — the mirror
   // of resolve's backfill above. A rejected request can never become
   // resolvable again, and wineDefinition isn't user-updatable, so a bottle
@@ -152,7 +221,7 @@ async function completeRequestReject(wineRequest, { resolvedBy = null, adminNote
     );
     bottlesDetached = result.modifiedCount || 0;
     // Their owners' statistics and bottle lists change with it — the same
-    // bump resolve makes (services/dataVersion; audit 2026-09-27 M6).
+    // bump resolve makes (services/dataVersion).
     pendingOwners.forEach(bumpDataVersion);
   }
 
@@ -174,4 +243,4 @@ async function completeRequestReject(wineRequest, { resolvedBy = null, adminNote
   return { bottlesDetached };
 }
 
-module.exports = { completeRequestResolve, completeRequestReject };
+module.exports = { claimRequest, releaseRequestClaim, completeRequestResolve, completeRequestReject };

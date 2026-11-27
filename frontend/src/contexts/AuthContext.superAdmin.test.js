@@ -5,7 +5,12 @@ import { AuthProvider, useAuth } from './AuthContext';
 // save echoes the user without it, and replacing the signed-in user with that
 // echo hid the SuperAdmin link until the next reload. The cellar page now
 // saves the sort on every pick, so this would happen all the time.
-vi.mock('../i18n', () => ({ default: { changeLanguage: vi.fn() }, hasLanguagePreview: () => false }));
+// `t` answers the inline English, as a failed sign-in words its message with it.
+vi.mock('../i18n', () => ({
+  default: { changeLanguage: vi.fn(), t: (key, fallback) => (typeof fallback === 'string' ? fallback : fallback?.defaultValue ?? key) },
+  hasLanguagePreview: () => false,
+  chooseLanguage: vi.fn(),
+}));
 
 const SERVER_USER = {
   _id: 'u1', id: 'u1', username: 'anna', email: 'anna@example.com', roles: ['user', 'admin'], plan: 'free',
@@ -68,4 +73,20 @@ it('and never grants it to anyone else', async () => {
   await signedInAs(false);
   await act(async () => { await ctx.updatePreferences({ cellarSort: 'maturity' }); });
   expect(screen.getByText('admin:false sort:maturity')).toBeInTheDocument();
+});
+
+// The Settings page replaces the user itself after a profile save, with the
+// echo of PUT /api/profile, which has no stamp either.
+it('a page that replaces the user with a server echo keeps the stamp', async () => {
+  await signedInAs(true);
+  act(() => { ctx.setUser({ ...SERVER_USER, displayName: 'Anna B' }); });
+  expect(ctx.user.displayName).toBe('Anna B');
+  expect(ctx.user.isSuperAdmin).toBe(true);
+  expect(screen.getByText('admin:true sort:-')).toBeInTheDocument();
+});
+
+it('and a page-side replace grants it to nobody', async () => {
+  await signedInAs(false);
+  act(() => { ctx.setUser({ ...SERVER_USER, displayName: 'Anna B' }); });
+  expect(ctx.user.isSuperAdmin).toBe(false);
 });

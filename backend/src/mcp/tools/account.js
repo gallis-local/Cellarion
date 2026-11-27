@@ -1,4 +1,4 @@
-// Self-service account tools (plan §3.18): the settings, profile, support and
+// Self-service account tools: the settings, profile, support and
 // wine-request surfaces the web app's Settings page exposes — so a user running
 // their cellar entirely through an AI never has to open the site for the small
 // stuff. All validation and writes delegate to services/accountOps, the same
@@ -19,7 +19,7 @@ const { logAudit } = require('../../services/audit');
 const featureFlags = require('../../config/featureFlags');
 // The human-queue writes (ticket, reply, wine request) cannot be unsent, so a
 // retry after an ambiguous transport failure must be safe: idempotency_key
-// claims/replays through the ledger (support ticket 2026-09-12).
+// claims/replays through the ledger.
 const { logAction, replay } = require('../actionLedger');
 // The replayable body stored on the ledger row: what ok() serialises.
 const envelopeOf = (summary, data) => ({ summary, data });
@@ -43,6 +43,9 @@ function prefsView(user) {
     currency: p.currency || 'USD',
     language: p.language || 'en',
     rating_scale: p.ratingScale || '5',
+    // How the user reads temperatures; every temperature this server answers
+    // is in °C, so convert the sentence when this says F.
+    temperature_unit: p.temperatureUnit === 'F' ? 'F' : 'C',
     rack_navigation: p.rackNavigation || 'auto',
     restock_scope: p.restockScope || 'all',
     cellar_sort: ALLOWED_CELLAR_SORTS.includes(p.cellarSort) ? p.cellarSort : '-createdAt',
@@ -124,6 +127,8 @@ registerTool({
     currency: z.string().length(3).optional(),
     language: z.string().max(LANGUAGE_TAG_MAX).regex(LANGUAGE_TAG).optional(),
     rating_scale: z.enum(['5', '20', '100']).optional(),
+    temperature_unit: z.enum(['C', 'F']).optional()
+      .describe('How temperatures are shown to the user (serving line, climate cards); stored values stay °C.'),
     rack_navigation: z.enum(['auto', 'room', 'rack']).optional(),
     restock_scope: z.enum(['all', 'cellar']).optional(),
     cellar_sort: z.enum(ALLOWED_CELLAR_SORTS).optional(),
@@ -137,6 +142,7 @@ registerTool({
     if (args.currency !== undefined) body.currency = args.currency;
     if (args.language !== undefined) body.language = args.language;
     if (args.rating_scale !== undefined) body.ratingScale = args.rating_scale;
+    if (args.temperature_unit !== undefined) body.temperatureUnit = args.temperature_unit;
     if (args.rack_navigation !== undefined) body.rackNavigation = args.rack_navigation;
     if (args.restock_scope !== undefined) body.restockScope = args.restock_scope;
     if (args.cellar_sort !== undefined) body.cellarSort = args.cellar_sort;
@@ -287,7 +293,7 @@ registerTool({
       admin_response: t.adminResponse || null,
       responded_at: t.respondedAt || null,
       replies: (t.replies || []).map((r) => ({ author: r.author, message: r.message, created_at: r.createdAt })),
-      // Mirror BOTH bounds reply_to_ticket enforces (MCP-audit M6): not closed
+      // Mirror BOTH bounds reply_to_ticket enforces: not closed
       // AND under the reply cap (which counts admin replies too), so the model
       // isn't told it can reply and then refused.
       can_reply: t.status !== 'closed' && (t.replies || []).length < TICKET_REPLY_CAP,
@@ -422,4 +428,4 @@ registerTool({
   },
 });
 
-module.exports = { prefsView, profileView };
+module.exports = {};

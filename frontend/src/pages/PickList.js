@@ -9,6 +9,7 @@ import { buildRackUrl } from '../utils/rackNavigation';
 import { bottleSizeLabel } from '../config/bottleSizes';
 import BetaBadge from '../components/BetaBadge';
 import './PickList.css';
+import { formatVintage } from '../utils/vintage';
 
 const BulkConsumeModal = lazy(() => import('../components/BulkConsumeModal'));
 
@@ -17,11 +18,10 @@ const BulkConsumeModal = lazy(() => import('../components/BulkConsumeModal'));
 const TICK_FLUSH_MS = 700;
 
 /**
- * One pick list (early access, flag pickLists; forum request 2026-10-13):
- * the bottles to fetch, grouped by cellar and rack in walking order, each
- * with its slot, a tick box, and a way out to the rack. Rendered outside the
- * app Layout, like Cellar Book, so Print gives a clean sheet to take down to
- * the cellar.
+ * One pick list (early access, flag pickLists): the bottles to fetch, grouped
+ * by cellar and rack in walking order, each with its slot, a tick box, and a
+ * way out to the rack. Rendered outside the app Layout, like Cellar Book, so
+ * Print gives a clean sheet to take down to the cellar.
  */
 export default function PickList() {
   const { t } = useTranslation();
@@ -38,7 +38,7 @@ export default function PickList() {
   const [consumeOpen, setConsumeOpen] = useState(false);
   // Ticks not yet confirmed by the server: waiting for the next batch, or
   // sent and not answered yet. A reload lays both over what it fetched, so a
-  // tick is never lost to a reload in between (release audit 2026-10-13).
+  // tick is never lost to a reload in between.
   const pending = useRef(new Map()); // bottleId → picked, not yet sent
   const inFlight = useRef(new Map()); // bottleId → picked, sent, not answered
   const flushing = useRef(Promise.resolve()); // batches go one at a time, in order
@@ -49,7 +49,7 @@ export default function PickList() {
   tRef.current = t;
 
   // The newest load wins: an older answer (history navigation between two
-  // lists on this same page) must not land over it (audit 2026-10-14).
+  // lists on this same page) must not land over it.
   const loadSeq = useRef(0);
 
   /** Loads the list; true when it worked. Never clears an error: the caller decides. */
@@ -71,7 +71,7 @@ export default function PickList() {
     } catch (err) {
       if (seq !== loadSeq.current) return false;
       // A dropped connection throws a TypeError with the browser's own text
-      // ("Failed to fetch"), not a message for the user (audit 2026-10-14).
+      // ("Failed to fetch"), not a message for the user.
       setError(err instanceof TypeError ? tRef.current('common.networkError', 'Network error') : err.message);
       return false;
     }
@@ -109,7 +109,7 @@ export default function PickList() {
   // moves to another list (history navigation) — only then: a ref, so a
   // re-render (a new flush) never sends a batch early. The ticks go to the
   // list they were made on (flush closes over its id); nothing of that list
-  // may then lie over the next one (audit 2026-10-14).
+  // may then lie over the next one.
   const flushRef = useRef(flush);
   flushRef.current = flush;
   useEffect(() => () => {
@@ -130,7 +130,7 @@ export default function PickList() {
   };
 
   // Every action catches a network failure too, and shows its error AFTER
-  // the reload (release audit 2026-10-13: the reload wiped it).
+  // the reload (the reload wiped it).
   const remove = async (bottleIds) => {
     setError('');
     let ok = false;
@@ -197,7 +197,7 @@ export default function PickList() {
 
   const wineText = (it) => [
     [it.wine.producer, it.wine.name].filter(Boolean).join(' — ') || t('common.unknownWine', 'Unknown wine'),
-    it.vintage && it.vintage !== 'Unknown' ? it.vintage : null,
+    it.vintage && it.vintage !== 'Unknown' ? formatVintage(it.vintage, t) : null,
     it.bottleSize && it.bottleSize !== '750ml' ? bottleSizeLabel(it.bottleSize, t) : null,
   ].filter(Boolean).join(' · ');
 
@@ -216,7 +216,7 @@ export default function PickList() {
       ) : (
         <div className="pick-list-title">
           {/* The button sits beside the heading, not in it: a screen reader
-              would read "Saturday dinner Rename" as the heading (audit 2026-10-14). */}
+              would read "Saturday dinner Rename" as the heading. */}
           <h1 className="pick-list-title-text">{list.name}</h1>
           <button type="button" className="pick-list-icon-btn no-print" onClick={() => { setNewName(list.name); setRenaming(true); }} aria-label={t('pickLists.rename', 'Rename')} title={t('pickLists.rename', 'Rename')}>✎</button>
         </div>

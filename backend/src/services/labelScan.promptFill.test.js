@@ -2,7 +2,7 @@
  * Every prompt builder inserts user text LITERALLY, and no assembled prompt
  * goes out oversized.
  *
- * Security audit 2026-09-02 (D10-9): suggestProfile and scanLabelBack had been
+ * suggestProfile and scanLabelBack had been
  * fixed in August, but identifyWineFromText, identifyWineFromQuery,
  * suggestDrinkWindow and suggestPrice still built their prompts with
  * String.prototype.replace(token, userString). A replacement STRING honours
@@ -85,7 +85,7 @@ describe('prompt builders insert user text literally (audit 2026-09-02 D10-9)', 
   });
 
   test('suggestDrinkWindow: registry text and grapes are literal, grapes capped per name', async () => {
-    await suggestDrinkWindow({ name: "$'", producer: '$`', vintage: '2019', grapes: ["$'", 'Syrah', 'Grenache'] });
+    await suggestDrinkWindow({ name: "$'", producer: '$`', vintage: '2019', grapes: ["$'", 'Syrah', '\u0007Grenache'] });
     const prompt = sentPrompt();
     expect(prompt).toContain("Window for $' by $` 2019 ($', Syrah, Grenache)");
     expect(tails(prompt)).toBe(1);

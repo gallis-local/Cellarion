@@ -1,15 +1,13 @@
 /**
- * Canonical producer SPELLING at mint time (registry strategy 2026-07-29, R1;
- * widened 2026-08-14 after the producer-display consolidation).
+ * Canonical producer SPELLING at mint time (registry strategy R1).
  *
  * The producer is a free string, and every dedup mechanism in the registry —
  * normalizedKey, canonicalKey, duplicate clusters, sibling matching — is
  * derived from it. The keys themselves are spelling-proof (normalizeString
  * folds accents/case/punctuation), which is exactly why display splits slip
- * through every net: "Cave de Ribeauvillé" (12 wines) and a hand-typed "Cave
- * de Ribeauville" (1 wine) never collide on any KEY, so nothing ever flagged
- * them, and the registry showed two producers where the world has one
- * (support ticket 2026-07-28, finding 2).
+ * through every net: "Cave de Ribeauvillé" and a hand-typed "Cave de
+ * Ribeauville" never collide on any KEY, so nothing flags them, and the
+ * registry would show two producers where the world has one.
  *
  * The fix is at the source: when a NEW wine is about to be minted, adopt the
  * spelling the registry already uses for this producer. Two stages, both
@@ -18,16 +16,15 @@
  * left for the next cleanup pass:
  *
  *   1. SAME normalized string (accent/case/punctuation variants): adopt the
- *      majority spelling. Unchanged from R1.
+ *      majority spelling.
  *
  *   2. SAME producer comparison key, SAME country (decoration variants:
  *      "Philipp Kuhn" vs "Weingut Philipp Kuhn", "Felton Road Wines Ltd" vs
- *      "Felton Road"). This is the split class stage 1 is blind to — the
- *      2026-08-14 consolidation found 130 such clusters, minted mostly by the
- *      LWIN import (whose PRODUCER_NAME column drops the estate title that
- *      label scans include). Guarded three ways, because the key
- *      DELIBERATELY over-folds (Domaine vs Bodegas Chandon share one; so do
- *      Napa's two Stags Leap estates):
+ *      "Felton Road"). This is the split class stage 1 is blind to, minted
+ *      mostly by the LWIN import (whose PRODUCER_NAME column drops the
+ *      estate title that label scans include). Guarded three ways, because
+ *      the key DELIBERATELY over-folds (Domaine vs Bodegas Chandon share
+ *      one; so do Napa's two Stags Leap estates):
  *        - country must match — "Weingut Jordan" (DE) never captures a new
  *          "Jordan Winery" (US) wine;
  *        - the bucket must hold exactly ONE existing spelling group — a
@@ -49,19 +46,19 @@
  *
  * ...except that a producer can also change on an EXISTING wine, and there
  * the resolver never runs. otherProducerSpellings / planProducerRename below
- * serve that path (approving a producer correction, routes/admin/
- * wineProposals.js): 9 of the 51 producer corrections approved in the week
- * to 2026-09-28 gave one wine a spelling the rest of its producer did not
- * use, and each became a display split the weekly registry-health check
- * rang for. They only REPORT and PLAN — which spelling wins stays a human's
- * call, because the bucket deliberately over-folds (two real Bordeaux
- * estates can share one).
+ * serve that path (approving a producer correction,
+ * services/wineProposalDecisionOps.js): a correction can give one wine a
+ * spelling the rest of its producer does not use, and each such wine is a
+ * display split the weekly registry-health check rings for. They only REPORT
+ * and PLAN — which spelling wins stays a human's call, because the bucket
+ * deliberately over-folds (two real Bordeaux estates can share one).
  */
 const mongoose = require('mongoose');
 const WineDefinition = require('../models/WineDefinition');
 const { escapeRegex } = require('../utils/sanitize');
 const { normalizeString, generateWineKey, isIdentitySentinel } = require('../utils/normalize');
 const { producerSegment } = require('../utils/wineIdentity');
+const { loadTerms } = require('./sweetnessOps');
 
 /** Do two normalized spellings differ only by decoration? (token subset,
  *  either direction — "philipp kuhn" ⊂ "weingut philipp kuhn", and the
@@ -79,8 +76,8 @@ const decorationOnlyDiff = (aNorm, bNorm) => {
  * @param {string} producerNorm  normalizeString(rawProducer) — caller already has it
  * @param {object} [opts]
  * @param {*}      [opts.countryId] the wine's resolved Country _id. Enables
- *   stage 2; without it only the same-string stage runs (the pre-2026-08-14
- *   behavior), because cross-estate safety needs the country fence.
+ *   stage 2; without it only the same-string stage runs, because
+ *   cross-estate safety needs the country fence.
  * @returns {Promise<string>} the spelling to store (the registry's canonical
  *   one, or the input when this producer is new / contested / not a pure
  *   decoration variant). Never throws — on lookup failure the input spelling
@@ -224,11 +221,14 @@ async function otherProducerSpellings(spelling, countryId, { excludeWineId = nul
  * own canonicalKey, the slug with its previousSlugs and the verifiedChecks
  * invalidation — the scripts/consolidate-producer-displays.js write path).
  *
- * normalizedKey is UNIQUE and not hook-maintained, so every new key is
- * checked first: against the rest of the registry, against the other wines
- * in the plan, and against `reservedKeys` (the corrected wine's own new key).
- * Any clash means two wines would become one — that is a merge, not a
- * rename, so the plan reports it and the caller writes nothing.
+ * normalizedKey is UNIQUE, and the hook maintains only its label-sweetness
+ * suffix (models/WineDefinition pre-validate), so every new key is built in
+ * full — the term included, or the check would compare a termed wine against
+ * its untermed twin — and checked first: against the rest of the registry,
+ * against the other wines in the plan, and against `reservedKeys` (the
+ * corrected wine's own new key). Any clash means two wines would become one —
+ * that is a merge, not a rename, so the plan reports it and the caller writes
+ * nothing.
  *
  * @returns {Promise<{wines: Array<{doc, from: string, newKey: string}>,
  *   clashes: Array<{wineId: string, name: string, from: string}>, tooMany: number}>}
@@ -245,8 +245,13 @@ async function planProducerRename(fromSpellings, to, countryId, { excludeWineId 
     .filter((d) => from.has(displaySpelling(d.producer)));
   if (docs.length > max) return { ...empty, tooMany: docs.length };
 
+  // The term's WORD from the table's in-memory copy (warm whenever the
+  // registry runs; empty without a connection, where the keys are bare as
+  // the docs are): no populate on the bucket query, no extra read per wine.
+  const terms = await loadTerms();
+  const sweetnessOf = (doc) => (doc.labelSweetness ? (terms.byId.get(String(doc.labelSweetness._id || doc.labelSweetness))?.name || null) : null);
   const wines = docs.map((doc) => ({
-    doc, from: displaySpelling(doc.producer), newKey: generateWineKey(doc.name, target, doc.appellation),
+    doc, from: displaySpelling(doc.producer), newKey: generateWineKey(doc.name, target, doc.appellation, { sweetness: sweetnessOf(doc) }),
   }));
   const taken = new Set(reservedKeys.filter(Boolean));
   const clashes = [];

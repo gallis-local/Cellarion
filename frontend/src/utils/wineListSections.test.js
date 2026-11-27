@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildSections, groupingLevels, localName } from './wineListSections';
+import { buildSections, groupingLevels, localName, bottleCountText } from './wineListSections';
 
 const WINES = {
   barolo: {
@@ -111,7 +111,7 @@ describe('buildSections', () => {
   });
 });
 
-describe('nested auto grouping, hidden prices and the last-bottle marker (support ticket 2026-09-12)', () => {
+describe('nested auto grouping, hidden prices and the last-bottle marker', () => {
   const rioja = {
     _id: 'w4', name: 'Rioja Reserva', producer: 'Muga', type: 'red',
     country: { name: 'Spain' }, region: { name: 'Rioja' }, grapes: [],
@@ -167,6 +167,22 @@ describe('nested auto grouping, hidden prices and the last-bottle marker (suppor
     expect(byName['Chablis'].lastBottle).toBe(false);
   });
 
+  it('carries the live bottle count only when the list shows counts', () => {
+    const list = (layout) => buildSections({
+      structureMode: 'auto', autoGrouping: { levels: ['type'] }, autoGroupEntries: [entry('w1')], layout,
+    }, winesByKey).flatMap(s => s.wines)[0];
+    expect(list({ showStock: true }).bottleCount).toBe(1); // this cellar holds one Barolo
+    expect(list({}).bottleCount).toBeNull();
+  });
+
+  it('says the count in the list language, as the PDF does', () => {
+    expect(bottleCountText(1)).toBe('1 bottle');
+    expect(bottleCountText(4, 'sv')).toBe('4 flaskor');
+    expect(bottleCountText(1, 'fr')).toBe('1 bouteille');
+    expect(bottleCountText(0, 'fr')).toBe('0 bouteille');
+    expect(bottleCountText(2, 'it')).toBe('2 bottiglie');
+  });
+
   it('groupingLevels caps at three distinct known fields and falls back to groupBy', () => {
     expect(groupingLevels({ levels: ['type', 'country', 'region', 'appellation'] })).toEqual(['type', 'country', 'region']);
     expect(groupingLevels({ levels: ['region', 'region', 'bogus'] })).toEqual(['region']);
@@ -175,7 +191,7 @@ describe('nested auto grouping, hidden prices and the last-bottle marker (suppor
   });
 });
 
-describe('nested grouping fallbacks (review 2026-09-12)', () => {
+describe('nested grouping fallbacks', () => {
   it('a wine without a region never repeats its country as a sub-heading; it goes to "Other", sorted last', () => {
     const chianti = { _id: 'w6', name: 'Chianti', producer: 'Antinori', type: 'red', country: { name: 'Italy' }, region: null, grapes: [] };
     const sections = buildSections({
@@ -188,7 +204,7 @@ describe('nested grouping fallbacks (review 2026-09-12)', () => {
   });
 });
 
-describe('geography in the list language (support ticket 2026-09-12)', () => {
+describe('geography in the list language', () => {
   const tuscan = {
     _id: 'g1', name: 'Brunello', producer: 'Biondi-Santi', type: 'red',
     country: { name: 'Italy', translations: { de: 'Italien' } },

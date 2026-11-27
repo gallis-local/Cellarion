@@ -3,9 +3,7 @@ import { formatVolume, mlFromCode } from '../config/bottleSizes';
 
 /**
  * Extra details a cellar-list card can show, picked by the user under
- * "Show on cards" (forum feedback 2026-10-12: "choose some of the additional
- * bottle details to display in the main list, for example ratings").
- * Kept per device, like the list's density and notes toggles.
+ * "Show on cards". Kept per device, like the list's density and notes toggles.
  */
 export const CARD_FIELDS = ['rating', 'price', 'size', 'region', 'purchased'];
 export const CARD_FIELDS_STORAGE_KEY = 'cellarion_bottle_fields';
@@ -26,7 +24,7 @@ export function storeCardFields(fields) {
 const same = (values) => values.every((v) => v === values[0]);
 
 // Formatters are costly to build and a list draws hundreds of cards: one per
-// locale (and currency), made once (release audit 2026-10-12).
+// locale (and currency), made once.
 const priceFormats = new Map();
 function priceFormat(locale, currency) {
   const key = `${locale}|${currency}`;
@@ -105,7 +103,7 @@ export function cardDetails(bottles, fields, { ratingScale = '5', locale, cardSh
     let text = '';
     if (field === 'rating') text = ratingText(list, ratingScale);
     else if (field === 'price') text = priceText(list, locale);
-    else if (field === 'size') text = formatVolume(mlFromCode(list[0].bottleSize)) || list[0].bottleSize || '';
+    else if (field === 'size') text = formatVolume(mlFromCode(list[0].bottleSize), locale) || list[0].bottleSize || '';
     else if (field === 'region') {
       const names = list.map((b) => {
         const region = b.wineDefinition?.region?.name;

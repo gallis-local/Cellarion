@@ -28,12 +28,12 @@ export function CollapseToggle({ collapsed, onToggle, label, controls }) {
 }
 
 /**
- * A card that folds down to its title row (the wine and vintage page, beta
- * feedback 2026-10-12). Wraps an existing card component untouched: the
- * button sits in the card's top-right corner and, folded, everything but the
- * card's first row (its title) is hidden — hidden, not unmounted, so the card
- * keeps what it loaded. `nested`: the card's title row is one level down
- * (the wine record's section inside its card).
+ * A card that folds down to its title row (the wine and vintage page). Wraps
+ * an existing card component untouched: the button sits in the card's
+ * top-right corner and, folded, everything but the card's first row (its
+ * title) is hidden — hidden, not unmounted, so the card keeps what it loaded.
+ * `nested`: the card's title row is one level down (the wine record's section
+ * inside its card).
  *
  * Many cards render nothing when they have nothing to say; the button only
  * appears once there is a card to fold.
@@ -54,14 +54,14 @@ export default function CollapsibleBlock({ id, label, collapsed, onToggle, neste
   const domId = `cblock-${id.replace(/\./g, '-')}`;
   // A control left visible in a folded card's title row ("+ Add", "Suggest
   // a fix") opens something in the folded part: using it unfolds the card
-  // first, so what it opens can be seen (release audit 2026-10-13).
+  // first, so what it opens can be seen.
   const onClickCapture = (e) => {
     if (!collapsed) return;
     const control = e.target instanceof Element ? e.target.closest('button, a, [role="button"]') : null;
     if (!control || control.closest('.cblock-toggle') || control.closest('.modal-overlay')) return;
     // A link that leaves for another page ("Open the vintage page →") opens
     // nothing in this card: following it must not unfold the card for the
-    // account (audit 2026-10-14). An in-page "#…" link still unfolds.
+    // account. An in-page "#…" link still unfolds.
     const href = control.tagName === 'A' ? control.getAttribute('href') : null;
     if (href && !href.startsWith('#')) return;
     onToggle();

@@ -4,7 +4,7 @@
  * WHY THIS TEST EXISTS:
  * Early access decides which screens a member sees, so switching it is
  * logged. The row must mean a real switch: a form re-sending the value the
- * account already has writes nothing (release audit 2026-10-10), and the
+ * account already has writes nothing, and the
  * other preferences stay unlogged as before.
  */
 process.env.JWT_SECRET = 'test-secret';
@@ -14,8 +14,8 @@ jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('../services/accountOps', () => ({ updatePreferences: jest.fn(), updateProfile: jest.fn() }));
 jest.mock('../services/search', () => ({
   getIsAvailable: jest.fn(() => false), indexWine: jest.fn(), removeWine: jest.fn(),
-  bulkIndexWines: jest.fn(), bulkIndexBottles: jest.fn(), fullSync: jest.fn(),
-  fullSyncBottles: jest.fn(), waitForTasks: jest.fn(), indexDiscussion: jest.fn(),
+  fullSync: jest.fn(),
+  waitForTasks: jest.fn(), indexDiscussion: jest.fn(),
 }));
 
 const express = require('express');

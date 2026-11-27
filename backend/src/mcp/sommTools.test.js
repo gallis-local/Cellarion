@@ -42,7 +42,7 @@ jest.mock('../models/Grape', () => {
   ctor.find = jest.fn();
   return ctor;
 });
-// list_held_profiles flags rows with an open owner inquiry (somm 6a872b98).
+// list_held_profiles flags rows with an open owner inquiry.
 // Default: none open — individual tests override to assert the flag.
 jest.mock('../models/WineOwnerInquiry', () => ({
   find: jest.fn(() => ({ select: () => ({ lean: () => Promise.resolve([]) }) })),
@@ -58,14 +58,14 @@ jest.mock('../models/WineVintagePrice', () => {
   M.deleteOne = jest.fn();
   return M;
 });
-jest.mock('../models/PriceTrackingRequest', () => ({ find: jest.fn(), findOne: jest.fn(), findById: jest.fn(), deleteOne: jest.fn(), findOneAndUpdate: jest.fn() }));
+jest.mock('../models/PriceTrackingRequest', () => ({ find: jest.fn(), findOne: jest.fn(), findById: jest.fn(), findOneAndDelete: jest.fn(), findOneAndUpdate: jest.fn(), updateOne: jest.fn() }));
 jest.mock('../models/PriceTrackingSkip', () => ({ find: jest.fn(), findOne: jest.fn(), findOneAndUpdate: jest.fn(), deleteOne: jest.fn() }));
 jest.mock('../models/WineCorrectionProposal', () => ({ create: jest.fn(), findById: jest.fn(), deleteOne: jest.fn(), find: jest.fn(), countDocuments: jest.fn() }));
-// The self-apply path (2026-08-21) reaches the admin route's own approveProposal
+// The self-apply path reaches the admin route's own approveProposal
 // rather than duplicating the write. Mocked so this suite stays a unit test of
 // the TOOL's routing; the apply itself is covered by wineProposals.test.js and
 // the direct/gated decision by services/proposalDirectApply.test.js.
-jest.mock('../routes/admin/wineProposals', () => ({ approveProposal: jest.fn() }));
+jest.mock('../services/wineProposalDecisionOps', () => ({ approveProposal: jest.fn() }));
 // Defaults to GATED so every pre-existing proposal test keeps asserting the
 // admin-review path it was written for; the self-apply tests opt in.
 jest.mock('../services/proposalDirectApply', () => ({
@@ -75,7 +75,7 @@ jest.mock('../models/ProfileAuditSample', () => ({ create: jest.fn(), find: jest
 jest.mock('../models/WineReport', () => ({ find: jest.fn(), findById: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../utils/cellarCred', () => ({ incrementCred: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../utils/rackGeometry', () => ({ getMaxPosition: jest.fn(() => 12) }));
-jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn(), indexWine: jest.fn().mockResolvedValue(undefined), fullSync: jest.fn().mockResolvedValue([]) }));
+jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), indexWine: jest.fn().mockResolvedValue(undefined), fullSync: jest.fn().mockResolvedValue([]) }));
 // edit_grape runs regional names through the admin editor's validator and
 // clears the public taxonomy list cache after a grape save; both are pinned
 // in editGrape.regionalNames.test.js, so here they pass through.
@@ -100,7 +100,7 @@ jest.mock('./mutationBudget', () => ({ takeMutationSlot: jest.fn(() => true), WR
 // below exercise the caveat it adds around that scan, not the scan itself.
 jest.mock('../services/crossFieldScan', () => ({ scanCrossFieldChecks: jest.fn(async () => ({ rows: [] })) }));
 // propose_wine_correction names the registry's other spellings of a proposed
-// producer (2026-09-28); the lookup itself is unit-tested in its own suite.
+// producer; the lookup itself is unit-tested in its own suite.
 jest.mock('../services/producerSpelling', () => ({
   ...jest.requireActual('../services/producerSpelling'),
   otherProducerSpellings: jest.fn(async () => []),
@@ -212,13 +212,12 @@ describe('list_maturity_queue', () => {
     expect(body.data[1].somm_notes).toBeNull();
   });
 
-  // Somm ticket 6a911643 (2026-08-28). The inline tasting_profile reported
-  // curator-verified profiles as {absent: true}, because presence was tested
-  // by generatedAt — the AI's stamp, which a hand-written profile never has.
-  // On production 1,769 of 2,113 curator profiles were misreported. Acting on
-  // the field, a curator overwrote another curator's deliberate decision not
-  // to set a window, and set_wine_profile accepted it silently.
-  describe('inline tasting_profile reflects the STORED profile (6a911643)', () => {
+  // The inline tasting_profile must reflect what is stored. Testing presence
+  // by generatedAt — the AI's stamp, which a hand-written profile never has —
+  // reports curator-verified profiles as {absent: true}, and a curator acting
+  // on that field can overwrite another curator's deliberate decision not to
+  // set a window while set_wine_profile accepts it silently.
+  describe('inline tasting_profile reflects the STORED profile', () => {
     const aiConfig = require('../config/aiConfig');
     const row = (aiProfile, wineExtra = {}) => ({
       _id: oid('1'), vintage: '2016', status: 'pending', relative: false,
@@ -355,8 +354,8 @@ describe('set_vintage_maturity', () => {
     expect(body.data.somm_notes).toBeNull();
   });
 
-  // Ticket d49cc924: once a pair left the pending queue nothing returned its
-  // profile_id, so a published-but-wrong window was unreachable over MCP.
+  // A pair that has left the pending queue must still be reachable: without
+  // its profile_id, a published-but-wrong window cannot be corrected over MCP.
   test('wine_id + vintage reaches a REVIEWED profile (the published-window correction path)', async () => {
     const p = {
       _id: oid('1'), vintage: '2017', status: 'reviewed', relative: false,
@@ -400,7 +399,7 @@ describe('set_vintage_maturity', () => {
     expect(body.error.code).toBe('invalid_input');
   });
 
-  // Audit 2026-08-10: profiles predating the relative-flag derivation hold
+  // Profiles predating the relative-flag derivation hold
   // absolute years under vintage 'NV'; a partial write flips relative=true on
   // save, silently reinterpreting retained years as offsets. Must refuse.
   test('a partial write on an NV profile carrying absolute years is refused, a full rewrite lands', async () => {
@@ -450,7 +449,7 @@ describe('remove_from_maturity_queue', () => {
     const body = parse(await tool('remove_from_maturity_queue').handler(
       { profile_id: oid('1'), reason: '2027 not released' }, SOMM_CTX));
     expect(body.error).toBeUndefined();
-    expect(WineVintageProfile.deleteOne).toHaveBeenCalledWith({ _id: oid('1') });
+    expect(WineVintageProfile.deleteOne).toHaveBeenCalledWith({ _id: oid('1'), status: { $ne: 'reviewed' } });
     const row = McpActionLog.create.mock.calls[0][0];
     expect(row.action).toBe('somm_maturity_remove');
     // The row being deleted, wine+vintage is ALL the undo has to work from.
@@ -481,7 +480,7 @@ describe('remove_from_maturity_queue', () => {
     // the undo must land on "it is in the queue again" either way.
     expect(WineVintageProfile.findOneAndUpdate).toHaveBeenCalledWith(
       { wineDefinition: oid('f'), vintage: '2027' },
-      { $setOnInsert: { wineDefinition: oid('f'), vintage: '2027', status: 'pending' } },
+      { $setOnInsert: { wineDefinition: oid('f'), vintage: '2027', status: 'pending', relative: false } },
       { upsert: true }
     );
     expect(McpActionLog.findOneAndUpdate).toHaveBeenCalledWith(
@@ -518,7 +517,7 @@ describe('set_wine_profile', () => {
       expect.anything(), expect.objectContaining({ via: 'mcp' }));
   });
 
-  // Ticket d4a1aef5: the vin jaune case — accurate prose, wrong type, empty
+  // The vin jaune case — accurate prose, wrong type, empty
   // grapes. The record fields must be correctable without claiming the
   // (already-correct) tasting profile was curator-verified.
   test('type + grapes correct the record WITHOUT claiming the profile verified', async () => {
@@ -536,7 +535,7 @@ describe('set_wine_profile', () => {
     expect(McpActionLog.create.mock.calls[0][0].prev).toMatchObject({ type: 'fortified', grapes: [] });
   });
 
-  // Support ticket 2026-09-17: a sparkling rosé is type sparkling + colour rosé.
+  // A sparkling rosé is type sparkling + colour rosé.
   test('colour is a record field too — set beside the type, snapshotted for undo', async () => {
     const w = wine({ type: 'rosé', colour: null });
     const body = parse(await tool('set_wine_profile').handler(
@@ -549,7 +548,31 @@ describe('set_wine_profile', () => {
     expect(McpActionLog.create.mock.calls[0][0].prev).toMatchObject({ type: 'rosé', colour: null });
   });
 
-  // Audit 2026-09-19: the model hook would drop it, so the tool used to report
+  // The serving trait: a temperature range and whether the wine needs air when
+  // young, stored on the profile and composed into advice against the
+  // vintage's phase on the day it is read (utils/servingUtils).
+  test('serving_temperature_c + needs_air land on the profile as a trait, echoed back, and undo keeps the old values', async () => {
+    const w = wine({ aiProfile: { description: 'Big, tannic.', source: 'ai', servingTempMin: null, servingTempMax: null, needsAir: null } });
+    const body = parse(await tool('set_wine_profile').handler(
+      { wine_id: oid('f'), serving_temperature_c: { min: 17, max: 18 }, needs_air: 'long' }, SOMM_CTX));
+    expect(body.error).toBeUndefined();
+    expect(w.aiProfile.servingTempMin).toBe(17);
+    expect(w.aiProfile.servingTempMax).toBe(18);
+    expect(w.aiProfile.needsAir).toBe('long');
+    expect(body.data.profile.serving_temperature_c).toEqual({ min: 17, max: 18 });
+    expect(body.data.profile.needs_air).toBe('long');
+    expect(McpActionLog.create.mock.calls[0][0].prev).toMatchObject({ servingTempMin: null, servingTempMax: null, needsAir: null });
+  });
+
+  test('a serving range with min above max is refused, nothing written', async () => {
+    const w = wine();
+    const body = parse(await tool('set_wine_profile').handler(
+      { wine_id: oid('f'), serving_temperature_c: { min: 18, max: 16 } }, SOMM_CTX));
+    expect(body.error.code).toBe('invalid_input');
+    expect(w.save).not.toHaveBeenCalled();
+  });
+
+  // The model hook would drop it, so the tool used to report
   // a success that stored nothing.
   test('a colour on a wine that stays red/white/rosé is refused, nothing written', async () => {
     const w = wine({ type: 'red' });
@@ -563,8 +586,8 @@ describe('set_wine_profile', () => {
     expect(cleared.error).toBeUndefined();
   });
 
-  // Ticket 2026-08-11: "Tinta Roriz" was silently stored as Tempranillo. The
-  // canonicalisation itself is the design (one variety doc keeps search and
+  // A synonym ("Tinta Roriz") is stored as its canonical variety (Tempranillo).
+  // The canonicalisation itself is the design (one variety doc keeps search and
   // stats coherent) — but the response must SAY it happened, at every reading
   // depth: summary, record payload, and note.
   test('a synonym-stored grape is REPORTED as a substitution, never silent', async () => {
@@ -590,8 +613,8 @@ describe('set_wine_profile', () => {
     expect(w.save).not.toHaveBeenCalled();
   });
 
-  // Ticket d49ca3af: clearing used to curator-freeze the wine out of
-  // enrichment — the worst-sourced rows got locked empty.
+  // Clearing must not curator-freeze the wine out of enrichment, or the
+  // worst-sourced rows get locked empty.
   test('a write that ONLY clears does not curator-freeze; the response says so', async () => {
     const w = wine(); // ai-sourced with a description
     const body = parse(await tool('set_wine_profile').handler(
@@ -753,7 +776,7 @@ describe('list_price_tracking_requests', () => {
   });
 });
 
-describe('sample_published_profiles (6a8464ea phase 3 — the weekly spot-check)', () => {
+describe('sample_published_profiles (the weekly spot-check)', () => {
   test('samples only published, AI-sourced, un-held rows and returns judgeable shapes', async () => {
     WineDefinition.aggregate.mockResolvedValue([{
       _id: oid('9'), name: 'Bacchus Trocken', producer: 'Weingut X', appellation: 'Rheinhessen',
@@ -839,7 +862,7 @@ describe('gap-report items 2/3/5/6 (2026-08-18 evening)', () => {
   });
 });
 
-describe('held-profile review queue over MCP (somm ticket 2026-08-18)', () => {
+describe('held-profile review queue over MCP', () => {
   const { releaseHeldProfile } = require('../services/enrichmentJob');
   // aiConfig.get's return value is set by earlier describes and survives
   // clearAllMocks — pin the default (automatic profiles on) so release runs
@@ -886,9 +909,9 @@ describe('held-profile review queue over MCP (somm ticket 2026-08-18)', () => {
     expect(body.data.filter((r) => r.state === 'held').map((r) => r.wine_id)).toEqual([oid('2')]);
   });
 
-  // Somm 6a872b98: a held profile was released over the top of an open
-  // inquiry asking the owner whether that very label reads Hunter Valley or
-  // Lodi. The flag makes the escalation visible where the decision is made.
+  // A held profile must not be released over the top of an open inquiry
+  // asking the owner what that very label reads. The flag makes the
+  // escalation visible where the decision is made.
   test('a row with an open owner inquiry carries open_owner_inquiry; others do not', async () => {
     const WineOwnerInquiry = require('../models/WineOwnerInquiry');
     WineDefinition.find.mockImplementation(() => heldListChain([
@@ -933,11 +956,11 @@ describe('held-profile review queue over MCP (somm ticket 2026-08-18)', () => {
     expect(body.data.by_owner_tier).toMatchObject({ 0: 2, 2: 1 });
   });
 
-  test('counts_only counts published_suspect WITHOUT the include flag (ticket 6a8ffaa1)', async () => {
+  test('counts_only counts published_suspect WITHOUT the include flag', async () => {
     // The listing default exists to keep suspects out of held-row paging; a
-    // count has no paging to protect. The regression reported suspect as a
-    // hard 0 — "adjudicated clear" — while three quarters of the backlog sat
-    // in the uncounted state. Assert on the QUERY, not just the totals: the
+    // count has no paging to protect. Applying the default to the count would
+    // report suspect as a hard 0 — "adjudicated clear" — while the backlog
+    // sits in the uncounted state. Assert on the QUERY, not just the totals: the
     // suspect $or branch must be present with no include flag passed.
     WineDefinition.find.mockImplementation(() => heldListChain([
       { _id: oid('1'), producer: 'Thomas Allen', aiProfile: { heldAt: new Date(), heldReason: 'low_confidence' } },
@@ -1047,11 +1070,11 @@ describe('held-profile review queue over MCP (somm ticket 2026-08-18)', () => {
     expect(update.$set.profileReviewedAt).toBeInstanceOf(Date);
   });
 
-  // Somm ticket 6a85f5e8: profileReviewedAt was doing two jobs. A curator
-  // profile write stamps it, so fixing a wine's grapes silently closed the
-  // producer-suspect question nobody had answered — 23 prod rows left that way
-  // against ONE genuine uphold, and upheld-count is the number the scaling
-  // review reads. The verdict now lives in its own field.
+  // profileReviewedAt cannot do two jobs. A curator profile write stamps it,
+  // so if it were also the verdict, fixing a wine's grapes would silently
+  // close the producer-suspect question nobody had answered — and
+  // upheld-count is the number the scaling review reads. The verdict lives
+  // in its own field.
   describe('the suspect verdict is recorded separately from "a human looked"', () => {
     const publishedSuspect = (over = {}) => heldWine({
       aiProfile: { heldAt: null, producerSuspect: true, description: 'x', generatedAt: new Date(), source: 'ai', ...over },
@@ -1079,10 +1102,10 @@ describe('held-profile review queue over MCP (somm ticket 2026-08-18)', () => {
       expect(update.$set['aiProfile.suspectDecision']).toBe('confirmed');
     });
 
-    // Somm ticket 6a882f3e. The note used to be kept "for curator context"
-    // after the flag it explained was cleared — so a confirmed row could still
-    // read "the true producing estate is unclear to me" with nothing left to
-    // qualify it, and no lever existed to correct it.
+    // A note kept "for curator context" after the flag it explained is
+    // cleared would leave a confirmed row reading "the true producing estate
+    // is unclear to me" with nothing left to qualify it, and no lever to
+    // correct it.
     describe('the producerNote goes with the flag it explains', () => {
       // Projection-aware for this block: the handler only ever sees the fields
       // its .select() asked for, as with the real query. The outer mock hands
@@ -1163,9 +1186,10 @@ describe('held-profile review queue over MCP (somm ticket 2026-08-18)', () => {
         expect(update.$set['aiProfile.producerNote']).toBeNull();
       });
 
-      // Somm 6a9eb3ae (2026-09-07): note_doubts_cuvee_not_producer lands a row
-      // CLEAN — no flag, only the rule tag — so a curator who had placed the
-      // producer got "nothing to review", and list_rule_downgrades had no exit.
+      // note_doubts_cuvee_not_producer lands a row CLEAN — no flag, only the
+      // rule tag — so confirm must still act on it: otherwise a curator who
+      // placed the producer gets "nothing to review", and list_rule_downgrades
+      // has no exit.
       test('confirm on a rule-downgraded row with no flag records the placement and clears the tag', async () => {
         WineDefinition.findById.mockReturnValue(selectChain(publishedSuspect({
           producerSuspect: false, producerUnknown: false, suspectDowngradedBy: 'note_doubts_cuvee_not_producer',
@@ -1174,7 +1198,7 @@ describe('held-profile review queue over MCP (somm ticket 2026-08-18)', () => {
         expect(body.error).toBeUndefined();
         const [, update] = WineDefinition.updateOne.mock.calls[0];
         expect(update.$set['aiProfile.suspectDowngradedBy']).toBeNull();
-        // suspectDecision stays the verdict on producerSuspect, and only that (6a85f5e8).
+        // suspectDecision stays the verdict on producerSuspect, and only that.
         expect(update.$set['aiProfile.suspectDecision']).toBeUndefined();
         expect(update.$set.profileReviewedAt).toBeInstanceOf(Date);
         expect(body.data).toMatchObject({ state: 'published_rule_downgraded', rule_cleared: 'note_doubts_cuvee_not_producer', left_rule_downgrades: true });
@@ -1263,7 +1287,7 @@ describe('held-profile review queue over MCP (somm ticket 2026-08-18)', () => {
     expect(body.error.code).toBe('invalid_input');
   });
 
-  // Somm ticket 6a856e97: the verb that upholds a CORRECT flag. Confirm
+  // The verb that upholds a CORRECT flag. Confirm
   // clears the flag; uphold keeps it — both stamp reviewed, both clear the
   // queue, and only one of them damages the data when the flag is right.
   test('uphold on a published_suspect KEEPS the flag and stamps reviewed — flag survives, queue does not', async () => {
@@ -1297,13 +1321,13 @@ describe('held-profile review queue over MCP (somm ticket 2026-08-18)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Somm-owned wine data (Johan, 2026-08-22): automatic AI enrichment is OFF,
-// so a new wine arrives with NO profile at all. list_held_profiles is the one
-// place the somm can see it — as state "unprofiled" — and add_grape is the
-// unblock for the taxonomy gaps that previously needed a support ticket each
-// (seven varieties in one week: Norton, St. Pepin, Souzão, Vidal, …).
+// Somm-owned wine data: automatic AI enrichment is OFF, so a new wine
+// arrives with NO profile at all. list_held_profiles is the one place the
+// somm can see it — as state "unprofiled" — and add_grape closes taxonomy
+// gaps (varieties such as Norton, St. Pepin, Souzão, Vidal) without an admin
+// request for each.
 // ---------------------------------------------------------------------------
-describe('the unprofiled intake queue (somm-owned data, 2026-08-22)', () => {
+describe('the unprofiled intake queue (somm-owned data)', () => {
   const heldListChain = (rows) => ({
     select: jest.fn().mockReturnThis(),
     limit: jest.fn().mockReturnThis(),
@@ -1322,11 +1346,11 @@ describe('the unprofiled intake queue (somm-owned data, 2026-08-22)', () => {
     await tool('list_held_profiles').handler({ include_published_suspects: true, limit: 30, offset: 0 }, SOMM_CTX);
     const or = WineDefinition.find.mock.calls[0][0].$or;
     expect(or).toHaveLength(3);
-    // The intake branch: never generated AND never written — the 188 curator
-    // rows that predate the generatedAt stamp have a description and stay out.
-    // body is part of the content test now (6a911643) — the Mongo branch must
-    // match hasProfileContent field for field.
-    expect(or[2]).toEqual({ 'aiProfile.generatedAt': null, 'aiProfile.description': null, 'aiProfile.body': null });
+    // The intake branch: never generated AND never written — curator rows
+    // that predate the generatedAt stamp have a description and stay out.
+    // The Mongo branch must match hasProfileContent field for field, and an
+    // empty description is as absent as a null one (as list_maturity_queue reads it).
+    expect(or[2]).toEqual({ 'aiProfile.generatedAt': null, 'aiProfile.description': { $in: [null, ''] }, 'aiProfile.body': null });
   });
 
   test('state:"unprofiled" narrows the query to the intake branch alone', async () => {
@@ -1335,7 +1359,7 @@ describe('the unprofiled intake queue (somm-owned data, 2026-08-22)', () => {
     Bottle.aggregate.mockResolvedValue([]);
     await tool('list_held_profiles').handler({ state: 'unprofiled', limit: 30, offset: 0 }, SOMM_CTX);
     const or = WineDefinition.find.mock.calls[0][0].$or;
-    expect(or).toEqual([{ 'aiProfile.generatedAt': null, 'aiProfile.description': null, 'aiProfile.body': null }]);
+    expect(or).toEqual([{ 'aiProfile.generatedAt': null, 'aiProfile.description': { $in: [null, ''] }, 'aiProfile.body': null }]);
   });
 
   test('an explicit state:"published_suspect" implies the include flag — no second switch to forget', async () => {
@@ -1345,7 +1369,7 @@ describe('the unprofiled intake queue (somm-owned data, 2026-08-22)', () => {
     await tool('list_held_profiles').handler({ state: 'published_suspect', limit: 30, offset: 0 }, SOMM_CTX);
     const or = WineDefinition.find.mock.calls[0][0].$or;
     expect(or).toHaveLength(1);
-    expect(or[0]).toMatchObject({ 'aiProfile.producerSuspect': true });
+    expect(or[0]).toMatchObject({ 'aiProfile.producerSuspect': true, 'aiProfile.description': { $nin: [null, ''] } });
   });
 
   test('an unprofiled row is shaped with state "unprofiled" and sorts after flagged rows of equal impact', async () => {
@@ -1378,13 +1402,13 @@ describe('the unprofiled intake queue (somm-owned data, 2026-08-22)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// edit_grape (somm ticket 3504c122). add_grape only CREATED, so a variety that
-// arrived with a null colour could never acquire one through MCP — and a null
+// edit_grape. add_grape only CREATES, so without this a variety that arrived
+// with a null colour could never acquire one through MCP — and a null
 // colour is not a cosmetic gap: findGrapeColourConflict cannot evaluate a wine
 // whose grape has no colour, so those wines are skipped by a live check that
 // then reports zero and reads as clean.
 // ---------------------------------------------------------------------------
-describe('edit_grape (2026-08-24)', () => {
+describe('edit_grape', () => {
   const Grape = require('../models/Grape');
   const Country = require('../models/Country');
   const Region = require('../models/Region');
@@ -1564,7 +1588,7 @@ describe('reject_price_request', () => {
   beforeEach(() => {
     WineDefinition.findById.mockReturnValue(chain({ _id: WINE_ID, name: 'Everyday Shiraz', producer: 'Casella' }));
     PriceTrackingSkip.findOneAndUpdate.mockResolvedValue({ lastErrorObject: { updatedExisting: false }, value: null });
-    PriceTrackingRequest.deleteOne.mockResolvedValue({ deletedCount: 1 });
+    PriceTrackingRequest.findOneAndDelete.mockResolvedValue(mkRequest());
   });
 
   test('requires a real plain-text reason — missing, too-short, and HTML-only all refused before any read', async () => {
@@ -1591,7 +1615,7 @@ describe('reject_price_request', () => {
     expect(skipFilter).toEqual({ wineDefinition: WINE_ID, vintage: '2019' });
     expect(skipUpdate.$setOnInsert).toMatchObject({ reason: 'No secondary market for this wine.', skippedBy: ME });
 
-    expect(PriceTrackingRequest.deleteOne).toHaveBeenCalledWith({ _id: REQ_ID });
+    expect(PriceTrackingRequest.findOneAndDelete).toHaveBeenCalledWith({ _id: REQ_ID });
 
     // Every requester gets the wine label AND the reason, verbatim.
     expect(createNotification).toHaveBeenCalledTimes(2);
@@ -1627,7 +1651,7 @@ describe('reject_price_request', () => {
       { request_id: REQ_ID, reason: 'No secondary market.' }, SOMM_CTX));
     expect(body.error.code).toBe('not_found');
     expect(PriceTrackingSkip.findOneAndUpdate).not.toHaveBeenCalled();
-    expect(PriceTrackingRequest.deleteOne).not.toHaveBeenCalled();
+    expect(PriceTrackingRequest.findOneAndDelete).not.toHaveBeenCalled();
     expect(createNotification).not.toHaveBeenCalled();
     expect(McpActionLog.create).not.toHaveBeenCalled();
   });
@@ -1656,7 +1680,7 @@ describe('reject_price_request', () => {
     expect(PriceTrackingRequest.findOneAndUpdate).toHaveBeenCalledWith(
       { wineDefinition: WINE_ID, vintage: '2019' },
       { $setOnInsert: expect.objectContaining({ requesters: prev.requesters }) },
-      { upsert: true }
+      { upsert: true, new: false, includeResultMetadata: true }
     );
     // The lift is scoped to the caller's own skip, like the somm_price delete.
     expect(PriceTrackingSkip.deleteOne).toHaveBeenCalledWith({ wineDefinition: WINE_ID, vintage: '2019', skippedBy: ME });
@@ -1695,12 +1719,12 @@ describe('propose_wine_correction', () => {
     return w;
   };
 
-  // --- self-apply (2026-08-21) ---------------------------------------------
+  // --- self-apply ---------------------------------------------
   // The tool's job here is ROUTING: ask the classifier, and either apply
   // through the admin route's own approveProposal or leave the row pending.
   describe('self-apply', () => {
     const { classifyProposal } = require('../services/proposalDirectApply');
-    const { approveProposal } = require('../routes/admin/wineProposals');
+    const { approveProposal } = require('../services/wineProposalDecisionOps');
 
     test('a blank-fill correction applies on filing and reports it as applied', async () => {
       mkWine({ appellation: null });
@@ -1719,7 +1743,7 @@ describe('propose_wine_correction', () => {
       expect(body.summary).toMatch(/^Applied to/);
       // Applied through the ONE write path, with the proposal id — not a
       // second implementation that could drift from canonicalization.
-      expect(approveProposal).toHaveBeenCalledWith('prop-2', expect.anything());
+      expect(approveProposal).toHaveBeenCalledWith('prop-2', expect.anything(), { onlyFields: ['appellation', 'region'] });
       // The row is still written first: review-after, not no-review.
       expect(WineCorrectionProposal.create).toHaveBeenCalled();
     });
@@ -1822,7 +1846,7 @@ describe('propose_wine_correction', () => {
     });
   });
 
-  // Audit 2026-09-19: the somm path had no type check at filing, so an admin
+  // The somm path had no type check at filing, so an admin
   // could "approve" a colour that the apply step then skipped.
   test('a colour on a wine the proposal leaves red/white/rosé is refused at filing; with the type it files', async () => {
     mkWine({ type: 'red' });
@@ -1909,11 +1933,11 @@ describe('propose_wine_correction', () => {
     expect(created.currentSnapshot).toEqual({
       producer: 'Pira', name: 'Barolo', appellation: 'Barolo',
       region: 'Piedmont', country: 'Italy', classification: 'DOCG',
-      // Both proposable since 2026-08-19, so both must ride in the snapshot —
+      // Both are proposable, so both must ride in the snapshot —
       // the admin drift check compares against it field by field.
       type: null, grapes: null,
-      // Proposable since 2026-09-19 (colour of a sparkling/dessert/fortified wine).
-      colour: null,
+      // Proposable too: the colour of a sparkling/dessert/fortified wine, and the sweetness style.
+      colour: null, sweetnessStyle: null,
     });
 
     const row = McpActionLog.create.mock.calls[0][0];
@@ -1923,9 +1947,9 @@ describe('propose_wine_correction', () => {
       expect.anything(), expect.objectContaining({ kind: 'field_correction', via: 'mcp' }));
   });
 
-  // Somm ticket 6a85ad44: type and grapes were the only identity fields with
-  // no route through this pipeline, so a curator who spotted a red stored on
-  // nothing but white grapes had to hand it to an admin.
+  // Type and grapes have a route through this pipeline like the other
+  // identity fields, so a curator who spots a red stored on nothing but
+  // white grapes need not hand it to an admin.
   describe('type and grapes', () => {
     test('files a type correction', async () => {
       mkWine({ type: 'red' });
@@ -2255,11 +2279,11 @@ describe('respond_to_wine_report', () => {
   });
 });
 
-// Somm ticket 6a887619: grapes were the ONE identity field the queue row hid,
-// so creation-time grapes surfacing on a later get_wine read as "populated by
-// an unidentified path during curation" — four instances filed before the
-// cause was found. The rule under test: emit names honestly, or omit the key.
-describe('wineLite carries grapes honestly (ticket 6a887619)', () => {
+// Grapes must not be the one identity field the queue row hides: then
+// creation-time grapes surfacing on a later get_wine read as "populated by
+// an unidentified path during curation". The rule under test: emit names
+// honestly, or omit the key.
+describe('wineLite carries grapes honestly', () => {
   const listQueue = async (wineDefinition) => {
     WineVintageProfile.countDocuments.mockResolvedValueOnce(1).mockResolvedValueOnce(1);
     WineVintageProfile.find.mockReturnValue(chain([{
@@ -2297,12 +2321,12 @@ describe('wineLite carries grapes honestly (ticket 6a887619)', () => {
 });
 
 
-// Somm ticket 6a944e46: remove_from_maturity_queue refused reviewed rows and
-// told the caller to "reset it to pending first" — and no tool could. A window
-// written in error (an en primeur 2025 Bordeaux; a "2015" on a non-vintage
-// tawny) was stuck: reviewed, all phases cleared, never re-queued, never
-// removable. This is the missing verb.
-describe('reset_maturity_row (6a944e46)', () => {
+// remove_from_maturity_queue refuses reviewed rows and tells the caller to
+// "reset it to pending first" — this is the verb that does it. Without it a
+// window written in error (an en primeur Bordeaux; a vintage on a
+// non-vintage tawny) is stuck: reviewed, all phases cleared, never
+// re-queued, never removable.
+describe('reset_maturity_row', () => {
   const reviewed = (over = {}) => ({
     _id: oid('a1'), vintage: '2025', status: 'reviewed', relative: false,
     earlyFrom: 2030, earlyUntil: 2033, peakFrom: 2034, peakUntil: 2045, lateFrom: 2046, lateUntil: 2055,
@@ -2370,7 +2394,7 @@ describe('reset_maturity_row (6a944e46)', () => {
   });
 });
 
-describe('list_maturity_queue unprofiled (audit ticket 2026-09-06)', () => {
+describe('list_maturity_queue unprofiled', () => {
   test('narrows to rows whose wine has no profile text, keeping the status filter', async () => {
     WineDefinition.find.mockReturnValue({ select: () => ({ lean: async () => [{ _id: oid('a') }, { _id: oid('b') }] }) });
     WineVintageProfile.countDocuments.mockResolvedValue(0);
@@ -2392,11 +2416,11 @@ describe('list_maturity_queue unprofiled (audit ticket 2026-09-06)', () => {
   });
 });
 
-// Somm ticket 6a9e9a2f (2026-09-07): three queue gaps found in one run — a
-// downgrade rule the filter enum could not name, a user-minted "Cherry" grape
-// turning every tasting note into a false variety claim, and a colour check
-// whose zero hid the varieties it never evaluated.
-describe('sommelier queue gaps (somm 6a9e9a2f)', () => {
+// Three queue gaps closed together: a downgrade rule the filter enum must be
+// able to name, a user-minted "Cherry" grape that would turn every tasting
+// note into a false variety claim, and a colour check whose zero must not
+// hide the varieties it never evaluated.
+describe('sommelier queue gaps', () => {
   const { DOWNGRADE_RULES } = require('../utils/producerSuspectCheck');
 
   beforeEach(() => { jest.clearAllMocks(); });

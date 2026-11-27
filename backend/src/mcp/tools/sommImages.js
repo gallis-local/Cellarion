@@ -1,8 +1,7 @@
 // Sommelier MCP tools for the PHOTO REVIEW queue (list_image_queue /
 // review_image): the photos members upload on their bottles wait for a curator
 // before they join the wine's public gallery, and reported photos wait for an
-// answer. Until now only an admin could work this queue, on the web; a curator
-// routine can now do it from the connector.
+// answer. A curator works this queue from the connector, an admin on the web.
 //
 // Role gating is STRUCTURAL (requireRole, same as tools/somm.js) with a re-check
 // inside each handler. The REST twin, /api/admin/images, stays admin-only: that
@@ -20,8 +19,8 @@
 //   - the uploader is never named: a pseudonymous uploader_ref groups one
 //     person's photos, and nothing else about them crosses this surface;
 //   - every read leaves an audit row naming the image ids (never the bytes),
-//     like the curation reads of label scans (audit 2026-09 M03-4);
-//   - label scans are never listed (private curation evidence, audit L-6), and
+//     like the curation reads of label scans;
+//   - label scans are never listed (private curation evidence), and
 //     photos with no bottle and no wine — uploads abandoned before the bottle
 //     was saved — are left to the 30-day sweep (services/scanImageRetentionJob).
 const crypto = require('crypto');
@@ -31,7 +30,7 @@ const BottleImage = require('../../models/BottleImage');
 const Bottle = require('../../models/Bottle');
 const WineDefinition = require('../../models/WineDefinition');
 const { registerTool } = require('../registry');
-const { ok, fail, objectId } = require('../toolUtil');
+const { ok, fail, objectId, SOMM_ROLES, requireSomm } = require('../toolUtil');
 const { logAction } = require('../actionLedger');
 const { logAudit } = require('../../services/audit');
 const { renderImage } = require('../../services/photoBytes');
@@ -45,7 +44,6 @@ const {
   dismissImageReport,
 } = require('../../services/imageModerationOps');
 
-const SOMM_ROLES = ['somm', 'admin'];
 const PAGE_MAX = 8;
 const IMAGE_MAX_EDGE = 1024;
 const IMAGE_TOTAL_CAP_BYTES = 4 * 1024 * 1024;
@@ -60,13 +58,6 @@ const PENDING_FILTER = {
 };
 const ORPHAN_FILTER = { kind: NOT_SCAN, status: 'processed', bottle: null, wineDefinition: null };
 const REPORTED_FILTER = { kind: NOT_SCAN, reportedAt: { $ne: null }, status: { $ne: 'rejected' } };
-
-function requireSomm(ctx) {
-  const roles = ctx.user?.roles || [];
-  return SOMM_ROLES.some((r) => roles.includes(r))
-    ? null
-    : fail('forbidden_scope', 'This tool needs the sommelier (or admin) role.');
-}
 
 // Stable across calls, so "the same person uploaded these" survives paging;
 // not a user id, and nothing on this surface maps it back to one.
@@ -387,4 +378,4 @@ registerTool({
   },
 });
 
-module.exports = { uploaderRef, reviewState };
+module.exports = { uploaderRef };

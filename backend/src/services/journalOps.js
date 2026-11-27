@@ -38,8 +38,8 @@ function sanitizeEntry(body) {
     const m = parseInt(mood, 10);
     if (Number.isInteger(m) && m >= 1 && m <= 5) clean.mood = m;
     else {
-      // Reject instead of silently nulling — a PUT with mood: 7 used to
-      // erase the stored value without any indication.
+      // Reject instead of silently nulling — a PUT with mood: 7 would
+      // otherwise erase the stored value without any indication.
       const err = new Error('Mood must be a whole number between 1 and 5');
       err.status = 400;
       throw err;
@@ -75,7 +75,7 @@ function sanitizeEntry(body) {
 
 /**
  * Ownership/existence validation for the references sanitizeEntry accepted by
- * shape alone (audit L-5). Mirrors sanitizeEntry's style: invalid references
+ * shape alone. Mirrors sanitizeEntry's style: invalid references
  * are silently dropped (nulled), never a hard 400 — exactly like a malformed
  * ObjectId already is.
  *
@@ -171,6 +171,37 @@ async function createEntry(userId, body, req, opts = {}) {
 }
 
 /**
+ * Update one of the user's entries (owner-scoped): sanitise → validate refs →
+ * save → audit. A date that is sent must be a real one, as on create; a field
+ * that is not sent keeps what is stored. Called by PUT /api/journal/:id; no
+ * MCP tool edits an entry. Returns { entry } (the saved doc), { notFound: true }
+ * or { error: { status, message } }.
+ */
+async function updateEntry(userId, entryId, body, req, opts = {}) {
+  if (!isValidId(String(entryId))) return { error: { status: 400, message: 'Invalid ID' } };
+  const entry = await JournalEntry.findOne({ _id: entryId, user: userId });
+  if (!entry) return { notFound: true };
+
+  let clean;
+  try {
+    clean = sanitizeEntry(body);
+  } catch (err) {
+    if (err.status === 400) return { error: { status: 400, message: err.message } };
+    throw err;
+  }
+  if (clean.date !== undefined && isNaN(clean.date.getTime())) {
+    return { error: { status: 400, message: 'Valid date is required' } };
+  }
+
+  await validatePairingRefs(clean, userId);
+  Object.assign(entry, clean);
+  await entry.save();
+
+  logAudit(req, 'journal.update', { type: 'journal', id: entry._id }, opts.auditMeta);
+  return { entry };
+}
+
+/**
  * Delete one of the user's entries (owner-scoped) with the audit row. Returns
  * { deleted: boolean, entry? }. Shared by the REST DELETE route and the MCP
  * tasting-note undo, so a reversal is audited exactly like a manual deletion.
@@ -184,6 +215,6 @@ async function deleteEntry(userId, entryId, req, opts = {}) {
 }
 
 module.exports = {
-  sanitizeEntry, validatePairingRefs, createEntry, deleteEntry,
-  OCCASIONS, MAX_PAIRINGS, MAX_PEOPLE, MAX_PHOTOS,
+  sanitizeEntry, validatePairingRefs, createEntry, updateEntry, deleteEntry,
+  OCCASIONS, MAX_PAIRINGS, MAX_PEOPLE,
 };

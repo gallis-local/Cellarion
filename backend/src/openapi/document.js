@@ -31,12 +31,24 @@ const DATE_TIME = { type: 'string', format: 'date-time' };
 const YEAR = { type: ['integer', 'null'], minimum: 1900, maximum: 2200 };
 const RATING_SCALE = { type: 'string', enum: ['5', '20', '100'], description: '"5" = stars, "20" = points out of 20, "100" = points out of 100.' };
 const WINE_TYPE = { type: ['string', 'null'], enum: ['red', 'white', 'rosé', 'sparkling', 'dessert', 'fortified', null] };
+// The sweetness category and what it rests on (services/sweetnessCategory
+// CATEGORIES and BASES; a test keeps the enums equal to them).
+const SWEETNESS_CATEGORY = {
+  type: ['string', 'null'],
+  enum: ['dry', 'off-dry', 'medium-sweet', 'sweet', null],
+  description: 'The sweetness the wine reads as, on one scale for still and sparkling wines. Null when the record states none (a Kabinett or Spätlese without a term is not guessed), and for a fortified wine or a drink that is not wine, which have no scale. Read from the record for every answer, never stored: the label\'s term (`labelSweetness`), else a sweetness word that ends the wine\'s name (anywhere in the name of a sparkling wine), else `sweetnessStyle`, else a tier that settles it (one that is sweet by law, such as Beerenauslese, Trockenbeerenauslese or Eiswein, is sweet; a Grosses Gewächs is dry), else the type `dessert`. The sparkling terms fold onto the four: brut nature, extra brut and brut are dry; extra dry and sec off-dry; demi-sec medium-sweet; doux sweet. Values may be added, never renamed or removed.',
+};
+const SWEETNESS_CATEGORY_BASIS = {
+  type: ['string', 'null'],
+  enum: ['label', 'name', 'style', 'tier', 'type', null],
+  description: 'What `sweetnessCategory` rests on: `label` (the label\'s term), `name` (a sweetness word in the wine\'s name), `style` (`sweetnessStyle`), `tier` (a tier the name or the classification states) or `type` (the type `dessert`). Null when `sweetnessCategory` is null. Values may be added, never renamed or removed.',
+};
 const MATURITY = {
   type: ['string', 'null'],
   enum: ['not-ready', 'early', 'peak', 'late', 'declining', null],
   description: 'Where the bottle is in its drink window today, or null when it has no window.',
 };
-const RACK_TYPE = { type: 'string', enum: ['grid', 'x-rack', 'hex', 'triangle', 'stack', 'cube', 'shelf', 'cabinet'] };
+const RACK_TYPE = { type: 'string', enum: ['grid', 'x-rack', 'hex', 'triangle', 'stack', 'cube', 'shelf', 'cabinet', 'wall'] };
 const CELLAR_ROLE = { type: 'string', enum: ['owner', 'editor', 'viewer'] };
 const BOTTLE_STATUS = {
   type: 'string',
@@ -71,6 +83,7 @@ const ID = {
   user: '66f0a1b2c3d4e5f6a7b8c901',
   cellar: '66f0a1b2c3d4e5f6a7b8c902',
   shared: '66f0a1b2c3d4e5f6a7b8c903',
+  cellar2: '66f0a1b2c3d4e5f6a7b8c90d',
   rack: '66f0a1b2c3d4e5f6a7b8c904',
   wine: '66f0a1b2c3d4e5f6a7b8c905',
   bottle: '66f0a1b2c3d4e5f6a7b8c906',
@@ -94,6 +107,8 @@ const exampleWineSummary = {
   region: { _id: ID.region, name: 'Pauillac' },
   appellation: 'Pauillac',
   classification: null,
+  sweetnessCategory: null,
+  sweetnessCategoryBasis: null,
   grapes: [{ _id: ID.grape, name: 'Cabernet Sauvignon', displayName: 'Cabernet Sauvignon' }],
   image: PHOTO,
 };
@@ -124,6 +139,15 @@ const exampleBottle = {
   otherVintageImageUrl: null,
 };
 
+// The list and detail answers add the image fields; a write answer has none.
+const withoutImageUrls = ({ defaultImageUrl, vintageImageUrl, pendingImageUrl, otherVintageImageUrl, ...bottle }) => bottle;
+
+const exampleRack = {
+  _id: ID.rack, cellar: ID.cellar, name: 'Wine fridge', group: null, type: 'cabinet', rows: 2, cols: 3,
+  typeConfig: { shelfRows: [1, 1] }, isModular: false, slots: [{ position: 5, bottle: ID.bottle }],
+  createdAt: '2025-01-02T10:00:00.000Z', updatedAt: '2025-01-02T10:00:00.000Z',
+};
+
 // ── Schemas ────────────────────────────────────────────────────────────────
 const schemas = {
   Error: {
@@ -132,7 +156,7 @@ const schemas = {
     required: ['error'],
     properties: {
       error: { type: 'string' },
-      code: { type: 'string', description: 'Present on some errors, e.g. `state_changed` on a consume with `ifActive`.' },
+      code: { type: 'string', description: 'Present on some errors, e.g. `state_changed` on a consume with `ifActive`, or `slot_changed` when a rack slot holds something other than you expected.' },
     },
   },
   Health: {
@@ -153,7 +177,7 @@ const schemas = {
   // Inventory
   Inventory: {
     type: 'object',
-    description: 'Every bottle still in the caller\'s cellars and in the cellars shared with them. Drunk, gifted, sold and on-order bottles are left out. Each wine appears once in `wines`; bottles reference it by id.',
+    description: 'Every bottle still in the caller\'s cellars and in the cellars shared with them. Drunk, gifted and sold bottles are left out unless asked for with `include=consumed`; on-order bottles are always left out. Each wine appears once in `wines`; bottles reference it by id.',
     required: ['schema', 'generatedAt', 'cellars', 'racks', 'wines', 'bottles'],
     properties: {
       schema: { type: 'integer', const: 1, description: 'The shape version of this document. It changes only with a breaking change, announced as described under Stability.' },
@@ -162,6 +186,11 @@ const schemas = {
       racks: { type: 'array', items: ref('InventoryRack') },
       wines: { type: 'object', additionalProperties: ref('InventoryWine'), description: 'Keyed by wine id.' },
       bottles: { type: 'array', items: ref('InventoryBottle') },
+      consumedTotal: { type: 'integer', minimum: 0, description: 'Only with `include=consumed`: how many bottles have left the cellars in total.' },
+      consumedTruncated: {
+        type: 'boolean',
+        description: 'Only with `include=consumed`: true when the answer holds fewer of those bottles than `consumedTotal`. They come newest finished first, up to a limit (10,000 today). The limit may change: read this flag rather than counting on the number.',
+      },
     },
   },
   InventoryCellar: {
@@ -176,22 +205,53 @@ const schemas = {
   },
   InventoryWine: {
     type: 'object',
-    required: ['name', 'producer', 'type', 'colour', 'country', 'region', 'appellation', 'classification', 'grapes', 'image', 'profile'],
+    required: ['name', 'displayName', 'producer', 'type', 'colour', 'country', 'region', 'appellation', 'classification', 'labelSweetness', 'sweetnessCategory', 'sweetnessCategoryBasis', 'grapes', 'image', 'profile'],
     properties: {
       name: { type: ['string', 'null'] },
+      displayName: { type: ['string', 'null'], description: 'The name as the label reads it: `name` followed by the label sweetness term when the wine has one ("Riesling Kabinett Trocken"). What to print when one line must carry the whole identity.' },
       producer: { type: ['string', 'null'] },
       type: WINE_TYPE,
+      category: { type: 'string', enum: ['wine', 'other'], description: '"other" for a drink that is not wine (cider, beer, spirits), kept in the cellar outside the shared wine registry; its type is then null.' },
       colour: { ...WINE_TYPE, description: 'The colour of a sparkling, dessert or fortified wine (e.g. a sparkling rosé), or null.' },
       country: { type: ['string', 'null'] },
       region: { type: ['string', 'null'] },
       appellation: { type: ['string', 'null'] },
       classification: { type: ['string', 'null'] },
+      classifications: { type: 'array', items: { type: 'object', required: ['name', 'kind'], properties: { name: { type: 'string' }, kind: { type: 'string', enum: ['vineyard_rank', 'ripeness', 'ageing', 'other'] } } }, description: 'The classification as curated taxonomy rows, each with its kind (vineyard rank, ripeness tier, ageing tier, other); `classification` is the same, joined into one string.' },
+      labelSweetness: {
+        oneOf: [{ type: 'null' }, {
+          type: 'object', required: ['name', 'band', 'scale', 'regulated'],
+          properties: {
+            name: { type: 'string', description: 'The term as the label prints it (trocken, Brut Nature, amabile).' },
+            band: { type: 'string', enum: ['dry', 'off-dry', 'medium-sweet', 'sweet', 'brut-nature', 'extra-brut', 'brut', 'extra-dry', 'sec', 'demi-sec', 'doux'], description: 'The term\'s place on one shared ladder: the four still-wine bands, or the seven sparkling (dosage) bands. Values may be added, never renamed or removed.' },
+            scale: { type: 'string', enum: ['still', 'sparkling'], description: 'Values may be added, never renamed or removed.' },
+            regulated: { type: 'boolean', description: 'True for a term with a legal definition (EU 2019/33); false for a customary word such as feinherb.' },
+          },
+        }],
+        description: 'The sweetness the LABEL states, as a curated term with its band, or null when the label states none. On a bottle this is the term for the bottle\'s vintage where one is published, otherwise the wine\'s. A different thing from `profile.sweetness`, the tasting estimate.',
+      },
+      sweetnessStyle: { oneOf: [{ type: 'null' }, ref('SweetnessStyle')], description: 'The sweetness term the wine is known by when its label states none, named by the producer or the trade. Null when the wine has none, including a wine recorded before the field existed. Absent when this server cannot vouch for the style (its term row was removed, or a stored source or link fails the rules): never null for that. Descriptive, not part of the wine\'s identity.' },
+      sweetnessCategory: SWEETNESS_CATEGORY,
+      sweetnessCategoryBasis: SWEETNESS_CATEGORY_BASIS,
       grapes: { type: 'array', items: { type: 'string' }, description: 'Display names, as on the label.' },
       image: { type: ['string', 'null'], description: 'A thumbnail path on this server (see Images), or null.' },
       profile: {
         oneOf: [{ type: 'null' }, ref('TastingProfile')],
         description: 'The stored tasting descriptors, or null when the wine has none.',
       },
+    },
+  },
+  SweetnessStyle: {
+    type: 'object',
+    description: 'The sweetness term the wine is known by when its label states none, named by the producer or the trade; descriptive, not part of the wine\'s identity. When the label states a term, `labelSweetness` carries it and wins.',
+    required: ['name', 'band', 'scale', 'regulated', 'source', 'sourceUrl'],
+    properties: {
+      name: { type: 'string', description: 'The term as the source names it (feinherb, fruchtsüß).' },
+      band: { type: 'string', enum: ['dry', 'off-dry', 'medium-sweet', 'sweet', 'brut-nature', 'extra-brut', 'brut', 'extra-dry', 'sec', 'demi-sec', 'doux'], description: 'The term\'s place on the shared ladder, as for `labelSweetness`. Values may be added, never renamed or removed.' },
+      scale: { type: 'string', enum: ['still', 'sparkling'], description: 'Values may be added, never renamed or removed.' },
+      regulated: { type: 'boolean', description: 'True for a term with a legal definition (EU 2019/33), which only the producer names as a style; false for a customary word such as feinherb.' },
+      source: { type: 'string', enum: ['producer', 'trade'], description: 'Who names the term: the producer (its own wording) or the trade (a merchant, a critic, a wine database). Values may be added, never renamed or removed.' },
+      sourceUrl: { type: 'string', format: 'uri', description: 'The page that names the term for this wine.' },
     },
   },
   TastingProfile: {
@@ -208,8 +268,8 @@ const schemas = {
   },
   InventoryBottle: {
     type: 'object',
-    required: ['id', 'wine', 'pending', 'cellar', 'vintage', 'size', 'price', 'currency', 'rating', 'ratingScale', 'notes',
-      'purchaseDate', 'purchaseLocation', 'addedAt', 'opened', 'maturity', 'window', 'location', 'place', 'image', 'personal'],
+    required: ['id', 'wine', 'pending', 'cellar', 'status', 'vintage', 'size', 'price', 'currency', 'rating', 'ratingScale', 'notes',
+      'purchaseDate', 'purchaseLocation', 'addedAt', 'opened', 'consumed', 'maturity', 'window', 'location', 'place', 'image', 'personal'],
     properties: {
       id: OBJECT_ID,
       wine: { ...NULL_ID, description: 'A key of `wines`, or null while the bottle waits on a wine request.' },
@@ -219,6 +279,11 @@ const schemas = {
         properties: { name: { type: ['string', 'null'] }, producer: { type: ['string', 'null'] } },
       },
       cellar: OBJECT_ID,
+      status: {
+        type: 'string',
+        enum: ['active', 'drank', 'gifted', 'sold', 'other'],
+        description: '`active` while the bottle is in the cellar; otherwise how it left (only with `include=consumed`).',
+      },
       vintage: { type: ['string', 'null'], examples: ['2015', 'NV'] },
       size: { type: ['string', 'null'], examples: ['750ml', '1500ml'] },
       price: { type: ['number', 'null'] },
@@ -230,12 +295,27 @@ const schemas = {
       purchaseLocation: { type: ['string', 'null'] },
       addedAt: { type: ['string', 'null'], format: 'date-time' },
       opened: { type: 'boolean', description: 'True while the bottle is open (some glasses poured).' },
-      maturity: MATURITY,
+      consumed: {
+        oneOf: [{ type: 'null' }, ref('InventoryConsumption')],
+        description: 'When and how the bottle was finished, or null while it is in the cellar.',
+      },
+      maturity: { ...MATURITY, description: 'Where the bottle is in its drink window today, or null when it has no window or has left the cellar.' },
       window: ref('DrinkWindow'),
       location: { oneOf: [{ type: 'null' }, ref('RackLocation')], description: 'The rack slot holding the bottle, or null when it is in no rack.' },
       place: { type: ['string', 'null'], description: 'The bottle\'s free-text location ("Basement, box 3").' },
       image: { type: ['string', 'null'], description: 'The bottle card\'s picture as a thumbnail path on this server, or null.' },
       personal: { type: 'array', items: ref('PersonalEntry') },
+    },
+  },
+  InventoryConsumption: {
+    type: 'object',
+    description: 'A bottle that left the cellar. How it left is the bottle\'s `status`.',
+    required: ['at', 'rating', 'ratingScale', 'note'],
+    properties: {
+      at: { type: ['string', 'null'], format: 'date-time', description: 'When it was drunk, given away or sold (the user may set an earlier day).' },
+      rating: { type: ['number', 'null'], description: 'The rating given when it was finished. The bottle\'s own `rating` is the one given before.' },
+      ratingScale: { ...nullable(RATING_SCALE), enum: ['5', '20', '100', null], description: 'Set only beside a rating.' },
+      note: { type: ['string', 'null'], description: 'The note written when it was finished.' },
     },
   },
   DrinkWindow: {
@@ -303,8 +383,25 @@ const schemas = {
       region: { oneOf: [{ type: 'null' }, ref('NamedRef')] },
       appellation: { type: ['string', 'null'] },
       classification: { type: ['string', 'null'] },
+      classifications: { type: 'array', items: { type: 'object', required: ['name', 'kind'], properties: { name: { type: 'string' }, kind: { type: 'string', enum: ['vineyard_rank', 'ripeness', 'ageing', 'other'] } } }, description: 'The classification as curated taxonomy rows, each with its kind (vineyard rank, ripeness tier, ageing tier, other); `classification` is the same, joined into one string.' },
+      labelSweetness: {
+        oneOf: [{ type: 'null' }, {
+          type: 'object', required: ['name', 'band', 'scale', 'regulated'],
+          properties: {
+            name: { type: 'string', description: 'The term as the label prints it (trocken, Brut Nature, amabile).' },
+            band: { type: 'string', enum: ['dry', 'off-dry', 'medium-sweet', 'sweet', 'brut-nature', 'extra-brut', 'brut', 'extra-dry', 'sec', 'demi-sec', 'doux'], description: 'The term\'s place on one shared ladder: the four still-wine bands, or the seven sparkling (dosage) bands. Values may be added, never renamed or removed.' },
+            scale: { type: 'string', enum: ['still', 'sparkling'], description: 'Values may be added, never renamed or removed.' },
+            regulated: { type: 'boolean', description: 'True for a term with a legal definition (EU 2019/33); false for a customary word such as feinherb.' },
+          },
+        }],
+        description: 'The sweetness the LABEL states, as a curated term with its band, or null when the label states none. On a bottle this is the term for the bottle\'s vintage where one is published, otherwise the wine\'s. A different thing from the tasting profile\'s sweetness estimate.',
+      },
+      sweetnessStyle: { oneOf: [{ type: 'null' }, ref('SweetnessStyle')], description: 'The sweetness term the wine is known by when its label states none, named by the producer or the trade. Null when the wine has none, including a wine recorded before the field existed. Absent when this server cannot vouch for the style (its term row was removed, or a stored source or link fails the rules): never null for that. Descriptive, not part of the wine\'s identity.' },
+      sweetnessCategory: { ...SWEETNESS_CATEGORY, description: `${SWEETNESS_CATEGORY.description} Sent on the bottle list and the bottle read; the answer to a write carries no such key.` },
+      sweetnessCategoryBasis: SWEETNESS_CATEGORY_BASIS,
       grapes: { type: 'array', items: ref('Grape') },
       image: { type: ['string', 'null'], description: 'The registry image URL, or null.' },
+      nonWine: { type: 'boolean', description: 'True for a drink that is not wine (cider, beer, spirits): the Other category, kept in the holder\'s cellar outside the shared wine registry; its type is then null.' },
     },
   },
   NamedRef: {
@@ -330,7 +427,7 @@ const schemas = {
       cellar: OBJECT_ID,
       wineDefinition: {
         oneOf: [{ type: 'null' }, OBJECT_ID, ref('WineSummary')],
-        description: 'The wine: an object in lists and the bottle detail, its id alone in the consume answer; null while the bottle waits on a wine request.',
+        description: 'The wine: an object in lists and the bottle detail, its id alone in the consume and move answers; null while the bottle waits on a wine request.',
       },
       pendingWineRequest: {
         description: 'The wine request the bottle waits on, when it has no wine yet.',
@@ -417,9 +514,9 @@ const schemas = {
       name: { type: 'string' },
       group: { type: ['string', 'null'], description: 'A user-named group, such as a room or an appliance.' },
       type: RACK_TYPE,
-      rows: { type: 'integer', minimum: 1, description: 'Cabinets: the number of shelves.' },
-      cols: { type: 'integer', minimum: 1 },
-      typeConfig: { type: 'object', description: 'Type-specific geometry (shelf rows, two-deep, …). Read `GET /api/inventory` for shelf/row/col instead of computing them.' },
+      rows: { type: 'integer', minimum: 1, description: 'Cabinets: the number of shelves. Walls: how many cells high the wall is.' },
+      cols: { type: 'integer', minimum: 1, description: 'Walls: how many cells wide the wall is.' },
+      typeConfig: { type: 'object', description: 'Type-specific geometry (shelf rows, two-deep, a wall\'s `boxes`, …). Read `GET /api/inventory` for shelf/row/col instead of computing them.' },
       isModular: { type: 'boolean' },
       slots: {
         type: 'array',
@@ -577,6 +674,45 @@ const schemas = {
     properties: { bottle: ref('Bottle') },
   },
 
+  // Moving
+  MoveRequest: {
+    type: 'object',
+    required: ['toCellarId'],
+    properties: { toCellarId: { ...OBJECT_ID, description: 'The cellar to move the bottle to. You must own it or be its editor.' } },
+  },
+  MoveResponse: {
+    type: 'object',
+    required: ['bottle'],
+    properties: { bottle: ref('Bottle') },
+  },
+  PlaceRequest: {
+    type: 'object',
+    required: ['bottleId'],
+    properties: {
+      bottleId: { ...OBJECT_ID, description: 'The bottle to put in the slot.' },
+      expectOccupant: {
+        ...NULL_ID,
+        description: 'What you believe is in the slot now: `null` for an empty slot, or the id of the bottle there. A slot that holds something else answers 409 `slot_changed` and nothing changes. Leave it out to place the bottle whatever is there.',
+      },
+    },
+  },
+  PlaceResponse: {
+    type: 'object',
+    required: ['rack', 'displaced'],
+    properties: {
+      rack: ref('RackSummary'),
+      displaced: { ...NULL_ID, description: 'The bottle that was in the slot and is now in no rack, or null when the slot was free.' },
+    },
+  },
+  UnplaceResponse: {
+    type: 'object',
+    required: ['rack', 'removed'],
+    properties: {
+      rack: ref('RackSummary'),
+      removed: { ...NULL_ID, description: 'The bottle that was taken out of the slot, or null when the slot was already empty.' },
+    },
+  },
+
   // Climate
   ClimateIngestRequest: {
     type: 'object',
@@ -592,7 +728,8 @@ const schemas = {
           properties: {
             channel: { type: 'string', pattern: '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$', description: 'Your name for the sensor, e.g. `fridge`.' },
             type: { type: 'string', enum: ['temperature', 'humidity'] },
-            value: { type: 'number', description: '°C, or % relative humidity.' },
+            value: { type: 'number', description: '°C (or °F when `unit` is F), or % relative humidity.' },
+            unit: { type: 'string', enum: ['C', 'F'], description: 'Unit of a temperature value. Omitted means °C; a °F value is converted on arrival and stored in °C. Any other value rejects the reading with `invalid_unit`.' },
             ts: { type: 'string', format: 'date-time', description: 'When it was measured, if not now.' },
           },
         },
@@ -632,17 +769,18 @@ const examples = {
     racks: [{ id: ID.rack, cellar: ID.cellar, name: 'Wine fridge' }],
     wines: {
       [ID.wine]: {
-        name: 'Château Exemple', producer: 'Château Exemple', type: 'red', colour: null,
-        country: 'France', region: 'Pauillac', appellation: 'Pauillac', classification: null,
+        name: 'Château Exemple', displayName: 'Château Exemple', producer: 'Château Exemple', type: 'red', colour: null,
+        country: 'France', region: 'Pauillac', appellation: 'Pauillac', classification: null, labelSweetness: null, sweetnessStyle: null,
+        sweetnessCategory: null, sweetnessCategoryBasis: null,
         grapes: ['Cabernet Sauvignon', 'Merlot'], image: THUMB,
         profile: { body: 'full', acidity: 'medium', sweetness: 'dry', tannin: 'high', flavors: ['blackcurrant', 'cedar'], foodPairings: ['lamb'] },
       },
     },
     bottles: [{
-      id: ID.bottle, wine: ID.wine, pending: null, cellar: ID.cellar,
+      id: ID.bottle, wine: ID.wine, pending: null, cellar: ID.cellar, status: 'active',
       vintage: '2015', size: '750ml', price: 350, currency: 'SEK', rating: 92, ratingScale: '100',
       notes: 'For a birthday', purchaseDate: '2024-05-01', purchaseLocation: 'Wine shop',
-      addedAt: '2025-01-02T10:00:00.000Z', opened: false, maturity: 'peak',
+      addedAt: '2025-01-02T10:00:00.000Z', opened: false, consumed: null, maturity: 'peak',
       window: { drinkFrom: 2022, peakFrom: 2025, peakUntil: 2032, drinkTo: 2038 },
       location: { rack: ID.rack, rackName: 'Wine fridge', position: 5, shelf: 2, row: 1, col: 2 },
       place: null, image: THUMB,
@@ -664,9 +802,19 @@ const paths = {
         'Send the `ETag` of the copy you hold as `If-None-Match`. When nothing changed you get `304` with no body. The tag moves when any of the data changes, and at least every 30 minutes.',
         '',
         'Limited to 60 requests per user per 10 minutes, 304s included. Poll every few minutes, or refetch when the event stream says something changed.',
+        '',
+        'Add `include=consumed` to get the drunk, gifted and sold bottles too, in the same shape: their `status` says how they left and `consumed` holds when, the rating and the note. They come newest finished first, up to a limit (10,000 today); `consumedTotal` says how many there are and `consumedTruncated` whether some were left out. Without it the answer is unchanged. Each `include` has its own `ETag`.',
       ].join('\n'),
       security: scope('read'),
-      parameters: [{ $ref: '#/components/parameters/IfNoneMatch' }],
+      parameters: [
+        { $ref: '#/components/parameters/IfNoneMatch' },
+        {
+          name: 'include',
+          in: 'query',
+          schema: { type: 'string', enum: ['consumed'] },
+          description: '`consumed` = also the bottles that left the cellar (drunk, gifted, sold, other), newest finished first, up to a limit; see `consumedTruncated`. Any other value answers `400`.',
+        },
+      ],
       responses: {
         200: ok('The inventory.', ref('Inventory'), examples.inventory, {
           ETag: { $ref: '#/components/headers/ETag' },
@@ -676,7 +824,7 @@ const paths = {
           description: 'Nothing changed since that ETag. No body.',
           headers: { ETag: { $ref: '#/components/headers/ETag' }, ...rateLimitHeaders },
         },
-        ...errors(401, 403, 429),
+        ...errors(400, 401, 403, 429),
       },
     },
   },
@@ -688,7 +836,7 @@ const paths = {
       description: [
         'A long-lived `text/event-stream` (Server-Sent Events). It says *that* something changed, not what: refetch what you show (for example `GET /api/inventory` with its ETag).',
         '',
-        'On connect: `retry: 5000`, then `event: ready`. Events: `stats_changed` (`data: {"reason": "…"}`), `notification` (`data: {"id": "…", "type": "…"}`) and `climate` (`data: {"device": "…"}`). Events are coalesced over about 2 seconds. A `: hb` comment arrives every 25 seconds; treat 90 seconds of silence as a lost connection and reconnect with backoff.',
+        'On connect: `retry: 5000`, then `event: ready`. Events: `stats_changed` (`data: {"reason": "…"}`) when bottles or cellars change, `racks_changed` (`data: {"reason": "…"}`) when a bottle is put in a rack slot, moved between slots or taken out of one, or a rack itself changes (a bottle that leaves its slot because it was drunk, deleted or moved to another cellar sends `stats_changed`), `notification` (`data: {"id": "…", "type": "…"}`) and `climate` (`data: {"device": "…"}`). Events are coalesced over about 2 seconds; while racks keep changing, `racks_changed` comes at most about twice a minute. A `: hb` comment arrives every 25 seconds; treat 90 seconds of silence as a lost connection and reconnect with backoff.',
         '',
         'A stream lasts at most 24 hours and closes when the token is revoked. At most 5 streams per user (429 beyond). New event names may appear; ignore the ones you don\'t know.',
       ].join('\n'),
@@ -748,6 +896,7 @@ const paths = {
         { name: 'search', in: 'query', schema: { type: 'string' }, description: 'Words that must all appear (accents ignored) in the wine name, producer, grapes, country, region, appellation, type, notes or location.' },
         { name: 'type', in: 'query', schema: { type: 'string' }, description: 'Wine type, e.g. `red`. Comma-separated for several.' },
         { name: 'vintage', in: 'query', schema: { type: 'string' }, description: 'One or more vintages, comma-separated.' },
+        { name: 'sweetnessCategory', in: 'query', schema: { type: 'string', examples: ['dry', 'off-dry,medium-sweet'] }, description: 'One or more of `dry`, `off-dry`, `medium-sweet`, `sweet`, comma-separated: the bottles whose wine reads as one of them (the wine\'s `sweetnessCategory`). `not-stated` finds the wines that could state one and do not. A fortified wine, a drink that is not wine and a bottle without a wine are found by none of them, and a value that names none of the five finds nothing.' },
         { name: 'sort', in: 'query', schema: { type: 'string', enum: ['createdAt', '-createdAt', 'vintage', '-vintage', 'price', '-price', 'rating', '-rating', 'name', '-name', 'maturity', '-maturity'], default: '-createdAt' }, description: 'A leading `-` sorts descending.' },
       ],
       responses: {
@@ -785,7 +934,25 @@ const paths = {
         content: json(ref('ConsumeRequest'), { reason: 'drank', rating: 4, consumedRatingScale: '5', note: 'With friends', ifActive: true }),
       },
       responses: {
-        200: ok('The bottle, now out of the cellar.', ref('ConsumeResponse'), { bottle: { ...exampleBottle, status: 'drank', consumedAt: '2026-10-22T19:30:00.000Z', consumedReason: 'drank' } }),
+        200: ok('The bottle, now out of the cellar.', ref('ConsumeResponse'), { bottle: { ...withoutImageUrls(exampleBottle), wineDefinition: ID.wine, status: 'drank', consumedAt: '2026-10-22T19:30:00.000Z', consumedReason: 'drank' } }),
+        ...errors(400, 401, 403, 404, 409, 429),
+      },
+    },
+  },
+  '/api/bottles/{bottleId}/move': {
+    post: {
+      operationId: 'moveBottle',
+      tags: ['Moving bottles'],
+      summary: 'Move a bottle to another cellar',
+      description: 'Moves a bottle that is in a cellar, or on order, to another cellar. Needs the `write` scope, and you must own or be an editor of both cellars. A bottle belongs to the owner of the cellar it is in, so a bottle moved into a cellar someone else owns becomes theirs. Everything recorded on the bottle is kept. It leaves its rack slot and arrives in no rack: place it with `PUT /api/racks/{rackId}/slots/{position}`.',
+      security: scope('write'),
+      parameters: [{ $ref: '#/components/parameters/BottleId' }],
+      requestBody: {
+        required: true,
+        content: json(ref('MoveRequest'), { toCellarId: ID.cellar2 }),
+      },
+      responses: {
+        200: ok('The bottle, now in the other cellar.', ref('MoveResponse'), { bottle: { ...withoutImageUrls(exampleBottle), wineDefinition: ID.wine, cellar: ID.cellar2 } }),
         ...errors(400, 401, 403, 404, 409, 429),
       },
     },
@@ -803,13 +970,52 @@ const paths = {
       ],
       responses: {
         200: ok('The racks.', ref('RackList'), {
-          racks: [{
-            _id: ID.rack, cellar: ID.cellar, name: 'Wine fridge', group: null, type: 'cabinet', rows: 2, cols: 3,
-            typeConfig: { shelfRows: [1, 1] }, isModular: false, slots: [{ position: 5, bottle: ID.bottle }],
-            createdAt: '2025-01-02T10:00:00.000Z', updatedAt: '2025-01-02T10:00:00.000Z',
-          }],
+          racks: [exampleRack],
         }),
         ...errors(400, 401, 403, 404),
+      },
+    },
+  },
+  '/api/racks/{rackId}/slots/{position}': {
+    put: {
+      operationId: 'placeBottle',
+      tags: ['Moving bottles'],
+      summary: 'Put a bottle in a rack slot',
+      description: [
+        'Places a bottle in a slot, or moves it there. A bottle sits in one slot at a time, so it leaves the slot it was in, in this rack or in another rack of the cellar. Needs the `write` scope and editor access to the cellar.',
+        '',
+        'The bottle must be in the rack\'s cellar and still in the cellar: one on order or already drunk answers 400. A bottle that is in the slot already is taken out of the rack, stays in the cellar and is named in `displaced`. Send `expectOccupant` to refuse that instead.',
+        '',
+        'Slot numbers are the `position` in `GET /api/racks` and in a bottle\'s `location` in `GET /api/inventory`.',
+      ].join('\n'),
+      security: scope('write'),
+      parameters: [{ $ref: '#/components/parameters/RackId' }, { $ref: '#/components/parameters/Position' }],
+      requestBody: {
+        required: true,
+        content: json(ref('PlaceRequest'), { bottleId: ID.bottle2, expectOccupant: null }),
+      },
+      responses: {
+        200: ok('The rack in summary form, and the bottle that had to leave the slot.', ref('PlaceResponse'), {
+          rack: { ...exampleRack, slots: [{ position: 2, bottle: ID.bottle2 }, { position: 5, bottle: ID.bottle }] },
+          displaced: null,
+        }),
+        ...errors(400, 401, 403, 404, 409, 429),
+      },
+    },
+    delete: {
+      operationId: 'unplaceBottle',
+      tags: ['Moving bottles'],
+      summary: 'Take a bottle out of a rack slot',
+      description: 'Empties the slot. The bottle stays in the cellar, in no rack. A slot that is already empty answers 200 with `removed: null`; a position the rack does not have answers 400. Needs the `write` scope and editor access to the cellar.',
+      security: scope('write'),
+      parameters: [
+        { $ref: '#/components/parameters/RackId' },
+        { $ref: '#/components/parameters/Position' },
+        { name: 'expect', in: 'query', schema: OBJECT_ID, description: 'The id of the bottle you believe is in the slot. A slot that holds another bottle, or none, answers 409 `slot_changed` and nothing changes.' },
+      ],
+      responses: {
+        200: ok('The rack in summary form, and the bottle that was taken out.', ref('UnplaceResponse'), { rack: { ...exampleRack, slots: [] }, removed: ID.bottle }),
+        ...errors(400, 401, 403, 404, 409, 429),
       },
     },
   },
@@ -972,7 +1178,7 @@ const components = {
         '- `read`: read your cellars, bottles, racks, personal fields, statistics and notifications, and the event stream.',
         '- `consume`: take bottles out of the cellar.',
         '- `climate`: post sensor readings (device tokens, made when you add a climate device).',
-        '- `write`: only for AI assistants over MCP; it opens no REST operation.',
+        '- `write`: move a bottle to another cellar, into a rack slot or out of one. It is the broadest scope: the same token also works over MCP, where it can add, edit and delete bottles, racks and cellars, change your profile and make a download link for your account export. Give it only to something you trust.',
         '',
         'A request the token\'s scopes don\'t cover answers 403. A revoked or unknown token answers 401.',
       ].join('\n'),
@@ -980,6 +1186,8 @@ const components = {
   },
   parameters: {
     BottleId: { name: 'bottleId', in: 'path', required: true, schema: OBJECT_ID },
+    RackId: { name: 'rackId', in: 'path', required: true, schema: OBJECT_ID },
+    Position: { name: 'position', in: 'path', required: true, schema: { type: 'integer', minimum: 1 }, description: 'The 1-based slot number.' },
     Limit: { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 200, default: 30 } },
     Offset: { name: 'offset', in: 'query', schema: { type: 'integer', minimum: 0, default: 0 }, description: 'Items to skip. `skip` is accepted as a synonym.' },
     IfNoneMatch: { name: 'If-None-Match', in: 'header', schema: { type: 'string' }, description: 'The `ETag` of the copy you hold, exactly as you received it.' },
@@ -996,11 +1204,11 @@ const components = {
     BadRequest: { description: 'The request is malformed, e.g. an invalid id or value.', content: json(ref('Error'), { error: 'Invalid ID' }) },
     Unauthorized: { description: 'No token, or the token is invalid or revoked. Ask the user for a new one; retrying will not help.', content: json(ref('Error'), { error: 'Invalid token' }) },
     Forbidden: {
-      description: 'The token lacks the scope this operation needs, or the caller lacks the role in that cellar. On a self-hosted server it can also mean the server is older than this operation.',
+      description: 'The token lacks the scope this operation needs, or the caller lacks the role in that cellar. A path that is not exactly a documented one, such as a malformed id, answers 403 too. On a self-hosted server it can also mean the server is older than this operation.',
       content: json(ref('Error'), { error: 'API token scope insufficient for this request' }),
     },
     NotFound: { description: 'No such resource visible to the caller, or a server older than this operation.', content: json(ref('Error'), { error: 'Bottle not found' }) },
-    Conflict: { description: 'The state moved on, e.g. the bottle already left the cellar (`code: state_changed`) or is still on order.', content: json(ref('Error'), { error: 'This bottle has already left the cellar', code: 'state_changed' }) },
+    Conflict: { description: 'The state moved on, e.g. the bottle already left the cellar (`code: state_changed`), is still on order, or a rack slot holds something other than you expected (`code: slot_changed`).', content: json(ref('Error'), { error: 'This bottle has already left the cellar', code: 'state_changed' }) },
     TooManyRequests: {
       description: 'Rate limited. Wait `Retry-After` seconds.',
       headers: { 'Retry-After': { $ref: '#/components/headers/RetryAfter' }, ...rateLimitHeaders },
@@ -1015,6 +1223,7 @@ const TAGS = [
   { name: 'Live updates', description: 'Know when to refetch, without polling.' },
   { name: 'Cellars and bottles', description: 'Cellars, filtered bottle lists, one bottle, racks.' },
   { name: 'Drinking', description: 'Take a bottle out of the cellar.' },
+  { name: 'Moving bottles', description: 'Move a bottle to another cellar, into a rack slot or out of one.' },
   { name: 'Statistics', description: 'Totals and drink-window counts for dashboards.' },
   { name: 'Notifications', description: 'Restock suggestions, drink-window reminders and other notices.' },
   { name: 'Climate sensors', description: 'Temperature and humidity from a sensor in your cellar.' },
@@ -1035,7 +1244,7 @@ function buildOpenApiDocument({ version, serverUrl = 'https://cellarion.app' } =
     info: {
       title: 'Cellarion API',
       version: version || '0.0.0',
-      summary: 'Read your cellar, take bottles out, post sensor readings.',
+      summary: 'Read your cellar, take bottles out, move them, post sensor readings.',
       description: guideMarkdown(serverUrl),
       termsOfService: `${serverUrl}/developers#section/Terms-of-use`,
       license: { name: 'AGPL-3.0', identifier: 'AGPL-3.0-only' },

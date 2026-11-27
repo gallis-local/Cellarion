@@ -2,7 +2,9 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
-import { getMaturityStatus, getPersonalWindowStatus, maturityBadgeText } from '../../utils/drinkStatus';
+import { getMaturityStatus, getPersonalWindowStatus, maturityBadgeText, personalWindowBadgeText } from '../../utils/drinkStatus';
+import { servingAdvice, servingText } from '../../utils/serving';
+import { temperatureUnitOf } from '../../utils/temperature';
 import { isReserved, reservationSummary } from '../../utils/reservation';
 import { bottleAnchorYear } from '../../utils/maturityUtils';
 import { convertAmountHistorical } from '../../utils/currency';
@@ -15,12 +17,20 @@ import WineRecordSection from './WineRecordSection';
 import CollapsibleBlock from '../CollapsibleBlock';
 import DraftWineBanner from './DraftWineBanner';
 import MaturityPhaseTable from './MaturityPhaseTable';
+import MaturityTimeline from './MaturityTimeline';
+import PersonalWindowTimeline from './PersonalWindowTimeline';
+import BetaBadge from '../BetaBadge';
+import { useFeature } from '../../utils/featureFlags';
 import PriceHistoryTimeline from './PriceHistoryTimeline';
 import PriceTrackingToggle from './PriceTrackingToggle';
+import { markNotWine } from '../../api/wines';
+import { formatVintage } from '../../utils/vintage';
+import { useContributionReviewed } from '../../utils/contributionReview';
 
-function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory, currentRelease, rates, userCurrency, canEdit, hasImage, onEdit, onRemove, onReportWine, suggestFixSignal = 0, wineDraft = null, onDraftChanged, draftNotice = null, recordFold = null }) {
+function ViewDetails({ bottle, rackInfo, cellarHasRacks = false, cellarId, vintageProfile, priceHistory, currentRelease, rates, userCurrency, canEdit, hasImage, onEdit, onRemove, onReportWine, suggestFixSignal = 0, wineDraft = null, onDraftChanged, onWineChanged, onBottleChange, draftNotice = null, recordFold = null }) {
   const { t } = useTranslation();
   const { user, apiFetch } = useAuth();
+  const reviewed = useContributionReviewed();
   const anchorYear = bottleAnchorYear(bottle);
   const maturityStatus = getMaturityStatus(vintageProfile, anchorYear);
   // The user's OWN drink window (drinkFrom/drinkTo) — takes precedence over
@@ -32,7 +42,71 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
   // treat it as still awaiting review rather than showing wrong years.
   const maturityReviewed = vintageProfile?.status === 'reviewed' && (!isNv || vintageProfile.relative);
   const [showSommNotes, setShowSommNotes] = useState(false);
+  const timelineOn = useFeature('maturityTimeline');
   const wine = bottle.wineDefinition;
+  // The sommelier's section shows for every known vintage (NV too) of a wine.
+  const sommShown = !!bottle.vintage && bottle.vintage !== 'Unknown' && wine?.nonWine !== true;
+  // Serving line: the sommelier's trait (or the style's default) read against
+  // the phase this bottle is in today — the owner's own window first, then the
+  // sommelier's — so the decanting advice follows the wine's age, not a date
+  // someone wrote it down.
+  const servingPhase = personalWindow?.status || (maturityReviewed ? maturityStatus?.status : null) || null;
+  const serving = servingAdvice(wine, servingPhase);
+  const servingLine = serving ? (
+    <p className="bd-maturity-note bd-serving">
+      {servingText(serving, t, temperatureUnitOf(user))}
+    </p>
+  ) : null;
+  // "Not a wine? Move it to Other": the member's own word moves a cider or a
+  // beer out of the shared wine registry (few holders) or asks a curator.
+  const [notWine, setNotWine] = useState({ busy: false, status: null, holders: 0, confirming: false });
+  const moveToOther = async () => {
+    setNotWine({ busy: true, status: null, holders: 0, confirming: false });
+    try {
+      const res = await markNotWine(apiFetch, wine._id);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { setNotWine({ busy: false, status: 'error', holders: 0 }); return; }
+      setNotWine({ busy: false, status: data.status, holders: data.holders || 0 });
+      if ((data.status === 'applied' || data.status === 'already') && onWineChanged) onWineChanged();
+    } catch {
+      setNotWine({ busy: false, status: 'error', holders: 0 });
+    }
+  };
+  const notWineMessage = {
+    applied: t('bottleDetail.notWineApplied', 'Moved to Other. It stays in your cellar and is no longer in the shared wine registry.'),
+    already: t('bottleDetail.notWineApplied', 'Moved to Other. It stays in your cellar and is no longer in the shared wine registry.'),
+    filed: t('bottleDetail.notWineFiled', 'Several members hold this one, so a curator will look at it.'),
+    pending: t('bottleDetail.notWinePending', 'A curator is already looking at this one.'),
+    error: t('bottleDetail.notWineError', 'That did not work. Please try again later.'),
+  };
+  // The way to a window of one's own, for whoever may edit the bottle and has
+  // none yet: under the sommelier's window, which it starts from. In early
+  // access it opens the sliding editor in place; otherwise the edit form, at
+  // its drink-window years.
+  const editOwnWindow = () => onEdit?.({ focus: 'drinkWindow' });
+  // A window made under the sommelier's, or removed from its own section,
+  // shows in the other place: the keyboard follows it there.
+  const [ownWindowMoved, setOwnWindowMoved] = useState(false);
+  const ownTimelineProps = {
+    bottle, personalWindow, vintageProfile, anchorYear,
+    sommReviewed: sommShown && maturityReviewed,
+    canEdit,
+    focusAction: ownWindowMoved,
+    onSaved: (win) => { setOwnWindowMoved(true); onBottleChange?.(win); },
+  };
+  // Not on a drink that is not wine; under the sommelier's section only once
+  // its profile has loaded, since the editor starts from those years.
+  const ownWindowOffer = canEdit && !personalWindow && wine?.nonWine !== true && (!sommShown || !!vintageProfile) ? (
+    timelineOn ? (
+      <PersonalWindowTimeline {...ownTimelineProps} inline />
+    ) : (
+      <div className="bd-own-window-offer">
+        <button type="button" className="bd-somm-notes-btn dwe-link" onClick={editOwnWindow}>
+          {t('bottleDetail.windowSetOwnDrink', 'Set your own drink window')}
+        </button>
+      </div>
+    )
+  ) : null;
   const record = (
     <WineRecordSection
       wine={wine}
@@ -41,8 +115,11 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
       apiFetch={apiFetch}
       // The "no grapes yet" invitation stays for whoever looks after the
       // bottle, as it always was — it now opens the record's own grape form.
-      promptMissingGrapes={canEdit}
+      // Not for a drink that is not wine: it has no grapes to record.
+      promptMissingGrapes={canEdit && wine?.nonWine !== true}
       suggestSignal={suggestFixSignal}
+      // A fix applied at once (a server that does not review) re-reads the wine.
+      onWineChanged={onWineChanged}
     />
   );
 
@@ -51,7 +128,7 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
       <div className="bd-detail-grid">
         <div className="bd-detail-item">
           <span className="bd-detail-label">{t('bottleDetail.vintage')}</span>
-          <span className="bd-detail-value">{bottle.vintage}</span>
+          <span className="bd-detail-value">{formatVintage(bottle.vintage, t)}</span>
         </div>
         {bottle.bottleSize && (
           <div className="bd-detail-item">
@@ -96,7 +173,7 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
             <span className="bd-detail-value">
               {currentRelease.medianPrice.toLocaleString()} {currentRelease.currency}
               {currentRelease.vintage && (
-                <span className="bd-detail-converted"> &middot; {currentRelease.vintage}</span>
+                <span className="bd-detail-converted"> &middot; {formatVintage(currentRelease.vintage, t)}</span>
               )}
               {(() => {
                 const c = convertAmountHistorical(currentRelease.medianPrice, currentRelease.currency, userCurrency, null, rates);
@@ -138,16 +215,17 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
           storageKey={`cellarion_contrib_photo_${wine?._id}`}
           icon="📷"
           title={t('bottleDetail.contributePhotoTitle', 'Help the community')}
-          message={t('bottleDetail.contributePhotoMsg', 'This wine has no photo yet. Adding one helps other collectors recognise it \u2014 it will be reviewed before going public.')}
+          message={reviewed
+            ? t('bottleDetail.contributePhotoMsg', 'This wine has no photo yet. Adding one helps other collectors recognise it \u2014 it will be reviewed before going public.')
+            : t('bottleDetail.contributePhotoMsgUnreviewed', 'This wine has no photo yet. Adding one helps everyone on this server recognise it.')}
           actionLabel={t('bottleDetail.contributePhotoAction', 'Add a photo')}
           onAction={onEdit}
         />
       )}
 
       {/* Grapes are a row of the wine record below, not a section of their
-          own (support ticket 2026-09-17): next to the rest of the record they
-          can be corrected the same way — a separate section could only ever
-          be ADDED to, and only while it was empty. */}
+          own: next to the rest of the record they can be corrected the same
+          way, not only ADDED to while empty. */}
 
       {/* A PRIVATE DRAFT wine: its creator edits and publishes it here; a
           shared-cellar member only sees that it is one. Drafts are edited
@@ -162,35 +240,61 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
         <DraftWineBanner wine={wine} wineDraft={wineDraft} onChanged={onDraftChanged} />
       )}
 
-      {/* The full public record with visible blanks + per-field suggestions
-          (#985). Demo visitors see the record but not the suggest actions
-          (writes are requireNonDemo). It folds to its title row like the
-          vintage page's (2026-10-14): a flat inner "card" lets the shared
-          folding rules find its title row inside this card. */}
+      {/* The full public record with visible blanks + per-field suggestions.
+          Demo visitors see the record but not the suggest actions (writes are
+          requireNonDemo). It folds to its title row like the vintage page's: a
+          flat inner "card" lets the shared folding rules find its title row
+          inside this card. */}
       {/* No registry wine (a bottle waiting on its request): the record shows
-          nothing, so there is nothing to fold (audit 2026-10-14). */}
+          nothing, so there is nothing to fold. */}
       {recordFold && wine ? (
         <CollapsibleBlock nested {...recordFold}>
           <div className="card bd-record-fold">{record}</div>
         </CollapsibleBlock>
       ) : record}
+      {/* The Other category: a drink that is not wine leaves the shared wine
+          registry on its holder's word, or a curator's when many hold it. */}
+      {canEdit && wine && wine.draft !== true && !user?.isDemo && (notWine.status || wine.nonWine !== true) && (
+        <div className="bd-not-wine">
+          {notWine.status ? (
+            // Outlives the reload that follows an applied move: the block stays
+            // for the message even though the row is now in Other.
+            <span className="bd-maturity-note">{notWineMessage[notWine.status] || notWineMessage.error}</span>
+          ) : notWine.confirming ? (
+            // A shared registry row leaves search, its vectors and its queued
+            // drink windows for everyone who holds it: ask once before doing it.
+            <span className="bd-not-wine-confirm">
+              <span className="bd-maturity-note">{t('bottleDetail.notWineConfirm', 'Move it to Other? It leaves the shared wine registry for everyone who holds it, and an admin would have to bring it back.')}</span>
+              <button type="button" className="bd-somm-notes-btn" disabled={notWine.busy} onClick={moveToOther}>
+                {t('bottleDetail.notWineConfirmAction', 'Yes, it is not wine')}
+              </button>
+              <button type="button" className="bd-somm-notes-btn" onClick={() => setNotWine((s) => ({ ...s, confirming: false }))}>
+                {t('common.cancel', 'Cancel')}
+              </button>
+            </span>
+          ) : (
+            <button type="button" className="bd-somm-notes-btn" onClick={() => setNotWine((s) => ({ ...s, confirming: true }))}>
+              {t('bottleDetail.notWineAction', 'Not a wine? Move it to Other')}
+            </button>
+          )}
+        </div>
+      )}
       {/* Personal drink window — the user's own drinkFrom/drinkTo. Takes
           precedence over the sommelier profile status below, so the profile
-          badge is suppressed while this is set. */}
-      {personalWindow && (
+          badge is suppressed while this is set. In early access it is a
+          timeline too, whose years an editor slides on the bar; saving
+          writes the same four fields as the edit form and patches the page's
+          bottle with what the server stored. Without a window of one's own
+          the offer of one sits in the sommelier's section below, and here
+          only when that section is not shown. */}
+      {timelineOn ? (
+        (personalWindow || (!sommShown && wine?.nonWine !== true)) && <PersonalWindowTimeline {...ownTimelineProps} />
+      ) : personalWindow ? (
         <div className="bd-section">
           <span className="bd-section-label">{t('bottleDetail.personalWindow')}</span>
           <div className="bd-personal-window">
             <span className={`maturity-badge maturity-badge--${personalWindow.status}`}>
-              {personalWindow.status === 'not-ready'
-                ? t('bottleDetail.personalNotReady', { year: personalWindow.from })
-                : personalWindow.status === 'declining'
-                  ? t('bottleDetail.personalPast')
-                  : personalWindow.status === 'early'
-                    ? t('bottleDetail.personalEarly', { year: personalWindow.peakFrom })
-                    : personalWindow.status === 'late'
-                      ? t('bottleDetail.personalLate')
-                      : t('bottleDetail.personalDrinkNow')}
+              {personalWindowBadgeText(personalWindow, t)}
             </span>
             <span className="bd-window-source" title={t('bottleDetail.yourWindowTooltip')}>
               {t('bottleDetail.yourWindow')}
@@ -202,13 +306,38 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
                   ? t('bottleDetail.windowFromYear', { year: personalWindow.from })
                   : t('bottleDetail.windowUntilYear', { year: personalWindow.to })}
             </span>
+            {canEdit && (
+              <button
+                type="button"
+                className="bd-somm-notes-btn dwe-link"
+                onClick={editOwnWindow}
+                aria-label={t('bottleDetail.windowChangeLabel', 'Change your drink window')}
+              >
+                {t('bottleDetail.windowChange', 'Change')}
+              </button>
+            )}
           </div>
+        </div>
+      ) : !sommShown && ownWindowOffer && (
+        <div className="bd-section">
+          <span className="bd-section-label">{t('bottleDetail.personalWindow')}</span>
+          {ownWindowOffer}
+        </div>
+      )}
+
+      {/* The serving temperature does not depend on the vintage: when the
+          maturity section below is hidden (no vintage, or Unknown), the line
+          gets a section of its own. */}
+      {(!bottle.vintage || bottle.vintage === 'Unknown') && servingLine && (
+        <div className="bd-section">
+          <span className="bd-section-label">{t('serving.label', 'Serving')}</span>
+          {servingLine}
         </div>
       )}
 
       {/* Sommelier maturity section — shown for NV too (somms can set a drink
           window for non-vintage sparkling); only hidden for unknown vintages */}
-      {bottle.vintage && bottle.vintage !== 'Unknown' && (
+      {sommShown && (
         <div className="bd-section">
           <span className="bd-section-label">{t('bottleDetail.sommMaturity')}</span>
           {!vintageProfile ? (
@@ -222,14 +351,30 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
             </div>
           ) : (
             <div className="bd-maturity-reviewed">
-              {/* Profile status badge hidden while a personal window is set —
-                  the personal window (above) takes precedence. */}
-              {maturityStatus && !personalWindow && (
-                <span className={`maturity-badge maturity-badge--${maturityStatus.status}`}>
-                  {maturityBadgeText(maturityStatus, t)}
-                </span>
+              {/* Profile status hidden while a personal window is set — the
+                  personal window (above) takes precedence. In early access
+                  the status rides on the timeline's marker instead of a
+                  badge of its own. */}
+              {timelineOn ? (
+                <>
+                  <BetaBadge feature="maturityTimeline" note={t('bottleDetail.maturityTimelineBeta', 'The drink window as a timeline is in early access.')} />
+                  <MaturityTimeline
+                    profile={vintageProfile}
+                    anchorYear={anchorYear}
+                    status={personalWindow ? null : maturityStatus}
+                    details={<MaturityPhaseTable profile={vintageProfile} anchorYear={anchorYear} />}
+                  />
+                </>
+              ) : (
+                <>
+                  {maturityStatus && !personalWindow && (
+                    <span className={`maturity-badge maturity-badge--${maturityStatus.status}`}>
+                      {maturityBadgeText(maturityStatus, t)}
+                    </span>
+                  )}
+                  <MaturityPhaseTable profile={vintageProfile} anchorYear={anchorYear} />
+                </>
               )}
-              <MaturityPhaseTable profile={vintageProfile} anchorYear={anchorYear} />
               {vintageProfile.sommNotes && (
                 <div className="bd-somm-notes-toggle">
                   <button
@@ -238,7 +383,7 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
                     aria-expanded={showSommNotes}
                   >
                     {t('bottleDetail.sommNotes')}
-                    <span className={`bd-somm-notes-chevron${showSommNotes ? ' bd-somm-notes-chevron--open' : ''}`}>&rsaquo;</span>
+                    <span className={`bd-somm-notes-chevron${showSommNotes ? ' bd-somm-notes-chevron--open' : ''}`} aria-hidden="true">&rsaquo;</span>
                   </button>
                   {showSommNotes && (
                     <p className="bd-maturity-notes">{vintageProfile.sommNotes}</p>
@@ -247,6 +392,11 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
               )}
             </div>
           )}
+          {ownWindowOffer}
+          {/* Serving line in every state: the temperature is the style's
+              until the sommelier sets one, and the air advice follows the
+              phase once a window exists (the owner's own, or the sommelier's). */}
+          {servingLine}
         </div>
       )}
 
@@ -259,6 +409,24 @@ function ViewDetails({ bottle, rackInfo, cellarId, vintageProfile, priceHistory,
             className="bd-rack-link"
           >
             <span aria-hidden="true">{'\u{1F4CD}'}</span> {rackInfo.rackName} &middot; {t('bottleDetail.rackSlot')} {rackInfo.position}
+          </Link>
+        </div>
+      )}
+
+      {/* An unplaced bottle, in a cellar that has racks: the way to give it a
+          slot from the bottle itself, not only from the rack page. The link
+          opens the rack page in the placing mode the add
+          flow uses, with this one bottle as the queue: tap a free slot, or
+          let it take the first free one. */}
+      {!rackInfo && cellarHasRacks && canEdit && bottle.status === 'active' && (
+        <div className="bd-section">
+          <span className="bd-section-label">{t('bottleDetail.rackLocation')}</span>
+          <Link
+            to={`/cellars/${cellarId}/racks`}
+            state={{ placeQueue: [bottle._id], placeFrom: 'bottle' }}
+            className="bd-rack-link"
+          >
+            <span aria-hidden="true">{'\u{1F4CD}'}</span> {t('bottleDetail.notInRack', 'Not in a rack yet')} &middot; {t('bottleDetail.placeInRack', 'Place in a rack')}
           </Link>
         </div>
       )}

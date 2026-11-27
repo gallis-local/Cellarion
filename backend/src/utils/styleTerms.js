@@ -1,14 +1,13 @@
 /**
  * Declared style terms — the label words that ARE the wine.
  *
- * Issue #1134. A Mosel estate's Riesling range came back from label scanning
- * filed under ONE registry row: "Brauneberger Juffer-Sonnenuhr Riesling
- * Spätlese Alte Reben", "… Auslese" and "… Spätlese Feinherb" all landed on
- * the Feinherb entry. Nothing was broken in the scorer — the composite is
+ * One estate's Riesling range from one vineyard — "Brauneberger
+ * Juffer-Sonnenuhr Riesling Spätlese Alte Reben", "… Auslese" and "… Spätlese
+ * Feinherb" — scores as ONE wine to the scorer alone. The composite is
  * name×0.45 + producer×0.45 + appellation×0.10, and on a range from one estate
  * in one vineyard the producer and appellation axes both score 1.0. That fixes
- * 0.55 before the name is read, so a name only has to reach 0.44 to clear the
- * scan path's old 0.75 floor. Measured against the real registry rows:
+ * 0.55 before the name is read, so a name only has to reach 0.44 to clear a
+ * 0.75 match floor. The scores of such pairs:
  *
  *   … Riesling Spätlese Alte Reben  vs … Spätlese Feinherb ......... 0.8749
  *   … Riesling Auslese              vs … Spätlese Feinherb ......... 0.8457
@@ -36,20 +35,19 @@
  * reject; where one side is silent it is silence, not disagreement.
  */
 
-const { normalizeString, spellStarGrades, MAX_STAR_GRADE } = require('./normalize');
+const { normalizeString, spellStarGrades, MAX_STAR_GRADE, SWEETNESS_ALIASES } = require('./normalize');
 
 // Sweetness / dryness across label languages, pre-normalized (normalizeString
 // folds "Roșu" → 'rosu', "off-dry" → 'offdry'; ß is not decomposable and is
 // stripped outright, so callers that care pre-fold ß→ss — "süß" → 'suss').
 //
 // SINGLE SOURCE OF TRUTH: utils/crossFieldChecks builds its producer-is-a-
-// style-term vocabulary from this set. It used to hold its own copy, and a
-// third copy here would be two lists too many.
+// style-term vocabulary from this set, so the two can never drift apart.
 const SWEETNESS_WORDS = new Set([
   'demidulce', 'demisec', 'dulce', 'seco', 'semiseco', 'semidulce',
   'abboccato', 'amabile', 'halbtrocken', 'feinherb', 'trocken', 'lieblich',
   'offdry', 'semisweet', 'moelleux', 'doux', 'brut', 'sec', 'dry', 'sweet',
-  'suss', 'edes',
+  'suss', 'edes', 'fruchtsuss',
 ]);
 
 // Prädikat tiers — the German/Austrian must-weight ladder. Each is a distinct
@@ -77,36 +75,28 @@ const PRADIKAT_WORDS = new Set([
 const PRADIKAT_ALIASES = new Map([
   ['spaetlese', 'spatlese'],
   ['icewine', 'eiswein'],
-  // An OBSERVED misspelling, not a guess: one owner's export carried
-  // "Trokenbeerenauslese" (one c, one s) in its appellation column, and the
-  // same file misspelled the wine's own name "Riesling Troken" — which is how
-  // we know the typo is the writer's rather than ours (somm ticket 6a966386,
-  // 2026-09-01). Added because it was seen in real data. This map is not a
-  // general typo-tolerance scheme and should not grow into one: every entry
-  // needs a file behind it.
+  // An OBSERVED misspelling, not a guess: "Trokenbeerenauslese" occurs in
+  // real cellar exports. This map is not a general typo-tolerance scheme and
+  // should not grow into one: every entry needs a file behind it.
   ['trokenbeerenauslese', 'trockenbeerenauslese'],
 ]);
 
 // The sweetness twin of PRADIKAT_ALIASES, for the same keyboard: "Süß" typed
 // without the umlaut is "Suess", which normalizeString leaves alone — without
-// this the guard silently fails open for the standard ue-transliteration
-// (found by the post-release audit, verified by execution). NAME side only,
-// like the Prädikat map: the producer-field rules in crossFieldChecks read
-// SWEETNESS_WORDS directly and must NOT gain 'suess' — Suess is a real
-// surname, and flagging every "Weingut Suess" as a style-term producer is
-// the 'dry'/'sweet' problem over again.
-const SWEETNESS_ALIASES = new Map([
-  ['suess', 'suss'],
-  // Same file as the Prädikat typo above: it wrote the wine's own name
-  // "Riesling Troken". Name side only, like every entry here — SWEETNESS_WORDS
-  // itself must not gain it, for the 'Weingut Suess' reason given above.
-  ['troken', 'trocken'],
-]);
+// this the guard silently fails open for the standard ue-transliteration.
+// "Troken" is an observed misspelling too, like the Prädikat one above.
+// NAME side only, like the Prädikat map: the producer-field rules in
+// crossFieldChecks read SWEETNESS_WORDS directly and must NOT gain 'suess' —
+// Suess is a real surname, and flagging every "Weingut Suess" as a style-term
+// producer is the 'dry'/'sweet' problem over again. The map lives in
+// utils/normalize (SWEETNESS_ALIASES), where the label sweetness write rule
+// and the display name read names through it too.
 
 // Style words that are also ordinary name words. "Dry Creek Zinfandel" states
 // no sweetness, and "Sweet Cheeks Pinot" is a winery. Excluded from the NAME
-// guard only — they stay in SWEETNESS_WORDS, where the producer-field rules
-// read a whole-string match and cannot be fooled this way.
+// guard, and never taken out of a name by the label sweetness write rule
+// (services/sweetnessWrite) — they stay in SWEETNESS_WORDS, where the
+// producer-field rules read a whole-string match and cannot be fooled this way.
 const NAME_AMBIGUOUS_WORDS = new Set(['dry', 'sweet']);
 
 // Two-word spellings that normalize to two tokens while their hyphenated form
@@ -126,7 +116,7 @@ const JOINED_PHRASES = [
 // one of these words. Each grade is its own wine, so two names stating
 // different grades are two wines, exactly like two Prädikate. Bounded by
 // MAX_STAR_GRADE: a typed "400000000star" is text, not a grade (an unbounded
-// count fed '*'.repeat in the reason below — release audit 2026-10-13).
+// count would feed '*'.repeat in the reason below).
 const STAR_GRADE_TOKEN = new RegExp(`^[1-${MAX_STAR_GRADE}]star$`);
 
 /**
@@ -138,9 +128,9 @@ const STAR_GRADE_TOKEN = new RegExp(`^[1-${MAX_STAR_GRADE}]star$`);
 function statedStyle(name) {
   // Lowercase BEFORE the ß-fold: the capital eszett ẞ (U+1E9E — the official
   // uppercase form, routine on all-caps German labels) only becomes ß under
-  // toLowerCase, and folding first left it for normalizeString to delete as
-  // punctuation, silently dropping the sweetness term (post-release audit,
-  // verified by execution: "SÜẞ" read as stating nothing).
+  // toLowerCase, and folding first would leave it for normalizeString to
+  // delete as punctuation, silently dropping the sweetness term ("SÜẞ" would
+  // read as stating nothing).
   let folded = normalizeString(spellStarGrades(String(name == null ? '' : name).toLowerCase().replace(/ß/g, 'ss')));
   for (const [re, joined] of JOINED_PHRASES) folded = folded.replace(re, joined);
 
@@ -161,15 +151,14 @@ function statedStyle(name) {
 /**
  * Is this appellation value a ripeness Prädikat rather than a place?
  *
- * Some cellar exports put the Prädikat in the appellation column — one file
- * carried "Auslese" for a Mosel Riesling and "Trokenbeerenauslese" for a Nahe
- * one (somm ticket 6a966386). Stored as written, those wines end up with NO
+ * Some cellar exports put the Prädikat in the appellation column ("Auslese",
+ * "Trockenbeerenauslese"). Stored as written, those wines end up with NO
  * appellation at all, which is exactly the thin-identity condition that makes
  * auto-enrichment decline them permanently: a data-entry habit quietly costs
- * the owner his tasting notes. One of the two was worse than useless — a wine
- * named "Riesling Trocken" (bone dry) whose appellation claimed the sweetest
- * botrytis category German law defines, which curated at face value would have
- * produced a 35-year dessert-wine window on a dry estate Riesling.
+ * the owner their tasting notes. It can be worse than useless — a wine named
+ * "Riesling Trocken" (bone dry) whose appellation claims the sweetest botrytis
+ * category German law defines would, curated at face value, produce a
+ * decades-long dessert-wine window on a dry estate Riesling.
  *
  * DELIBERATELY STRICT. Only a value whose every meaningful token is a Prädikat
  * qualifies, so "Auslese" is routed and "Auslese Goldkapsel" is not: the
@@ -208,20 +197,18 @@ const DRY_SIDE_WORDS = new Set(['trocken', 'halbtrocken', 'feinherb', 'sec', 'se
 /**
  * Does this Prädikat contradict the wine it is attached to?
  *
- * The second ticket record is why this exists. Its file said appellation
- * "Trokenbeerenauslese" on a wine named "Riesling Trocken" — the sweetest
- * botrytis category German law defines, on a bone-dry wine. Both cannot be
- * true. Moving that value into the classification would keep the falsehood and
- * merely change which field carries it, and a classification is read as
- * curated fact: it would have argued for a decades-long dessert-wine window on
- * an estate dry Riesling.
+ * Appellation "Trockenbeerenauslese" on a wine named "Riesling Trocken" puts
+ * the sweetest botrytis category German law defines on a bone-dry wine. Both
+ * cannot be true. Moving that value into the classification would keep the
+ * falsehood and merely change which field carries it, and a classification is
+ * read as curated fact: it would argue for a decades-long dessert-wine window
+ * on an estate dry Riesling.
  *
  * So a contradicted Prädikat is DROPPED, not rescued — the appellation is still
  * cleared of it, because a ripeness level is not a place whether or not it is
  * true. What is left is an honest gap, which is the state that asks a curator
- * to fill it. That is independently the judgement the sommelier reached on
- * these two records (proposals 6a965b0e / 6a965b19, 2026-09-01): Auslese kept
- * as a classification, Trockenbeerenauslese dropped.
+ * to fill it. An uncontradicted Prädikat (an Auslese on a plain Riesling)
+ * still moves to an empty classification.
  *
  * @param {string} pradikat a value pradikatOnlyValue has already vouched for
  * @param {string} wineName the name the wine is being minted under
@@ -237,6 +224,34 @@ function pradikatContradictsName(pradikat, wineName) {
 }
 
 
+// The Prädikat tiers a wine's classification rows of kind `ripeness` state.
+const ripenessTiers = (rows) => {
+  const tiers = new Set();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (row && typeof row === 'object' && row.kind === 'ripeness' && typeof row.name === 'string') {
+      for (const t of statedStyle(row.name).pradikat) tiers.add(t);
+    }
+  }
+  return tiers;
+};
+
+/**
+ * The Prädikat a wine states that is sweet BY LAW (ALWAYS_SWEET_PRADIKAT) —
+ * in its name, its ripeness classification rows or its classification
+ * string — or null. The label sweetness write rule (services/sweetnessWrite)
+ * holds a dry-side TERM against it, as pradikatContradictsName holds a dry
+ * name. Accepts a bare name too.
+ *
+ * @param {string|{name?:string, classifications?:any[], classification?:string}} wineLike
+ * @returns {string|null} the tier, normalised ("trockenbeerenauslese")
+ */
+function sweetByLawPradikat(wineLike) {
+  const w = wineLike == null || typeof wineLike === 'string' ? { name: wineLike } : wineLike;
+  const tiers = new Set([...statedStyle(w.name).pradikat, ...ripenessTiers(w.classifications)]);
+  if (typeof w.classification === 'string') for (const t of statedStyle(w.classification).pradikat) tiers.add(t);
+  return [...tiers].sort().find((t) => ALWAYS_SWEET_PRADIKAT.has(t)) || null;
+}
+
 const subset = (a, b) => [...a].every((x) => b.has(x));
 
 // Both sides state something, and neither statement contains the other. A
@@ -244,21 +259,86 @@ const subset = (a, b) => [...a].every((x) => b.has(x));
 // ways, "Brut" vs "Demi-Sec" is two wines.
 const disagree = (a, b) => a.size > 0 && b.size > 0 && !subset(a, b) && !subset(b, a);
 
+const ID_RX = /^[0-9a-f]{24}$/i;
+// The label sweetness term on a wine-like object: the populated row's word,
+// or — for an unpopulated ref — the word the term table's in-memory copy
+// knows (services/sweetnessOps, when it is warm; a belt for a caller that
+// forgot the populate). Never a bare string as the word: a string here is an
+// id or nothing, so no caller can smuggle a word in past the term table.
+const fieldTerm = (w) => {
+  const t = w && w.labelSweetness;
+  if (!t) return null;
+  if (typeof t === 'object' && typeof t.name === 'string' && t.name.trim()) return t.name.trim();
+  const id = typeof t === 'string' ? t : (typeof t.toString === 'function' ? t.toString() : '');
+  if (!ID_RX.test(id)) return null;
+  // Lazy: sweetnessOps loads the model; this util must stay requirable alone.
+  return require('../services/sweetnessOps').cachedTermName(id);
+};
+
 /**
- * Do these two wine names declare a DIFFERENT style? A non-null return means
- * they are two wines and must never be linked without the user saying so.
+ * The style a WINE declares — the record first, the name as the fallback.
  *
- * @param {string} nameA
- * @param {string} nameB
+ * Label sweetness has a field of its own (WineDefinition.labelSweetness), and
+ * the word leaves the names. A guard that read only names would go blind on
+ * exactly the wines it is built for, so this reads the field where the record
+ * carries it and the name where it does not: a row from before the migration,
+ * a name a scan or an import typed, a Bridge peer on the older protocol. The ripeness
+ * tier likewise: the classification rows of kind `ripeness` count beside any
+ * Prädikat the name states.
+ *
+ * Accepts a plain name string too, so every caller that held a string keeps
+ * working. The sweetness set is the same token set statedStyle builds, so a
+ * field term and a name compare like two names; `term` carries the field's
+ * own word (normalised) for the exact comparison two fields allow.
+ *
+ * @param {string|{name?:string, labelSweetness?:any, classifications?:any[]}} wineLike
+ * @returns {{pradikat: Set<string>, sweetness: Set<string>, grade: Set<string>, term: string|null, termName: string|null}}
+ */
+function styleOf(wineLike) {
+  if (wineLike == null || typeof wineLike === 'string') {
+    return { ...statedStyle(wineLike), term: null, termName: null };
+  }
+  const fromName = statedStyle(wineLike.name);
+  const pradikat = new Set([...fromName.pradikat, ...ripenessTiers(wineLike.classifications)]);
+  const termName = fieldTerm(wineLike);
+  if (!termName) return { pradikat, sweetness: fromName.sweetness, grade: fromName.grade, term: null, termName: null };
+  // The field is an explicit statement, so a word the NAME tokenizer would
+  // leave out ("Mild", "Medium Dry" — 'dry' is ambiguous in a name, not here)
+  // still counts: the whole term stands in as one token when nothing else does.
+  const term = normalizeString(termName.toLowerCase().replace(/ß/g, 'ss'));
+  const sweetness = statedStyle(termName).sweetness;
+  if (sweetness.size === 0 && term) sweetness.add(term);
+  return { pradikat, sweetness, grade: fromName.grade, term, termName };
+}
+
+/** Does this wine state a label sweetness at all — in its record or its name? */
+function sweetnessStated(wineLike) {
+  return styleOf(wineLike).sweetness.size > 0;
+}
+
+/**
+ * Do these two wines declare a DIFFERENT style? A non-null return means they
+ * are two wines and must never be linked without the user saying so. Each side
+ * may be a wine-like object (record + name, see styleOf) or a bare name.
+ *
+ * Where BOTH sides carry the field, the terms compare exactly — "Brut Nature"
+ * and "Brut" are two wines, which the token comparison below (built for names,
+ * where "Brut" ⊂ "Brut Rosé" must stay one wine) cannot tell apart. One field
+ * against one name compares as two names do.
+ *
+ * @param {string|object} wineA
+ * @param {string|object} wineB
  * @returns {string|null} human-readable reason, or null when compatible
  */
-function conflictingStyleTerms(nameA, nameB) {
-  const a = statedStyle(nameA);
-  const b = statedStyle(nameB);
+function conflictingStyleTerms(wineA, wineB) {
+  const a = styleOf(wineA);
+  const b = styleOf(wineB);
   if (disagree(a.pradikat, b.pradikat)) {
     return `each name states a different Prädikat (${[...a.pradikat].sort().join(', ')} vs ${[...b.pradikat].sort().join(', ')})`;
   }
-  if (disagree(a.sweetness, b.sweetness)) {
+  if (a.term && b.term) {
+    if (a.term !== b.term) return `each records a different label sweetness (${a.termName} vs ${b.termName})`;
+  } else if (disagree(a.sweetness, b.sweetness)) {
     return `each name states a different sweetness (${[...a.sweetness].sort().join(', ')} vs ${[...b.sweetness].sort().join(', ')})`;
   }
   if (disagree(a.grade, b.grade)) {
@@ -270,20 +350,24 @@ function conflictingStyleTerms(nameA, nameB) {
 
 module.exports = {
   SWEETNESS_WORDS,
-  PRADIKAT_WORDS,
+  SWEETNESS_ALIASES,
   NAME_AMBIGUOUS_WORDS,
   statedStyle,
+  styleOf,
+  sweetnessStated,
   conflictingStyleTerms,
   pradikatContradictsName,
   pradikatOnlyValue,
+  sweetByLawPradikat,
 };
 
 /**
- * Route a bare Prädikat out of an appellation — the one rule for EVERY mint
- * (findOrCreateWine and the two admin routes that build a WineDefinition
- * themselves; audit 2026-09-07). Returns the appellation to store (null when
- * it was only the Prädikat) and the classification: the caller's own when
- * given, else the Prädikat unless the name contradicts it.
+ * Route a bare Prädikat out of an appellation, for the two admin routes that
+ * build a WineDefinition themselves. findOrCreateWine and the import apply the
+ * same rule through pradikatOnlyValue and pradikatContradictsName. Returns the
+ * appellation to store (null when it was only the Prädikat) and the
+ * classification: the caller's own when given, else the Prädikat unless the
+ * name contradicts it.
  */
 function splitPradikatFromAppellation(appellation, classification, name) {
   const ap = typeof appellation === 'string' ? appellation.trim() : '';

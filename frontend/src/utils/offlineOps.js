@@ -1,5 +1,5 @@
 /**
- * Offline writes (#1355) — the pure part. Recognises the writes that may be
+ * Offline writes — the pure part. Recognises the writes that may be
  * made offline, turns one into a queued operation carrying what the user saw
  * (the server's preconditions), applies it to the device's snapshot the way the
  * server will, and shapes the response the page expects.
@@ -167,6 +167,8 @@ export function applyOp(snapshot, op) {
       break;
     case 'open':
       if (bi >= 0) s.bottles[bi] = { ...s.bottles[bi], openedAt: op.body.openedAt, preservationMethod: op.body.preservationMethod, pours: [] };
+      // "Take it out of the rack": the server frees the slot, so the device does too.
+      if (op.body.takeOutOfRack === true) unrack(op.bottleId);
       break;
     case 'pour':
       if (bi >= 0) {

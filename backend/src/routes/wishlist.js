@@ -9,6 +9,8 @@ const { escapeRegex } = require('../utils/sanitize');
 const { resolveOrMintWine } = require('../services/wineCommit');
 const { findVisibleWine } = require('../services/wineVisibility');
 const { MEMBER_WINE_HIDDEN_FIELDS } = require('../config/constants');
+const { errorBody } = require('../config/errorCodes');
+const { normalizeShopUrl } = require('../utils/shopUrl');
 
 const router = express.Router();
 
@@ -102,8 +104,10 @@ router.get('/', async (req, res) => {
       // (config/constants). None of these is ever part of a wishlist answer:
       // createdBy and contribution name the contributing member, normalizedKey
       // carries a pending row's creator id verbatim, and the scan pointers and
-      // front/back disagreements are CURATION evidence.
-      { $unset: MEMBER_WINE_HIDDEN_FIELDS.map((f) => `wineDefinition.${f}`) }
+      // front/back disagreements are CURATION evidence. The sweetness style
+      // goes too: a $lookup ignores the model's select: false, and this list
+      // does not send it in its outgoing shape.
+      { $unset: [...MEMBER_WINE_HIDDEN_FIELDS, 'sweetnessStyle'].map((f) => `wineDefinition.${f}`) }
     ];
 
     // Free-text search on wine name or producer. Guard the type: an object/array
@@ -176,35 +180,36 @@ router.get('/', async (req, res) => {
 /**
  * POST /api/wishlist
  * Add a wine to the authenticated user's wishlist.
- * Body: { wineDefinitionId, vintage?, notes?, priority? }
+ * Body: { wineDefinitionId, vintage?, notes?, priority?, shopUrl? }
  *   or: { newWine: { name, producer, country, region?, appellation?, type?,
  *                    grapes?, confirmCreate?, source?, scanImageId?,
- *                    scanImageBackId?, scanConflicts? }, vintage?, notes?, priority? }
+ *                    scanImageBackId?, scanConflicts? }, vintage?, notes?, priority?, shopUrl? }
  *
  * Exactly one of wineDefinitionId | newWine. A wishlist item REQUIRES a real
  * registry row (the schema references WineDefinition, and the whole list UI
  * populates it), so wishing for a not-yet-registered wine is a legitimate
  * zero-bottle registry write — but the mint belongs HERE, at the commit,
- * not in step 1 of the AddToWishlist flow. The step-1 mint (via the old
- * find-or-create route) left an orphan whenever the user confirmed the wine
- * and then abandoned the form — the same leak POST /api/bottles closed for
- * bottles (31 zero-bottle createdVia:'ui' rows on prod, 2026-08-10; the
- * "Domaine de Riquewihr — Kaefferkopf" case). Shared implementation:
+ * not in step 1 of the AddToWishlist flow: a step-1 mint would leave an
+ * orphan whenever the user confirms the wine and then abandons the form, the
+ * same rule POST /api/bottles keeps for bottles. Shared implementation:
  * services/wineCommit (dedup soft zone → 200 { candidates }, nothing created;
  * wine.create audit + IndexNow on a real mint).
  */
 router.post('/', async (req, res) => {
   try {
-    const { wineDefinitionId, newWine, vintage, notes, priority } = req.body;
+    const { wineDefinitionId, newWine, vintage, notes, priority, shopUrl } = req.body;
 
     if ((!wineDefinitionId && !newWine) || (wineDefinitionId && newWine)) {
       return res.status(400).json({ error: 'Provide wineDefinitionId or newWine (exactly one)' });
     }
 
-    // Item-field validation BEFORE any registry work (release-audit LOW-1):
-    // a 400 on notes/priority/vintage after the mint would leave the exact
-    // orphan the mint-at-commit change exists to prevent.
+    // Item-field validation BEFORE any registry work: a 400 on
+    // notes/priority/vintage after the mint would leave the exact orphan
+    // mint-at-commit exists to prevent.
     const safeVintage = vintage != null ? String(vintage) : '';
+    if (notes != null && typeof notes !== 'string') {
+      return res.status(400).json({ error: 'Notes must be text' });
+    }
     if (notes && notes.length > 2000) {
       return res.status(400).json({ error: 'Notes must be 2000 characters or less' });
     }
@@ -214,17 +219,19 @@ router.post('/', async (req, res) => {
     if (safeVintage && safeVintage.length > 20) {
       return res.status(400).json({ error: 'Vintage must be 20 characters or less' });
     }
+    const shop = normalizeShopUrl(shopUrl);
+    if (shop.error) return res.status(400).json(errorBody('wishlist_shop_url_invalid'));
 
     let resolvedWineId;
     if (newWine) {
-      // Registry write — same demo bar the old find-or-create route had
+      // Registry write — the same demo bar POST /api/bottles has
       // (requireNonDemo): purgeUserData only reassigns createdBy on reap, so a
       // demo-minted row would persist forever. The by-id path stays open to
       // demo accounts (it references existing wines, writing nothing shared).
       if (req.user.isDemo) {
         return res.status(403).json({ error: 'This action is not available in the demo. Create a free account to use it.' });
       }
-      // Drafts are for bottles (draft design 2026-09-12): an empty draft is
+      // Drafts are for bottles: an empty draft is
       // deleted when its clock lapses, which would orphan a wishlist item.
       if (newWine.draft === true) {
         return res.status(400).json({ error: 'A wishlist wine cannot be a private draft — add it as a bottle first, or publish it.' });
@@ -245,7 +252,7 @@ router.post('/', async (req, res) => {
       }
       // The id was taken on trust — no existence check at all, so a wish could
       // be filed against any id, including a stranger's pending row, whose
-      // name then came back through the populate above (security audit M-4).
+      // name then came back through the populate above.
       const wine = await findVisibleWine(wineDefinitionId, {
         // noDrafts: a wishlist item on an empty draft would be orphaned by its expiry.
         userId: req.user.id, roles: req.user.roles, select: '_id', lean: true, noDrafts: true,
@@ -278,6 +285,7 @@ router.post('/', async (req, res) => {
       wineDefinition: resolvedWineId,
       vintage: safeVintage || undefined,
       notes: notes || undefined,
+      shopUrl: shop.url || undefined,
       priority: priority || 'medium'
     });
 
@@ -285,7 +293,7 @@ router.post('/', async (req, res) => {
     const populated = await WishlistItem.findById(item._id)
       .populate({
         path: 'wineDefinition',
-        // EXPLICIT select (security audit M-4). Without it the whole registry
+        // EXPLICIT select. Without it the whole registry
         // document came back — including createdBy, scanImage and
         // normalizedKey, and a pending row's normalizedKey IS
         // `pending~<creator-id>:…`, so the projection itself handed out
@@ -309,7 +317,7 @@ router.post('/', async (req, res) => {
 
 /**
  * PUT /api/wishlist/:id
- * Update a wishlist item (notes, priority, status, vintage).
+ * Update a wishlist item (notes, priority, status, vintage, shopUrl).
  * Only the owning user can update.
  */
 router.put('/:id', async (req, res) => {
@@ -325,7 +333,7 @@ router.put('/:id', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { notes, priority, status, vintage } = req.body;
+    const { notes, priority, status, vintage, shopUrl } = req.body;
 
     // null clears a field (mirrors POST's "absent" semantics) — guard before
     // reading .length, and never store the literal string 'null'.
@@ -353,13 +361,18 @@ router.put('/:id', async (req, res) => {
       if (safeVin.length > 20) return res.status(400).json({ error: 'Vintage too long' });
       item.vintage = safeVin || undefined;
     }
+    if (shopUrl !== undefined) {
+      const shop = normalizeShopUrl(shopUrl);
+      if (shop.error) return res.status(400).json(errorBody('wishlist_shop_url_invalid'));
+      item.shopUrl = shop.url || undefined;
+    }
 
     await item.save();
 
     const populated = await WishlistItem.findById(item._id)
       .populate({
         path: 'wineDefinition',
-        // EXPLICIT select (security audit M-4). Without it the whole registry
+        // EXPLICIT select. Without it the whole registry
         // document came back — including createdBy, scanImage and
         // normalizedKey, and a pending row's normalizedKey IS
         // `pending~<creator-id>:…`, so the projection itself handed out

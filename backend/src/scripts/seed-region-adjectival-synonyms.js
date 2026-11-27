@@ -5,7 +5,7 @@
  * THE HOLE: findOrCreateWine's mint gate asks
  *   Region.exists({ $or: [{ normalizedName }, { normalizedSynonyms }] })
  * — an EXACT match. "Tokaji" is what a Hungarian label prints, the Region doc
- * is "Tokaj", and the two strings are not equal, so "Tokaji" walked into the
+ * is "Tokaj", and the two strings are not equal, so "Tokaji" passes into the
  * producer field of a shared-registry wine. Every adjectival label form has the
  * same hole: "Bordelais", "Riojano", "Alentejano", "Egri", "Wachauer" are how
  * their regions appear IN PRINT, and none of them matches its Region doc.
@@ -13,7 +13,7 @@
  * The fix is data, not code: they are synonyms of regions the taxonomy already
  * holds, and `normalizedSynonyms` is exactly the field the gate already
  * queries. Adding them widens the gate, the cross-field producer-is-region
- * rule, and findOrCreateRegion's dedup (a label scan can no longer mint
+ * rule, and findOrCreateRegion's dedup (a label scan then cannot mint
  * "Tokaji" as a second region beside "Tokaj") in one write.
  *
  * INVENTS NOTHING. Every entry names a region that must ALREADY exist — the
@@ -68,7 +68,7 @@ const ENTRIES = [
   { region: 'Pfalz',      country: 'Germany', synonyms: ['Pfälzer', 'Pfalzer'], why: 'adjectival label form' },
   { region: 'Rheingau',   country: 'Germany', synonyms: ['Rheingauer'],         why: 'adjectival label form' },
   { region: 'Baden',      country: 'Germany', synonyms: ['Badener', 'Badische'], why: 'adjectival label forms' },
-  // DELIBERATELY ABSENT: Mosel ← "Moselle" (audit L-9). Moselle is also a real
+  // DELIBERATELY ABSENT: Mosel ← "Moselle". Moselle is also a real
   // French AOC on the same river, and aliasing the string to the GERMAN region
   // would make a later mint resolve a Lorraine wine to Germany — a
   // cross-jurisdiction error the taxonomy cannot detect afterwards, and one
@@ -83,7 +83,7 @@ const ENTRIES = [
   { region: 'Champagne',  country: 'France',  synonyms: ['Champenois'],         why: 'adjectival form' },
 
   // ── Spain — Castilian/Catalan variants and the -ano adjective.
-  // "La Rioja" is NOT here (audit L-9): it is also an Argentine wine province,
+  // "La Rioja" is NOT here: it is also an Argentine wine province,
   // and pointing the bare string at SPAIN's Rioja would silently resolve
   // Argentine wines to the wrong country. Same rule as Moselle above.
   { region: 'Rioja',      country: 'Spain',   synonyms: ['Riojano'],             why: 'adjectival form' },

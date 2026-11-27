@@ -10,8 +10,8 @@ const { rateLimitKey } = require('../utils/clientIp');
 const { logAudit } = require('../services/audit');
 const rateLimitsConfig = require('../config/rateLimits');
 
-// Dedicated strict limiter for unauthenticated Dynamic Client Registration
-// (security audit M-6): /register persists an OAuthClient row per call and
+// Dedicated strict limiter for unauthenticated Dynamic Client Registration:
+// /register persists an OAuthClient row per call and
 // otherwise rode only the 200/15min global write limiter — an IP-rotating
 // attacker could accumulate ~19k inert client rows/day, so it still needs a
 // per-IP bound of its own.
@@ -32,23 +32,23 @@ const registerLimiter = rateLimit({
   message: { error: 'invalid_request', error_description: 'Too many client registrations from this address; try again later.' },
 });
 
-// Ceiling for the REST of the authorization server (security audit 2026-07-25
-// M-1). /authorize, /approve, /token and /revoke are exempt from the global
-// apiLimiter + writeLimiter (app.js `isMcp`) because a hosted platform's whole
-// user base refreshes hourly from one egress IP — but that exemption left them
-// with NO bound whatsoever, and frontend/nginx.conf carries no limit_req, so a
-// self-hosted instance had nothing at all in front of four unauthenticated
-// DB-touching endpoints.
+// Ceiling for the REST of the authorization server. /authorize, /approve,
+// /token and /revoke are exempt from the global apiLimiter + writeLimiter
+// (app.js `isMcp`) because a hosted platform's whole user base refreshes
+// hourly from one egress IP — but without this they would have NO bound
+// whatsoever, and frontend/nginx.conf carries no limit_req, so a self-hosted
+// instance would have nothing in front of four unauthenticated DB-touching
+// endpoints.
 //
 // This is a ceiling that EXISTS, not a tight one: the number is sized for
 // shared egress and admin-tunable (SuperAdmin → rate limits, mcp.oauthMax) so a
-// bad default is correctable without a deploy — the same lesson registerMax
-// learned on launch day. One shared bucket across the four endpoints keeps the
-// accounting simple; per-endpoint precision would buy nothing here because the
-// point is bounding aggregate load, not shaping it.
+// bad default is correctable without a deploy, like registerMax. One shared
+// bucket across the four endpoints keeps the accounting simple; per-endpoint
+// precision would buy nothing here because the point is bounding aggregate
+// load, not shaping it.
 //
 // Note this is NOT a credential-guessing control: auth codes and refresh tokens
-// are 256-bit random, so brute force was never the exposure. What it bounds is
+// are 256-bit random, so brute force is not the exposure. What it bounds is
 // unauthenticated DB load and unbounded OAuthAuthCode row creation.
 const oauthLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -71,11 +71,11 @@ const oauthLimiter = rateLimit({
 });
 const eventBus = require('../services/eventBus');
 const {
-  issuer, resourceUrl, verifyPkce, grantedScopes, redirectUriRegistered,
-  rotateCredentials, tokenResponse,
+  CLIENT_AUTH_METHODS, issuer, resourceUrl, verifyPkce, grantedScopes, redirectUriRegistered,
+  parseClientBasicAuth, rotateCredentials, tokenResponse,
 } = require('../services/mcpOAuth');
 
-// The OAuth 2.1 authorization server for the MCP connector (plan §2.4 Phase B).
+// The OAuth 2.1 authorization server for the MCP connector (docs/mcp-oauth.md).
 // Mounted at /api/mcp/oauth. Endpoints:
 //   POST /register   RFC 7591 Dynamic Client Registration (public, rate-limited)
 //   GET  /authorize  validate the request, then bounce the browser to the
@@ -86,19 +86,22 @@ const {
 //
 // The issued access token is a scoped, EXPIRING cel_ ApiToken (origin:'oauth'),
 // so /api/mcp auth, the SCOPE_ALLOWLIST, instant revoke and the connected-tokens
-// UI all work unchanged (middleware/apiTokenAuth.js).
+// UI treat it as any other token (middleware/apiTokenAuth.js).
 
 // /token and /revoke are application/x-www-form-urlencoded (RFC 6749 §4.1.3 /
 // RFC 7009). The global express.json() skips those content-types, so add a
 // urlencoded parser here; /register (json) is already parsed globally.
 router.use(express.urlencoded({ extended: false }));
 
-const MAX_REDIRECT_URIS = 5;
-// Per-URI length cap (security audit 2026-09-02 D16-2): the count was capped
-// but each entry was stored verbatim, so one anonymous registration could park
-// ~2 MB of redirect URIs in Mongo for 30 days, 200 times an hour per address.
-// 2048 is the same bound accountOps applies to URLs; no real client is near it.
+// Registration is anonymous and a client is kept for 30 days, so what one
+// registration may store is bounded three ways: the count, each URI's length
+// (2048, the bound accountOps applies to URLs) and the sum of the lengths.
+// The count leaves room for real clients: Gemini's custom connector registers
+// six callbacks (production, sandbox and test hosts, each with /r/ and /a/).
+// The sum keeps the stored worst case at five full-length URIs.
+const MAX_REDIRECT_URIS = 10;
 const MAX_REDIRECT_URI_LEN = 2048;
+const MAX_REDIRECT_URIS_TOTAL_LEN = 5 * MAX_REDIRECT_URI_LEN;
 const MAX_OAUTH_CONNECTIONS_PER_USER = 20; // Claude + ChatGPT + Desktop + … — generous, but bounded.
 // A refresh token that was just rotated away is honoured once more for this
 // long after the rotation (OAUTH_REFRESH_GRACE_S seconds; 0 = never). A
@@ -112,11 +115,11 @@ const MAX_OAUTH_CONNECTIONS_PER_USER = 20; // Claude + ChatGPT + Desktop + … �
 // still fires and the connection dies as it would have under strict
 // rotation. What the window gives up: a thief who replays a spent token
 // within a minute of the owner's rotation holds a live pair until the
-// owner's next refresh trips detection (release audit 2026-10-09, M2).
-// Usage check 2026-10-09: one connector replayed its revoked token every ten
-// minutes for a day and a half, because it never re-authorizes on
-// invalid_grant. An empty value means "unset" (compose forwards knobs as
-// ${X:-}), only an explicit 0 is strict.
+// owner's next refresh trips detection.
+// A connector that never re-authorizes on invalid_grant replays a revoked
+// token indefinitely, so a lost rotation response must not end its connection.
+// An empty value means "unset" (compose forwards knobs as ${X:-}), only an
+// explicit 0 is strict.
 const REFRESH_REUSE_GRACE_MS = (process.env.OAUTH_REFRESH_GRACE_S === undefined || process.env.OAUTH_REFRESH_GRACE_S === ''
   ? 60
   : Math.max(0, parseInt(process.env.OAUTH_REFRESH_GRACE_S, 10) || 0)) * 1000;
@@ -125,6 +128,13 @@ const REFRESH_REUSE_GRACE_MS = (process.env.OAUTH_REFRESH_GRACE_S === undefined 
 function oauthError(res, status, error, description) {
   res.setHeader('Cache-Control', 'no-store');
   return res.status(status).json({ error, error_description: description });
+}
+// A client that tried the Authorization header and failed is answered 401
+// with a challenge for the scheme it used (RFC 6749 §5.2).
+const BASIC_CHALLENGE = 'Basic realm="Cellarion"';
+function invalidClient(res, viaHeader) {
+  if (viaHeader) res.setHeader('WWW-Authenticate', BASIC_CHALLENGE);
+  return oauthError(res, 401, 'invalid_client', 'client authentication failed');
 }
 // Errors that happen AFTER redirect_uri is validated go back to the client as
 // query params on the redirect (RFC 6749 §4.1.2.1), preserving state.
@@ -156,17 +166,21 @@ router.post('/register', registerLimiter, async (req, res) => {
     if (!redirectUris.every((u) => typeof u === 'string' && u.length <= MAX_REDIRECT_URI_LEN)) {
       return oauthError(res, 400, 'invalid_redirect_uri', `each redirect_uri must be a string of at most ${MAX_REDIRECT_URI_LEN} characters`);
     }
+    if (redirectUris.reduce((sum, u) => sum + u.length, 0) > MAX_REDIRECT_URIS_TOTAL_LEN) {
+      return oauthError(res, 400, 'invalid_redirect_uri', `redirect_uris may hold at most ${MAX_REDIRECT_URIS_TOTAL_LEN} characters in all`);
+    }
     if (!redirectUris.every(isValidRedirectUri)) {
       return oauthError(res, 400, 'invalid_redirect_uri', 'redirect_uris must all be https, or http on a loopback host');
     }
-    // Only the two methods the token endpoint actually implements, and that the
-    // AS metadata advertises. `client_secret_basic` is deliberately NOT accepted
-    // — authenticateClient reads the secret from the body only, so a basic
-    // client could never authenticate; rejecting it at registration is honest
-    // instead of handing out a client_id that can never get a token.
+    // Only the methods the token endpoint implements and the AS metadata
+    // advertises. Either secret method makes a confidential client, issued a
+    // secret below. Absent stays 'none' (a public client) rather than RFC 7591
+    // §2's default client_secret_basic: a client that names no method and then
+    // sends no secret must still get its token.
     const authMethod = body.token_endpoint_auth_method || 'none';
-    if (!['none', 'client_secret_post'].includes(authMethod)) {
-      return oauthError(res, 400, 'invalid_client_metadata', 'token_endpoint_auth_method must be "none" or "client_secret_post"');
+    if (!CLIENT_AUTH_METHODS.includes(authMethod)) {
+      return oauthError(res, 400, 'invalid_client_metadata',
+        `token_endpoint_auth_method must be one of ${CLIENT_AUTH_METHODS.map((m) => `"${m}"`).join(', ')}`);
     }
 
     const clientId = OAuthClient.generateClientId();
@@ -187,7 +201,7 @@ router.post('/register', registerLimiter, async (req, res) => {
       responseTypes: ['code'],
       softwareId: typeof body.software_id === 'string' ? body.software_id.slice(0, 200) : null,
       softwareVersion: typeof body.software_version === 'string' ? body.software_version.slice(0, 50) : null,
-      // Auto-reap if it never completes a token exchange (M-6). Cleared on
+      // Auto-reap if it never completes a token exchange. Cleared on
       // first use below, so a real connector persists.
       expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
     });
@@ -339,51 +353,86 @@ router.post('/approve', oauthLimiter, requireAuth, requireNonDemo, async (req, r
 });
 
 /**
- * Authenticate the client at the token/revoke endpoints. Public clients present
- * only client_id; confidential clients also present client_secret. Returns the
- * OAuthClient doc, or null (caller returns invalid_client).
+ * Authenticate the client at the token/revoke endpoints (RFC 6749 §2.3.1).
+ * The client id comes from an `Authorization: Basic` header or the body; when
+ * both carry one they must agree. A public client ('none') presents only its
+ * id. A confidential client also presents its secret, in the header or the
+ * body, whichever secret method it registered: RFC 6749 lets the server accept
+ * both, the secret is the same either way, and a client that registered one
+ * method and sends the other is not left without a token. A header secret and
+ * a body secret that differ are refused.
+ *
+ * Returns { client, viaHeader }: client is the OAuthClient doc, or null (the
+ * caller answers invalid_client); viaHeader says the client tried the
+ * Authorization header, which makes that refusal carry a challenge.
  */
 async function authenticateClient(req) {
-  const clientId = req.body.client_id;
-  if (!clientId || typeof clientId !== 'string') return null;
+  const basic = parseClientBasicAuth(req.get('authorization'));
+  const viaHeader = basic !== null;
+  const refused = { client: null, viaHeader };
+  if (basic?.malformed) return refused;
+
+  // A JSON body can carry an object here (app.js parses JSON on this prefix).
+  const { client_id: bodyId, client_secret: bodySecret } = req.body || {};
+  if ((bodyId !== undefined && typeof bodyId !== 'string')
+    || (bodySecret !== undefined && typeof bodySecret !== 'string')) return refused;
+
+  if (basic && bodyId && bodyId !== basic.clientId) return refused;
+  const clientId = basic ? basic.clientId : bodyId;
+  // Only a non-empty string reaches the query, never an operator object.
+  if (typeof clientId !== 'string' || !clientId) return refused;
+  const headerSecret = basic ? basic.clientSecret : '';
+  if (headerSecret && bodySecret && headerSecret !== bodySecret) return refused;
+  const secret = headerSecret || bodySecret || '';
+
   const client = await OAuthClient.findOne({ clientId });
-  if (!client) return null;
-  if (client.tokenEndpointAuthMethod === 'none') return client; // public — client_id is enough
-  const secret = req.body.client_secret;
-  if (typeof secret !== 'string' || !client.clientSecretHash) return null;
+  if (!client) return refused;
+  if (client.tokenEndpointAuthMethod === 'none') return { client, viaHeader }; // public — client_id is enough
+  if (!secret || !client.clientSecretHash) return refused;
   // Constant-time compare, same as verifyPkce. (Both sides are SHA-256 hex, so
   // a timing leak would only be over the hash — but keep one habit for every
   // credential comparison rather than reasoning about which ones are safe.)
   const a = Buffer.from(OAuthClient.hashSecret(secret));
   const b = Buffer.from(client.clientSecretHash);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
-  return client;
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return refused;
+  return { client, viaHeader };
 }
 
 // ── POST /token — code exchange + refresh rotation ───────────────────────────
 router.post('/token', oauthLimiter, async (req, res) => {
-  // Every refusal is logged — client, grant and reason, never a token value.
-  // A connector looping on a dead refresh token was invisible for a day and a
-  // half (usage check 2026-10-09). Request strings ride as log ARGUMENTS,
-  // never inside the format string.
+  // Every refusal is logged — client, grant and reason, never a token value —
+  // so a connector looping on a dead refresh token is visible. Request strings
+  // ride as log ARGUMENTS, never inside the format string.
   const grantType = typeof req.body?.grant_type === 'string' ? req.body.grant_type : undefined;
-  const refuse = (client, status, error, description) => {
+  // Whether the client sent its credentials in the Authorization header. The
+  // log records that it did, never the header or the secret in it.
+  let viaHeader = false;
+  const logRefusal = (client, status, error) => {
     console.warn('[oauth] token request refused', {
       status,
       error,
       grant: grantType ? grantType.slice(0, 40) : null,
       client: client?.clientName || client?.clientId || null,
+      basicAuth: viaHeader,
       userAgent: String(req.get('user-agent') || '').slice(0, 80),
     });
+  };
+  const refuse = (client, status, error, description) => {
+    logRefusal(client, status, error);
     return oauthError(res, status, error, description);
   };
   try {
-    const client = await authenticateClient(req);
-    if (!client) return refuse(null, 401, 'invalid_client', 'client authentication failed');
+    const auth = await authenticateClient(req);
+    viaHeader = auth.viaHeader;
+    const { client } = auth;
+    if (!client) {
+      logRefusal(null, 401, 'invalid_client');
+      return invalidClient(res, viaHeader);
+    }
 
     if (grantType === 'authorization_code') {
       const { code, code_verifier, redirect_uri, resource } = req.body;
-      // typeof, not truthiness (L-2). The urlencoded parser below only ever
+      // typeof, not truthiness. The urlencoded parser above only ever
       // yields strings, but app.js mounts express.json() on the /api/mcp
       // PREFIX — which matches /api/mcp/oauth/* — so a caller sending
       // Content-Type: application/json can put an object here. hashCode()
@@ -422,7 +471,7 @@ router.post('/token', oauthLimiter, async (req, res) => {
         resource: codeDoc.resource || resourceUrl(),
         ...cred.fields,
       });
-      // Mark used → make the client permanent (drop the never-used TTL, M-6).
+      // Mark used → make the client permanent (drop the never-used TTL).
       OAuthClient.updateOne({ _id: client._id }, { $set: { lastUsedAt: new Date() }, $unset: { expiresAt: '' } }).catch(() => {});
       logAudit(req, 'oauth.token_issued', { type: 'apiToken', id: token._id }, { clientId: client.clientId, scopes: codeDoc.scopes });
       res.setHeader('Cache-Control', 'no-store');
@@ -513,10 +562,10 @@ router.post('/token', oauthLimiter, async (req, res) => {
 // ── POST /revoke — RFC 7009 ──────────────────────────────────────────────────
 router.post('/revoke', oauthLimiter, async (req, res) => {
   try {
-    const client = await authenticateClient(req);
-    if (!client) return oauthError(res, 401, 'invalid_client', 'client authentication failed');
+    const { client, viaHeader } = await authenticateClient(req);
+    if (!client) return invalidClient(res, viaHeader);
     const { token } = req.body;
-    // typeof for the same JSON-content-type reason as /token (L-2). RFC 7009
+    // typeof for the same JSON-content-type reason as /token. RFC 7009
     // §2.2 says an unknown/invalid token is still a 200, so a malformed one
     // simply falls through to the success response — never a 500.
     if (typeof token === 'string' && token) {

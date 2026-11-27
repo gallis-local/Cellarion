@@ -1,5 +1,5 @@
 /**
- * Personal typed key/value data (issue #986) — ONE implementation shared by
+ * Personal typed key/value data — ONE implementation shared by
  * the REST routes (routes/personalData.js) and the MCP tools
  * (mcp/tools/personalData.js), following the ownerInquiryOps pattern so the
  * two surfaces cannot drift on visibility or validation semantics.
@@ -105,7 +105,7 @@ async function listForBottle(bottle, cellar) {
           wineDefinition: bottle.wineDefinition,
           author: { $in: cellarMemberIds(cellar) },
           // Vintage-scoped wine entries only surface on bottles of that
-          // vintage (user ticket 6a853211 — ABV drifts year to year).
+          // vintage (ABV drifts year to year).
           $or: [{ vintage: null }, { vintage: bottle.vintage || null }],
         })
           .sort({ createdAt: 1 })
@@ -251,23 +251,35 @@ async function listForBottles(bottles, cellars) {
 async function bumpPersonalDataViewers(authorId, { cellarIds = [], bottleIds = [], wineLevel = false } = {}) {
   try {
     bumpDataVersion(authorId);
-    const cellars = new Set(cellarIds.map(idStr).filter(Boolean));
-    const bottleList = bottleIds.filter(Boolean);
-    if (bottleList.length) {
-      for (const c of await Bottle.distinct('cellar', { _id: { $in: bottleList } })) if (c) cellars.add(String(c));
-    }
-    const owners = new Set();
-    if (cellars.size) {
-      for (const o of await Cellar.distinct('user', { _id: { $in: [...cellars] } })) if (o) owners.add(String(o));
-    }
-    if (wineLevel) {
-      for (const o of await Cellar.distinct('user', { 'members.user': authorId, deletedAt: null })) if (o) owners.add(String(o));
-    }
-    owners.delete(String(authorId));
-    for (const o of owners) bumpDataVersion(o);
+    for (const o of await personalDataViewerOwners(authorId, { cellarIds, bottleIds, wineLevel })) bumpDataVersion(o);
   } catch (err) {
     console.error('Personal data version bump failed:', err.message);
   }
+}
+
+/**
+ * The owners, other than the author, of the cellars an author's entries show
+ * in: the cellars of the given bottles and cellars, and with `wineLevel` every
+ * cellar the author is a member of. Their data version is what keeps cached
+ * cellar data (the cellar search's documents) current. Callers:
+ * bumpPersonalDataViewers, and the account purge (userData/accountAndCellar),
+ * which reads it before the memberships are gone. Returns a Set of user ids.
+ */
+async function personalDataViewerOwners(authorId, { cellarIds = [], bottleIds = [], wineLevel = false } = {}) {
+  const cellars = new Set(cellarIds.map(idStr).filter(Boolean));
+  const bottleList = bottleIds.filter(Boolean);
+  if (bottleList.length) {
+    for (const c of await Bottle.distinct('cellar', { _id: { $in: bottleList } })) if (c) cellars.add(String(c));
+  }
+  const owners = new Set();
+  if (cellars.size) {
+    for (const o of await Cellar.distinct('user', { _id: { $in: [...cellars] } })) if (o) owners.add(String(o));
+  }
+  if (wineLevel) {
+    for (const o of await Cellar.distinct('user', { 'members.user': authorId, deletedAt: null })) if (o) owners.add(String(o));
+  }
+  owners.delete(String(authorId));
+  return owners;
 }
 
 /** bumpPersonalDataViewers' audience for one stored entry (or its raw target refs). */
@@ -310,9 +322,9 @@ async function resolveKey(userId, { keyId, newKey }) {
 
   // Name first, type second: an EXISTING key is matched on its name alone, so
   // a caller who declared the key once does not have to repeat its type on
-  // every write (chfish ticket 6aa6c90e, 2026-09-13 — the MCP schema promised
-  // "required only when the key is new" and this function made a liar of it
-  // by validating the full definition before looking the name up). A type
+  // every write — the MCP schema promises "required only when the key is
+  // new", so the full definition must never be validated before the name is
+  // looked up. A type
   // that IS supplied still has to agree with the stored one; only a genuinely
   // new key needs the full definition. The name is trimmed here exactly as
   // validateKeyDefinition trims it, so the lookup key matches what create
@@ -325,8 +337,8 @@ async function resolveKey(userId, { keyId, newKey }) {
   });
   if (existing) {
     const suppliedType = newKey && newKey.type;
-    // A type that is not a type at all is still the old message, not a
-    // "keeps one type" conflict (audit 2026-09-14 L4).
+    // A type that is not a type at all gets the plain invalid-type message,
+    // not a "keeps one type" conflict.
     if (suppliedType && !TYPES.includes(suppliedType)) {
       return fail('invalid', `Key type must be one of: ${TYPES.join(', ')}`);
     }
@@ -342,12 +354,12 @@ async function resolveKey(userId, { keyId, newKey }) {
   const checked = validateKeyDefinition(newKey || {});
   // needsType lets the MCP layer add its "pass key_type" hint ONLY here —
   // where the key is genuinely new — and not on a value error for an
-  // existing key (audit 2026-09-14 L2).
+  // existing key.
   if (!checked.ok) return { ...fail('invalid', checked.error), needsType: !(newKey && newKey.type) };
   // A genuinely new key is NOT written here: the caller validates the value
   // against the definition and checks the room on the target first, then
   // creates it (createKey) — so a refused value never leaves a typed key
-  // behind with no entry (release audit 2026-09-27, L).
+  // behind with no entry.
   return { ok: true, key: null, def: checked.def };
 }
 
@@ -366,8 +378,8 @@ async function createKey(userId, def) {
  * Caller has already resolved bottle access for userId.
  *
  * `dedupe` returns the caller's existing entry for the same key and target
- * slot instead of writing a second one. Off by default — the bottle page has
- * always allowed a repeat and nothing should change under it — and ON for the
+ * slot instead of writing a second one. Off by default — the bottle page
+ * allows a repeat and nothing should change under it — and ON for the
  * add-bottle form, where a six-bottle batch posts the same WINE-level field
  * once per bottle and a retry re-posts what the first attempt already wrote.
  */
@@ -378,8 +390,8 @@ async function createEntry(userId, bottle, { level, keyId, newKey, value, vintag
   if (level === 'wine' && !bottle.wineDefinition) {
     return fail('invalid', 'This bottle has no wine record to attach wine-level data to');
   }
-  // "Every bottle of this vintage" (user ticket 6a853211): a wine-level entry
-  // narrowed to THE BOTTLE'S vintage — derived server-side, never client text.
+  // "Every bottle of this vintage": a wine-level entry narrowed to THE
+  // BOTTLE'S vintage — derived server-side, never client text.
   if (vintageScoped && level !== 'wine') {
     return fail('invalid', 'vintage scope only applies to wine-level entries — a bottle-level entry already has its vintage');
   }
@@ -519,11 +531,11 @@ async function ownKey(userId, keyId) {
 }
 
 /**
- * Rename a key and/or change its unit (chfish ticket 6aa6c95e, 2026-09-13).
+ * Rename a key and/or change its unit.
  *
- * A key's name, type and unit are fixed by the very first write — the moment
+ * A key's name, type and unit are set by the very first write — the moment
  * the user knows least about the data they are about to enter — so a typo or
- * a wrong scale used to be permanent. The id never changes, so stored entries
+ * a wrong scale must stay fixable. The id never changes, so stored entries
  * and analytics field ids stay valid. Rules:
  *   - name: any time; must not collide with another of the user's keys
  *     (case-insensitive, the unique {user, nameKey} index is the last word).
@@ -533,14 +545,17 @@ async function ownKey(userId, keyId) {
  *   - type: never (every stored value would need revalidation; not offered).
  * Returns the previous name/unit so a caller (MCP undo) can restore them.
  */
-async function updateKey(userId, keyId, { name, unit } = {}) {
+async function updateKey(userId, keyId, { name, unit, enumOptions } = {}) {
   const found = await ownKey(userId, keyId);
   if (!found.ok) return found;
   const { key } = found;
 
   const wantsName = name !== undefined;
   const wantsUnit = unit !== undefined;
-  if (!wantsName && !wantsUnit) return fail('invalid', 'Nothing to change — pass name and/or unit');
+  const wantsOptions = enumOptions !== undefined;
+  if (!wantsName && !wantsUnit && !wantsOptions) {
+    return fail('invalid', 'Nothing to change — pass name, unit and/or enumOptions');
+  }
 
   let cleanName = key.name;
   if (wantsName) {
@@ -548,8 +563,7 @@ async function updateKey(userId, keyId, { name, unit } = {}) {
     if (!cleanName) return fail('invalid', 'Key name is required');
     if (cleanName.length > KEY_NAME_MAX) return fail('invalid', `Key name too long (max ${KEY_NAME_MAX} characters)`);
     // A key's name is visible to shared-cellar members on every entry that
-    // carries it — the same surface the discussion ban protects on writes
-    // (audit 2026-09-14 M1).
+    // carries it — the same surface the discussion ban protects on writes.
     if (await isBanned(userId)) {
       return fail('banned', 'You are banned from posting content visible to other users');
     }
@@ -569,10 +583,37 @@ async function updateKey(userId, keyId, { name, unit } = {}) {
     cleanUnit = cleanUnit || null;
   }
 
-  const prev = { name: key.name, unit: key.unit || null };
+  // The allowed values of a list key can change after its creation, so a
+  // list can grow. The new list replaces the old one under the creation
+  // rules; a value some entry still holds must stay on it, so no stored
+  // value ever falls outside its key's definition.
+  let cleanOptions = key.enumOptions ? [...key.enumOptions] : null;
+  if (wantsOptions) {
+    if (key.type !== 'enum') {
+      return fail('invalid', `Only "one of a list" keys carry allowed values — "${key.name}" is a ${key.type} key`);
+    }
+    const checked = validateKeyDefinition({ name: key.name, type: 'enum', enumOptions });
+    if (!checked.ok) return fail('invalid', checked.error);
+    cleanOptions = checked.def.enumOptions;
+    const dropped = (key.enumOptions || []).filter((o) => !cleanOptions.includes(o));
+    if (dropped.length > 0) {
+      const inUse = await PersonalDataEntry.distinct('value', { key: key._id, value: { $in: dropped } });
+      if (inUse.length > 0) {
+        const list = inUse.map((v) => `"${v}"`).join(', ');
+        return fail('in_use', `${list} ${inUse.length === 1 ? 'is' : 'are'} still used by an entry — keep ${inUse.length === 1 ? 'it' : 'them'} on the list, or change those entries first`);
+      }
+    }
+  }
+
+  const prev = {
+    name: key.name,
+    unit: key.unit || null,
+    ...(key.type === 'enum' ? { enumOptions: key.enumOptions ? [...key.enumOptions] : null } : {}),
+  };
   key.name = cleanName;
   key.nameKey = cleanName.toLowerCase();
   key.unit = cleanUnit || undefined;
+  if (wantsOptions) key.enumOptions = cleanOptions;
   try {
     await key.save();
   } catch (err) {
@@ -581,7 +622,7 @@ async function updateKey(userId, keyId, { name, unit } = {}) {
     }
     throw err;
   }
-  // The name (and unit) shows on every entry under the key.
+  // The name (unit, allowed values) shows on every entry under the key.
   await bumpKeyViewers(userId, key._id);
   return { ok: true, key: serializeKey(key), prev };
 }
@@ -602,7 +643,7 @@ async function deleteKey(userId, keyId) {
   }
   // A saved board or table view may filter or group on `personal.<id>`; the
   // analytics engine answers "Unknown field" for a deleted key and the board
-  // silently stops opening (audit 2026-09-14 L3). Refuse while referenced.
+  // silently stops opening. Refuse while referenced.
   const fieldRef = `personal.${String(key._id)}`;
   const [boards, views] = await Promise.all([
     SavedDashboard.find({ user: userId }).select('name query').lean(),
@@ -618,7 +659,7 @@ async function deleteKey(userId, keyId) {
   };
   await PersonalDataKey.deleteOne({ _id: key._id, user: userId });
   // Compensate the count→delete window: an entry written in between would
-  // otherwise dangle without a key (audit 2026-09-14 L1). Put the key back
+  // otherwise dangle without a key. Put the key back
   // under its id and report the key as in use.
   const late = await PersonalDataEntry.countDocuments({ key: key._id });
   if (late > 0) {
@@ -636,6 +677,7 @@ module.exports = {
   listForBottle,
   listForBottles,
   bumpPersonalDataViewers,
+  personalDataViewerOwners,
   bumpKeyViewers,
   createEntry,
   updateEntry,
@@ -644,6 +686,5 @@ module.exports = {
   updateKey,
   deleteKey,
   // exported for tests
-  serializeEntry,
   cellarMemberIds,
 };

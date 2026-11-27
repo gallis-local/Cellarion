@@ -1,5 +1,5 @@
 /**
- * Personal-data MCP tools (#986) — list/add/update/delete + undo.
+ * Personal-data MCP tools — list/add/update/delete + undo.
  *
  * Pins: the read/write scope split; access gating through resolveBottleAccess
  * (foreign bottle → not_found, never forbidden); every handler delegating to
@@ -18,9 +18,16 @@ jest.mock('../services/personalData', () => ({
 jest.mock('../models/Bottle', () => ({ findById: jest.fn(), aggregate: jest.fn(), find: jest.fn(), countDocuments: jest.fn() }));
 jest.mock('../models/Cellar', () => ({ findById: jest.fn(), find: jest.fn() }));
 jest.mock('../models/McpActionLog', () => ({ create: jest.fn(), findOne: jest.fn(), findOneAndUpdate: jest.fn(), updateOne: jest.fn().mockResolvedValue({}) }));
-jest.mock('../models/PersonalDataEntry', () => ({ findOne: jest.fn(), findOneAndDelete: jest.fn(), create: jest.fn(), countDocuments: jest.fn() }));
+jest.mock('../models/PersonalDataEntry', () => ({ findOne: jest.fn(), findOneAndDelete: jest.fn(), create: jest.fn(), countDocuments: jest.fn(), distinct: jest.fn(async () => []) }));
 jest.mock('../models/PersonalDataKey', () => ({ findOne: jest.fn(), create: jest.fn() }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
+// The wine record add_personal_data reads for its hint. Unit-tested in
+// registryDataOps.test.js; here it is the seam the hint is built from.
+jest.mock('../services/registryDataOps', () => ({
+  dataForWine: jest.fn(async () => ({ ok: true, fields: [], vintage: null })),
+  suggestValue: jest.fn(), listAcceptedKeys: jest.fn(), proposeKey: jest.fn(),
+  resolveForVintage: jest.fn(() => ({ row: null, from: null })), normaliseVintage: jest.fn(),
+}));
 // revert.js and tools/write.js top-require bottleOps (which pulls the search/
 // meili chain) — mock the full surface they read at load, same as
 // wineListTools.test.js.
@@ -37,6 +44,7 @@ const McpActionLog = require('../models/McpActionLog');
 const PersonalDataEntry = require('../models/PersonalDataEntry');
 const PersonalDataKey = require('../models/PersonalDataKey');
 const svc = require('../services/personalData');
+const registryDataOps = require('../services/registryDataOps');
 const { logAudit } = require('../services/audit');
 const { allTools } = require('./registry');
 const { revertLedgerRow, WRITE_REVERSIBLE } = require('./revert');
@@ -95,7 +103,7 @@ describe('registration + scopes', () => {
   });
 });
 
-describe('update_personal_key / delete_personal_key (ticket 6aa6c95e)', () => {
+describe('update_personal_key / delete_personal_key', () => {
   const keyRow = { _id: KEY_ID, name: 'Falstaff', type: 'decimal', unit: '/100', enumOptions: null };
 
   test('rename delegates to the service and logs an undoable key_update row carrying the previous definition', async () => {
@@ -186,6 +194,50 @@ describe('update_personal_key / delete_personal_key (ticket 6aa6c95e)', () => {
     expect(svc.bumpKeyViewers).toHaveBeenCalledWith(ME, KEY_ID);
     expect(svc.bumpPersonalDataViewers).toHaveBeenCalledWith(ME, undefined);
   });
+
+  test('enum_options replaces the allowed values; the ledger row carries only the old list', async () => {
+    const enumRow = { _id: KEY_ID, name: 'Closure', type: 'enum', unit: null, enumOptions: ['cork', 'screwcap', 'crown'] };
+    svc.updateKey.mockResolvedValue({ ok: true, key: enumRow, prev: { name: 'Closure', unit: null, enumOptions: ['cork', 'screwcap'] } });
+
+    const res = await tool('update_personal_key').handler({ key_id: KEY_ID, enum_options: ['cork', 'screwcap', 'crown'] }, CTX);
+
+    expect(svc.updateKey).toHaveBeenCalledWith(ME, KEY_ID, { name: undefined, unit: undefined, enumOptions: ['cork', 'screwcap', 'crown'] });
+    const body = parse(res);
+    expect(body.summary).toMatch(/allowed values now: cork, screwcap, crown/);
+    expect(body.data.key.options).toEqual(['cork', 'screwcap', 'crown']);
+    expect(McpActionLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      tool: 'update_personal_key',
+      detail: expect.objectContaining({ op: 'key_update', keyId: KEY_ID }),
+      prev: { enumOptions: ['cork', 'screwcap'] },
+    }));
+  });
+
+  test('undo of an allowed-values change restores the old list, unless an entry now holds a dropped value', async () => {
+    McpActionLog.findOneAndUpdate.mockResolvedValue({ _id: 'row' });
+    const saved = jest.fn().mockResolvedValue(undefined);
+    const key = { _id: KEY_ID, name: 'Closure', nameKey: 'closure', type: 'enum', enumOptions: ['cork', 'screwcap', 'crown'], save: saved };
+    PersonalDataKey.findOne.mockResolvedValue(key);
+
+    PersonalDataEntry.distinct.mockResolvedValueOnce(['crown']);
+    const refused = await revertLedgerRow({
+      _id: 'row', action: 'personal_data', tool: 'update_personal_key',
+      detail: { op: 'key_update', keyId: KEY_ID, key: 'Closure' }, prev: { enumOptions: ['cork', 'screwcap'] },
+    }, CTX, okHelpers);
+    expect(refused.isError).toBe(true);
+    expect(parse(refused).error.code).toBe('conflict');
+    expect(McpActionLog.updateOne).toHaveBeenCalledWith({ _id: 'row' }, { $set: { reversed: false } });
+    expect(saved).not.toHaveBeenCalled();
+    expect(key.enumOptions).toEqual(['cork', 'screwcap', 'crown']);
+
+    PersonalDataEntry.distinct.mockResolvedValueOnce([]);
+    const ok = await revertLedgerRow({
+      _id: 'row2', action: 'personal_data', tool: 'update_personal_key',
+      detail: { op: 'key_update', keyId: KEY_ID, key: 'Closure' }, prev: { enumOptions: ['cork', 'screwcap'] },
+    }, CTX, okHelpers);
+    expect(parse(ok)).toMatchObject({ undone: 'update_personal_key', restored: { name: 'Closure', options: ['cork', 'screwcap'] } });
+    expect(key.enumOptions).toEqual(['cork', 'screwcap']);
+    expect(saved).toHaveBeenCalled();
+  });
 });
 
 describe('list_personal_data', () => {
@@ -234,6 +286,72 @@ describe('add_personal_data', () => {
       action: 'personal_data',
       detail: expect.objectContaining({ op: 'create', entryId: ENTRY }),
     }));
+  });
+
+  describe('hint when the key is part of the public vocabulary', () => {
+    const PUBLIC_ABV = {
+      _id: oid('9'), name: 'ABV', displayName: 'ABV', type: 'decimal', unit: '%',
+      translations: { sv: 'Alkoholhalt', fr: 'Degré d’alcool' },
+    };
+    const field = (extra) => ({
+      key: PUBLIC_ABV, value: null, resolvedFrom: null, resolvedVintage: null, wineValue: null,
+      overrides: [], hasPendingSuggestion: false, hasPendingWineSuggestion: false, mySuggestion: null, ...extra,
+    });
+    const add = async (keyName) => {
+      Bottle.findById.mockResolvedValue({ _id: BOTTLE_ID, cellar: CELLAR_ID, wineDefinition: WINE, vintage: '2019' });
+      Cellar.findById.mockResolvedValue({ _id: CELLAR_ID, user: ME, members: [], deletedAt: null });
+      svc.createEntry.mockResolvedValue({
+        ok: true, keyCreated: false,
+        entry: svcEntry({ key: { _id: KEY_ID, name: keyName, type: 'decimal', unit: '%', enumOptions: null } }),
+      });
+      return parse(await tool('add_personal_data').handler({
+        bottle_id: BOTTLE_ID, level: 'wine', key: keyName, value: 13.5,
+      }, CTX));
+    };
+
+    test('no public value: points at suggest_wine_public_value with the canonical key and the vintage', async () => {
+      registryDataOps.dataForWine.mockResolvedValueOnce({ ok: true, vintage: '2019', fields: [field()] });
+      const body = await add('Alkoholhalt');
+
+      expect(registryDataOps.dataForWine).toHaveBeenCalledWith(WINE, ME, { roles: ['user'], vintage: '2019' });
+      expect(body.data.hint).toMatch(/ABV is part of the shared wine record/);
+      expect(body.data.hint).toContain('suggest_wine_public_value');
+      expect(body.data.hint).toContain(`key_id ${oid('9')}`);
+      expect(body.data.hint).toContain('vintage 2019');
+      // Existing fields are unchanged.
+      expect(body.data).toMatchObject({ key_created: false, undo: expect.any(String) });
+      expect(body.data.entry.entry_id).toBe(ENTRY);
+    });
+
+    test('a published value: says what the record holds instead', async () => {
+      registryDataOps.dataForWine.mockResolvedValueOnce({
+        ok: true, vintage: '2019', fields: [field({ value: 13.5, resolvedFrom: 'wine', wineValue: 13.5 })],
+      });
+      const body = await add('ABV');
+      expect(body.data.hint).toBe('The shared wine record already holds ABV = 13.5 % (for every vintage).');
+    });
+
+    test('a suggestion already waiting: no nudge to file another', async () => {
+      registryDataOps.dataForWine.mockResolvedValueOnce({
+        ok: true, vintage: '2019', fields: [field({ hasPendingSuggestion: true })],
+      });
+      const body = await add("degré d'alcool");
+      expect(body.data.hint).toMatch(/already awaiting curator review/);
+      expect(body.data.hint).not.toContain('suggest_wine_public_value');
+    });
+
+    test('a key the vocabulary does not have, or a wine without a record: no hint, and the write still answers', async () => {
+      registryDataOps.dataForWine.mockResolvedValueOnce({ ok: true, vintage: '2019', fields: [field()] });
+      expect((await add('Cork condition')).data.hint).toBeUndefined();
+
+      registryDataOps.dataForWine.mockResolvedValueOnce({ ok: false, code: 'not_found' });
+      expect((await add('ABV')).data.hint).toBeUndefined();
+
+      registryDataOps.dataForWine.mockRejectedValueOnce(new Error('db down'));
+      const body = await add('ABV');
+      expect(body.data.hint).toBeUndefined();
+      expect(body.data.entry.entry_id).toBe(ENTRY);
+    });
   });
 
   test('service type_conflict maps to MCP conflict', async () => {

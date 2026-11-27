@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next';
+import { formatVintage } from '../../utils/vintage';
 
 /**
  * `onBarClick(year)` makes each vintage bar a clickable deep-link target.
@@ -7,21 +8,26 @@ function VintageBarChart({ data, onBarClick }) {
   const { t } = useTranslation();
   if (!data || data.length === 0) return <p className="stats-empty">{t('statistics.noVintageData')}</p>;
 
-  const numeric  = data.filter(d => d.year !== 'NV');
+  // The two stored codes are bars of their own, after the years, labelled
+  // through the display helper: among the years, 'Unknown' would show as a
+  // raw word, sliced to "wn" past twenty bars.
+  const CODES = ['NV', 'Unknown'];
+  const numeric  = data.filter(d => !CODES.includes(String(d.year)));
   const nvItem   = data.find(d => d.year === 'NV');
+  const unknownItem = data.find(d => d.year === 'Unknown');
   const maxCount = Math.max(...data.map(d => d.count), 1);
   const BAR_HEIGHT = 160;
   const clickable = typeof onBarClick === 'function';
 
   const renderBar = (d, extraClass = '') => {
-    const title = t('statistics.vintageBottle', { vintage: d.year, count: d.count });
+    const title = t('statistics.vintageBottle', { vintage: formatVintage(d.year, t), count: d.count });
     const content = (
       <>
         <div className="vintage-bar-count">{d.count > 1 ? d.count : ''}</div>
         <div className={`vintage-bar${extraClass ? ` ${extraClass}` : ''}`}
           style={{ height: `${Math.max(4, (d.count / maxCount) * BAR_HEIGHT)}px` }} />
         <div className="vintage-bar-label">
-          {numeric.length > 20 ? String(d.year).slice(-2) : d.year}
+          {CODES.includes(String(d.year)) ? formatVintage(d.year, t) : numeric.length > 20 ? String(d.year).slice(-2) : d.year}
         </div>
       </>
     );
@@ -51,6 +57,7 @@ function VintageBarChart({ data, onBarClick }) {
       <div className="vintage-bars">
         {numeric.map(d => renderBar(d))}
         {nvItem && renderBar({ ...nvItem, year: 'NV' }, 'vintage-bar--nv')}
+        {unknownItem && renderBar({ ...unknownItem, year: 'Unknown' }, 'vintage-bar--nv')}
       </div>
     </div>
   );

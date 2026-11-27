@@ -1,15 +1,14 @@
 /**
  * Which photos belong to the shared registry, and so outlive the bottle they
- * were taken of and the account that uploaded them (policy, 2026-09-27).
+ * were taken of and the account that uploaded them.
  *
  * A photo an admin approved as PUBLIC is registry content: every owner of the
  * wine sees it, it may be the wine's picture, and other people's cellars and
  * exports point at it. Deleting it with its bottle, or with its uploader's
  * account, would take a picture away from everyone else — so it is kept and,
  * on account deletion, anonymised (uploadedBy re-pointed to the [deleted]
- * sentinel, like forum content). Until 2026-09-27 only the wine's chosen
- * picture (assignedToWine) was kept; every other approved photo went with the
- * bottle or the account.
+ * sentinel, like forum content). That holds for every approved public photo,
+ * not only the wine's chosen picture (assignedToWine).
  *
  * Everything else — pending, private, rejected tombstones, and every label
  * scan (private curation evidence, never approvable) — is the uploader's own

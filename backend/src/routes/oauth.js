@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const User = require('../models/User');
 const { logAudit } = require('../services/audit');
 const { issueTokens, clientHint } = require('../services/authTokens');
+const { clearSignupBinding } = require('../services/signupBinding');
 const { resolvePendingShares } = require('../services/pendingShares');
 const { CookieStateStore } = require('../services/oauthStateStore');
 const { isReservedUsername } = require('../utils/deletedUser');
@@ -18,7 +19,7 @@ const router = express.Router();
 const GOOGLE_ENABLED = Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
 
 // The same opt-in shape for a generic OIDC provider, so a self-hoster can point
-// Cellarion at their own identity provider instead of Google (#1203). Nothing
+// Cellarion at their own identity provider instead of Google. Nothing
 // here is Google-specific and nothing changes for a deployment that leaves
 // these unset — there is no mode flag and no either/or: both can be on.
 //
@@ -170,8 +171,36 @@ async function upsertSsoUser(provider, claims, { trustEmailVerified = false, iss
   const existing = await User.findOne({ email });
   if (existing) {
     existing.authProviders.push({ ...identity });
-    if (!existing.emailVerified) existing.emailVerified = true; // provider-verified
+    const claimed = !existing.emailVerified;
+    if (claimed) {
+      // Nobody had proven owning this mailbox before this sign-in: the account
+      // was registered with the address and never verified. What was set on it
+      // (a password, sessions, a pending verification or reset link, the
+      // consent given at registration) came from someone who may not be the
+      // owner, so none of it carries over. Kept, it would let whoever
+      // registered the address first go on signing in with their password
+      // beside the owner. The account becomes this provider's sign-in, and the
+      // owner gives consent themselves, as a new SSO account does.
+      existing.emailVerified = true; // provider-verified
+      existing.password = undefined;
+      existing.sessions = [];
+      existing.refreshTokenHash = null;
+      existing.refreshTokenExpiresAt = null;
+      existing.refreshTokenPersistent = null;
+      existing.emailVerificationTokenHash = null;
+      existing.emailVerificationExpiresAt = null;
+      existing.passwordResetTokenHash = null;
+      existing.passwordResetExpiresAt = null;
+      existing.failedLoginAttempts = { count: 0, firstFailedAt: null, lockedUntil: null };
+      existing.gdprConsent = {
+        privacyPolicy: { accepted: false, acceptedAt: null, version: null },
+        dataProcessing: { accepted: false, acceptedAt: null },
+      };
+    }
     await existing.save();
+    if (claimed) {
+      logAudit(null, 'auth.sso.claimed_unverified', { type: 'user', id: existing._id }, { provider });
+    }
     return existing;
   }
 
@@ -199,7 +228,7 @@ async function upsertSsoUser(provider, claims, { trustEmailVerified = false, iss
  * Adapter: map a passport-google-oauth20 profile onto the neutral claim shape.
  * Google asserts email verification itself and is an open issuer, so it never
  * blanket-trusts — trustEmailVerified stays false and the email_verified claim
- * is authoritative. Behaviour is identical to the pre-refactor path.
+ * is authoritative.
  */
 async function upsertGoogleUser(profile) {
   const emailEntry = Array.isArray(profile.emails) ? profile.emails[0] : null;
@@ -352,8 +381,8 @@ if (OIDC_ENABLED) {
 // session. Registered for EITHER provider rather than only inside the Google
 // block, so an OIDC-only deployment is set up the same way a Google one is.
 // Defensive rather than load-bearing: passport 0.7 tolerates authenticate()
-// without initialize() when sessions are off, so the old placement works today
-// — but that is undocumented tolerance, not a promise.
+// without initialize() when sessions are off — but that is undocumented
+// tolerance, not a promise.
 if (GOOGLE_ENABLED || OIDC_ENABLED) {
   router.use(passport.initialize());
 }
@@ -400,6 +429,8 @@ router.get('/google/callback', (req, res, next) => {
     }
     try {
       await issueTokens(user, res, { rememberMe: true, client: clientHint(req) });
+      // A sign-in ends the signup binding, as /login does.
+      if (req.cookies?.signupBinding) clearSignupBinding(res);
       logAudit(req, 'auth.oauth.success', { type: 'user', id: user._id }, { provider: 'google' });
       resolvePendingShares(user).catch(() => {});
       return res.redirect(successRedirect);
@@ -437,6 +468,8 @@ router.get('/oidc/callback', (req, res, next) => {
     }
     try {
       await issueTokens(user, res, { rememberMe: true, client: clientHint(req) });
+      // A sign-in ends the signup binding, as /login does.
+      if (req.cookies?.signupBinding) clearSignupBinding(res);
       logAudit(req, 'auth.oauth.success', { type: 'user', id: user._id }, { provider: 'oidc' });
       resolvePendingShares(user).catch(() => {});
       return res.redirect(successRedirect);
@@ -451,5 +484,4 @@ module.exports = router;
 // Exported for unit tests (the account-linking logic is the important part).
 module.exports.upsertSsoUser = upsertSsoUser;
 module.exports.upsertGoogleUser = upsertGoogleUser;
-module.exports.upsertOidcUser = upsertOidcUser;
 module.exports.generateUniqueUsername = generateUniqueUsername;

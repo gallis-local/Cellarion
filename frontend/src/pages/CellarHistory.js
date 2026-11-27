@@ -21,6 +21,8 @@ import SearchInput from '../components/SearchInput';
 import './CellarDetail.css';
 import './CellarHistory.css';
 import '../components/BottleUndoNotice.css';
+import { formatVintage } from '../utils/vintage';
+import { sweetnessChipLabel } from '../utils/sweetnessCategory';
 
 const AddMoreBottlesModal = lazy(() => import('../components/AddMoreBottlesModal'));
 
@@ -44,13 +46,13 @@ const reasonOf = (bottle) => {
 const cursorOf = (bottle) => `${bottle.consumedAt || ''}|${bottle._id}`;
 
 // What the history view was showing — search, filters and scope — kept per
-// cellar for this tab, so Back from a bottle finds the same list (it used to
-// start over: everything in component state only). Only Back/Forward (or a
-// reload) restores it — a link to the history opens it fresh.
+// cellar for this tab, so Back from a bottle finds the same list instead of
+// starting over. Only Back/Forward (or a reload) restores it — a link to the
+// history opens it fresh.
 const HISTORY_VIEW_PREFIX = 'cellarion.historyView.';
 const DEFAULT_HISTORY_FILTERS = {
   search: '',
-  type: [], country: [], region: [], appellation: [], grapes: [], vintage: [],
+  type: [], country: [], region: [], appellation: [], grapes: [], vintage: [], sweetnessCategory: [],
   minRating: '', maxRating: '', maturity: []
 };
 const readSavedHistoryView = (cellarId) => {
@@ -156,7 +158,8 @@ function CellarHistory() {
   const filterKey = [
     debouncedSearch,
     filters.type.join(','), filters.country.join(','), filters.region.join(','),
-    (filters.appellation || []).join(','), filters.grapes.join(','), filters.vintage.join(',')
+    (filters.appellation || []).join(','), filters.grapes.join(','), filters.vintage.join(','),
+    (filters.sweetnessCategory || []).join(',')
   ].join('|');
 
   // `id` is included so navigating to another cellar whose scope key matches the
@@ -321,10 +324,11 @@ function CellarHistory() {
   (filters.appellation || []).forEach(v => activeChips.push({ key: 'appellation', value: v, label: v }));
   (filters.grapes || []).forEach(v => activeChips.push({ key: 'grapes', value: v, label: grapeNames[v] || v }));
   (filters.vintage || []).forEach(v => activeChips.push({ key: 'vintage', value: v, label: v }));
+  (filters.sweetnessCategory || []).forEach(v => activeChips.push({ key: 'sweetnessCategory', value: v, label: sweetnessChipLabel(t, v) }));
 
   // Something narrows the list — a filter chip or the search box (which has
-  // no chip, so a search that found nothing used to show the empty-history
-  // note). Read from the answer on screen (shownNarrowed).
+  // no chip, so without it a search that found nothing would show the
+  // empty-history note). Read from the answer on screen (shownNarrowed).
   const narrowed = shownNarrowed;
 
   const removeChip = (chip) => {
@@ -336,7 +340,7 @@ function CellarHistory() {
   };
 
   const clearAll = () => setFilters(prev => ({
-    ...prev, type: [], country: [], region: [], appellation: [], grapes: [], vintage: [],
+    ...prev, type: [], country: [], region: [], appellation: [], grapes: [], vintage: [], sweetnessCategory: [],
     minRating: '', maxRating: '', maturity: []
   }));
 
@@ -526,8 +530,8 @@ function CellarHistory() {
             bottle={addTemplate}
             copyDetailsDefault={false}
             onClose={() => setAddTemplate(null)}
-            onAdded={(count) => {
-              const name = bottleNoticeName(addTemplate);
+            onAdded={(count, vintage) => {
+              const name = bottleNoticeName({ ...addTemplate, vintage });
               setAddTemplate(null);
               setNotice(name
                 ? t('bottleNotice.added', { count, name })
@@ -626,7 +630,7 @@ function HistoryBottleCard({ bottle, cellarId, showCellarBadge = false, canEdit 
           <h3>{wine?.name || t('common.unknownWine')}</h3>
           <p className="history-producer">{wine?.producer}</p>
           <div className="history-meta">
-            <span>{t('history.vintageLabel')} {bottle.vintage}</span>
+            <span>{t('history.vintageLabel')} {formatVintage(bottle.vintage, t)}</span>
             {consumedDate && <span>· {consumedDate}</span>}
             {bottle.price && <span>· {t('history.paidLabel')} {bottle.price} {bottle.currency}</span>}
           </div>
@@ -642,8 +646,8 @@ function HistoryBottleCard({ bottle, cellarId, showCellarBadge = false, canEdit 
           )}
         </div>
         <div className="history-bottle-main-right">
-          {/* The vintage page stays reachable after the last bottle is drunk
-              (support ticket 2026-10-09): from here, not only from the cellar
+          {/* The vintage page stays reachable after the last bottle is drunk:
+              from here, not only from the cellar
               list's group, which is gone by then. */}
           {wine?._id && (
             <Link
@@ -655,8 +659,8 @@ function HistoryBottleCard({ bottle, cellarId, showCellarBadge = false, canEdit 
             </Link>
           )}
           {/* "Add again": new bottles of this wine and vintage, copied from
-              this one, straight into the cellar — the visible way back used to
-              be the wishlist, which never adds a bottle. */}
+              this one, straight into the cellar — the wishlist never adds a
+              bottle. */}
           {onAddAgain && (
             <button
               type="button"

@@ -1,7 +1,7 @@
 /**
  * POST /api/admin/taxonomy/grapes/:id/approve — the review verb for
- * user-minted grapes (somm ticket 6a942a60: bottle-add/import wrote "Honey"
- * and "Alvarão" straight into the shared taxonomy with no gate).
+ * user-minted grapes (bottle-add and import can mint a grape name into the
+ * shared taxonomy; this verb records that a human reviewed such a row).
  *
  * Pins the three properties the regions verb established: approval is an
  * explicit act (flag flips, audit written), it is idempotent (a second click
@@ -15,10 +15,7 @@ jest.mock('../../services/search', () => ({
   getIsAvailable: jest.fn(() => false),
   indexWine: jest.fn(),
   removeWine: jest.fn(),
-  bulkIndexWines: jest.fn(),
-  bulkIndexBottles: jest.fn(),
   fullSync: jest.fn(),
-  fullSyncBottles: jest.fn(),
   waitForTasks: jest.fn(),
 }));
 jest.mock('../../services/audit', () => ({ logAudit: jest.fn() }));

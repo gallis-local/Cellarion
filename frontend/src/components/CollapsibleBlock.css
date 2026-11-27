@@ -10,6 +10,14 @@
   min-width: 0;
 }
 
+/* A block whose card renders nothing (the vintage page's history with no
+   bottles drunk and no other vintages) takes no room: an empty wrapper still
+   took its section's gap and left a wider space above the next card. The
+   bottle page has had the same rule for its own blocks. */
+.cblock:empty {
+  display: none;
+}
+
 /* The section's gap spaces the blocks; a card's own top margin would sit
    inside the wrapper and push the card below its fold button. */
 .cblock > .card {
@@ -65,7 +73,7 @@
 }
 
 /* Folded: the title row stays, the rest is hidden — never a dialog the card
-   renders inside itself (release audit 2026-10-13: "+ Add" on a folded card
+   renders inside itself ("+ Add" on a folded card
    opened an invisible dialog). */
 .cblock--collapsed > .card > :not(:first-child):not(.modal-overlay),
 .cblock--nested.cblock--collapsed > .card > :first-child > :not(:first-child):not(.modal-overlay) {

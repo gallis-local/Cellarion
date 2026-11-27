@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { getMyOwnerInquiries, respondToOwnerInquiry } from '../../api/ownerInquiries';
 
@@ -13,18 +14,20 @@ import { getMyOwnerInquiries, respondToOwnerInquiry } from '../../api/ownerInqui
  * Two states, in priority order:
  *   ASK    — an unanswered inquiry: the question and the answer form.
  *   REPLY  — one the viewer answered and a curator has since resolved WITH a
- *            reply. Before this the card simply vanished on resolve, so
- *            someone who walked to their shelf and read a back label for us
- *            got silence; the reply is why they would do it a second time.
+ *            reply. The card must not simply vanish on resolve: someone
+ *            who walked to their shelf and read a back label for us would
+ *            get silence; the reply is why they would do it a second time.
  * An unanswered question outranks a reply — it is the one that still needs
  * them. Replies are transient by design: the server stops returning them 30
  * days after resolution.
  */
-function OwnerInquiryCard({ apiFetch, wineId, inquiry: given = null, intro = null }) {
+function OwnerInquiryCard({ apiFetch, wineId, inquiry: given = null, intro = null, headingLevel = 2, onAnswered = null }) {
   const { t } = useTranslation();
-  // `inquiry` given (the question page, support ticket 2026-10-14): show THAT
+  // `inquiry` given (the question page, the list): show THAT
   // question, not whichever one the wine has, and skip the lookup. `intro`
   // replaces the "you own a bottle of it" line when the member has none left.
+  // The list nests the card under its own headings (`headingLevel`) and moves
+  // an answered question out of its waiting section (`onAnswered`).
   const [inquiry, setInquiry] = useState(given);
   const [answer, setAnswer] = useState('');
   const [sending, setSending] = useState(false);
@@ -68,6 +71,7 @@ function OwnerInquiryCard({ apiFetch, wineId, inquiry: given = null, intro = nul
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
         setSent(true);
+        onAnswered?.(text);
       } else {
         setError(data.error || t('bottleDetail.ownerInquiry.sendError', 'Could not send your answer — please try again.'));
         // 409 is terminal (already answered, or the inquiry closed) — hide the
@@ -83,6 +87,13 @@ function OwnerInquiryCard({ apiFetch, wineId, inquiry: given = null, intro = nul
 
   // The viewer answered and a curator has replied — read-only outcome card.
   const isReply = inquiry.responded && !!inquiry.curatorReply;
+  const Heading = `h${headingLevel}`;
+  // A page with several cards (the list) needs each answer box to say which
+  // wine it is for; on a bottle page the wine is the page itself.
+  const givenWine = given?.wine ? [given.wine.producer, given.wine.name].filter(Boolean).join(' — ') : '';
+  const answerLabel = givenWine
+    ? t('bottleDetail.ownerInquiry.answerAbout', 'Your answer about {{wine}}', { wine: givenWine })
+    : t('bottleDetail.ownerInquiry.yourAnswer', 'Your answer');
 
   const quoteStyle = {
     margin: '0 0 0.75rem', padding: '0.5rem 0.75rem',
@@ -90,12 +101,21 @@ function OwnerInquiryCard({ apiFetch, wineId, inquiry: given = null, intro = nul
     borderRadius: 'var(--radius-sm)', fontSize: '0.95rem',
   };
 
+  // Only where the card found the question itself (a bottle or vintage page):
+  // the pages that hand it one are the question page and the list, which
+  // carry their own way to the list.
+  const listLink = given ? null : (
+    <p style={{ margin: '0.6rem 0 0', fontSize: '0.8rem' }}>
+      <Link to="/questions">{t('curatorQuestions.allLink', 'All questions from the curators')}</Link>
+    </p>
+  );
+
   if (isReply) {
     return (
       <div className="card oi-card" style={{ padding: '1rem 1.25rem', borderLeft: '3px solid var(--color-primary, #7c2d3a)' }}>
-        <h2 style={{ margin: '0 0 0.35rem', fontSize: '1rem' }}>
+        <Heading style={{ margin: '0 0 0.35rem', fontSize: '1rem' }}>
           {t('bottleDetail.ownerInquiry.replyTitle', 'A curator replied about this wine')}
-        </h2>
+        </Heading>
         <p style={{ margin: '0 0 0.6rem', color: 'var(--color-text-muted)', fontSize: '0.85rem' }}>
           {t('bottleDetail.ownerInquiry.replyIntro', 'You answered a question about this wine — here is what came of it. Thank you: the shared registry is more accurate because you checked.')}
         </p>
@@ -110,15 +130,16 @@ function OwnerInquiryCard({ apiFetch, wineId, inquiry: given = null, intro = nul
         <blockquote style={{ ...quoteStyle, margin: 0, borderLeft: '2px solid var(--color-primary, #7c2d3a)' }}>
           {inquiry.curatorReply}
         </blockquote>
+        {listLink}
       </div>
     );
   }
 
   return (
     <div className="card oi-card" style={{ padding: '1rem 1.25rem', borderLeft: '3px solid var(--color-primary, #7c2d3a)' }}>
-      <h2 style={{ margin: '0 0 0.35rem', fontSize: '1rem' }}>
+      <Heading style={{ margin: '0 0 0.35rem', fontSize: '1rem' }}>
         {t('bottleDetail.ownerInquiry.title', 'A curator has a question about this wine')}
-      </h2>
+      </Heading>
       <p style={{ margin: '0 0 0.6rem', color: 'var(--color-text-muted)', fontSize: '0.85rem' }}>
         {intro || t('bottleDetail.ownerInquiry.intro', 'You own a bottle of it, so you can check what research cannot. Answering is optional; only registry curators see your answer.')}
       </p>
@@ -136,6 +157,7 @@ function OwnerInquiryCard({ apiFetch, wineId, inquiry: given = null, intro = nul
         <form onSubmit={submit}>
           {error && <div className="alert alert-error" style={{ marginBottom: 8 }}>{error}</div>}
           <textarea
+            aria-label={answerLabel}
             value={answer}
             onChange={(e) => setAnswer(e.target.value)}
             placeholder={t('bottleDetail.ownerInquiry.placeholder', 'e.g. The label says “E. Pira e Figli — Chiara Boschis” on the front.')}
@@ -156,6 +178,7 @@ function OwnerInquiryCard({ apiFetch, wineId, inquiry: given = null, intro = nul
           </div>
         </form>
       )}
+      {listLink}
     </div>
   );
 }

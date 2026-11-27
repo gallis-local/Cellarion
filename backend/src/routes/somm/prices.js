@@ -1,17 +1,16 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const { requireAuth, requireSommOrAdmin } = require('../../middleware/auth');
+const { requireAuth, requireSommOrAdmin, isSommOrAdmin } = require('../../middleware/auth');
 const WineVintagePrice = require('../../models/WineVintagePrice');
 const PriceTrackingRequest = require('../../models/PriceTrackingRequest');
-const PriceTrackingSkip = require('../../models/PriceTrackingSkip');
 const Bottle = require('../../models/Bottle');
 const WineDefinition = require('../../models/WineDefinition');
-const { getOrCreateDailySnapshot, getSnapshotsForDates } = require('../../utils/exchangeRates');
-const { createNotification } = require('../../services/notifications');
-const { logAudit } = require('../../services/audit');
-const { stripHtml } = require('../../utils/sanitize');
-const { parseAndValidateVintage } = require('../../utils/validation');
+const { getSnapshotsForDates } = require('../../utils/exchangeRates');
 const { SUPPORTED_CURRENCIES } = require('../../config/currencies');
+const { isValidId } = require('../../utils/validation');
+// The curation body shared with the MCP somm tools: queue rules, snapshot,
+// decline and their undo. This route parses input and words the answers.
+const priceOps = require('../../services/priceOps');
 
 const aiConfig = require('../../config/aiConfig');
 const { suggestPrice } = require('../../services/labelScan');
@@ -20,11 +19,7 @@ const router = express.Router();
 
 router.use(requireAuth);
 
-const STALE_MS = 90 * 24 * 60 * 60 * 1000; // 3 months
-
-// Decline reasons are written for the requester: required, plain text, bounded.
-const DECLINE_REASON_MIN = 5;
-const DECLINE_REASON_MAX = 500; // matches PriceTrackingSkip.reason maxlength
+const { DECLINE_REASON_MIN, DECLINE_REASON_MAX } = priceOps;
 
 /**
  * GET /api/somm/prices/queue
@@ -47,49 +42,18 @@ router.get('/queue', requireSommOrAdmin, async (req, res) => {
 
     if (requests.length === 0) return res.json({ queue: [] });
 
-    // Drop any requests whose wine was deleted out from under them.
-    let validRequests = requests.filter(r => r.wineDefinition);
-    if (validRequests.length === 0) return res.json({ queue: [] });
-
-    // Curator-declined pairs never surface. The decline flow deletes the
-    // request doc AND records a PriceTrackingSkip, so this filter is normally
-    // a no-op — it exists so a re-request that raced a decline can't
-    // resurrect the card while the skip stands.
-    const skips = await PriceTrackingSkip.find({
-      wineDefinition: { $in: validRequests.map(r => r.wineDefinition._id) }
-    }).select('wineDefinition vintage').lean();
-    if (skips.length > 0) {
-      const skippedPairs = new Set(skips.map(s => `${s.wineDefinition}:${s.vintage}`));
-      validRequests = validRequests.filter(r => !skippedPairs.has(`${r.wineDefinition._id}:${r.vintage}`));
-      if (validRequests.length === 0) return res.json({ queue: [] });
-    }
-
-    // Step 2: latest price snapshot per pair (for staleness display).
-    // $last is only meaningful with a defined input order — sort by setAt
-    // first, or "latest" is whatever natural order happens to yield.
-    const latestPrices = await WineVintagePrice.aggregate([
-      // Only the requested pairs' snapshots — without this $match the $group
-      // scanned every price ever recorded on every queue load.
-      { $match: { wineDefinition: { $in: validRequests.map(r => r.wineDefinition._id) } } },
-      { $sort: { setAt: 1 } },
-      { $group: {
-          _id: { wineDefinition: '$wineDefinition', vintage: '$vintage' },
-          latestSetAt:    { $last: '$setAt' },
-          latestPrice:    { $last: '$price' },
-          latestCurrency: { $last: '$currency' },
-          latestSource:   { $last: '$source' }
-      }}
-    ]);
-    const priceMap = new Map(latestPrices.map(lp => [
-      `${lp._id.wineDefinition}:${lp._id.vintage}`, lp
-    ]));
+    // Step 2: the actionable pairs in queue order — wine still there, not
+    // declined, no price or a stale one (services/priceOps, the same rules
+    // as list_price_tracking_requests).
+    const actionable = await priceOps.actionablePriceRequests(requests);
+    if (actionable.length === 0) return res.json({ queue: [] });
 
     // Step 3: bottle counts per pair (so somms see how many users are affected)
     const bottleCounts = await Bottle.aggregate([
       { $match: {
           status: 'active',
-          wineDefinition: { $in: validRequests.map(r => r.wineDefinition._id) },
-          vintage: { $in: validRequests.map(r => r.vintage) }
+          wineDefinition: { $in: actionable.map(({ request: r }) => r.wineDefinition._id) },
+          vintage: { $in: actionable.map(({ request: r }) => r.vintage) }
       }},
       { $group: {
           _id: { wineDefinition: '$wineDefinition', vintage: '$vintage' },
@@ -97,39 +61,24 @@ router.get('/queue', requireSommOrAdmin, async (req, res) => {
       }}
     ]);
     const bottleCountMap = new Map(bottleCounts.map(b => [
-      `${b._id.wineDefinition}:${b._id.vintage}`, b.bottleCount
+      priceOps.pairKey(b._id.wineDefinition, b._id.vintage), b.bottleCount
     ]));
 
-    // Filter to actionable items: no price history yet, OR latest price is stale (>3 months old).
-    const staleThreshold = new Date(Date.now() - STALE_MS);
-    const actionable = validRequests.filter(r => {
-      const latest = priceMap.get(`${r.wineDefinition._id}:${r.vintage}`);
-      return !latest || latest.latestSetAt < staleThreshold;
-    });
-    if (actionable.length === 0) return res.json({ queue: [] });
-
-    const queue = actionable.map(r => {
-      const key = `${r.wineDefinition._id}:${r.vintage}`;
-      const latest = priceMap.get(key);
-      const firstReq = r.requesters[0];
+    const queue = actionable.map(({ request: r, latest }) => {
+      const requesters = r.requesters || [];
+      const firstReq = requesters[0];
       return {
         requestId:      r._id,
         wineDefinition: r.wineDefinition,
         vintage:        r.vintage,
-        bottleCount:    bottleCountMap.get(key) || 0,
-        requesterCount: r.requesters.length,
+        bottleCount:    bottleCountMap.get(priceOps.pairKey(r.wineDefinition._id, r.vintage)) || 0,
+        requesterCount: requesters.length,
         firstRequestedAt: r.firstRequestedAt,
         firstRequester:  firstReq ? { username: firstReq.user?.username, note: firstReq.note } : null,
         latestPrice: latest
-          ? { price: latest.latestPrice, currency: latest.latestCurrency, setAt: latest.latestSetAt, source: latest.latestSource }
+          ? { price: latest.price, currency: latest.currency, setAt: latest.setAt, source: latest.source }
           : null
       };
-    });
-
-    // Sort: most requesters first, then oldest first-request
-    queue.sort((a, b) => {
-      if (b.requesterCount !== a.requesterCount) return b.requesterCount - a.requesterCount;
-      return new Date(a.firstRequestedAt) - new Date(b.firstRequestedAt);
     });
 
     // Step 4: attach exchange-rate snapshots for time-anchored display
@@ -155,7 +104,9 @@ router.get('/queue', requireSommOrAdmin, async (req, res) => {
 /**
  * GET /api/somm/prices/lookup?wine=:wineId&vintage=:vintage
  * Returns the full price history for a wine+vintage (newest first).
- * Any authenticated user — used by BottleDetail for premium users.
+ * Any authenticated user — used by BottleDetail and CellarVintage. Who recorded
+ * an entry (setBy) goes to sommeliers and admins only: the registry never
+ * shows members who contributed its data (as GET /api/somm/maturity/lookup).
  */
 router.get('/lookup', async (req, res) => {
   try {
@@ -167,10 +118,10 @@ router.get('/lookup', async (req, res) => {
       return res.status(400).json({ error: 'Invalid wine ID' });
     }
 
-    const history = await WineVintagePrice.find({ wineDefinition: String(wine), vintage: String(vintage) })
-      .populate('setBy', 'username')
-      .sort({ setAt: -1 })
-      .lean();
+    const query = WineVintagePrice.find({ wineDefinition: String(wine), vintage: String(vintage) }).sort({ setAt: -1 });
+    // A member sees the prices, their source and the curator's note, never who
+    // recorded them: the field is left out of the query altogether.
+    const history = await (isSommOrAdmin(req.user) ? query.populate('setBy', 'username') : query.select('-setBy')).lean();
 
     // Batch-fetch rate snapshots for all entry dates and attach as exchangeRates.
     const dates = [...new Set(history.map(e => e.setAt.toISOString().slice(0, 10)))];
@@ -200,18 +151,21 @@ router.post('/ai-suggest', requireSommOrAdmin, async (req, res) => {
     if (!wineId || !vintage) {
       return res.status(400).json({ error: 'wineDefinition and vintage are required' });
     }
+    if (!isValidId(wineId)) {
+      return res.status(400).json({ error: 'Invalid wineDefinition ID' });
+    }
 
     const wine = await WineDefinition.findById(wineId)
       .populate('country', 'name')
       .populate('region', 'name')
       .populate('grapes', 'name');
 
-    // A user's private draft is nobody's curation work (draft design 2026-09-12).
+    // A user's private draft is nobody's curation work.
     if (!wine || wine.draft === true) {
       return res.status(404).json({ error: 'Wine definition not found' });
     }
 
-    // Cost control (Johan 2026-08-21) — see the same gate on the maturity
+    // Cost control — see the same gate on the maturity
     // suggestion. The curator researches market prices anyway.
     if (!aiConfig.get().sommPriceSuggestEnabled) {
       return res.status(503).json({
@@ -263,24 +217,33 @@ router.post('/', requireSommOrAdmin, async (req, res) => {
     // Coerce + validate user-controlled values before they reach Mongo queries.
     // Without this an attacker could pass an object like { $ne: null } as the
     // vintage and turn an exact-match into a broad query.
-    if (!mongoose.isValidObjectId(wineDefinition)) {
+    if (!isValidId(wineDefinition)) {
       return res.status(400).json({ error: 'Invalid wineDefinition ID' });
     }
     if (typeof vintage !== 'string') {
       return res.status(400).json({ error: 'vintage must be a string' });
     }
+    // Text, and no longer than the snapshot stores: the schema would refuse
+    // it at save, as a failure of the server's instead of the request's.
+    for (const [field, value, max] of [['source', source, priceOps.PRICE_SOURCE_MAX], ['sommNotes', sommNotes, priceOps.PRICE_NOTES_MAX]]) {
+      if (value != null && typeof value !== 'string') return res.status(400).json({ error: `${field} must be text` });
+      if (typeof value === 'string' && value.trim().length > max) return res.status(400).json({ error: `${field} must be ${max} characters or less` });
+    }
     const wineDefId = String(wineDefinition);
-    // The bottles' canonical vintage ("nv" → "NV", a malformed or impossible
-    // year refused), so the snapshot matches the bottles and the request it
-    // answers. An unknown vintage has no vintage price.
-    // The helper reads a blank value as NV; for a price that is a missing vintage.
-    if (!vintage.trim()) return res.status(400).json({ error: 'wineDefinition and vintage are required' });
-    const parsedVintage = parseAndValidateVintage(vintage);
-    if (!parsedVintage.ok) return res.status(400).json({ error: parsedVintage.error });
-    if (parsedVintage.value === 'Unknown') return res.status(400).json({ error: 'A price needs a vintage year or NV' });
-    const safeVintage = parsedVintage.value;
-    const priceNum = parseFloat(price);
-    if (isNaN(priceNum) || priceNum < 0) {
+    // The bottles' canonical vintage, shared with the MCP tool; the wording is this route's.
+    const parsedVintage = priceOps.parsePriceVintage(vintage);
+    if (!parsedVintage.ok) {
+      if (parsedVintage.code === 'required') return res.status(400).json({ error: 'wineDefinition and vintage are required' });
+      if (parsedVintage.code === 'unknown') return res.status(400).json({ error: 'A price needs a vintage year or NV' });
+      return res.status(400).json({ error: parsedVintage.error });
+    }
+    // The whole value must be a number: a figure with a decimal comma or a
+    // trailing unit is refused, not cut off at the first stray character, and
+    // an infinite one never reaches the shared price history.
+    const priceNum = typeof price === 'number' ? price
+      : typeof price === 'string' ? Number(price.trim())
+        : NaN;
+    if (!Number.isFinite(priceNum) || priceNum < 0) {
       return res.status(400).json({ error: 'price must be a non-negative number' });
     }
 
@@ -290,53 +253,24 @@ router.post('/', requireSommOrAdmin, async (req, res) => {
       return res.status(404).json({ error: 'Wine definition not found' });
     }
 
-    // Ensure today's rate snapshot exists so the setAt date can be used for
-    // time-anchored conversions later. Non-fatal if the API call fails.
-    await getOrCreateDailySnapshot();
-
-    // String() coercion: a truthy non-string (number/object) used to throw
-    // TypeError on .trim() → 500 instead of a validation response.
-    const safeCurrency = String(currency || 'USD').toUpperCase();
-    if (!SUPPORTED_CURRENCIES.includes(safeCurrency)) {
+    const safeCurrency = priceOps.normalizeCurrency(currency);
+    if (!safeCurrency.ok) {
       return res.status(400).json({ error: `Unsupported currency (use one of: ${SUPPORTED_CURRENCIES.join(', ')})` });
     }
 
-    const entry = new WineVintagePrice({
-      wineDefinition: wineDefId,
-      vintage: safeVintage,
+    // Rate snapshot, save, audit and the requesters' notification: the same
+    // body as the MCP set_vintage_price (services/priceOps).
+    const entry = await priceOps.addPriceSnapshot({
+      wineId: wineDefId,
+      vintage: parsedVintage.value,
       price: priceNum,
-      currency: safeCurrency,
-      source: source ? String(source).trim() : undefined,
-      sommNotes: sommNotes ? String(sommNotes).trim() : undefined,
-      setBy: req.user.id
+      currency: safeCurrency.value,
+      source,
+      sommNotes,
+      actorId: req.user.id,
+      req,
     });
-
-    await entry.save();
     await entry.populate('setBy', 'username');
-
-    logAudit(req, 'somm.price.add',
-      { type: 'wine', id: wineDefId },
-      { vintage: safeVintage, price: priceNum, currency: safeCurrency }
-    );
-
-    // Notify everyone who requested tracking for this pair (best-effort,
-    // never block the response on it).
-    PriceTrackingRequest.findOne({ wineDefinition: wineDefId, vintage: safeVintage })
-      .populate('wineDefinition', 'name producer')
-      .then(request => {
-        if (!request || !request.requesters.length) return;
-        const wineLabel = request.wineDefinition
-          ? [request.wineDefinition.producer, request.wineDefinition.name].filter(Boolean).join(' — ')
-          : 'wine';
-        const title = 'Market price updated';
-        const body = `A sommelier just added a market price for ${wineLabel} ${safeVintage}: ${entry.currency} ${entry.price}.`;
-        // The public wine page: requesters are members, and /somm/prices
-        // answers them with Access Denied.
-        for (const r of request.requesters) {
-          createNotification(r.user, 'price_tracked', title, body, `/wines/${wineDefId}`);
-        }
-      })
-      .catch(err => console.error('Notify price requesters failed:', err.message));
 
     res.status(201).json({ entry });
   } catch (error) {
@@ -352,10 +286,10 @@ router.post('/', requireSommOrAdmin, async (req, res) => {
  * requester's notification.
  *
  * Removes the request and records a PriceTrackingSkip for the pair, which
- * (a) keeps the pair out of the queue and (b) makes routes/bottles.js refuse
+ * (a) keeps the pair out of the queue and (b) makes routes/bottlePriceTracking.js refuse
  * future tracking requests for the same wine+vintage while the skip stands.
- * (Replaces the old reason-less DELETE /requests/:requestId — support ticket
- * 6a703236: junk requests need a decline path the requester learns from.)
+ * (There is no reason-less delete: junk requests need a decline path the
+ * requester learns from.)
  */
 router.post('/requests/:requestId/decline', requireSommOrAdmin, async (req, res) => {
   try {
@@ -366,54 +300,27 @@ router.post('/requests/:requestId/decline', requireSommOrAdmin, async (req, res)
 
     // Required, human-written reason — HTML-stripped and length-bounded before
     // it reaches the skip document and the requester notifications.
-    const reason = stripHtml(typeof req.body?.reason === 'string' ? req.body.reason : '');
-    if (!reason || reason.length < DECLINE_REASON_MIN) {
-      return res.status(400).json({ error: `A decline reason of at least ${DECLINE_REASON_MIN} characters is required — the requester(s) will see it` });
-    }
-    if (reason.length > DECLINE_REASON_MAX) {
-      return res.status(400).json({ error: `Reason too long (max ${DECLINE_REASON_MAX} characters)` });
+    const checked = priceOps.validateDeclineReason(req.body?.reason);
+    if (!checked.ok) {
+      return res.status(400).json({ error: checked.code === 'long'
+        ? `Reason too long (max ${DECLINE_REASON_MAX} characters)`
+        : `A decline reason of at least ${DECLINE_REASON_MIN} characters is required — the requester(s) will see it` });
     }
 
-    // No populate here: a deleted wine would null the ref and lose the id the
-    // skip needs. Load the label separately, best-effort.
     const request = await PriceTrackingRequest.findById(requestId);
     if (!request) {
       return res.status(404).json({ error: 'Tracking request not found — it may already be fulfilled or declined' });
     }
-    const wine = await WineDefinition.findById(request.wineDefinition).select('name producer').lean();
 
-    // Suppression: the skip keeps the pair from being re-queued by future user
-    // requests. $setOnInsert keeps the FIRST decline's reason if two curators
-    // race on the unique (wineDefinition, vintage) index.
-    await PriceTrackingSkip.findOneAndUpdate(
-      { wineDefinition: request.wineDefinition, vintage: request.vintage },
-      { $setOnInsert: {
-        wineDefinition: request.wineDefinition,
-        vintage: request.vintage,
-        reason,
-        skippedBy: req.user.id,
-        skippedAt: new Date()
-      } },
-      { upsert: true }
-    );
-
-    await request.deleteOne();
-
-    const wineLabel = wine
-      ? [wine.producer, wine.name].filter(Boolean).join(' — ')
-      : 'this wine';
-    const title = 'Price tracking request declined';
-    const body = `Your request to track market price for ${wineLabel} ${request.vintage} was declined by a sommelier. Reason: ${reason}`;
-    for (const r of request.requesters) {
-      createNotification(r.user, 'price_tracking_declined', title, body, null);
+    // Skip upserted, request deleted, requesters told verbatim, audited: the
+    // same body as the MCP reject_price_request (services/priceOps).
+    const declined = await priceOps.declinePriceRequest({ request, reason: checked.reason, actorId: req.user.id, req });
+    // Another curator declined it between the load above and the delete.
+    if (declined.gone) {
+      return res.status(404).json({ error: 'Tracking request not found — it may already be fulfilled or declined' });
     }
 
-    logAudit(req, 'somm.price.decline',
-      { type: 'wine', id: request.wineDefinition },
-      { vintage: request.vintage, reason, requesters: request.requesters.length }
-    );
-
-    res.json({ message: 'Tracking request declined', requestersNotified: request.requesters.length });
+    res.json({ message: 'Tracking request declined', requestersNotified: declined.requestersNotified });
   } catch (error) {
     console.error('Decline tracking request error:', error);
     res.status(500).json({ error: 'Failed to decline tracking request' });

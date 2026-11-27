@@ -1,9 +1,9 @@
 const mongoose = require('mongoose');
 
-// A typed personal value on a wine or a bottle (issue #986). "Personal" means
-// not published to the shared registry — NOT hidden from shared-cellar
-// members: entries are visible to everyone who can see the bottle, always
-// attributed to their author (same rule Bottle.notes follows, but attributed).
+// A typed personal value on a wine or a bottle. "Personal" means not published
+// to the shared registry — NOT hidden from shared-cellar members: entries are
+// visible to everyone who can see the bottle, always attributed to their
+// author (same rule Bottle.notes follows, but attributed).
 //
 // Exactly one of wineDefinition/bottle is set, matching targetType:
 //   wine   — applies to every bottle of that wine the author owns
@@ -41,8 +41,8 @@ const personalDataEntrySchema = new mongoose.Schema({
     required: function () { return this.targetType === 'bottle'; },
     index: true
   },
-  // Optional vintage scope on WINE-level entries (user ticket 6a853211: ABV
-  // drifts year to year). null = every vintage of the wine; a value (matching
+  // Optional vintage scope on WINE-level entries (ABV, for one, drifts year
+  // to year). null = every vintage of the wine; a value (matching
   // Bottle.vintage, incl. 'NV') narrows the entry to bottles of that vintage.
   // Derived server-side from the bottle the entry was created on — never
   // client-supplied free text. Meaningless on bottle-level entries (that

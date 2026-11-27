@@ -7,6 +7,7 @@ import { adoptRegistryWine } from '../api/bridge';
 import useLabelScanner from '../hooks/useLabelScanner';
 import useTapToFocus from '../hooks/useTapToFocus';
 import CameraFocusRing from '../components/CameraFocusRing';
+import ScanLabelButtons from '../components/ScanLabelButtons';
 import { addToWishlist } from '../api/wishlist';
 import '../components/ImageUpload.css';
 import './AddBottle.css';
@@ -16,6 +17,8 @@ import { WINE_TYPES } from '../config/wineTypes';
 import { swatchType, wineTypeLabel, isStyleType, colourLabel, WINE_COLOURS } from '../utils/wineColour';
 import './AddToWishlist.css';
 import { backLabel } from '../utils/backLabel';
+import { formatVintage, parseVintageInput } from '../utils/vintage';
+import { messageForResponse } from '../utils/friendlyError';
 
 function AddToWishlist() {
   const { t } = useTranslation();
@@ -117,7 +120,7 @@ function AddToWishlist() {
   }, [clearAi]);
 
   // Resolve confirmed wine data against the registry (READ-ONLY — nothing is
-  // created here any more): matched wine, soft-zone candidates, or no match
+  // created here): matched wine, soft-zone candidates, or no match
   // (→ the fields ride to the save, which mints).
   const resolveSelectedWine = useCallback(async (wineData, opts = {}) => {
     setError(null);
@@ -141,8 +144,7 @@ function AddToWishlist() {
       // noMatch — but the label scan may have found a registry row this
       // resolve did not (the scan matcher looks from 0.75, the resolver's
       // "did you mean?" floor is 0.85). Ask instead of minting a duplicate;
-      // the scan's match never links on its own (issue #1134, mirrors
-      // AddBottle).
+      // the scan's match never links on its own (mirrors AddBottle).
       if (opts.fallback?.wine) {
         setSoftCandidates([{ wine: opts.fallback.wine, score: opts.fallback.confidence || 0 }]);
         setSoftPending({ wineData, queryLabel: opts.queryLabel });
@@ -159,6 +161,7 @@ function AddToWishlist() {
   // ── Wishlist item details ──
   const [vintage, setVintage] = useState('');
   const [notes, setNotes] = useState('');
+  const [shopUrl, setShopUrl] = useState('');
   const [priority, setPriority] = useState('medium');
   const [saving, setSaving] = useState(false);
 
@@ -181,7 +184,7 @@ function AddToWishlist() {
       ? (data.extracted.producer || '') : null;
     if (partial) {
       // Straight to the EDITABLE form, prefilled — never the read-only card
-      // (release-audit M-1; see AddBottle for the full argument).
+      // (see AddBottle for the full argument).
       const e = data.extracted || {};
       setPendingWineData({
         name: e.name || '',
@@ -252,7 +255,7 @@ function AddToWishlist() {
         if (!typed && fromMerged[key]) next[key] = fromMerged[key];
       }
       // A SUSPECT front producer may be REPLACED by the back label's — only
-      // while the box still holds the exact prefilled string (audit M-1).
+      // while the box still holds the exact prefilled string.
       if (suspectValue
           && next.producer === suspectValue
           && fromMerged.producer
@@ -269,10 +272,10 @@ function AddToWishlist() {
   }, [scanResult]);
 
   const {
-    labelCam, labelScanning, labelFacing, setLabelFacing,
+    labelCam, labelScanning, setLabelFacing,
     labelVideoRef, labelCanvasRef,
     startCamera: startLabelCamera, startBackCamera: startBackLabelCamera,
-    stopCamera: stopLabelCamera, capturePhoto: captureLabelPhoto
+    stopCamera: stopLabelCamera, capturePhoto: captureLabelPhoto, scanFile: scanLabelFile
   } = useLabelScanner(apiFetch, {
     onScanSuccess: handleScanSuccess,
     onScanError: handleScanError,
@@ -293,7 +296,7 @@ function AddToWishlist() {
   useEffect(() => {
     const restock = location.state?.fromRestock;
     const rawWineParam = new URLSearchParams(location.search).get('wine');
-    // Only a well-formed id may be interpolated into the API path (audit 2026-09 F01-2).
+    // Only a well-formed id may be interpolated into the API path.
     const wineParam = /^[a-f0-9]{24}$/i.test(rawWineParam || '') ? rawWineParam : null;
     const wineId = restock?.wineId || wineParam;
     if (!wineId) return;
@@ -318,19 +321,17 @@ function AddToWishlist() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Confirm scan result — resolve the wine, then add details. The label
-  // image is NOT part of the wine payload (the old find-or-create route
-  // ignored it, and it must not bloat the wishlist commit). ──
+  // image is NOT part of the wine payload (the resolve route ignores it, and
+  // it must not bloat the wishlist commit). ──
   //
-  // Resolve on WHAT THE LABEL SAID — never on the matched row. Same silent
-  // substitution AddBottle carried (issue #1134), and worse here: this page
-  // never rendered the matched wine at all, so there was nothing on screen
-  // that could have shown the swap.
+  // Resolve on WHAT THE LABEL SAID — never on the matched row: a substituted
+  // identity files the wine under its neighbour with nothing on screen
+  // saying so (see AddBottle for the full argument).
   const handleConfirmScan = useCallback(async () => {
     const { extracted, match } = scanResult;
     // country/type GAP-FILL from the matched row — never identity (mirrors
-    // AddBottle; see the comment there). Restores the healing the old
-    // matched branch provided for countryless/typeless extractions without
-    // reintroducing the identity substitution.
+    // AddBottle; see the comment there): it heals countryless and typeless
+    // extractions without substituting the identity.
     await resolveSelectedWine(
       {
         name: extracted.name,
@@ -390,9 +391,8 @@ function AddToWishlist() {
     clearAi();
   }, [clearAi]);
 
-  // ── Text search. Registry search ONLY — the parallel AI call that used to
-  // run here spent budget on every search and (before identify-text became
-  // read-only) minted a registry wine per guess. AI is opt-in below. ──
+  // ── Text search. Registry search ONLY — an AI call here would spend budget
+  // on every search. AI is opt-in below. ──
   const handleSearch = useCallback(() => {
     if (!search.trim()) { setWines([]); return; }
     const query = search.trim();
@@ -504,11 +504,14 @@ function AddToWishlist() {
     try {
       const res = await adoptRegistryWine(apiFetch, item.registryId);
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.wine) throw new Error(data.error || 'adopt failed');
+      if (!res.ok || !data.wine) throw Object.assign(new Error(data.error || 'adopt failed'), { code: data.code });
       setRegistryWines(prev => prev.filter(r => r.registryId !== item.registryId));
       handleSelectWine(data.wine);
-    } catch {
-      setAiSearchError(t('addToWishlist.registryAdoptFailed', 'The shared registry could not be reached. Try again in a minute, or add the wine by hand.'));
+    } catch (err) {
+      // A conflict is not "try again" (see AddBottle.js): the server's message says what to do.
+      setAiSearchError(err?.code === 'conflict' && err.message
+        ? err.message
+        : t('addToWishlist.registryAdoptFailed', 'The shared registry could not be reached. Try again in a minute, or add the wine by hand.'));
     } finally {
       setAdoptingId(null);
     }
@@ -523,7 +526,7 @@ function AddToWishlist() {
         <div className="wine-meta">
           {item.country && <span>{item.country}</span>}
           {item.region && <span>• {item.region}</span>}
-          {item.type && <span className={`wine-type-pill ${swatchType(item)}`}>{wineTypeLabel(item, t)}</span>}
+          {(item.type || item.nonWine) && <span className={`wine-type-pill ${swatchType(item)}`}>{wineTypeLabel(item, t)}</span>}
         </div>
         {item.grapes?.length > 0 && (
           <p className="wine-grapes">{item.grapes.join(', ')}</p>
@@ -568,8 +571,9 @@ function AddToWishlist() {
     setSaving(true);
     try {
       const body = {
-        vintage: vintage || undefined,
+        vintage: parseVintageInput(vintage, t) || undefined,
         notes: notes || undefined,
+        shopUrl: shopUrl.trim() || undefined,
         priority
       };
       // The scan evidence rides at the ONE place a newWine payload is sent, so
@@ -594,11 +598,11 @@ function AddToWishlist() {
         return;
       }
       if (!res.ok) {
-        setError(data.error || t('addToWishlist.failedAdd'));
-        // Release-audit MEDIUM (same as AddBottle): a mint-gate 400 arrives
-        // after the wine form is gone — when the failed save carried newWine,
-        // reopen the manual form seeded with the typed fields so the user
-        // fixes the named field instead of retyping the wine.
+        setError(messageForResponse(res, data, t('addToWishlist.failedAdd'), t));
+        // Same as AddBottle: a mint-gate 400 arrives after the wine form is
+        // gone — when the failed save carried newWine, reopen the manual form
+        // seeded with the typed fields so the user fixes the named field
+        // instead of retyping the wine.
         if (newWinePayload) {
           setPendingWineData({ ...newWinePayload, grapes: (newWinePayload.grapes || []).join(', ') });
           setShowManualForm(true);
@@ -716,7 +720,7 @@ function AddToWishlist() {
             </p>
           )}
 
-          {/* WHY the scan is partial with filled boxes (audit M-2). */}
+          {/* WHY the scan is partial with filled boxes: the producer looks like label text. */}
           {producerSuspect && (
             <p className="scan-back-conflicts">
               {t('addToWishlist.producerSuspectNote')}
@@ -733,9 +737,8 @@ function AddToWishlist() {
                 }
               </div>
               <div className="scan-wine-body">
-                {/* Names the registry row the scan matched (issue #1134).
-                    This page showed no sign of a match at all while quietly
-                    committing to it. */}
+                {/* Names the registry row the scan matched: a match the
+                    page does not show could not be seen to be wrong. */}
                 {scanResult.match?.wine && (
                   <div className="ai-result-badge scan-wine-badge">
                     {t('addToWishlist.scanRegistryMatch', {
@@ -765,7 +768,7 @@ function AddToWishlist() {
                   <p className="wine-grapes">{scanResult.extracted.grapes.join(', ')}</p>
                 )}
                 {scanResult.extracted.vintage && (
-                  <p className="scan-vintage-note">{t('addToWishlist.vintageDetected', { vintage: scanResult.extracted.vintage })}</p>
+                  <p className="scan-vintage-note">{t('addToWishlist.vintageDetected', { vintage: formatVintage(scanResult.extracted.vintage, t) })}</p>
                 )}
                 <div className="scan-wine-actions">
                   <button type="button" className="btn btn-success" onClick={handleConfirmScan} disabled={findingWine}>
@@ -872,9 +875,7 @@ function AddToWishlist() {
                 <p className="camera-prompt-hint">
                   {t('addToWishlist.cameraHint')}
                 </p>
-                <button type="button" className="btn btn-primary" onClick={startLabelCamera}>
-                  {t('addToWishlist.startCamera')}
-                </button>
+                <ScanLabelButtons cameraLabel={t('addToWishlist.startCamera')} onCamera={startLabelCamera} onFile={scanLabelFile} />
               </div>
               <button type="button" className="wine-select-manual-link" onClick={() => setShowTextSearch(true)}>
                 {t('addToWishlist.noCameraSearch')}
@@ -985,7 +986,7 @@ function AddToWishlist() {
                 </div>
               )}
 
-              {/* Search results list — no longer hidden behind the AI card */}
+              {/* Search results list — never hidden behind the AI card */}
               {!aiSearching && wines.length > 0 && (
                 <div className="wines-list">
                   {wines
@@ -1041,9 +1042,7 @@ function AddToWishlist() {
       {selectedWine && !success && (
         <div className="card">
           <div className="selected-wine-bar">
-            {selectedWine.image && (
-              <img src={selectedWine.image} alt={selectedWine.name} className="selected-wine-bar-img" onError={(e) => { e.target.style.display = 'none'; }} />
-            )}
+            <WineImage image={selectedWine.image} alt={selectedWine.name} className="selected-wine-bar-img" />
             <div className="selected-wine-bar-info">
               <strong className="selected-wine-bar-name">{selectedWine.name}</strong>
               <span className="selected-wine-bar-producer">{selectedWine.producer}</span>
@@ -1080,6 +1079,19 @@ function AddToWishlist() {
                   onChange={(e) => setNotes(e.target.value)}
                   placeholder={t('addToWishlist.notesPlaceholder')}
                   rows="3"
+                  maxLength={2000}
+                />
+              </div>
+              <div className="form-group form-group-full">
+                <label htmlFor="wishlist-shop-url">{t('addToWishlist.shopUrl')}</label>
+                <input
+                  id="wishlist-shop-url"
+                  type="text"
+                  inputMode="url"
+                  autoComplete="off"
+                  value={shopUrl}
+                  onChange={(e) => setShopUrl(e.target.value)}
+                  placeholder={t('addToWishlist.shopUrlPlaceholder')}
                   maxLength={2000}
                 />
               </div>

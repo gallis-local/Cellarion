@@ -11,7 +11,7 @@
  * one 2026-07-07 session imported an entire spirits bar (Jack Daniel's,
  * Johnnie Walker, tequilas, grappas…), plus an April cider/alcohol-free
  * cluster and three sakes. All are owned by users, so nothing may be deleted.
- * Policy (Johan, 2026-07-26): KEEP the rows and their bottles, HIDE them from
+ * Policy: KEEP the rows and their bottles, HIDE them from
  * registry search, type facets, public taxonomy/OG/sitemap listings and the
  * admin duplicate-scan pools — i.e. set WineDefinition.nonWine.
  *
@@ -77,7 +77,7 @@ async function run() {
       // indexWine reads the flag just written and drops the row's document.
       if (searchOk) await searchService.indexWine(id);
       // Vectors too: semantic search and the similar-wines graph read the
-      // WineEmbedding rows, not the flag (audit 2026-10-14).
+      // WineEmbedding rows, not the flag.
       await WineEmbedding.deleteMany({ wineDefinition: id });
     }
     stats.flagged += 1;

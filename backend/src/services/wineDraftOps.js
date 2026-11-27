@@ -1,8 +1,7 @@
 /**
  * wineDraftOps — everything a creator can do with a PRIVATE DRAFT wine, in
  * one place for the REST router (routes/wineDrafts.js) and the MCP tools.
- * Support ticket 2026-09-12; the design note lives on
- * models/WineDefinition.draft.
+ * The design note lives on models/WineDefinition.draft.
  *
  * A draft is a pendingIdentity row (invariant) with `draft: true`, keyed into
  * the per-creator 'draft~' namespace. Its creator edits it directly (no
@@ -31,8 +30,9 @@ const Appellation = require('../models/Appellation');
 const { logAudit } = require('./audit');
 const {
   generateWineKey, pendingWineKey, draftWineKey, normalizeAppellation, normalizeAppellationKey,
-  normalizeString, resolveCountryName, isIdentitySentinel, isImplausibleIdentity, stripTrailingVintage,
+  normalizeString, resolveCountryName, isIdentitySentinel, isImplausibleIdentity, stripTrailingVintage, normalizeClassification,
 } = require('../utils/normalize');
+const { assignClassification } = require('./classificationOps');
 const { canonicalizeWineName } = require('../utils/producerPrefix');
 const { resolveCanonicalAppellation } = require('./appellationResolve');
 const { resolveGrapeIdsStrict } = require('./wineProfileOps');
@@ -122,7 +122,8 @@ function validateDraftPatch(patch) {
     }
     const c = (classification || '').trim().replace(/\s+/g, ' ');
     if (c.length > FIELD_MAX) return { ok: false, error: `classification must be at most ${FIELD_MAX} characters` };
-    clean.classification = c;
+    // A regulatory mark (DOCG, AOC …) is no tier: it clears the field instead.
+    clean.classification = normalizeClassification(c) || '';
   }
   if (Object.keys(clean).length === 0) {
     return { ok: false, error: `Nothing to change — send at least one of: ${DRAFT_FIELDS.join(', ')}` };
@@ -200,17 +201,18 @@ async function updateDraft(wine, clean, userId) {
       ? await resolveCanonicalAppellation(normalizeAppellation(clean.appellation))
       : null;
   }
-  // Refused, not accepted-and-dropped by the model hook (audit 2026-09-19).
+  // Refused, not accepted-and-dropped by the model hook.
   const colourErr = colourTypeConflict(clean.type || wine.type, clean.colour);
   if (colourErr) return fail('invalid_input', colourErr);
   if (clean.type) wine.type = clean.type;
   if (clean.colour !== undefined) stateColour(wine, clean.colour);
-  if (clean.classification !== undefined) wine.classification = clean.classification || null;
+  // The write rule, lenient for a member's draft (services/classificationOps).
+  if (clean.classification !== undefined) await assignClassification(wine, { classification: clean.classification });
 
   let countryDoc = null;
   if (clean.countryName !== undefined) {
     // Country is required on every registry row — it cannot be cleared, and
-    // saying so beats a silent no-op the form springs back from (audit 2026-09-12).
+    // saying so beats a silent no-op the form springs back from.
     if (!clean.countryName) return fail('invalid_input', 'Country cannot be cleared — every wine needs one.');
     countryDoc = await Country.findOne({ normalizedName: normalizeString(resolveCountryName(clean.countryName)) });
     if (!countryDoc) {
@@ -252,8 +254,7 @@ async function updateDraft(wine, clean, userId) {
     // stripped, producer prefix folded out — services/findOrCreateWine does
     // exactly this before keying a mint), so a retry add of the same wine
     // resolves to this draft instead of minting a second one, and the key the
-    // publish step regenerates matches what the registry would compute
-    // (audit 2026-09-12).
+    // publish step regenerates matches what the registry would compute.
     wine.name = canonicalizeWineName(stripTrailingVintage(wine.name), wine.producer || '') || wine.name;
     wine.normalizedKey = draftWineKey(wine.name, wine.producer, wine.createdBy, wine.appellation);
   }
@@ -356,7 +357,7 @@ async function publishDraft(wine, { userId = null, req = null, confirmCreate = f
   const identity = await checkPublishIdentity(wine);
   let producerMissing = identity.ok ? identity.producerMissing === true : false;
   // The producer string an unattended publish had to drop survives in the
-  // audit entry, as it does for a refused mint (audit 2026-09-12).
+  // audit entry, as it does for a refused mint.
   let rejectedProducer = null;
   if (!identity.ok) {
     if (!auto) return fail('invalid_identity', identity.message);
@@ -388,8 +389,7 @@ async function publishDraft(wine, { userId = null, req = null, confirmCreate = f
 
   // Everything below mutates the document before the save; a failed save
   // must hand the caller back the draft it passed in (the expiry job and the
-  // erasure path reuse the object for the attach that follows a duplicate —
-  // audit 2026-09-12).
+  // erasure path reuse the object for the attach that follows a duplicate).
   const before = {
     producer: wine.producer, normalizedKey: wine.normalizedKey, draft: wine.draft,
     draftExpiresAt: wine.draftExpiresAt, draftExpiryWarnedAt: wine.draftExpiryWarnedAt,
@@ -409,10 +409,14 @@ async function publishDraft(wine, { userId = null, req = null, confirmCreate = f
   try {
     await wine.save();
   } catch (err) {
+    // The key the save tried to write — the hook may have added the label
+    // sweetness suffix to the bare publishedKey — so the holder lookup below
+    // meets the row that actually collided, not an untermed twin.
+    const collidedKey = wine.normalizedKey;
     // Whatever failed, the in-memory document is a draft again.
     Object.assign(wine, before);
     if (err?.code === 11000) {
-      const holder = await WineDefinition.findOne({ normalizedKey: publishedKey, _id: { $ne: wine._id } })
+      const holder = await WineDefinition.findOne({ normalizedKey: collidedKey || publishedKey, _id: { $ne: wine._id } })
         .populate(POPULATE).lean();
       return {
         ok: false, code: 'duplicate',
@@ -470,8 +474,8 @@ async function removeDraftRow(wine, req, action, detail = {}, { requireEmpty = f
   await deleteDraftImages(wine._id);
   try { require('./search').removeWine(wine._id); } catch { /* never indexed; best-effort */ }
   // The "no bottles" decision is repeated right before the delete: a bottle
-  // added during the cleanup above must not be left pointing at nothing
-  // (audit 2026-09-12). The predicate on draft:true guards a publish in the
+  // added during the cleanup above must not be left pointing at nothing.
+  // The predicate on draft:true guards a publish in the
   // same window the same way.
   if (requireEmpty && (await Bottle.exists({ wineDefinition: wine._id }) || await DeletedBottle.exists({ wineDefinition: wine._id }))) {
     return { ok: false, code: 'conflict', message: 'A bottle was added to this draft while it was being removed — it stays.' };
@@ -518,13 +522,13 @@ async function attachDraftBottles(wine, targetWineId, { userId, roles = [], req 
   // on the target they would be unreadable-but-retained forever.
   await deleteDraftImages(wine._id, { kind: 'label-scan' });
   // Then EVERY reference follows the bottles — the admin merge's own
-  // re-pointer (audit 2026-09-12): bottles, their photos, price-tracking
+  // re-pointer: bottles, their photos, price-tracking
   // requests and skips, wishlist items, reviews, reports, discussions, journal
   // pairings, recommendations, restock alerts, wine-list entries. A draft's
   // bottle can acquire any of these exactly like an ordinary one, and a
   // two-collection re-point left the rest pointing at a deleted id.
-  // Lazy: the admin router is a heavy module tree.
-  const { reassignWineRefs } = require('../routes/admin/wines');
+  // Lazy: the merge service loads every model that references a wine.
+  const { reassignWineRefs } = require('./wineMergeOps');
   await reassignWineRefs(wine._id, target._id);
   try {
     const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
@@ -544,7 +548,7 @@ async function deleteDraft(wine, req = null, { action = 'wine.draft_delete' } = 
     return fail('conflict', 'This draft holds bottles — publish it, or attach the bottles to an existing wine, instead of deleting it.');
   }
   // Bottles in a "Recently deleted" (services/bottleTrash) still need their
-  // wine — and its photos — to come back (release audit 2026-10-12).
+  // wine — and its photos — to come back.
   if (await DeletedBottle.exists({ wineDefinition: wine._id })) {
     return fail('conflict', 'Bottles of this draft are in Recently deleted. Restore them, or wait until they are deleted for good, before deleting the draft.');
   }
@@ -555,10 +559,8 @@ module.exports = {
   DRAFT_TTL_DAYS,
   DRAFT_TTL_MS,
   DRAFT_WARN_HOURS,
-  DRAFT_FIELDS,
   PUBLISH_BATCH_MAX,
   draftSummary,
-  matchSummary,
   validateDraftPatch,
   loadOwnDraft,
   listDrafts,

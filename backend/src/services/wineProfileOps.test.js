@@ -113,6 +113,26 @@ describe('validateProfilePatch', () => {
     expect(validateProfilePatch({ grapes: ['x'.repeat(61)] }).ok).toBe(false);
     expect(validateProfilePatch({ grapes: Array.from({ length: 21 }, (_, i) => `g${i}`) }).ok).toBe(false);
   });
+
+  // The serving trait (utils/servingUtils): a temperature RANGE in whole °C
+  // and an air trait — stored, never a sentence; the page composes the advice
+  // against the vintage's phase on the day it is read.
+  test('the serving temperature is a pair of whole °C: both ends or neither, min ≤ max', () => {
+    expect(validateProfilePatch({ servingTempMin: 16, servingTempMax: 18 }).clean).toEqual({ servingTempMin: 16, servingTempMax: 18 });
+    expect(validateProfilePatch({ servingTempMin: null, servingTempMax: null }).clean).toEqual({ servingTempMin: null, servingTempMax: null });
+    expect(validateProfilePatch({ servingTempMin: 16 }).ok).toBe(false);
+    expect(validateProfilePatch({ servingTempMin: 16, servingTempMax: null }).ok).toBe(false);
+    expect(validateProfilePatch({ servingTempMin: 18, servingTempMax: 16 }).ok).toBe(false);
+    expect(validateProfilePatch({ servingTempMin: 16.5, servingTempMax: 18 }).ok).toBe(false);
+    expect(validateProfilePatch({ servingTempMin: -1, servingTempMax: 18 }).ok).toBe(false);
+    expect(validateProfilePatch({ servingTempMin: 16, servingTempMax: 31 }).ok).toBe(false);
+  });
+
+  test('needsAir is a closed vocabulary; null clears it back to the type\'s default', () => {
+    expect(validateProfilePatch({ needsAir: 'long' }).clean).toEqual({ needsAir: 'long' });
+    expect(validateProfilePatch({ needsAir: null }).clean).toEqual({ needsAir: null });
+    expect(validateProfilePatch({ needsAir: 'always' }).ok).toBe(false);
+  });
 });
 
 describe('resolveGrapeIdsStrict (match-only)', () => {
@@ -122,8 +142,9 @@ describe('resolveGrapeIdsStrict (match-only)', () => {
   test('resolves a synonym to its canonical doc — and REPORTS the substitution', async () => {
     Grape.findOne.mockReturnValue(found({ _id: 'g-syrah', name: 'Syrah' }));
     const r = await resolveGrapeIdsStrict(['Shiraz']);
-    // Ticket 2026-08-11: "Tinta Roriz" silently became Tempranillo — the
-    // resolver must flag every stored-name override so callers can surface it.
+    // A synonym ("Tinta Roriz") must not silently become its canonical name
+    // (Tempranillo) — the resolver flags every stored-name override so
+    // callers can surface it.
     expect(r).toEqual({
       ok: true, ids: ['g-syrah'], names: ['Syrah'],
       substitutions: [{ from: 'Shiraz', to: 'Syrah' }],
@@ -169,7 +190,7 @@ describe('resolveGrapeIdsStrict (match-only)', () => {
     expect(Grape.findOne).toHaveBeenCalledTimes(2);
   });
 
-  // Audit 2026-08-10: names that normalize to '' (non-Latin scripts, bare
+  // Names that normalize to '' (non-Latin scripts, bare
   // percentages) were silently DROPPED — a set became a partial write, and an
   // all-such list became an accidental clear of wine.grapes.
   test('a name that normalizes to nothing is refused, never silently dropped', async () => {
@@ -215,9 +236,9 @@ describe('applyProfilePatch', () => {
     expect(wine.aiProfile.source).toBe('curator');
   });
 
-  // Ticket d49ca3af: clearing a bad AI description used to curator-freeze the
-  // wine, locking exactly the worst-sourced rows out of the re-enrichment that
-  // would have fixed them once their real defect (null geography) was repaired.
+  // Clearing a bad AI description must not curator-freeze the wine: that
+  // would lock exactly the worst-sourced rows out of the re-enrichment that
+  // fixes them once their real defect (e.g. null geography) is repaired.
   test('a write that ONLY clears an AI profile resets fields but does NOT verify', () => {
     const wine = fakeWine({ description: 'invented filler', body: 'full', source: 'ai', confidence: 0.3 });
     applyProfilePatch(wine, { description: null, flavors: [] }, 'user-1');
@@ -318,7 +339,7 @@ describe('snapshot / restore (the undo_last contract)', () => {
   });
 });
 
-// Support ticket 2026-09-17 ("Colour Sparkling/Rosè"): the colour of a
+// The colour of a
 // sparkling/dessert/fortified wine is a record field beside type and grapes.
 describe('colour (record field)', () => {
   test('validates against red/white/rosé; null clears it', () => {
@@ -356,5 +377,30 @@ describe('colour (record field)', () => {
     wine.colour = 'rosé';
     restoreProfile(wine, { description: 'y', source: 'ai', type: 'sparkling', grapes: [] });
     expect(wine.colour).toBe('rosé');
+  });
+});
+
+// The serving trait is a fact about service, not a
+// review of the prose — a serving-only write must not vouch for the profile.
+describe('applyProfilePatch — the serving trait on its own', () => {
+  test('stores the trait without stamping the profile curator-verified, ending its hold or marking it reviewed', () => {
+    const wine = fakeWine({ body: 'light', description: 'ai text', confidence: 0.6, source: 'ai', heldAt: new Date('2026-07-01') });
+    const now = new Date('2026-07-28T12:00:00Z');
+
+    applyProfilePatch(wine, { servingTempMin: 16, servingTempMax: 18, needsAir: 'long' }, 'user-1', { now });
+
+    expect(wine.aiProfile).toMatchObject({ servingTempMin: 16, servingTempMax: 18, needsAir: 'long', source: 'ai', heldAt: new Date('2026-07-01') });
+    expect(wine.aiProfile.verifiedBy).toBeUndefined();
+    expect(wine.aiProfile.verifiedAt).toBeUndefined();
+    expect(wine.profileReviewedAt).toBeNull();
+    expect(wine.markModified).toHaveBeenCalledWith('aiProfile');
+  });
+
+  test('a descriptor written together with the trait still vouches, as before', () => {
+    const wine = fakeWine({ body: 'light', description: 'wrong', source: 'ai' });
+    const now = new Date('2026-07-28T12:00:00Z');
+    applyProfilePatch(wine, { description: 'right', needsAir: 'none' }, 'user-1', { now });
+    expect(wine.aiProfile).toMatchObject({ description: 'right', needsAir: 'none', source: 'curator', verifiedBy: 'user-1', verifiedAt: now });
+    expect(wine.profileReviewedAt).toBe(now);
   });
 });

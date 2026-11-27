@@ -11,6 +11,7 @@ import ProtectedRoute from './components/ProtectedRoute';
 import ReconsentModal from './components/ReconsentModal';
 import Analytics from './components/Analytics';
 import { loadFeatureFlags } from './utils/featureFlags';
+import { FRONT_PAGE_LANGUAGES, frontPagePath } from './config/frontPages';
 import './styles/common.css';
 
 // Lazy-load all pages so each route gets its own chunk.
@@ -77,6 +78,7 @@ const AddToWishlist        = lazy(() => import('./pages/AddToWishlist'));
 const PickLists            = lazy(() => import('./pages/PickLists'));
 const PickList             = lazy(() => import('./pages/PickList'));
 const CuratorQuestion      = lazy(() => import('./pages/CuratorQuestion'));
+const CuratorQuestions     = lazy(() => import('./pages/CuratorQuestions'));
 const Unsubscribed         = lazy(() => import('./pages/Unsubscribed'));
 const DeleteAccountLink    = lazy(() => import('./pages/DeleteAccountLink'));
 const Recommendations      = lazy(() => import('./pages/Recommendations'));
@@ -95,11 +97,9 @@ const WineLists            = lazy(() => import('./pages/WineLists'));
 const WineListEditor       = lazy(() => import('./pages/WineListEditor'));
 const PublicWineList       = lazy(() => import('./pages/PublicWineList'));
 
-// The page of one wine and vintage (the early-access layout, out for
-// everyone since 2026-10-13 — the classic page and its flag are gone).
-// Keyed by the address: one vintage page links to another (its "Other
-// vintages"), and the next one must start fresh — no notice, open window or
-// folded list carried over from the last.
+// The page of one wine and vintage. Keyed by the address: one vintage page
+// links to another (its "Other vintages"), and the next one must start fresh
+// — no notice, open window or folded list carried over from the last.
 function VintagePage() {
   const { id, wineId, vintage } = useParams();
   return <CellarVintage key={`${id}/${wineId}/${vintage}`} />;
@@ -145,6 +145,9 @@ function AppRoutes() {
 
         {/* Protected routes wrapped in Layout */}
         <Route path="/" element={<LandingPage />} />
+        {FRONT_PAGE_LANGUAGES.map((lang) => (
+          <Route key={lang} path={frontPagePath(lang)} element={<LandingPage pageLanguage={lang} />} />
+        ))}
         <Route
           path="/cellars"
           element={
@@ -301,13 +304,21 @@ function AppRoutes() {
           }
         />
         {/* A curator question from a notification: goes on to a bottle of the
-            wine the member can open now, or shows the question on its own
-            (support ticket 2026-10-14). */}
+            wine the member can open now, or shows the question on its own. */}
         <Route
           path="/questions/:id"
           element={
             <ProtectedRoute>
               <Layout><CuratorQuestion /></Layout>
+            </ProtectedRoute>
+          }
+        />
+        {/* Every curator question addressed to the member, grouped by cellar. */}
+        <Route
+          path="/questions"
+          element={
+            <ProtectedRoute>
+              <Layout><CuratorQuestions /></Layout>
             </ProtectedRoute>
           }
         />

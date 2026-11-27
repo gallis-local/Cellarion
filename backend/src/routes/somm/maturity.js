@@ -1,11 +1,13 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const { requireAuth, requireSommOrAdmin } = require('../../middleware/auth');
+const { requireAuth, requireSommOrAdmin, isSommOrAdmin } = require('../../middleware/auth');
 const WineVintageProfile = require('../../models/WineVintageProfile');
 const { isValidId } = require('../../utils/validation');
 const { parsePagination } = require('../../utils/pagination');
-const { logAudit } = require('../../services/audit');
-const { bumpWineOwners } = require('../../services/dataVersion');
+// The curation body shared with the MCP somm tools: the write, the reset and
+// the remove, each with its owners' data-version bump and its audit row.
+// This route parses input and words the answers.
+const maturityOps = require('../../services/maturityOps');
 
 const aiConfig = require('../../config/aiConfig');
 const { suggestDrinkWindow } = require('../../services/labelScan');
@@ -15,13 +17,35 @@ const router = express.Router();
 // All routes require authentication
 router.use(requireAuth);
 
-const PHASE_FIELDS = ['earlyFrom', 'earlyUntil', 'peakFrom', 'peakUntil', 'lateFrom', 'lateUntil'];
+const { PHASE_FIELDS } = maturityOps;
 
-// Parse an optional year field from the request body (returns null if blank/absent)
+// An optional year field of the request body: null when blank or absent, NaN
+// when it is not a whole number. The whole value must be the number: a figure
+// with a decimal or a trailing word is refused, not cut off at the first
+// stray character.
 function parseYear(val) {
   if (val === undefined || val === null || val === '') return null;
-  const yr = parseInt(val);
-  return isNaN(yr) ? NaN : yr;
+  if (typeof val === 'number') return Number.isInteger(val) ? val : NaN;
+  if (typeof val === 'string' && /^-?\d+$/.test(val.trim())) return parseInt(val.trim(), 10);
+  return NaN;
+}
+
+// A refused window (maturityOps.checkWindow) in this route's words.
+const ORDER_WORDS = {
+  'earlyUntil<earlyFrom': 'Early "until" must be after early "from"',
+  'peakUntil<peakFrom': 'Peak "until" must be after peak "from"',
+  'lateUntil<lateFrom': 'Late "until" must be after late "from"',
+  'peakFrom<earlyFrom': 'Peak phase cannot start before early phase',
+  'lateFrom<peakFrom': 'Late phase cannot start before peak phase',
+};
+function windowRefusal(refusal) {
+  const { rule, relative, field, value, after } = refusal;
+  if (rule === 'range') return relative ? `${field} must be between 0 and 100 years` : `Year out of range for ${field}`;
+  if (rule === 'retained') {
+    return `The stored ${field} (${value}) is outside ${relative ? 'the 0–100 year offsets an NV wine uses' : 'the years 1900–2200'}: ` +
+      'this window still holds values in the other unit. Send all six fields to rewrite it.';
+  }
+  return ORDER_WORDS[`${field}<${after}`];
 }
 
 /**
@@ -31,8 +55,8 @@ function parseYear(val) {
  *        ?limit / ?offset — pagination (default 100, max 500)
  *
  * Paginated + lean: every added/imported bottle seeds a pending profile, so
- * this collection grows one row per wine+vintage forever — unpaginated it
- * deep-populated the whole set into one response per queue visit.
+ * this collection grows one row per wine+vintage forever — unpaginated, every
+ * queue visit would deep-populate the whole set into one response.
  */
 router.get('/', requireSommOrAdmin, async (req, res) => {
   try {
@@ -48,10 +72,9 @@ router.get('/', requireSommOrAdmin, async (req, res) => {
       WineVintageProfile.find(filter)
         .populate({
           // aiProfile rides along so a curator can see the generated tasting
-          // note next to the drink window they are about to set — the ticket's
-          // point being that a somm who spots wrong prose currently works
-          // around it silently and the bad data survives. appellation feeds
-          // the same judgement (a Vintage Port's style follows from Porto).
+          // note next to the drink window they are about to set, and wrong
+          // prose is caught instead of surviving unseen. appellation feeds the
+          // same judgement (a Vintage Port's style follows from Porto).
           path: 'wineDefinition',
           select: 'name producer type colour image country region appellation aiProfile',
           populate: [
@@ -91,12 +114,14 @@ router.get('/lookup', async (req, res) => {
       return res.status(400).json({ error: 'Invalid wine ID' });
     }
 
-    const curator = req.user.roles.includes('somm') || req.user.roles.includes('admin');
+    const curator = isSommOrAdmin(req.user);
     const query = WineVintageProfile.findOne({
       wineDefinition: String(wine),
       vintage: String(vintage)
     });
-    const profile = await (curator ? query.populate({ path: 'setBy', select: 'username' }) : query.select('-setBy'));
+    // A member sees the window, never the curation behind it: who set it, or
+    // an install's suggestion (which names the wine request it came with).
+    const profile = await (curator ? query.populate({ path: 'setBy', select: 'username' }) : query.select('-setBy -suggestion'));
 
     if (!profile) {
       return res.json({ profile: null });
@@ -122,58 +147,37 @@ router.put('/:id', requireSommOrAdmin, async (req, res) => {
       return res.status(404).json({ error: 'Profile not found' });
     }
 
-    // Parse all year fields
-    // NV wines store the window as year-offsets after each bottle's purchase
-    // year (relative), since there's no vintage to anchor absolute years to.
-    const isNv = profile.vintage === 'NV';
-    const [lo, hi] = isNv ? [0, 100] : [1900, 2200];
-    const years = {};
+    // Only the fields explicitly sent change (null or blank = clear the
+    // field); a field not sent keeps its stored value.
+    const incoming = {};
     for (const field of PHASE_FIELDS) {
       const yr = parseYear(req.body[field]);
-      if (yr !== null && isNaN(yr)) {
+      if (Number.isNaN(yr)) {
         return res.status(400).json({ error: `Invalid value for ${field}` });
       }
-      if (yr !== null && (yr < lo || yr > hi)) {
-        return res.status(400).json({ error: isNv ? `${field} must be between 0 and 100 years` : `Year out of range for ${field}` });
-      }
-      years[field] = yr;
+      incoming[field] = req.body[field] === undefined ? undefined : yr;
+    }
+    // The window the row would hold AFTER the patch is what is checked: the
+    // range (year offsets for NV, years otherwise), stored values the patch
+    // keeps, and the ordering across sent and stored values alike. The same
+    // check as the MCP set_vintage_maturity (services/maturityOps).
+    const checked = maturityOps.checkWindow(profile, incoming);
+    if (!checked.ok) {
+      return res.status(checked.code === 'conflict' ? 409 : 400).json({ error: windowRefusal(checked) });
+    }
+    const { next } = checked;
+    // String() coercion: a truthy non-string would throw on .trim() → 500.
+    const sommNotes = req.body.sommNotes !== undefined
+      ? (req.body.sommNotes ? String(req.body.sommNotes).trim() : '')
+      : undefined;
+    if (sommNotes !== undefined && sommNotes.length > maturityOps.SOMM_NOTES_MAX) {
+      return res.status(400).json({ error: `Notes too long (max ${maturityOps.SOMM_NOTES_MAX} characters)` });
     }
 
-    const { earlyFrom, earlyUntil, peakFrom, peakUntil, lateFrom, lateUntil } = years;
-
-    // Ordering validations — only check pairs that are both provided.
-    // Compare against null, not truthiness: 0 is a legitimate NV offset.
-    if (earlyFrom != null && earlyUntil != null && earlyUntil < earlyFrom)
-      return res.status(400).json({ error: 'Early "until" must be after early "from"' });
-    if (peakFrom  != null && peakUntil  != null && peakUntil  < peakFrom)
-      return res.status(400).json({ error: 'Peak "until" must be after peak "from"' });
-    if (lateFrom  != null && lateUntil  != null && lateUntil  < lateFrom)
-      return res.status(400).json({ error: 'Late "until" must be after late "from"' });
-    if (earlyFrom != null && peakFrom   != null && peakFrom   < earlyFrom)
-      return res.status(400).json({ error: 'Peak phase cannot start before early phase' });
-    if (peakFrom  != null && lateFrom   != null && lateFrom   < peakFrom)
-      return res.status(400).json({ error: 'Late phase cannot start before peak phase' });
-
-    // Apply — only update fields that were explicitly sent (null = clear the field)
-    for (const field of PHASE_FIELDS) {
-      if (req.body[field] !== undefined) {
-        profile[field] = years[field] ?? undefined;
-      }
-    }
-    if (req.body.sommNotes !== undefined) {
-      // String() coercion: a truthy non-string threw on .trim() → 500.
-      profile.sommNotes = req.body.sommNotes ? String(req.body.sommNotes).trim() : '';
-    }
-
-    profile.relative = isNv;
-    profile.status = 'reviewed';
-    profile.setBy  = req.user.id;
-    profile.setAt  = new Date();
-
-    await profile.save();
-    // The owners' maturity statistics change with the window: move their data
-    // version so no read cache keeps the old one (audit 2026-09-27 M6).
-    bumpWineOwners([profile.wineDefinition?._id || profile.wineDefinition]);
+    // Phases, note, reviewed stamp and relative flag written; the owners'
+    // data version moved; audited: the same body as the MCP
+    // set_vintage_maturity (services/maturityOps).
+    await maturityOps.applyWindow(profile, next, { sommNotes, actorId: req.user.id, req });
     await profile.populate([
       {
         path: 'wineDefinition',
@@ -186,15 +190,12 @@ router.put('/:id', requireSommOrAdmin, async (req, res) => {
       { path: 'setBy', select: 'username' }
     ]);
 
-    // Shared-data mutation visible to every user of this wine+vintage —
-    // audit like the comparable admin mutations do.
-    logAudit(req, 'somm.maturity.review',
-      { type: 'wine', id: profile.wineDefinition?._id || profile.wineDefinition },
-      { vintage: profile.vintage, relative: profile.relative }
-    );
-
     res.json({ profile });
   } catch (error) {
+    // The row was removed from the queue between the load and the save.
+    if (error?.name === 'DocumentNotFoundError') {
+      return res.status(409).json({ error: 'This vintage was removed from the queue while saving — reload the queue.' });
+    }
     console.error('Update maturity profile error:', error);
     res.status(500).json({ error: 'Failed to update profile' });
   }
@@ -223,7 +224,7 @@ router.post('/:id/ai-suggest', requireSommOrAdmin, async (req, res) => {
     }
 
     const wine = profile.wineDefinition;
-    // Cost control (Johan 2026-08-21): the suggestion answers a question the
+    // Cost control: the suggestion answers a question the
     // curator is already researching by hand, and they work on a flat-rate
     // subscription. 503 rather than a silent empty result, with the reason
     // spelled out so the caller knows to research rather than retry.
@@ -276,26 +277,15 @@ router.delete('/:id/reset', requireSommOrAdmin, async (req, res) => {
       return res.status(409).json({ error: 'This vintage is already pending — there is no window to withdraw.' });
     }
 
-    for (const field of PHASE_FIELDS) {
-      profile[field] = undefined;
-    }
-    profile.sommNotes = '';
-    profile.status    = 'pending';
-    profile.setBy     = null;
-    profile.setAt     = null;
-
-    await profile.save();
-    // Withdrawing the window changes the owners' maturity statistics just as
-    // setting it does: move their data version so no read cache keeps it.
-    bumpWineOwners([profile.wineDefinition]);
-
-    logAudit(req, 'somm.maturity.reset',
-      { type: 'wine', id: profile.wineDefinition },
-      { vintage: profile.vintage }
-    );
+    // Cleared, pending again, stamp dropped, owners bumped, audited: the same
+    // body as the MCP reset_maturity_row (services/maturityOps).
+    await maturityOps.resetWindow(profile, { req });
 
     res.json({ profile });
   } catch (error) {
+    if (error?.name === 'DocumentNotFoundError') {
+      return res.status(409).json({ error: 'This vintage was removed from the queue while saving — reload the queue.' });
+    }
     console.error('Reset maturity profile error:', error);
     res.status(500).json({ error: 'Failed to reset profile' });
   }
@@ -329,14 +319,13 @@ router.delete('/:id', requireSommOrAdmin, async (req, res) => {
       return res.status(409).json({ error: 'This vintage is already reviewed — reset it to pending before removing it.' });
     }
 
-    await WineVintageProfile.deleteOne({ _id: profile._id });
-
-    // Shared-data mutation (the pair leaves every curator's queue) — audited
-    // like the review it stands in for.
-    logAudit(req, 'somm.maturity.remove',
-      { type: 'wine', id: profile.wineDefinition },
-      { vintage: profile.vintage }
-    );
+    // Deleted and audited like the review it stands in for: the same body as
+    // the MCP remove_from_maturity_queue (services/maturityOps). The delete
+    // re-checks the status, so a row reviewed since the load above stays.
+    const removed = await maturityOps.removePendingRow(profile, { req });
+    if (!removed) {
+      return res.status(409).json({ error: 'This vintage was reviewed or removed by someone else just now — reload the queue.' });
+    }
 
     res.json({ removed: true });
   } catch (error) {

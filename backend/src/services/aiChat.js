@@ -68,15 +68,13 @@ function getEventLog() {
  *
  * Deleting a cellar is a SOFT delete — the bottles keep `deletedAt: null` so a
  * restore can bring them back — so scoping bottles by `user` alone counts wine
- * the user believes they threw away. Support ticket 6a86268f (2026-08-20): a
- * user with 71 bottles was told they owned 779, because four deleted cellars
- * still held 708. On prod that day: 8 deleted cellars, 1,266 live bottles, 4
- * users, one of whom has an EMPTY cellar and was being quoted 132.
+ * the user believes they threw away: a user whose deleted cellars still hold
+ * bottles would be quoted a count far above what they actually own.
  *
- * Every sibling surface already does this (insightsService, mcp/tools/stats,
- * routes/stats, the analytics engine's deriveScope); the chat was the one that
- * did not. Members are included because a bottle can live in a cellar shared
- * with the user, exactly as deriveScope treats it.
+ * Every sibling surface does the same (insightsService, mcp/tools/stats,
+ * routes/stats, the analytics engine's deriveScope). Members are included
+ * because a bottle can live in a cellar shared with the user, exactly as
+ * deriveScope treats it.
  *
  * @returns {Promise<Array>} always an ARRAY — an empty one means "no live
  *   cellars", which must still filter everything out rather than mean "no
@@ -108,10 +106,10 @@ async function filterToUserCellar(hits, maxResults, { cellarIds } = {}) {
 
   // Fetch active bottles in the user's live cellars for those wine definitions.
   // Scoped by CELLAR, not by bottle owner: in a shared cellar the owner added
-  // the bottles, so `user: userId` hid every one of them from editors and
-  // viewers (issue #1421). The cellar list is therefore the ONLY scope and is
+  // the bottles, so `user: userId` would hide every one of them from editors
+  // and viewers. The cellar list is therefore the ONLY scope and is
   // mandatory — a missing or EMPTY list must match nothing, never every
-  // bottle in the database (and never deleted cellars, ticket 6a86268f).
+  // bottle in the database (and never deleted cellars).
   const bottleFilter = {
     status: 'active',
     wineDefinition: { $in: wineDefIds },
@@ -216,7 +214,7 @@ function formatWineList(matches, { profileMap, countMap, priceMap } = {}) {
 // bottles" counts below must be scoped the same way as everything else, or a
 // wine shown once would report the total including deleted cellars. Like the
 // wine list, it counts every bottle in those cellars whoever added it, so a
-// shared-cellar member sees the same counts as the owner (issue #1421).
+// shared-cellar member sees the same counts as the owner.
 async function fetchEnrichmentData(matches, scopedCellarIds = []) {
   if (!matches.length) return { profileMap: new Map(), countMap: new Map(), priceMap: new Map() };
 
@@ -355,7 +353,7 @@ function parseExpandResult(text, originalMessage, hasHistory) {
   return { searchQuery, needsNewSearch };
 }
 
-// ── Shared pipeline (used by both chat and chatStream) ────────────────────
+// ── The pipeline behind chat() ─────────────────────────────────────────────
 
 /**
  * Prepare the chat context: expand query, search, filter, enrich.
@@ -397,7 +395,7 @@ async function _prepareChatContext(userId, message, { useQueryExpansion = true, 
 
     // Restrict the vector search to wines the user actually owns. Without this,
     // top-K is pulled from the global catalogue and small cellars get filtered
-    // out entirely (see issue #386).
+    // out entirely.
     // Resolved ONCE and threaded through everything below, so the count, the
     // vector pre-filter and the wine list cannot disagree with each other —
     // which is the same invariant the HONEST SCOPING note further down cares
@@ -405,7 +403,7 @@ async function _prepareChatContext(userId, message, { useQueryExpansion = true, 
     // are shown.
     const scopedCellarIds = await liveCellarIds(userId, cellarIds);
     // No `user` here: the cellars ARE the scope, including ones shared with
-    // the user, whose bottles were added by the owner (issue #1421).
+    // the user, whose bottles were added by the owner.
     const bottleScope = { status: 'active', cellar: { $in: scopedCellarIds } };
     const userWineDefIds = await Bottle.distinct('wineDefinition', bottleScope);
 
@@ -424,11 +422,10 @@ async function _prepareChatContext(userId, message, { useQueryExpansion = true, 
     // Enrich matches with maturity, price, and count data
     const enrichment = await fetchEnrichmentData(matches, scopedCellarIds);
 
-    // HONEST SCOPING (support ticket 2026-08-12 "IA bottles known false"): the
-    // model only ever sees the chatMaxResults most relevant bottles, and
-    // without the cellar's true size it presents that selection AS the cellar
-    // — a user with 71 bottles concluded the AI "has knowledge only on 11".
-    // State the total inside the context itself, counted on the SAME scope as
+    // HONEST SCOPING: the model only ever sees the chatMaxResults most
+    // relevant bottles, and without the cellar's true size it presents that
+    // selection AS the cellar — the user concludes the AI knows only a few of
+    // their bottles. State the total inside the context itself, counted on the SAME scope as
     // the search (user + active + optional cellar selection) so the number can
     // never contradict the list. The line lives in wineSection, so a reused
     // context (previousWines) carries it forward without re-counting.
@@ -441,7 +438,7 @@ async function _prepareChatContext(userId, message, { useQueryExpansion = true, 
       wineSection = 'The user has no active bottles in their cellar.';
     } else {
       // Empty SEARCH, non-empty CELLAR — without the distinction the model
-      // told users their cellar had nothing in it.
+      // tells users their cellar has nothing in it.
       wineSection = `${scopeLine} None of them matched this question semantically — the cellar is not empty, this search just surfaced no relevant bottles.`;
     }
   } else {
@@ -491,7 +488,7 @@ async function _prepareChatContext(userId, message, { useQueryExpansion = true, 
   };
 }
 
-// ── Main entry point (non-streaming) ──────────────────────────────────────
+// ── Entry point ────────────────────────────────────────────────────────────
 
 async function chat(userId, message, opts = {}) {
   const { cfg, callParams, wines, searchQuery, needsNewSearch, wineSection, useQueryExpansion } =
@@ -546,100 +543,4 @@ async function chat(userId, message, opts = {}) {
   };
 }
 
-// ── Streaming entry point (SSE) ───────────────────────────────────────────
-
-/**
- * Stream the chat response via SSE events written to an Express response.
- *
- * Events sent:
- *   meta  – { wines, expandedQuery, searchPerformed, wineContext }
- *   delta – { text }  (each token as it arrives)
- *   done  – { usage }
- *   error – { error }
- */
-async function chatStream(userId, message, opts, res) {
-  const { cfg, callParams, wines, searchQuery, needsNewSearch, wineSection, useQueryExpansion } =
-    await _prepareChatContext(userId, message, opts);
-
-  // Send metadata before streaming starts
-  _sseWrite(res, 'meta', {
-    wines,
-    expandedQuery: useQueryExpansion && needsNewSearch ? searchQuery : null,
-    searchPerformed: needsNewSearch,
-    wineContext: wineSection,
-  });
-
-  const client = aiProvider.getChatClient({ feature: 'chat' });
-
-  // messages.stream() returns synchronously and reports HTTP failures via the
-  // 'error' event (never by throwing), so the model fallback has to live in
-  // the error handler: retry once on the fallback model if the primary fails
-  // before any tokens were emitted.
-  const canFallback = canFallbackTo(cfg);
-
-  return new Promise((resolve, reject) => {
-    let aborted = false;
-    let receivedText = false;
-    let stream;
-
-    const runStream = (model, allowFallback) => {
-      stream = client.messages.stream({ ...callParams, model, ...thinkingOff(model) });
-
-      stream.on('text', (textDelta) => {
-        receivedText = true;
-        if (!aborted) {
-          _sseWrite(res, 'delta', { text: textDelta });
-        }
-      });
-
-      stream.on('finalMessage', (msg) => {
-        if (!aborted) {
-          const usage = {
-            inputTokens:  msg.usage?.input_tokens  ?? 0,
-            outputTokens: msg.usage?.output_tokens ?? 0,
-          };
-          _sseWrite(res, 'done', { usage });
-          res.end();
-        }
-        resolve({ usage: { inputTokens: msg.usage?.input_tokens ?? 0, outputTokens: msg.usage?.output_tokens ?? 0 } });
-      });
-
-      stream.on('error', (err) => {
-        const isRetryable = [429, 500, 502, 503, 529].includes(err.status)
-          || err.error?.type === 'overloaded_error';
-        if (allowFallback && isRetryable && !receivedText && !aborted) {
-          runStream(cfg.chatModelFallback, false);
-          return;
-        }
-        if (!aborted) {
-          _sseWrite(res, 'error', { error: err.message || 'Stream error' });
-          res.end();
-        }
-        reject(err);
-      });
-
-      // An aborted stream emits 'abort' — NOT 'error' — and with no listener
-      // the SDK turns it into an unhandled promise rejection (process-fatal
-      // under Node's default policy). It also means neither 'finalMessage'
-      // nor 'error' fires, so without this the promise never settles and the
-      // caller's finally (concurrency-slot release) never runs.
-      stream.on('abort', () => {
-        resolve({ usage: null, aborted: true });
-      });
-    };
-
-    res.on('close', () => {
-      aborted = true;
-      stream?.abort?.();
-    });
-
-    runStream(cfg.chatModel, canFallback);
-  });
-}
-
-/** Write a single SSE event to the response. */
-function _sseWrite(res, event, data) {
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
-
-module.exports = { chat, chatStream, getEventLog };
+module.exports = { chat, getEventLog };

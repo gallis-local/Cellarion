@@ -8,6 +8,10 @@ import {
 } from '../api/admin';
 
 const PAGE_SIZE = 20;
+// The server's bounds on a reject reason (backend routes/admin/wineProposals,
+// REJECT_REASON_MIN / REJECT_REASON_MAX), for the single and the bulk reject.
+const REJECT_REASON_MIN = 5;
+const REJECT_REASON_MAX = 2000;
 
 const KIND_KEYS = {
   field_correction: 'admin.wines.proposals.kindFieldCorrection',
@@ -22,12 +26,15 @@ const FIELD_KEYS = {
   region: 'admin.wines.proposals.fields.region',
   country: 'admin.wines.proposals.fields.country',
   classification: 'admin.wines.proposals.fields.classification',
-  // Proposable since 2026-08-19 (somm ticket 6a85ad44). Grapes arrive as a
+  // Type and grapes are proposable too. Grapes arrive as a
   // joined string from the route, so the generic diff row renders them as-is.
   type: 'admin.wines.proposals.fields.type',
-  // The colour of a sparkling/dessert/fortified wine (support ticket 2026-09-17).
+  // The colour of a sparkling/dessert/fortified wine.
   colour: 'admin.wines.proposals.fields.colour',
   grapes: 'admin.wines.proposals.fields.grapes',
+  // The term a wine is known by when its label prints none: "term (source)"
+  // on both sides, with the page that names the proposed term as a link.
+  sweetnessStyle: 'admin.wines.proposals.fields.sweetnessStyle',
 };
 
 const wineLabel = (w) => (w ? [w.producer, w.name].filter(Boolean).join(' — ') : null);
@@ -141,10 +148,10 @@ function WineProposalsModal({ apiFetch, onClose, onChanged }) {
     const gone = new Set(ids);
     decidedDelta.current += gone.size;
     setItems(prev => (prev || []).filter(x => !gone.has(x._id)));
-    // Decided rows leave the SELECTION too (audit 2026-08-16): a row approved
-    // via its own button kept its id in selectedIds, inflating the count and
-    // making the next bulk call send an already-decided id whose 409 landed
-    // as an error on a row no longer rendered. (After a bulk call,
+    // Decided rows leave the SELECTION too: a row approved via its own button
+    // would keep its id in selectedIds, inflating the count and making the
+    // next bulk call send an already-decided id whose 409 lands as an error
+    // on a row no longer rendered. (After a bulk call,
     // applyBulkResults re-sets the selection to the failed ids — functional
     // updates apply in order, so that write wins, as intended.)
     setSelectedIds(prev => {
@@ -239,7 +246,7 @@ function WineProposalsModal({ apiFetch, onClose, onChanged }) {
 
   const reject = async (proposal) => {
     const reason = rejectReason.trim();
-    if (reason.length < 5) {
+    if (reason.length < REJECT_REASON_MIN) {
       setError(t('admin.wines.proposals.rejectReasonRequired'));
       return;
     }
@@ -330,7 +337,7 @@ function WineProposalsModal({ apiFetch, onClose, onChanged }) {
     const ids = [...selectedIds];
     const reason = bulkReason.trim();
     if (ids.length === 0) return;
-    if (reason.length < 5) {
+    if (reason.length < REJECT_REASON_MIN) {
       setError(t('admin.wines.proposals.rejectReasonRequired'));
       return;
     }
@@ -441,7 +448,7 @@ function WineProposalsModal({ apiFetch, onClose, onChanged }) {
                 value={bulkReason}
                 onChange={(e) => setBulkReason(e.target.value)}
                 placeholder={t('admin.wines.proposals.bulkRejectPlaceholder')}
-                maxLength={2000}
+                maxLength={REJECT_REASON_MAX}
                 disabled={!!pendingId}
                 style={{ flex: '1 1 220px', minWidth: 180 }}
               />
@@ -530,6 +537,13 @@ function WineProposalsModal({ apiFetch, onClose, onChanged }) {
                   <span style={{ textDecoration: 'line-through', ...mutedStyle }}>{d.current || '—'}</span>
                   <span aria-hidden="true">→</span>
                   <strong>{d.proposed}</strong>
+                  {/* A sweetness style names its page: the reviewer opens it
+                      to see that it uses the term for this wine. */}
+                  {d.url && (
+                    <a href={d.url} target="_blank" rel="noopener noreferrer nofollow" style={{ fontSize: '0.78rem' }}>
+                      {t('admin.wines.proposals.styleSource', 'the page that names it')}
+                    </a>
+                  )}
                   {/* Drift: the wine changed since the somm looked at it — the
                       snapshot is what they judged, so flag the difference. */}
                   {p.currentSnapshot && p.currentSnapshot[field] !== d.current && (
@@ -688,7 +702,7 @@ function WineProposalsModal({ apiFetch, onClose, onChanged }) {
                         value={rejectReason}
                         onChange={(e) => setRejectReason(e.target.value)}
                         placeholder={t('admin.wines.proposals.rejectPlaceholder')}
-                        maxLength={2000}
+                        maxLength={REJECT_REASON_MAX}
                         disabled={!!pendingId}
                         style={{ flex: '1 1 220px', minWidth: 180 }}
                       />

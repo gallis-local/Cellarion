@@ -3,21 +3,26 @@
  * the REST somm routes (routes/somm/pendingWines.js) and the MCP somm tools
  * (mcp/tools/somm.js), so the two surfaces cannot drift on projection,
  * anonymisation, taxonomy resolution or conflict semantics. Same shape as
- * services/ownerInquiryOps (#930) and services/wineProfileOps.
+ * services/ownerInquiryOps and services/wineProfileOps.
  *
  * What is in the queue: WineDefinitions minted at bottle-commit from an
  * incomplete identity — no producer, a sentinel producer, or a geography typed
  * into the producer box (models/WineDefinition.pendingIdentity). They are
  * invisible to everyone but their creator until a curator completes them.
+ * Also in it: wines taken from a member's own data that no curator has
+ * checked yet (models/WineDefinition.uncheckedIdentity). Those usually have a
+ * complete identity and leave the queue on a fix that sends identityChecked.
  *
- * ANONYMISED, deliberately (the #930 rule): the row carries the wine, its
- * bottle count and its IMAGES — never the creator's id, username or email. A
- * curator fixes a record; who owns the bottle is not part of that judgement,
- * and the queue is reachable over MCP, where the payload leaves the building.
+ * ANONYMISED, deliberately: the row carries the wine, its bottle count and its
+ * IMAGES — never the creator's id, username or email. A curator fixes a
+ * record; who owns the bottle is not part of that judgement, and the queue is
+ * reachable over MCP, where the payload leaves the building.
  *
  * The FIX is a plain field write. Promotion is not done here and must not be:
  * the WineDefinition pre-validate hook flips pendingIdentity off as soon as
  * producer + name are both real, so every write path promotes identically.
+ * (An unchecked wine is held back by its own flag; the fix clears that flag
+ * on identityChecked and the same hook then promotes.)
  * What IS done here is the follow-through a promotion needs — search index,
  * embeddings, maturity queue, IndexNow — because a row that was excluded from
  * all four while pending has to be let back in exactly once.
@@ -30,12 +35,20 @@ const Country = require('../models/Country');
 // pendingWineKey comes from utils/normalize (beside generateWineKey), NOT from
 // services/findOrCreateWine: one definition of the key shape, and no dependency
 // from the curation queue onto the resolver's module tree to build a string.
-const { generateWineKey, pendingWineKey, normalizeAppellation, normalizeString, resolveCountryName, isIdentitySentinel, isImplausibleIdentity } = require('../utils/normalize');
+const { generateWineKey, pendingWineKey, uncheckedWineKey, normalizeAppellation, normalizeString, resolveCountryName, isIdentitySentinel, isImplausibleIdentity } = require('../utils/normalize');
+const { assignClassification } = require('./classificationOps');
 const { IDENTITY_BLOCKING_CROSS_FIELD_CHECK_IDS, resolveCrossFieldCheck } = require('../utils/crossFieldChecks');
 // Top-level: labelScanAccess requires nothing at load (its own model require is
 // lazy), so it adds no module tree to the curation queue.
 const { stampPromotedScanRetention } = require('./labelScanAccess');
+const { isValidId } = require('../utils/validation');
 const { DRAFT_EXCLUDED } = require('./wineVisibility');
+// Not curation work either: a row quarantined as not wine (the Other
+// category) keeps pendingIdentity but never gets an identity completed,
+// so without this filter it stays on the curators' list for good.
+// Spread beside DRAFT_EXCLUDED at every site: the draft-gates
+// guard reads the word next to each pendingIdentity filter.
+const NOT_WINE_EXCLUDED = { nonWine: { $ne: true } };
 // Same reasoning: appellationResolve requires only the Appellation model and
 // utils/normalize, so the curation queue keeps its light module tree.
 const { resolveCanonicalAppellation } = require('./appellationResolve');
@@ -46,11 +59,16 @@ const { WINE_COLOURS, stateColour, colourTypeConflict } = require('../utils/wine
 // row; the rest ride along so one pass can fix everything the misread label
 // got wrong. Deliberately NOT here: type-only/profile fields (set_wine_profile
 // owns those), nonWine (a quarantine proposal), and anything about the bottle.
-const FIXABLE_FIELDS = ['producer', 'name', 'appellation', 'regionName', 'countryName', 'grapeNames', 'type', 'colour', 'identityUnavailable'];
+//
+// `identityChecked` is the curator's check of a wine taken from a member's own
+// data (models/WineDefinition.uncheckedIdentity): "the identity is right as it
+// stands after this write". It is what lets such a row leave the queue; sent
+// alone it confirms the record unchanged.
+const FIXABLE_FIELDS = ['producer', 'name', 'appellation', 'classification', 'regionName', 'countryName', 'grapeNames', 'type', 'colour', 'identityUnavailable', 'identityChecked'];
 /**
  * Not a field — an explicit, audited OVERRIDE of the cross-field refusal below.
  *
- * Why it has to exist (audit L-10b): the gate refuses a producer that matches a
+ * Why it has to exist: the gate refuses a producer that matches a
  * Region or Appellation document, and users can MINT those. A junk Region
  * called "Ferreirinha" or an appellation promoted from a misread label makes
  * that real producer's name permanently unwritable — and the only escape the
@@ -90,21 +108,29 @@ const CREATED_VIA_FILTERS = ['ui', 'import', 'mcp', 'ai'];
  *   session while still clearing the trickle of 'ui' scans. (Grouping by
  *   import session was the alternative; ImportSession is deleted the moment an
  *   import finishes, so there would be nothing left to group by.)
- * @returns {{ rows, total, pendingTotal, unavailableTotal }}
+ * @param {'needs_check'|'needs_identity'} [opts.kind] one half of the queue:
+ *   the wines taken from a member's own data that wait for a curator's check
+ *   (models/WineDefinition.uncheckedIdentity), OLDEST first, because their
+ *   owners are waiting in the order they imported; or the rows with an
+ *   incomplete identity only. Omitted: both, newest first.
+ * @returns {{ rows, total, pendingTotal, unavailableTotal, uncheckedTotal }}
  */
-async function queryPendingWines({ limit = 20, offset = 0, createdVia = null, includeUnavailable = false } = {}) {
+async function queryPendingWines({ limit = 20, offset = 0, createdVia = null, includeUnavailable = false, kind = null } = {}) {
   // A private draft is pending too (model invariant) but is NOT curation
   // work — it is hidden from curators until its creator publishes it.
-  const filter = { pendingIdentity: true, ...DRAFT_EXCLUDED };
+  const filter = { pendingIdentity: true, ...DRAFT_EXCLUDED, ...NOT_WINE_EXCLUDED };
   if (!includeUnavailable) filter.identityUnavailable = { $ne: true };
+  const needsCheck = kind === 'needs_check';
+  if (needsCheck) filter.uncheckedIdentity = true;
+  else if (kind === 'needs_identity') filter.uncheckedIdentity = { $ne: true };
   // Literal from the static array, never raw input (CodeQL query-injection
   // rule, the aiBudgetRequests pattern).
   const viaIdx = CREATED_VIA_FILTERS.indexOf(String(createdVia || ''));
   if (viaIdx !== -1) filter.createdVia = CREATED_VIA_FILTERS[viaIdx];
 
-  const [wines, total, pendingTotal, unavailableTotal] = await Promise.all([
+  const [wines, total, pendingTotal, unavailableTotal, uncheckedTotal] = await Promise.all([
     WineDefinition.find(filter)
-      .sort({ createdAt: -1 })
+      .sort(needsCheck ? { createdAt: 1, _id: 1 } : { createdAt: -1, _id: -1 })
       .skip(offset)
       .limit(limit)
       .populate('country', 'name')
@@ -115,8 +141,9 @@ async function queryPendingWines({ limit = 20, offset = 0, createdVia = null, in
     // The WORK figure: rows still awaiting an identity, excluding the ones a
     // curator has already dispositioned. Counted separately below so the UI can
     // still say how many of those there are.
-    WineDefinition.countDocuments({ pendingIdentity: true, identityUnavailable: { $ne: true }, ...DRAFT_EXCLUDED }),
-    WineDefinition.countDocuments({ pendingIdentity: true, identityUnavailable: true, ...DRAFT_EXCLUDED }),
+    WineDefinition.countDocuments({ pendingIdentity: true, identityUnavailable: { $ne: true }, ...DRAFT_EXCLUDED, ...NOT_WINE_EXCLUDED }),
+    WineDefinition.countDocuments({ pendingIdentity: true, identityUnavailable: true, ...DRAFT_EXCLUDED, ...NOT_WINE_EXCLUDED }),
+    WineDefinition.countDocuments({ pendingIdentity: true, uncheckedIdentity: true, identityUnavailable: { $ne: true }, ...DRAFT_EXCLUDED, ...NOT_WINE_EXCLUDED }),
   ]);
 
   const ids = wines.map((w) => w._id);
@@ -201,6 +228,10 @@ async function queryPendingWines({ limit = 20, offset = 0, createdVia = null, in
       grapeNames: (w.grapes || []).map((g) => g.name).filter(Boolean),
       type: w.type || null,
       identityUnavailable: w.identityUnavailable === true,
+      // true = taken from a member's own data and waiting for a check: the
+      // identity is usually complete, and the row leaves the queue only on a
+      // fix that sends identityChecked.
+      unchecked: w.uncheckedIdentity === true,
       createdAt: w.createdAt,
       createdVia: w.createdVia || null,
       bottleCount: countBy.get(String(w._id)) || 0,
@@ -221,7 +252,7 @@ async function queryPendingWines({ limit = 20, offset = 0, createdVia = null, in
     };
   });
 
-  return { rows, total, pendingTotal, unavailableTotal };
+  return { rows, total, pendingTotal, unavailableTotal, uncheckedTotal };
 }
 
 /**
@@ -272,6 +303,15 @@ function validatePendingFix(patch) {
         return { ok: false, error: 'identityUnavailable must be true or false' };
       }
       clean.identityUnavailable = patch.identityUnavailable;
+      continue;
+    }
+    if (field === 'identityChecked') {
+      // Only `true`: a check is given, never taken back. A checked wine that
+      // turns out wrong is corrected like any registry wine.
+      if (patch.identityChecked !== true) {
+        return { ok: false, error: 'identityChecked must be true (leave it out to keep the wine waiting)' };
+      }
+      clean.identityChecked = true;
       continue;
     }
     if (typeof patch[field] !== 'string') {
@@ -326,6 +366,7 @@ async function applyPendingFix(wine, clean, userId) {
     producer: wine.producer || null,
     name: wine.name,
     appellation: wine.appellation || null,
+    classification: wine.classification || null,
     type: wine.type || null,
     identityUnavailable: wine.identityUnavailable === true,
   };
@@ -337,7 +378,35 @@ async function applyPendingFix(wine, clean, userId) {
   // the row simply leaves the WORK list (see the field comment on
   // models/WineDefinition.identityUnavailable). Reversible with `false`.
   if (clean.identityUnavailable !== undefined) {
+    // "The label prints no producer" cannot be said of a row that has one: it
+    // would take a wine waiting for a check out of the queue with nobody left
+    // to publish it.
+    if (clean.identityUnavailable === true && !isIdentitySentinel(wine.producer)) {
+      return {
+        ok: false,
+        code: 'invalid_input',
+        message: 'This wine has a producer, so it cannot be recorded as having none on the label. Correct the record instead, or leave it waiting.',
+      };
+    }
     wine.identityUnavailable = clean.identityUnavailable;
+  }
+  // The curator's check of a wine taken from a member's own data
+  // (models/WineDefinition.uncheckedIdentity). Clearing the flag is what lets
+  // the pre-validate hook promote the row on the save below; without it the
+  // fields are written and the row keeps waiting.
+  const wasUnchecked = wine.uncheckedIdentity === true;
+  if (clean.identityChecked === true) wine.uncheckedIdentity = false;
+  // A check says the identity is right, so it needs one: refused here with the
+  // reason, where the hook would leave the row in the queue with none.
+  if (clean.identityChecked === true &&
+      (isIdentitySentinel(wine.producer) || isIdentitySentinel(wine.name) || isImplausibleIdentity(wine.producer, wine.name))) {
+    return {
+      ok: false,
+      code: 'invalid_input',
+      message:
+        'This wine cannot be checked as it stands: it has no usable producer or name. Send the producer and the ' +
+        'name together with the check, or leave the check out to keep the wine waiting.',
+    };
   }
 
   // SHAPE gate, before any DB work. The same predicate the auto-promote hook
@@ -360,7 +429,14 @@ async function applyPendingFix(wine, clean, userId) {
       ? await resolveCanonicalAppellation(normalizeAppellation(clean.appellation))
       : null;
   }
-  // Refused, not accepted-and-dropped by the model hook (audit 2026-09-19).
+  // '' clears; a regulatory mark stores as none. The write rule is strict for
+  // a curator (services/classificationOps): a tier the taxonomy lacks is
+  // refused with the known tiers.
+  if (clean.classification !== undefined) {
+    const cls = await assignClassification(wine, { classification: clean.classification, strict: true });
+    if (!cls.ok) return { ok: false, code: 'invalid_input', message: cls.message };
+  }
+  // Refused, not accepted-and-dropped by the model hook.
   const colourErr = colourTypeConflict(clean.type || wine.type, clean.colour);
   if (colourErr) return { ok: false, code: 'invalid_input', message: colourErr };
   if (clean.type) wine.type = clean.type;
@@ -416,10 +492,11 @@ async function applyPendingFix(wine, clean, userId) {
   // Run when the producer was written, or when this save would PROMOTE (the
   // hook's own predicate, predicted here exactly as the key regen below does) —
   // never on an appellation-only touch-up of a row staying in the queue.
-  const willPromote = !isIdentitySentinel(wine.producer) && !isIdentitySentinel(wine.name) &&
+  const willPromote = wine.uncheckedIdentity !== true &&
+    !isIdentitySentinel(wine.producer) && !isIdentitySentinel(wine.name) &&
     !isImplausibleIdentity(wine.producer, wine.name);
   //
-  // OVERRIDABLE, explicitly and audibly (audit L-10b). The rules read the LIVE
+  // OVERRIDABLE, explicitly and audibly. The rules read the LIVE
   // taxonomy, and users can mint Regions and Appellations — so a junk Region
   // doc bearing a real producer's name makes that producer permanently
   // unwritable, and the only remaining escape (identityUnavailable) records
@@ -427,7 +504,7 @@ async function applyPendingFix(wine, clean, userId) {
   // the label may say so with crossFieldOverride; the override is refused
   // unless a producer is actually being written, it is never a default, and the
   // caller logs it — see the audit metadata in routes/somm/pendingWines.js and
-  // mcp/tools/somm.fix_pending_wine.
+  // mcp/tools/somm/pendingWines.fix_pending_wine.
   let crossFieldOverridden = null;
   if (clean.producer !== undefined || willPromote) {
     // Lazy require, same reason as findOrCreateRegion above: keep the curation
@@ -469,7 +546,7 @@ async function applyPendingFix(wine, clean, userId) {
       wine.region = null;
     } else {
       // Lazy require: findOrCreateWine top-requires services/search → the
-      // ESM-only meilisearch package jest cannot parse (the #702 failure mode).
+      // ESM-only meilisearch package jest cannot parse.
       const { findOrCreateRegion } = require('./findOrCreateWine');
       const regionDoc = await findOrCreateRegion(clean.regionName, countryDoc?._id || wine.country, userId);
       wine.region = regionDoc?._id || null;
@@ -484,18 +561,28 @@ async function applyPendingFix(wine, clean, userId) {
   // …but ONLY when the row is actually leaving. `wine.pendingIdentity` is still
   // true at this point (the pre-validate hook flips it during save below), so
   // this must PREDICT the hook with the hook's own predicate rather than read
-  // the flag. Using generateWineKey unconditionally dropped the creator id out
-  // of a STILL-PENDING row's key (security audit M-2), breaking the documented
-  // namespace invariant: two curator-renamed pending rows by different users
-  // could then land on the same ordinary key and E11000 into a "merge them
-  // instead" 409 that is simply false.
-  // …computed once above (it also decides whether the cross-field gate runs),
-  // and it now carries the hook's implausibility term too — a row the hook
-  // refuses to promote must keep its per-creator pending key.
-  if (clean.name || clean.producer || clean.appellation !== undefined) {
-    wine.normalizedKey = willPromote
-      ? generateWineKey(wine.name, wine.producer, wine.appellation)
-      : pendingWineKey(wine.name, wine.createdBy, wine.appellation);
+  // the flag. Using generateWineKey unconditionally would drop the creator id
+  // out of a STILL-PENDING row's key, breaking the documented namespace
+  // invariant: two curator-renamed pending rows by different users could then
+  // land on the same ordinary key and E11000 into a "merge them instead" 409
+  // that is simply false. willPromote is computed once above (it also decides
+  // whether the cross-field gate runs) and carries the hook's implausibility
+  // term — a row the hook refuses to promote must keep its per-creator
+  // pending key.
+  //
+  // A row that stays UNCHECKED keeps its own per-creator namespace, and the
+  // pending one when it has no producer: the rule the mint applies
+  // (services/findOrCreateWine). The check itself moves the key as well, with
+  // no field written, because it is what takes the row out of that namespace.
+  const checkedNow = wasUnchecked && wine.uncheckedIdentity !== true;
+  if (clean.name || clean.producer || clean.appellation !== undefined || checkedNow) {
+    if (willPromote) {
+      wine.normalizedKey = generateWineKey(wine.name, wine.producer, wine.appellation);
+    } else if (wine.uncheckedIdentity === true && !isIdentitySentinel(wine.producer)) {
+      wine.normalizedKey = uncheckedWineKey(wine.name, wine.producer, wine.createdBy, wine.appellation);
+    } else {
+      wine.normalizedKey = pendingWineKey(wine.name, wine.createdBy, wine.appellation);
+    }
   }
 
   // The pre-validate hook promotes; read the outcome rather than deciding it.
@@ -503,10 +590,28 @@ async function applyPendingFix(wine, clean, userId) {
     await wine.save();
   } catch (err) {
     if (err.code === 11000) {
+      // Which wine it collided with, so the caller can name it and offer the
+      // merge (mergePendingInto). Best-effort: the refusal stands without it.
+      let duplicate = null;
+      try {
+        const twin = await WineDefinition.findOne({ normalizedKey: wine.normalizedKey, _id: { $ne: wine._id } })
+          .select('name producer appellation pendingIdentity draft nonWine').lean();
+        if (twin && twin.draft !== true) {
+          duplicate = {
+            wineId: String(twin._id), name: twin.name, producer: twin.producer || null,
+            appellation: twin.appellation || null,
+            published: twin.pendingIdentity !== true && twin.nonWine !== true,
+            // A record kept outside the wine registry (a spirit, a cider): it
+            // can be neither completed nor merged into.
+            nonWine: twin.nonWine === true,
+          };
+        }
+      } catch { /* the conflict is the answer either way */ }
       return {
         ok: false,
         code: 'conflict',
         message: 'This fix would make the wine identical to an existing registry wine — merge them instead (the registry already holds that identity).',
+        ...(duplicate ? { duplicate } : {}),
       };
     }
     if (err?.name === 'VersionError') {
@@ -517,8 +622,8 @@ async function applyPendingFix(wine, clean, userId) {
 
   // The bottles' owners see this wine's new identity in their statistics and
   // bottle lists: move their data version so no read cache keeps the old one
-  // (services/dataVersion; audit 2026-09-27 M6). Lazy so the tests that mock
-  // Bottle without `distinct` are unaffected — the helper never throws.
+  // (services/dataVersion). Lazy so the tests that mock Bottle without
+  // `distinct` are unaffected — the helper never throws.
   require('./dataVersion').bumpWineOwners([wine._id]);
 
   const promoted = wine.pendingIdentity !== true;
@@ -530,6 +635,7 @@ async function applyPendingFix(wine, clean, userId) {
     producer: wine.producer || null,
     name: wine.name,
     appellation: wine.appellation || null,
+    classification: wine.classification || null,
     type: wine.type || null,
     identityUnavailable: wine.identityUnavailable === true,
   };
@@ -537,6 +643,7 @@ async function applyPendingFix(wine, clean, userId) {
   for (const k of Object.keys(after)) {
     if (before[k] !== after[k]) diff[k] = { from: before[k], to: after[k] };
   }
+  if (checkedNow) diff.identityChecked = { from: false, to: true };
   if (clean.countryName !== undefined) diff.country = { to: clean.countryName || null };
   if (clean.regionName !== undefined) diff.region = { to: clean.regionName || null };
   if (grapeNames !== null) diff.grapes = { to: grapeNames };
@@ -553,19 +660,18 @@ async function applyPendingFix(wine, clean, userId) {
 async function runPromotionFollowThrough(wine) {
   // The label scan's clock starts HERE. While the row was pending the scan was
   // curation evidence with a live purpose; promotion ends that purpose, but not
-  // instantly — a wrong completion has to be correctable against the label,
-  // which under the old rule became unreadable the moment the row left the
-  // queue (services/labelScanAccess). So the scan stays readable for
+  // instantly — a wrong completion has to be correctable against the label
+  // (services/labelScanAccess). So the scan stays readable for
   // PROMOTED_SCAN_GRACE_DAYS and is then deleted, file and doc, by the daily
-  // sweep. GDPR: this REDUCES retention — a promoted wine's scan was previously
-  // kept indefinitely, reachable by nobody.
+  // sweep. GDPR: this bounds retention — without a deadline a promoted wine's
+  // scan would be kept indefinitely, reachable by nobody.
   //
-  // The stamp itself now lives on the TRANSITION — a post('save') hook on
-  // WineDefinition — because "every promoting caller runs this follow-through"
-  // was simply false: the admin PUT and /strip-producer promote by setting a
-  // producer and saving, and called nothing (audit M-4). Kept here as well,
-  // deliberately: the update matches `retainUntil: null` and so cannot extend a
-  // live deadline, and this call is what the curation path's own test asserts.
+  // The stamp itself lives on the TRANSITION — a post('save') hook on
+  // WineDefinition — because not every promoting caller runs this
+  // follow-through: the admin PUT and /strip-producer promote by setting a
+  // producer and saving. Kept here as well, deliberately: the update matches
+  // `retainUntil: null` and so cannot extend a live deadline, and this call is
+  // what the curation path's own test asserts.
   await stampPromotedScanRetention(wine);
   const searchService = require('./search');
   // indexWine owns index membership in BOTH directions — this is the call that
@@ -578,17 +684,15 @@ async function runPromotionFollowThrough(wine) {
   // budgetUserId: this is curation work, not a user action, so it is not
   // debited to whoever happened to add the bottle.
   //
-  // Deliberately NOT passed trigger:'add' (2026-08-21): the enrichmentOnAdd
+  // Deliberately NOT passed trigger:'add': the enrichmentOnAdd
   // policy exists to stop paying for profiles on records nobody has looked
   // at, and this is the opposite — a curator has just supplied the identity
   // by hand. Same family as reenrichAfterRecordEdit: chosen, not incidental.
   //
-  // …except under 'off', which since 2026-08-22 means wine data is somm-owned
-  // and the AI writes NOTHING automatically — reenrichAfterRecordEdit honours
-  // it, and this hook, a day older than the rule, did not. On prod the
-  // sommelier had already replaced 106 of the 113 AI profiles generated in the
-  // 30 days to 2026-09-24. The draft-publish paths (services/wineDraftOps) run
-  // this same function, so this one check covers them too.
+  // …except under 'off', which means wine data is somm-owned and the AI
+  // writes NOTHING automatically — reenrichAfterRecordEdit honours it too.
+  // The draft-publish paths (services/wineDraftOps) run this same function,
+  // so this one check covers them too.
   if (require('../config/aiConfig').get().enrichmentOnAdd !== 'off') {
     require('./enrichmentJob').enrichWineById(wine._id).catch?.(() => {});
   }
@@ -604,7 +708,7 @@ async function runPromotionFollowThrough(wine) {
   } catch (err) {
     console.warn('Maturity re-seed after pending promotion failed (non-fatal):', err.message);
   }
-  // The wine now has a public page worth announcing (it 404'd while pending).
+  // The wine now has a public page worth announcing (it is a 404 while pending).
   try {
     require('./indexNow').submitUrls(`/wines/${wine.slug || wine._id}`);
   } catch { /* non-fatal */ }
@@ -635,14 +739,85 @@ async function loadPendingWine(wineId) {
   return { ok: true, wine };
 }
 
+/**
+ * A wine in the pending queue IS a wine the registry already holds: move
+ * everything that points at it (bottles, their photos, wishlist items,
+ * reviews and the rest — services/wineMergeOps) onto that published wine and
+ * remove the queue row. This is how the second member's row of a wine ends,
+ * once a curator has checked the first: checking it too is refused as a
+ * duplicate (applyPendingFix answers `duplicate`).
+ *
+ * The target must be a published wine: not pending, not a draft, not a
+ * non-wine record. The bottles' owners keep everything that is theirs; only
+ * the wine their bottles point at changes.
+ *
+ * Called by POST /api/somm/pending-wines/:id/merge and the MCP tool
+ * merge_pending_wine. The merge writes its own audit row (admin.wine.merge).
+ *
+ * @param {object} wine  the queue row, from loadPendingWine
+ * @param {string} targetWineId
+ * @param {{ req?: object }} [opts] req for audit attribution
+ * @returns {{ ok:true, target, bottlesMoved }} | {{ ok:false, code, message }}
+ */
+async function mergePendingInto(wine, targetWineId, { req = null } = {}) {
+  // The id arrives from a request body: only a 24-hex STRING reaches the
+  // query, never the value as it was sent (an object would be an operator).
+  const targetId = typeof targetWineId === 'string' ? targetWineId : '';
+  if (!isValidId(targetId)) {
+    return { ok: false, code: 'invalid_input', message: 'Invalid target wine id' };
+  }
+  if (targetId === String(wine._id)) {
+    return { ok: false, code: 'invalid_input', message: 'A wine cannot be merged into itself' };
+  }
+  // A drink that is not wine is no row of this queue and is never merged
+  // onto a wine, whoever has its id.
+  if (wine.nonWine === true) {
+    return { ok: false, code: 'conflict', message: 'This record is not a wine; it stays outside the wine registry and cannot be merged into a wine.' };
+  }
+  const target = await WineDefinition.findOne({ _id: { $eq: targetId } }).select('name producer pendingIdentity draft nonWine').lean();
+  if (!target || target.draft === true) {
+    return { ok: false, code: 'not_found', message: 'No registry wine with that id' };
+  }
+  if (target.pendingIdentity === true || target.nonWine === true) {
+    return {
+      ok: false,
+      code: 'conflict',
+      message: 'The target is not a published wine. Check or complete that wine first, then merge this one into it.',
+    };
+  }
+
+  // The vintages still in a cellar get a maturity row on the target, as a
+  // promotion gives them (runPromotionFollowThrough): read before the merge
+  // re-points the bottles.
+  const vintages = await Bottle.distinct('vintage', { wineDefinition: wine._id, status: 'active' });
+  // The label scan moves to the target with the other photos. Give it the
+  // deadline a promotion gives it, or it would sit on a published wine with
+  // none: unreadable and never swept (services/labelScanAccess).
+  await stampPromotedScanRetention(wine);
+
+  // Lazy: the merge service loads every model that references a wine.
+  const { performWineMerge } = require('./wineMergeOps');
+  const merged = await performWineMerge(String(wine._id), String(target._id), req);
+  if (merged.error) {
+    return { ok: false, code: merged.error.status === 404 ? 'not_found' : 'invalid_input', message: merged.error.message };
+  }
+  try {
+    const { ensurePendingVintageProfile } = require('../utils/vintageProfile');
+    for (const v of vintages) if (v) await ensurePendingVintageProfile(target._id, v);
+  } catch (err) {
+    console.warn('[pendingWineOps] maturity seed after merge failed (non-fatal):', err.message);
+  }
+  return { ok: true, target: merged.target, bottlesMoved: merged.bottlesMoved };
+}
+
 module.exports = {
   queryPendingWines,
+  mergePendingInto,
   validatePendingFix,
   applyPendingFix,
   loadPendingWine,
   runPromotionFollowThrough,
   FIXABLE_FIELDS,
-  CROSS_FIELD_OVERRIDE_FIELD,
   CREATED_VIA_FILTERS,
   FIELD_MAX,
   MAX_BOTTLE_IMAGES,

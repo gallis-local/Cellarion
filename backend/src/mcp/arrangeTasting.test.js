@@ -29,7 +29,7 @@ jest.mock('../models/WineDefinition', () => ({ find: jest.fn(), findById: jest.f
 jest.mock('../models/WineEmbedding', () => ({ findOne: jest.fn() }));
 jest.mock('../models/WineVintageProfile', () => ({ find: jest.fn() }));
 jest.mock('../models/McpActionLog', () => ({ create: jest.fn(), findOne: jest.fn(), findOneAndUpdate: jest.fn(), find: jest.fn(), deleteMany: jest.fn() }));
-jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn(), searchBottles: jest.fn() }));
+jest.mock('../services/search', () => ({ getIsAvailable: jest.fn(() => false), search: jest.fn() }));
 jest.mock('../services/statsService', () => ({ computeOverview: jest.fn(), buildEmptyStats: jest.fn() }));
 jest.mock('../services/audit', () => ({ logAudit: jest.fn() }));
 jest.mock('./mutationBudget', () => ({ takeMutationSlot: jest.fn(() => true), ipKeyFor: jest.fn(() => null), WRITE_WINDOW_MS: 900000 }));
@@ -129,7 +129,7 @@ describe('auto_arrange preview', () => {
     ]);
     expect(stored.prev.target[0]).toEqual({ position: 1, bottleId: oid('2') });
     expect(rack.save).not.toHaveBeenCalled(); // preview never mutates
-    // A stored preview costs one write slot and trims older unconsumed ones (audit 2026-09-02 D08-1)
+    // A stored preview costs one write slot and trims older unconsumed ones
     expect(takeMutationSlot).toHaveBeenCalledWith(ME, 1, null);
     expect(McpActionLog.find).toHaveBeenCalledWith({ user: ME, action: 'arrange_preview', reversed: false });
   });
